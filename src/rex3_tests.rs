@@ -3160,6 +3160,232 @@ mod jit_tests {
         );
     }
 
+    /// GFIFO pressure sweep: how much can we draw per second, as primitives shrink?
+    ///
+    /// `jit_timing_shade_scanlines_fullscreen` already goes through the GFIFO
+    /// (`reg()` calls `rex.write32()`, the real bus entry point), but it draws
+    /// 1280-pixel scanlines from 5 register writes -- about 0.004 queue entries
+    /// per pixel. Guest GL drawing small triangles is nothing like that: tens of
+    /// entries per primitive covering ~32 pixels, call it 1 entry/pixel, some
+    /// 250x denser. So the fullscreen number says the queue is fast at *low*
+    /// entry density and nothing about high density.
+    ///
+    /// This runs each configuration for a fixed wall-clock budget and reports
+    /// how much it managed, rather than timing a fixed amount of work: at
+    /// ~2000 Mpx/s a fixed-work run finishes in milliseconds and measures
+    /// mostly noise. Short spans mean more GOs and more register writes for the
+    /// same fill, so the Mpx/s curve across span lengths isolates what queue
+    /// traffic costs. Flat means the queue is free at any density; collapsing
+    /// means per-entry cost dominates once primitives get small -- the regime
+    /// real GL content lives in.
+    ///
+    /// Both plain Gouraud and ZPATTERN-masked spans are measured. ZPATTERN is
+    /// Indy's depth path (the GL driver compares in software and hands REX3 a
+    /// 32-bit coverage mask per 32-pixel span), so it costs an extra register
+    /// write per span *and* a per-pixel mask test -- exactly what depth-tested
+    /// content pays, and the guest-side numbers show depth is expensive.
+    ///
+    /// Not an assertion test: it prints a table. Run with
+    /// `cargo test --release --features rex-jit gfifo_pressure_sweep -- --nocapture`
+    /// (add `--ignored`; it is ignored by default since it burns real seconds).
+    #[test]
+    #[ignore = "benchmark: runs for several seconds of wall clock"]
+    fn gfifo_pressure_sweep() {
+        /// Minimum wall-clock per sample. The loop runs whole batches and stops
+        /// once this has elapsed, so a sample is always *at least* this long and
+        /// usually a little over — which is why every rate below divides the
+        /// pixels actually drawn by the nanoseconds actually measured, never by
+        /// an assumed budget.
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
+        /// Samples per cell; the median is reported, with min/max as spread.
+        /// Three at >=1s each, rather than one: the short-span rows varied 2.6x
+        /// run to run on single samples (span 32 read 163 / 429 / 229 Mpx/s),
+        /// and one number gives the reader no way to see that.
+        const SAMPLES: usize = 3;
+        const SPAN_LENS: [i32; 6] = [1280, 256, 64, 32, 16, 8];
+        /// Spans per timing check — checking the clock every span would itself
+        /// cost more than the draw at short lengths.
+        const BATCH: u64 = 256;
+
+        let dm1 = DM1_RGB24_SRC;
+        let dm0_plain = DM0_DRAW_SPAN | (1 << 18);              // shade + stoponx
+        // Depth mode as the GL driver actually drives it: ENZPATTERN (bit 12)
+        // for the coverage mask AND LENGTH32 (bit 15), which hard-caps the draw
+        // at 32 pixels (see execute_go's `length32 && pixel_count > 32`). That
+        // cap is why ZPATTERN is a *fixed* 32-pixel row below rather than part
+        // of the span sweep: a longer span would not draw longer, it would just
+        // recycle the same 32-bit mask over pixels it never reaches.
+        let dm0_zpat  = DM0_DRAW_SPAN | (1 << 18) | (1 << 12) | (1 << 15);
+
+        // Draw spans of `len` pixels for BUDGET, through the GFIFO.
+        // Returns (pixels drawn, queue entries pushed, elapsed nanos).
+        let run = |rex: &Rex3, len: i32, zpat: bool| -> (u64, u64, u64) {
+            reg(rex, REX3_DRAWMODE0,  if zpat { dm0_zpat } else { dm0_plain });
+            reg(rex, REX3_DRAWMODE1,  dm1);
+            reg(rex, REX3_WRMASK,     0xFFFFFF);
+            reg(rex, REX3_SLOPERED,   2u32 << 11);
+            reg(rex, REX3_SLOPEGRN,   1u32 << 11);
+            reg(rex, REX3_SLOPEBLUE,  0);
+
+            // 5 writes + 1 GO per span, plus the ZPATTERN mask when enabled --
+            // the extra queue entry per span that depth content actually pays.
+            let per_span = if zpat { 7 } else { 6 };
+            let mut spans = 0u64;
+            let start = std::time::Instant::now();
+            loop {
+                for _ in 0..BATCH {
+                    let i = spans;
+                    // Walk across the framebuffer so successive draws touch
+                    // different lines rather than rewriting one hot row.
+                    let y = (i % 1024) as i32;
+                    let x0 = ((i / 1024) as i32 * len) % (1280 - len).max(1);
+                    if zpat {
+                        // A fresh mask per span, as the GL driver emits after
+                        // each 32-pixel software depth compare. Varying it (not
+                        // a constant) keeps the per-pixel test honest and stops
+                        // the value being hoisted; the alternating-ish patterns
+                        // reject roughly half the pixels.
+                        reg(rex, REX3_ZPATTERN, (0xAAAA_AAAAu32 ^ (i as u32).wrapping_mul(2654435761)));
+                    }
+                    reg(rex, REX3_COLORRED,  ((i * 7 % 200) as u32) << 11);
+                    reg(rex, REX3_COLORGRN,  ((i * 3 % 180) as u32) << 11);
+                    reg(rex, REX3_COLORBLUE, ((i * 5 % 160) as u32) << 11);
+                    reg(rex, REX3_XYENDI,    xy(x0 + len - 1, y));
+                    rex.write32(go_addr(REX3_XYSTARTI), xy(x0, y));
+                    spans += 1;
+                }
+                if start.elapsed() >= BUDGET { break; }
+            }
+            rex.wait_idle();
+            let ns = start.elapsed().as_nanos() as u64;
+            // LENGTH32 caps the draw at 32 pixels however long the span is, so
+            // count what was actually rasterized, not what was requested.
+            let drawn = if zpat { len.min(32) } else { len } as u64;
+            (spans * drawn, spans * per_span, ns)
+        };
+
+        let rex_interp = make_rex3();
+        rex3init(rex_interp);
+        let rex_jit = make_rex3_jit();
+        rex3init(rex_jit);
+
+        // Force both shader variants compiled before timing.
+        for dm0 in [dm0_plain, dm0_zpat] {
+            reg(rex_jit, REX3_DRAWMODE0, dm0);
+            reg(rex_jit, REX3_DRAWMODE1, dm1);
+            reg(rex_jit, REX3_XYENDI,    xy(63, 0));
+            reg_go(rex_jit, REX3_XYSTARTI, xy(0, 0));
+            if let Some(ref jit) = rex_jit.rex_jit {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !jit.compiled_pairs().contains(&(dm0, dm1, 0)) {
+                    assert!(std::time::Instant::now() < deadline,
+                            "JIT compile timed out for dm0={dm0:#010x}");
+                    jit.request_compile(dm0, dm1, 0);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+
+        // Median of `SAMPLES` runs, plus the observed min/max, in Mpx/s.
+        let sample = |rex: &Rex3, len: i32, zpat: bool| -> (u64, u64, u64, u64, u64, u64) {
+            let mut rates = Vec::with_capacity(SAMPLES);
+            let mut entries = 0u64;
+            let mut last_ms = 0u64;
+            let mut last_spans = 0u64;
+            for _ in 0..SAMPLES {
+                let (px, e, ns) = run(rex, len, zpat);
+                entries = e;
+                last_ms = ns / 1_000_000;
+                last_spans = px / if zpat { len.min(32) } else { len } as u64;
+                // Measured pixels over measured nanos — never an assumed budget.
+                rates.push(px * 1000 / ns.max(1));
+            }
+            rates.sort_unstable();
+            (rates[SAMPLES / 2], rates[0], rates[SAMPLES - 1], entries, last_ms, last_spans)
+        };
+
+        // --- self-validation -------------------------------------------------
+        // A throughput number from draws that never touched a pixel is worse
+        // than no number: it looks like a fast configuration. Likewise a "JIT"
+        // column that is really the interpreter. Check both before reporting,
+        // on both engines and both modes, rather than trusting the setup.
+        for (rex, engine) in [(rex_interp, "interp"), (rex_jit, "jit")] {
+            for (zpat, mode) in [(false, "plain"), (true, "zpat")] {
+                // Clear a known region, draw one span into it, confirm it moved.
+                let probe_y = 700;
+                {
+                    let fb = unsafe { &mut *rex.fb_rgb.get() };
+                    for x in 0..64usize { fb[probe_y as usize * 2048 + x] = 0; }
+                }
+                let go_before  = rex.jit_go_count.load(Ordering::Relaxed);
+                let int_before = rex.interp_go_count.load(Ordering::Relaxed);
+
+                reg(rex, REX3_DRAWMODE0, if zpat { dm0_zpat } else { dm0_plain });
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_SLOPERED,  2u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  1u32 << 11);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                if zpat { reg(rex, REX3_ZPATTERN, 0xFFFF_FFFF); }
+                reg(rex, REX3_COLORRED,  200u32 << 11);
+                reg(rex, REX3_COLORGRN,  180u32 << 11);
+                reg(rex, REX3_COLORBLUE, 160u32 << 11);
+                reg(rex, REX3_XYENDI,    xy(31, probe_y));
+                reg_go(rex, REX3_XYSTARTI, xy(0, probe_y));
+
+                let changed = {
+                    let fb = unsafe { &*rex.fb_rgb.get() };
+                    (0..32usize).filter(|&x| fb[probe_y as usize * 2048 + x] != 0).count()
+                };
+                assert!(changed > 0,
+                    "{engine}/{mode}: draw mutated no pixels — the benchmark would be timing nothing");
+
+                let jit_gos = rex.jit_go_count.load(Ordering::Relaxed) - go_before;
+                let int_gos = rex.interp_go_count.load(Ordering::Relaxed) - int_before;
+                println!("  validate {engine:>6}/{mode:<5}: {changed:>2}/32 px written, \
+                          GOs jit={jit_gos} interp={int_gos}");
+                if engine == "jit" {
+                    assert!(jit_gos > 0,
+                        "{engine}/{mode}: no GO dispatched through the JIT (jit={jit_gos} \
+                         interp={int_gos}) — the 'jit' column would just be the interpreter");
+                }
+            }
+        }
+
+        for (label, zpat) in [("plain Gouraud", false), ("ZPATTERN-masked (LENGTH32: 32px draws)", true)] {
+            println!("\n=== GFIFO pressure sweep: {label} ({} ms per cell) ===",
+                     BUDGET.as_millis());
+            println!("  {:>6}  {:>10}  {:>21}  {:>21}  {:>8}  {:>11}  {:>17}",
+                     "span", "entries/px", "interp Mpx/s [min-max]", "jit Mpx/s [min-max]",
+                     "jit x", "ms i/j", "spans i/j");
+            // ZPATTERN draws are capped at 32 pixels, so sweeping span length
+            // past that measures nothing new -- one row is the whole story.
+            let lens: &[i32] = if zpat { &[32, 16, 8] } else { &SPAN_LENS };
+            for &len in lens {
+                let (i_mpx, i_lo, i_hi, entries, i_ms, i_spans) = sample(rex_interp, len, zpat);
+                let (j_mpx, j_lo, j_hi, _, j_ms, j_spans)           = sample(rex_jit,    len, zpat);
+                let drawn = if zpat { len.min(32) } else { len } as u64;
+                // entries/px uses pixels actually rasterized (LENGTH32 caps
+                // ZPATTERN draws at 32), not the span length requested.
+                let per_px = entries as f64
+                    / (entries / if zpat { 7 } else { 6 }).max(1) as f64
+                    / drawn as f64;
+                // Ratio must come from WORK DONE, not elapsed time: every
+                // sample runs for the same wall-clock budget, so i_ns/j_ns is
+                // ~1.00 by construction and says nothing. (It printed a
+                // reassuring "1.00x" next to cells where the JIT was doing
+                // half the interpreter's work.)
+                println!("  {:>6}  {:>10.3}  {:>6}[{:>5}-{:>6}]  {:>6}[{:>5}-{:>6}]  {:>7.2}x  {:>5}/{:<5} {:>8}/{:<8}",
+                         len, per_px,
+                         i_mpx, i_lo, i_hi,
+                         j_mpx, j_lo, j_hi,
+                         j_mpx as f64 / i_mpx.max(1) as f64,
+                         i_ms, j_ms, i_spans, j_spans);
+            }
+        }
+        println!("\n  For comparison: guest-side gltest --bench ~44 Mpx/s,\n                    \x20 --bench --depth ~20 Mpx/s.\n");
+    }
+
     /// Verify Gouraud interpolation pixel-by-pixel: R ramps from 255 down to 0 across 256 pixels.
     ///
     /// slope = (0 - 255) / 255 = -1 per pixel = -1 << 11 in o12.11 fixed-point.
