@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use crossbeam_utils::CachePadded;
-use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BUS_BUSY, BusDevice, Device, Resettable, Saveable};
 use crate::devlog::{LogModule, devlog_is_active, devlog};
 use crate::snapshot::{get_field, u32_slice_to_toml, u16_slice_to_toml, u8_slice_to_toml, load_u32_slice, load_u16_slice, load_u8_slice, toml_u32, toml_u64, toml_u8, hex_u32, hex_u64, hex_u8};
 use std::cell::{Cell, UnsafeCell};
@@ -1015,26 +1015,40 @@ impl GFifo {
         tail.wrapping_sub(head) & GFIFO_MASK
     }
 
-    /// Push an entry. Spins if full. Safe to call from multiple producers concurrently.
+    /// Try to push an entry without blocking. Returns `false` if another
+    /// producer holds the lock or the queue is full — the caller should report
+    /// back-pressure and retry rather than spin here.
+    ///
+    /// Spinning inside the CPU's store path is what this exists to avoid. That
+    /// spin runs with no interrupt servicing, so a sustained full queue starves
+    /// IP7 delivery — and because the guest's own clock is driven by IP7, it
+    /// also *dilates guest time*: wall-clock advances while guest-visible time
+    /// does not. Any guest-side benchmark then reports inflated throughput, and
+    /// inflated most for whatever configuration spins most. Returning `false`
+    /// lets the bus write report `BUS_BUSY` (== `EXEC_RETRY`), so the CPU leaves
+    /// the store, re-enters `step()` — sampling interrupts in `step_preamble!`
+    /// — and re-dispatches the same instruction. Nothing is lost by not making
+    /// progress here: if the queue is full the CPU cannot retire this store
+    /// anyway.
     #[inline]
-    pub fn push(&self, addr: u32, val: u64) {
-        // Acquire the spinlock — uncontested in the common case (one active producer).
-        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            while self.lock.load(Ordering::Relaxed) {
-                std::hint::spin_loop();
-            }
+    pub fn try_push(&self, addr: u32, val: u64) -> bool {
+        // Acquire the spinlock — uncontested in the common case (one active
+        // producer: IRIX only drives DMA for pixmap blits, never while the CPU
+        // is writing REX3 registers), so a failure here is rare.
+        if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return false;
         }
-        // Spin if full — consumer will drain it.
         let tail = self.tail.load(Ordering::Relaxed);
         let next_tail = tail.wrapping_add(1) & GFIFO_MASK;
         let mut cached_head = self.shadow_head.get();
         if next_tail == cached_head {
             cached_head = self.head.load(Ordering::Acquire);
             self.shadow_head.set(cached_head);
-            while next_tail == cached_head {
-                std::hint::spin_loop();
-                cached_head = self.head.load(Ordering::Acquire);
-                self.shadow_head.set(cached_head);
+            if next_tail == cached_head {
+                // Full — release the lock and let the caller retry once the
+                // consumer has drained something.
+                self.lock.store(false, Ordering::Release);
+                return false;
             }
         }
         // SAFETY: we hold the lock; no other producer touches this slot.
@@ -1046,6 +1060,20 @@ impl GFifo {
         // Release: consumer's Acquire on tail sees the slot write above.
         self.tail.store(next_tail, Ordering::Release);
         self.lock.store(false, Ordering::Release);
+        true
+    }
+
+    /// Push an entry, spinning until it fits. Safe to call from multiple
+    /// producers concurrently.
+    ///
+    /// For callers with no way to report back-pressure: shutdown sentinels, and
+    /// MC's VDMA worker thread, which has no EXEC_RETRY mechanism of its own.
+    /// The CPU store path uses `try_push` instead — see its doc comment.
+    #[inline]
+    pub fn push(&self, addr: u32, val: u64) {
+        while !self.try_push(addr, val) {
+            std::hint::spin_loop();
+        }
     }
 
     /// Peek at the next entry without advancing head. Returns `None` if empty.
@@ -3409,6 +3437,34 @@ impl Rex3 {
         }
     }
 
+    /// Non-blocking `gfifo_push`: returns `false` when the queue is full or a
+    /// producer holds the lock, so a bus write can report `BUS_BUSY`
+    /// (== `EXEC_RETRY`) instead of spinning with interrupts unserviced.
+    ///
+    /// Only safe for callers that commit no other state first: the CPU
+    /// re-executes the entire store on retry, so anything done beforehand would
+    /// be applied twice.
+    #[must_use]
+    fn gfifo_try_push(&self, addr: u32, val: u64) -> bool {
+        #[cfg(feature = "developer")]
+        {
+            let len = self.gfifo.len() + 1;
+            let _ = self.gfifo_hwm.try_update(Ordering::Relaxed, Ordering::Relaxed, |hwm| {
+                if len > hwm { Some(len) } else { None }
+            });
+        }
+        if !self.gfifo.try_push(addr, val) {
+            return false;
+        }
+        #[cfg(feature = "idle-pause")]
+        if self.processor_parked.load(Ordering::Acquire) {
+            if let Some(t) = self.processor_unparker.get() {
+                t.unpark();
+            }
+        }
+        true
+    }
+
     fn wait_idle(&self) {
         loop {
             // Acquire load: when gfxbusy goes false, all execute_go() writes become visible.
@@ -5184,6 +5240,11 @@ impl BusDevice for Rex3 {
             }
         }
 
+        // Blocking push, deliberately: `result` is already computed above and a
+        // HOSTRW read has already called note_hostrw_read(), advancing the
+        // read-then-advance pipeline. Returning BUS_BUSY here would re-run that
+        // on retry. Unlike write32's default arm, this path cannot be made
+        // retryable without moving the push ahead of the read side effects.
         if is_go { self.gfifo_push(GFIFO_PURE_GO, 0); }
         result
     }
@@ -5281,7 +5342,15 @@ impl BusDevice for Rex3 {
             }
             REX3_DCBRESET => { *self.dcb.lock() = Rex3DcbState::default(); }
             _ => {
-                self.gfifo_push(offset, val as u64);
+                // The push is this write's ONLY effect, so a full queue can
+                // safely report BUS_BUSY (== EXEC_RETRY): the CPU re-executes
+                // the store from scratch, having sampled interrupts in
+                // step_preamble!, and nothing was half-applied. Spinning here
+                // would starve IP7 — and with it the guest clock — for as long
+                // as the queue stays full.
+                if !self.gfifo_try_push(offset, val as u64) {
+                    return BUS_BUSY;
+                }
                 return BUS_OK;
             }
         }
@@ -5363,7 +5432,11 @@ impl BusDevice for Rex3 {
         if reg_offset64 == REX3_HOSTRW0 {
             // Encode as REX3_HOSTRW64 (0x0231) + GO bit if present.
             // addr bit 0 = is_64bit, bit 11 = GO.
-            self.gfifo_push(REX3_HOSTRW64 | (offset & 0x0800), val);
+            // Sole effect of this write, so a full queue reports BUS_BUSY and
+            // the CPU retries the store (see write32's default arm).
+            if !self.gfifo_try_push(REX3_HOSTRW64 | (offset & 0x0800), val) {
+                return BUS_BUSY;
+            }
             return BUS_OK;
         }
 
