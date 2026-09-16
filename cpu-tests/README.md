@@ -132,10 +132,13 @@ yet. Each is plain architecture rather than a part-specific quirk:
 | `excep/cp0_usable_cu0` | ... unless `Status.CU0` is set |
 | `identity/config_k0` | re-enabled: Config.K0 is writable, with the sweep kept in registers so no dirty D-cache line can be lost across a change of KSEG0's attribute |
 | `mem/load_then_use` | the instructions right behind a load read its value correctly, cached and not |
+| `mem/load_then_trap` | a syscall, break, trap, overflow or reserved instruction right behind a load: exactly one exception, EPC on it, the load complete |
+| `mem/load_then_more` | a CP0 read, a divide, a jump, and nearby loads and stores right behind a load |
+| `fpu/trap_behind_a_load` | an FP trap right behind an integer load, while the load may still be waiting on its fill |
 
 The first results for them are from the `sgiindy_MiSTer` FPGA core presenting as
-an R4600: all pass (2187 checks in its simulator, 2192 with the benchmark group
-on the board).
+an R4600: all pass (2259 checks over 246 tests in its simulator, both with every
+load stalling execute and with loads that stall only when they must).
 
 ## Writing a test
 
