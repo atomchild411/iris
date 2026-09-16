@@ -120,6 +120,23 @@ new: start with [docs/gotchas.md](docs/gotchas.md), which collects the times the
 `run/diff-hw.py` classifies a hardware log against an emulator one; the archived
 hardware logs live in `oracle/`.
 
+### Added since the oracle runs, not yet run on silicon
+
+These went in on branch `claude/r4600-cputests` after the Indys ran the suite,
+so the silicon counts above do not include them and no Indy has passed them
+yet. Each is plain architecture rather than a part-specific quirk:
+
+| test | checks |
+|---|---|
+| `excep/cp0_unusable_user` | CP0 instructions from User and Supervisor mode raise Coprocessor Unusable, CE = 0 (R4000 manual ch. 5) |
+| `excep/cp0_usable_cu0` | ... unless `Status.CU0` is set |
+| `identity/config_k0` | re-enabled: Config.K0 is writable, with the sweep kept in registers so no dirty D-cache line can be lost across a change of KSEG0's attribute |
+| `mem/load_then_use` | the instructions right behind a load read its value correctly, cached and not |
+
+The first results for them are from the `sgiindy_MiSTer` FPGA core presenting as
+an R4600: all pass (2187 checks in its simulator, 2192 with the benchmark group
+on the board).
+
 ## Writing a test
 
 Add a function to the right file in `tests/`, register it in that file's table,
