@@ -435,6 +435,102 @@ static void t_kseg0_kseg1_alias(void)
     CHECK_EQ(*k0, 0x5EED0000u);
 }
 
+/* ── a load, and the instructions right after it ──────────────────────────── */
+
+/*
+ * A pipelined CPU finds a load's value one stage later than any other result,
+ * so the instruction immediately behind a load is where forwarding goes wrong:
+ * using the loaded register at once, one instruction later, as the base of the
+ * next load, in a branch, as the value of a store that is itself reloaded,
+ * after a second load into the same register, and with the load in a branch
+ * delay slot. None of this is CPU-specific - it is plain ISA semantics - but a
+ * core that stalls every load hides a whole class of bugs that a core which
+ * stalls only when it must can have, so the sequences are spelled out.
+ *
+ * Every sequence runs twice: once with its lines not in the D-cache (the load
+ * waits on a fill) and once with them already cached (the load completes in
+ * the cache's own time), because those are different paths through a core.
+ */
+static void t_load_then_use(void)
+{
+    volatile u64 *q = (volatile u64 *)(_scratch_start + 256);
+    const u64 v0 = 0x0123456789ABCDEFull;
+    const u64 v2 = 0x1122334455667788ull;
+    u64 r;
+    int pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        q[0] = v0;
+        q[1] = (u64)(s64)(s32)(unsigned long)&q[2];   /* a KSEG0 pointer, sign-extended */
+        q[2] = v2;
+        q[3] = 0x8000000000000001ull;
+        q[4] = 0;
+        q[5] = 0x80FF7F0100000000ull;                   /* bytes 80 FF 7F 01 ... */
+        SYNC();
+        dcache_wb_invalidate_range(q, 6 * 8);           /* in memory, not in the cache */
+        SYNC();
+        if (pass == 1) {
+            u64 warm = q[0] ^ q[1] ^ q[2] ^ q[3] ^ q[4] ^ q[5];
+            (void)warm;                                  /* now the lines are cached */
+        }
+
+        /* Used by the very next instruction. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\tdaddu %0, $8, $8" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("next", pass, r, v0 + v0);
+
+        /* Used two instructions later, with an unrelated one between. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\tdaddu $9, $zero, $zero\n\tdaddu %0, $8, $9" Z
+                             : "=r"(r) : "r"(q) : "$8", "$9");
+        CHECK_EQ_AT("after one", pass, r, v0);
+
+        /* As the base of the next load: a pointer chase. */
+        __asm__ __volatile__(A "ld $8, 8(%1)\n\tld %0, 0($8)" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("chase", pass, r, v2);
+
+        /* In the branch right behind it. The output is written only at the
+         * end: GCC may give an "=r" output the same hard register as an
+         * input, and the compare needs %2 intact. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\t"
+                               "beq $8, %2, 1f\n\t"
+                               "daddu $9, $zero, $zero\n\t"
+                               "daddiu $9, $zero, 7\n\t"
+                               "1: daddiu %0, $9, 1" Z
+                             : "=r"(r) : "r"(q), "r"(OPAQUE((u64)v0)) : "$8", "$9");
+        CHECK_EQ_AT("branch", pass, r, 1u);
+
+        /* Stored at once, and the store reloaded at once. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\tsd $8, 32(%1)\n\tld %0, 32(%1)" Z
+                             : "=r"(r) : "r"(q) : "$8", "memory");
+        CHECK_EQ_AT("store reload", pass, r, v0);
+
+        /* A second load into the same register wins. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\tld $8, 16(%1)\n\tdaddu %0, $8, $zero" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("reload", pass, r, v2);
+
+        /* Narrow loads extend before the next instruction sees them. */
+        __asm__ __volatile__(A "lb $8, 40(%1)\n\tdaddu %0, $8, $zero" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("lb", pass, r, 0xFFFFFFFFFFFFFF80ull);
+        __asm__ __volatile__(A "lhu $8, 42(%1)\n\tdaddu %0, $8, $8" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("lhu", pass, r, 0x7F01u + 0x7F01u);
+        __asm__ __volatile__(A "lw $8, 4(%1)\n\tdsubu %0, $zero, $8" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("lw", pass, r, 0x0000000076543211ull);
+
+        /* The load in a delay slot, used at the branch target. */
+        __asm__ __volatile__(A "beq $zero, $zero, 1f\n\t"
+                               "ld $8, 0(%1)\n\t"
+                               "daddu $8, $zero, $zero\n\t"
+                               "1: daddu %0, $8, $8" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("delay slot", pass, r, v0 + v0);
+    }
+}
+
 static const struct test tests[] = {
     TEST("mem/load_widths_sign",      t_load_widths_and_sign,            CPU_ALL),
     TEST("mem/store_widths",          t_store_widths,                    CPU_ALL),
@@ -454,6 +550,7 @@ static const struct test tests[] = {
     TEST("mem/unaligned_lh_faults",   t_unaligned_lh_faults,             CPU_ALL),
     TEST("mem/unaligned_family_ok",   t_unaligned_family_never_faults,   CPU_ALL),
     TEST("mem/kseg0_kseg1_alias",     t_kseg0_kseg1_alias,               CPU_ALL),
+    TEST("mem/load_then_use",         t_load_then_use,                   CPU_ALL),
 };
 
 const struct test_group group_mem = {
