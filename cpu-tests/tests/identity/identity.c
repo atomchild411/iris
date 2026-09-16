@@ -76,45 +76,76 @@ static void t_config_cache_geometry(void)
 /* Config.K0 (bits 2:0) is the KSEG0 coherency attribute and is writable;
  * everything else in Config is read-only on these parts.
  *
- * DISABLED (2026-09-12) — the test changes KSEG0's cacheability with live
- * dirty data in the D-cache, which is architecturally unsound and wedges the
- * machine under IRIS.
- *
- * GCC spills `orig` to the stack at t_config_k0_writable+0x38 while KSEG0 is
- * still cached, so the value sits dirty in L1D and never reaches RAM. It then
- * hoists the reload into the delay slot of the loop-exit branch, where it
- * executes while the last iteration has left K0=7 — i.e. KSEG0 uncached. An
+ * WHY THE SWEEP IS IN REGISTERS. The first version of this test was disabled
+ * (2026-09-12) because it changed KSEG0's cacheability with live dirty data in
+ * the D-cache: GCC spilled `orig` to the stack while KSEG0 was cached, so the
+ * value sat dirty in L1D and never reached RAM, then hoisted the reload into a
+ * delay slot that ran while the loop had left K0 on an uncached value. An
  * uncached load goes straight to the bus (R4000 UM p.326: it "issues a
- * noncoherent ... read request"), bypassing the dirty line, so `orig` comes
- * back as pre-spill RAM. The restore then writes K0=0, and the CPU runs off
- * into unmapped KUSEG and spins forever in a TLB-refill loop it cannot
- * service (empty TLB, EXL already set).
+ * noncoherent ... read request"), bypassing the dirty line, so `orig` came back
+ * as pre-spill RAM, the restore wrote K0=0, and the CPU ran off into unmapped
+ * KUSEG. Nothing about that is emulator-specific - changing a region's
+ * coherency attribute with unflushed dirty lines in that region loses them on
+ * hardware too, which is why the PROM always flips K0 from KSEG1 - and it
+ * passed on the reference Indy only because the line happened to still be
+ * resident at the reload.
  *
- * Nothing here is IRIS-specific: changing a region's coherency attribute with
- * unflushed dirty lines in that region loses them on real hardware too, which
- * is why the PROM always flips K0 from KSEG1. The suite's own
- * cache/cached_uncached documents exactly this rule ("a write-back cache has
- * not written anything out yet"). It happens to pass on the reference Indy,
- * but whether the line is still resident at the reload depends on eviction
- * pressure from the loop's own printf/counter traffic, so that is luck rather
- * than a guarantee — and the final CHECK compares Config against `orig`, so a
- * corrupted `orig` is compared to itself and still reports PASS.
- *
- * The fix is a dcache_wb_invalidate_range() over the stack (or keeping `orig`
- * in a callee-saved register) before the sweep. Reported upstream.
+ * So from the first MTC0 to the restore there is no load, no store and no
+ * call: `orig`, the loop counter and the two failure bitmasks all live in
+ * registers, and nothing reaches memory until Config is back as it was. The
+ * one thing KSEG0's attribute can still affect is instruction fetch, and the
+ * text was written back to memory when the suite relocated itself.
  */
-__attribute__((unused)) static void t_config_k0_writable(void)
+static void t_config_k0_writable(void)
 {
-    u32 orig = cp0_config();
-    u32 i;
-    for (i = 0; i < 8; i++) {
-        cp0_config_set((orig & ~CFG_K0_MASK) | i);
-        CHECK_EQ_AT("k0", i, cp0_config() & CFG_K0_MASK, i);
-        /* The rest of Config must not have moved. */
-        CHECK_EQ_AT("k0", i, cp0_config() & ~CFG_K0_MASK, orig & ~CFG_K0_MASK);
-    }
-    cp0_config_set(orig);
-    CHECK_EQ(cp0_config(), orig);
+    u64 bad_k0 = 0, bad_rest = 0, orig = 0, final = 0;
+
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
+        "mfc0   $8, $16\n\t"               /* $8  = orig                        */
+        "nop; nop\n\t"
+        "daddu  $9, $zero, $zero\n\t"      /* $9  = K0 value under test         */
+        "daddu  $10, $zero, $zero\n\t"     /* $10 = bitmask: K0 did not stick   */
+        "daddu  $11, $zero, $zero\n\t"     /* $11 = bitmask: other bits moved   */
+        "addiu  $12, $zero, -8\n\t"        /* $12 = ~7                          */
+        "and    $13, $8, $12\n\t"          /* $13 = orig & ~K0                  */
+        "1:\n\t"
+        "or     $14, $13, $9\n\t"
+        "mtc0   $14, $16\n\t"
+        "nop; nop; nop\n\t"
+        "mfc0   $15, $16\n\t"
+        "nop; nop\n\t"
+        "addiu  $25, $zero, 1\n\t"
+        "sllv   $25, $25, $9\n\t"          /* $25 = 1 << K0                     */
+        "andi   $24, $15, 7\n\t"
+        "beq    $24, $9, 2f\n\t"
+        "nop\n\t"
+        "or     $10, $10, $25\n\t"
+        "2:\n\t"
+        "and    $24, $15, $12\n\t"
+        "beq    $24, $13, 3f\n\t"
+        "nop\n\t"
+        "or     $11, $11, $25\n\t"
+        "3:\n\t"
+        "addiu  $9, $9, 1\n\t"
+        "sltiu  $24, $9, 8\n\t"
+        "bnez   $24, 1b\n\t"
+        "nop\n\t"
+        "mtc0   $8, $16\n\t"               /* restore, before any memory access */
+        "nop; nop; nop\n\t"
+        "mfc0   $24, $16\n\t"
+        "nop; nop\n\t"
+        "daddu  %0, $10, $zero\n\t"
+        "daddu  %1, $11, $zero\n\t"
+        "daddu  %2, $8, $zero\n\t"
+        "daddu  %3, $24, $zero\n\t"
+        ".set pop"
+        : "=r"(bad_k0), "=r"(bad_rest), "=r"(orig), "=r"(final)
+        :: "$8", "$9", "$10", "$11", "$12", "$13", "$14", "$15", "$24", "$25");
+
+    /* One bit per K0 value 0..7. */
+    CHECK_EQ(bad_k0, 0u);
+    CHECK_EQ(bad_rest, 0u);
+    CHECK_EQ(final, orig);
 }
 
 /* All three parts have 48 TLB entries, so Random must wrap within 0..47 and
@@ -136,9 +167,7 @@ static const struct test tests[] = {
     TEST("identity/prid",             t_prid,                   CPU_ALL),
     TEST("identity/fir",              t_fir,                    CPU_ALL),
     TEST("identity/cache_geometry",   t_config_cache_geometry,  CPU_ALL),
-    /* DISABLED — see the block comment on t_config_k0_writable above.
-     * Re-enable once the test flushes the D-cache before changing K0. */
-    /* TEST("identity/config_k0",        t_config_k0_writable,     CPU_ALL), */
+    TEST("identity/config_k0",        t_config_k0_writable,     CPU_ALL),
     TEST("identity/tlb_size",         t_tlb_size,               CPU_ALL),
 };
 
