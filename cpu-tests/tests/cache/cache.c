@@ -1,11 +1,12 @@
 /* cache — geometry, the CACHE instruction, and the coherency software has to
  * maintain by hand.
  *
- * The R4400 and R5000 differ here more than anywhere else in the suite:
+ * The parts differ here more than anywhere else in the suite:
  *
  *              L1 I/D size   ways   line   secondary
  *   R4400        16 KB        1      16 B   external, Config.SC = 0
  *   R5000        32 KB        2      32 B   none, or Triton on-die
+ *   R4600        16 KB        2      32 B   none (data sheet, not measured)
  *
  * so most tests read the geometry out of Config rather than assuming it.
  *
@@ -46,7 +47,7 @@ static void t_geometry_matches_cpu(void)
         CHECK_EQ(dc_size, 32u * 1024);
         CHECK_EQ(ic_line, 32u);
         CHECK_EQ(dc_line, 32u);
-    } else if (PRID_IMP(cpu_prid) == IMP_R4600) {
+    } else if (is_r4600()) {
         CHECK_EQ(ic_size, 16u * 1024);
         CHECK_EQ(dc_size, 16u * 1024);
         CHECK_EQ(ic_line, 32u);
@@ -178,8 +179,9 @@ static void t_hit_invalidate_discards(void)
 static void t_set_conflict_eviction(void)
 {
     /* One way's worth of bytes: total size / ways. Config does not encode the
-     * associativity directly on these parts, so it comes from the CPU id. */
-    u32 ways = is_r5000() ? 2u : 1u;
+     * associativity directly on these parts, so it comes from the CPU id: the
+     * R4600 and the R5000 both have two ways, the R4400 one. */
+    u32 ways = is_r4400() ? 1u : 2u;
     u32 way_size = dc_size / ways;
     volatile u32 *base = (volatile u32 *)_scratch_start;
     volatile u32 *k1_base = (volatile u32 *)K1_PTR(_scratch_start);

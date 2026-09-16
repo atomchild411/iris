@@ -23,14 +23,21 @@ typedef long long           s64;
 /* Bitmask: a test declares which CPUs it is valid on. */
 #define CPU_R4400   0x1
 #define CPU_R5000   0x2
-#define CPU_ALL     (CPU_R4400 | CPU_R5000)
+/* The R4600 is the one part here that no oracle run has covered: its
+ * expectations are inferred, and docs/r4600.md says from what. */
+#define CPU_R4600   0x4
+#define CPU_ALL     (CPU_R4400 | CPU_R5000 | CPU_R4600)
 
-extern u32 cpu_kind;          /* CPU_R4400 or CPU_R5000, set at startup */
+extern u32 cpu_kind;          /* CPU_R4400, CPU_R5000 or CPU_R4600, set at startup */
 extern u32 cpu_prid;
 extern u32 cpu_fir;
 extern u32 cpu_config;
 static inline int is_r5000(void) { return cpu_kind == CPU_R5000; }
 static inline int is_r4400(void) { return cpu_kind == CPU_R4400; }
+static inline int is_r4600(void) { return cpu_kind == CPU_R4600; }
+/* MIPS IV is the R5000's alone: the R4400 and the R4600 are both MIPS III
+ * parts and must refuse every MIPS IV encoding. */
+static inline int has_mips4(void) { return cpu_kind == CPU_R5000; }
 
 /* ── Console ──────────────────────────────────────────────────────────────── */
 void con_init(void);

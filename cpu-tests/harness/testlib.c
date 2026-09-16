@@ -173,9 +173,11 @@ static void identify(void)
 
     switch (PRID_IMP(cpu_prid)) {
     case IMP_R4400: cpu_kind = CPU_R4400; break;
-    /* An R4600 is R4000-class for every expectation here: MIPS III, 48 TLB
-     * entries, direct-mapped primary caches, the same FPU trap behaviour. */
-    case IMP_R4600: cpu_kind = CPU_R4400; break;
+    /* An R4600 is a MIPS III part like the R4400 but with the R5000's cache
+     * organisation (two ways, 32-byte lines, no L2). It gets its own kind so
+     * that neither set of expectations is borrowed silently — see
+     * docs/r4600.md for where each R4600 answer comes from. */
+    case IMP_R4600: cpu_kind = CPU_R4600; break;
     case IMP_R5000: cpu_kind = CPU_R5000; break;
     default:        cpu_kind = 0; break;
     }
@@ -185,7 +187,21 @@ static const char *cpu_name(void)
 {
     if (cpu_kind == CPU_R4400) return "R4400";
     if (cpu_kind == CPU_R5000) return "R5000";
+    if (cpu_kind == CPU_R4600) return "R4600";
     return "unknown";
+}
+
+static const char *cpus_name(u32 cpus)
+{
+    switch (cpus) {
+    case CPU_R4400:              return "R4400";
+    case CPU_R5000:              return "R5000";
+    case CPU_R4600:              return "R4600";
+    case CPU_R4400 | CPU_R4600:  return "R4400/R4600";
+    case CPU_R4400 | CPU_R5000:  return "R4400/R5000";
+    case CPU_R5000 | CPU_R4600:  return "R5000/R4600";
+    default:                     return "other CPU";
+    }
 }
 
 /* Pad the test name out so the PASS/FAIL column lines up. */
@@ -250,8 +266,7 @@ int main(void)
             if (!(t->cpus & cpu_kind)) {
                 n_skip++;
                 print_name(t->name);
-                con_printf("skip (%s only)\n",
-                           t->cpus == CPU_R5000 ? "R5000" : "R4400");
+                con_printf("skip (%s only)\n", cpus_name(t->cpus));
                 continue;
             }
 

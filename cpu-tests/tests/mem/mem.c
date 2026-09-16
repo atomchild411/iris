@@ -167,10 +167,29 @@ static void t_lwr_all_offsets(void)
          * Both measured on real silicon — R4400 rev 6.0 and R5000 rev 1.0.
          * LWL sign-extends everywhere on both, because it always writes all
          * 32 bits.
+         *
+         * No R4600 has run this. Its integer unit is QED's, like the R5000's,
+         * but that is a guess, not a measurement — so for the R4600 either
+         * measured behaviour passes and the log says which one it showed.
+         * Anything else (a partial load that corrupts the low half, say)
+         * still fails.
          */
-        want = (o == 3 || is_r5000())
-                        ? (u64)(s64)(s32)want32[o]
-                        : ((orig & 0xFFFFFFFF00000000ull) | want32[o]);
+        {
+            u64 upper_kept = (orig & 0xFFFFFFFF00000000ull) | want32[o];
+            u64 sign_ext   = (u64)(s64)(s32)want32[o];
+
+            if (is_r4600() && o != 3) {
+                con_printf("\n      [lwr off=%u on R4600: %s]", o,
+                           v == sign_ext   ? "sign-extends, as an R5000" :
+                           v == upper_kept ? "keeps the upper half, as an R4400" :
+                                             "neither");
+                /* Either answer passes; a mismatch reports against the
+                 * R5000's. */
+                want = (v == upper_kept) ? upper_kept : sign_ext;
+            } else {
+                want = (o == 3 || is_r5000()) ? sign_ext : upper_kept;
+            }
+        }
         CHECK_EQ_AT("off", o, v, want);
     }
 }

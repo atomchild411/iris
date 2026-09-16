@@ -1,10 +1,10 @@
 /* mips4 — the MIPS IV additions, and the R4400's obligation to refuse them.
  *
- * This is the group that justifies running the same binary on both CPUs. Every
- * test here is registered for BOTH, and branches internally:
+ * This is the group that justifies running the same binary on every CPU. Every
+ * test here is registered for ALL of them, and branches internally:
  *
  *   on R5000 the instruction must compute the right answer;
- *   on R4400 the very same encoding must raise Reserved Instruction.
+ *   on R4400 and R4600 (both MIPS III) the very same encoding must be refused.
  *
  * An emulator that implements MIPS IV unconditionally passes the first half
  * and fails the second, and nothing else in the suite would notice.
@@ -88,7 +88,7 @@ static void report_exc(const char *what)
  */
 static void t_movn_movz(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_RI("0x01AE600B");     /* movn $12, $13, $14 */
         CHECK_RI("0x01AE600A");     /* movz $12, $13, $14 */
         return;
@@ -136,7 +136,7 @@ static void t_movn_movz(void)
  */
 static void t_pref(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_RI("0xCDA00000");
         return;
     }
@@ -162,7 +162,7 @@ static void t_pref(void)
  */
 static void t_recip_rsqrt(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_COP1_UNIMPL("0x46000095");     /* recip.s $f2, $f0 */
         CHECK_COP1_UNIMPL("0x46000096");     /* rsqrt.s $f2, $f0 */
         return;
@@ -199,7 +199,7 @@ static void t_recip_rsqrt(void)
  */
 static void t_movci(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_RI("0x01A16001");     /* movt $12, $13, $fcc0 */
         CHECK_RI("0x01A06001");     /* movf $12, $13, $fcc0 */
         return;
@@ -242,7 +242,7 @@ static void t_movci(void)
  */
 static void t_cop1x(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_RI("0x4DAE0000");     /* lwxc1  $f0, $14($13) */
         CHECK_RI("0x4C000020");     /* madd.s $f0, $f0, $f0, $f0 */
         return;
@@ -300,14 +300,15 @@ static void t_cop1x(void)
  */
 static void t_multiple_fp_condition_codes(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         /* On MIPS III the cc field is reserved-zero, so a non-zero cc is not
          * an architecturally-defined encoding. R4400 behaviour here is not
          * pinned by the manual — it may ignore the field rather than trap —
          * so this is reported, not asserted. */
         exc_clear();
         __asm__ __volatile__(A ".word 0x46000332" Z);
-        con_printf("\n      [c.eq.s cc=3 on R4400: exc=%u code=%u]",
+        con_printf("\n      [c.eq.s cc=3 on %s: exc=%u code=%u]",
+                   is_r4600() ? "R4600" : "R4400",
                    exc.count, exc.count ? CAUSE_EXC(exc.cause) : 0);
         CHECK(1);
         return;
