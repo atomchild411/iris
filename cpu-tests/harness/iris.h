@@ -79,6 +79,10 @@
 #define PRID_R5000        0x00002321u
 #define FIR_R4000         0x00000500u
 #define FIR_R5000         0x00002300u
+/* Not an IRIS model: the R4600 has never been emulated here. Revision 2.0 is
+ * the common Indy part; t_fir masks the revision off anyway. */
+#define PRID_R4600        0x00002020u
+#define FIR_R4600         0x00002000u
 #define PRID_IMP(p)       (((p) >> 8) & 0xFF)
 #define PRID_REV_MAJOR(p) (((p) >> 4) & 0xF)
 #define PRID_REV_MINOR(p) ((p) & 0xF)

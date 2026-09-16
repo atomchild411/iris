@@ -4,8 +4,10 @@ MIPS III / MIPS IV tests that run **on the emulated CPU** with no operating
 system. They print PASS/FAIL over the serial console and report the failure
 count as the emulator's exit code.
 
-One binary covers both CPUs: it reads `PRId` at startup and picks expectations
-for R4400 (MIPS III) or R5000 (MIPS IV).
+One binary covers every CPU it knows: it reads `PRId` at startup and picks
+expectations for R4400 (MIPS III) or R5000 (MIPS IV) — both validated on real
+Indys — or R4600 (MIPS III), whose expectations are inferred rather than
+measured; [docs/r4600.md](docs/r4600.md) says from what.
 
 **This branch is tests only** — no emulator changes. Findings are reported, not
 fixed, so the suite keeps showing them.
@@ -84,9 +86,12 @@ what IRIS emulates.
 Unlike `bench/`, this suite also **legitimately refuses an unrecognised CPU**
 (exit 127). That is not the same limitation and should not be "fixed" the same
 way: these tests check R4400-versus-R5000 behaviour by construction — cache
-geometry, MIPS IV availability, FPU quirks — so a third CPU genuinely has no
-expected answer here. `bench/` has no CPU-specific anything and does run on any
-MIPS III-or-later part.
+geometry, MIPS IV availability, FPU quirks — so a CPU the suite has no case
+for genuinely has no expected answer here. The R4600 case was added the honest
+way: each of its answers is either documented, shared by both measured parts,
+or accepts both measured parts' answers — [docs/r4600.md](docs/r4600.md).
+`bench/` has no CPU-specific anything and does run on any MIPS III-or-later
+part.
 
 The assumptions, which of them were tested, and what a port to another SGI
 family would actually involve, are written up once in
@@ -134,8 +139,11 @@ static const struct test tests[] = {
 };
 ```
 
-`CPU_ALL`, `CPU_R4400` or `CPU_R5000` says which parts it applies to; the
-others are skipped rather than failed. `A`/`Z` are the strict asm prologue —
+`CPU_ALL`, or any combination of `CPU_R4400`, `CPU_R5000` and `CPU_R4600`,
+says which parts it applies to; the others are skipped rather than failed.
+Inside a test, `is_r4400()` / `is_r5000()` / `is_r4600()` name one part and
+`has_mips4()` asks the ISA question — use that one for MIPS IV availability, so
+the R4600 is not mistaken for an R5000. `A`/`Z` are the strict asm prologue —
 use them, or the assembler will quietly rewrite your instructions (see
 [docs/gotchas.md](docs/gotchas.md)).
 

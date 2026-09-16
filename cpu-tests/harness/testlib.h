@@ -116,7 +116,7 @@ extern volatile u64 exl_resume_pc;
 struct test {
     const char *name;      /* "alu/dadd_overflow" */
     void (*fn)(void);
-    u32 cpus;              /* CPU_ALL, CPU_R4400, CPU_R5000 */
+    u32 cpus;              /* CPU_ALL, or any OR of CPU_R4400/R5000/R4600 */
 };
 
 /* Every test file defines its tests then exposes a table via TEST_GROUP. */

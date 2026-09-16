@@ -105,7 +105,7 @@ static volatile u64 *dw(void) { return (volatile u64 *)_scratch_start; }
  */
 static void t_recip_rsqrt_double(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_COP1_UNIMPL("0x46200095");
         CHECK_COP1_UNIMPL("0x46200096");
         return;
@@ -142,7 +142,7 @@ static void t_recip_rsqrt_double(void)
  */
 static void t_cop1x_indexed_memory(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_RI_INDEXED("0x4DAE0001");
         CHECK_RI_INDEXED("0x4DAE0008");
         CHECK_RI_INDEXED("0x4DAE0009");
@@ -206,7 +206,7 @@ static void t_cop1x_indexed_memory(void)
  */
 static void t_multiply_add_family_single(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_RI("0x4C8201A8");
         CHECK_RI("0x4C8201B0");
         CHECK_RI("0x4C8201B8");
@@ -235,7 +235,7 @@ static void t_multiply_add_family_single(void)
 
 static void t_multiply_add_family_double(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_RI("0x4C8201A1");
         CHECK_RI("0x4C8201A9");
         CHECK_RI("0x4C8201B1");
@@ -283,7 +283,7 @@ static void t_multiply_add_family_double(void)
  */
 static void t_fp_conditional_moves_single(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_COP1_UNIMPL("0x46010111");
         CHECK_COP1_UNIMPL("0x46000111");
         CHECK_COP1_UNIMPL("0x460D0113");
@@ -360,7 +360,7 @@ static void t_fp_conditional_moves_single(void)
  */
 static void t_fp_conditional_moves_double(void)
 {
-    if (is_r4400()) {
+    if (!has_mips4()) {
         CHECK_COP1_UNIMPL("0x46210111");
         CHECK_COP1_UNIMPL("0x462D0113");
         return;

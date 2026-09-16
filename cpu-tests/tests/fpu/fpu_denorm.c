@@ -36,6 +36,13 @@
  * manual is not, and denormal handling is exactly the kind of thing two
  * implementations of the same architecture are allowed to differ on — so the
  * R5000 side is reported rather than asserted. See docs/oracle.md §2.
+ *
+ * The R4600 is asserted with the R4400. No R4600 has run this, but the two
+ * parts that have — an R4400 rev 6.0 and an R5000 rev 1.0 — reported
+ * byte-identical observations for every case in this file (oracle/, the
+ * r5000 run2 log's reported lines against the r4400 run5 assertions), and
+ * the R4600's FPU sits between them in lineage. An inference, recorded as one
+ * in docs/r4600.md.
  */
 
 #include "fpu_common.h"
@@ -90,7 +97,7 @@ static void t_denorm_operand_is_unimplemented(void)
 {
     struct fp_obs o = observe_s(F_DENORM, F_1, 0, op_add_s);
 
-    if (is_r4400()) check_unimplemented(&o, 0);
+    if (!is_r5000()) check_unimplemented(&o, 0);
     else            report_obs("denorm operand, R5000", &o, 0);
 
     /* FS covers denormalized *results*; the manual says nothing about whether
@@ -116,7 +123,7 @@ static void t_qnan_operand_propagates(void)
 {
     struct fp_obs o = observe_s(F_QNAN, F_1, 0, op_add_s);
 
-    if (is_r4400()) {
+    if (!is_r5000()) {
         CHECK_EQ(o.exceptions, 0u);
         CHECK_EQ(o.cause & FP_E, 0u);
         CHECK_EQ(o.result, 0x7FBFFFFFu);
@@ -182,7 +189,7 @@ static void t_denorm_result_without_fs(void)
 {
     struct fp_obs o = observe_s(F_MIN_NORM, F_0P5, 0, op_mul_s);
 
-    if (is_r4400()) check_unimplemented(&o, 0);
+    if (!is_r5000()) check_unimplemented(&o, 0);
     else            report_obs("denorm result FS=0, R5000", &o, 0);
 }
 
@@ -195,7 +202,7 @@ static void t_denorm_result_flushed_with_fs(void)
 {
     struct fp_obs o = observe_s(F_MIN_NORM, F_0P5, FCSR_FS, op_mul_s);
 
-    if (is_r4400()) {
+    if (!is_r5000()) {
         CHECK_EQ(o.exceptions, 0u);
         CHECK_EQ(o.result, F_0);
         CHECK_EQ(o.cause & (FP_U | FP_I), (u32)(FP_U | FP_I));
@@ -206,7 +213,7 @@ static void t_denorm_result_flushed_with_fs(void)
 
     /* The sign of the intermediate result survives the flush. */
     o = observe_s(0x80800000u, F_0P5, FCSR_FS, op_mul_s);   /* -2^-126 * 0.5 */
-    if (is_r4400()) CHECK_EQ(o.result, F_NEG0);
+    if (!is_r5000()) CHECK_EQ(o.result, F_NEG0);
     else            report_obs("negative underflow FS=1, R5000", &o, 0);
 }
 
@@ -222,7 +229,7 @@ static void t_underflow_enable_forces_unimplemented(void)
     struct fp_obs o = observe_s(F_MIN_NORM, F_0P5,
                                 FCSR_FS | FCSR_ENABLE(FP_U), op_mul_s);
 
-    if (is_r4400()) {
+    if (!is_r5000()) {
         check_unimplemented(&o, 0);
         CHECK_EQ(o.cause & FP_U, 0u);
     } else {
@@ -241,15 +248,15 @@ static void t_denorm_double(void)
 {
     struct fp_obs o = observe_d(D_DENORM, D_1, 0, op_add_d);
 
-    if (is_r4400()) check_unimplemented(&o, 1);
+    if (!is_r5000()) check_unimplemented(&o, 1);
     else            report_obs("denorm operand .d, R5000", &o, 1);
 
     o = observe_d(D_MIN_NORM, D_0P5, 0, op_mul_d);
-    if (is_r4400()) check_unimplemented(&o, 1);
+    if (!is_r5000()) check_unimplemented(&o, 1);
     else            report_obs("denorm result .d FS=0, R5000", &o, 1);
 
     o = observe_d(D_MIN_NORM, D_0P5, FCSR_FS, op_mul_d);
-    if (is_r4400()) {
+    if (!is_r5000()) {
         CHECK_EQ(o.exceptions, 0u);
         CHECK_EQ(o.result_d, D_0);
         CHECK_EQ(o.cause & (FP_U | FP_I), (u32)(FP_U | FP_I));
