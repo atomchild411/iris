@@ -173,6 +173,9 @@ static void identify(void)
 
     switch (PRID_IMP(cpu_prid)) {
     case IMP_R4400: cpu_kind = CPU_R4400; break;
+    /* An R4600 is R4000-class for every expectation here: MIPS III, 48 TLB
+     * entries, direct-mapped primary caches, the same FPU trap behaviour. */
+    case IMP_R4600: cpu_kind = CPU_R4400; break;
     case IMP_R5000: cpu_kind = CPU_R5000; break;
     default:        cpu_kind = 0; break;
     }

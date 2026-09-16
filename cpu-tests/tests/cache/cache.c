@@ -46,6 +46,11 @@ static void t_geometry_matches_cpu(void)
         CHECK_EQ(dc_size, 32u * 1024);
         CHECK_EQ(ic_line, 32u);
         CHECK_EQ(dc_line, 32u);
+    } else if (PRID_IMP(cpu_prid) == IMP_R4600) {
+        CHECK_EQ(ic_size, 16u * 1024);
+        CHECK_EQ(dc_size, 16u * 1024);
+        CHECK_EQ(ic_line, 32u);
+        CHECK_EQ(dc_line, 32u);
     } else {
         CHECK_EQ(ic_size, 16u * 1024);
         CHECK_EQ(dc_size, 16u * 1024);
