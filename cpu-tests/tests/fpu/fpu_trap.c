@@ -307,6 +307,48 @@ static void t_trap_in_a_branch_delay_slot(void)
     CHECK_EQ(exc.epc, branch);
 }
 
+/*
+ * An FP trap on the instruction right behind an integer load. A core that lets
+ * a load move on without holding execute runs the FP instruction while the
+ * load is still in flight - in the first pass, still waiting for its D-cache
+ * fill - and the FPU can raise the trap before the load has finished. The
+ * load comes first, so it must still complete, and EPC must still name the FP
+ * instruction. The loaded word sits on a different D-cache line from the
+ * operands, so the operand loads do not fill it.
+ */
+static void t_trap_right_behind_a_load(void)
+{
+    const u64 v = 0x0123456789ABCDEFull;
+    u64 addr, got;
+    int pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        w()[0] = F_1; w()[1] = F_0;
+        d()[8] = v;
+        SYNC();
+        dcache_wb_invalidate_range(&d()[8], 8);
+        SYNC();
+        if (pass == 1) { u64 warm = d()[8]; (void)warm; }
+        fcsr_set(FCSR_ENABLE(FP_Z));
+        exc_clear();
+        __asm__ __volatile__(AF DLA("$9", "1f")
+                                "lwc1 $f0, 0(%2)\n\t"
+                                "lwc1 $f2, 4(%2)\n\t"
+                                "ld $8, 64(%2)\n\t"
+                                "1:\n\t"
+                                "div.s $f4, $f0, $f2\n\t"
+                                "daddu %0, $8, $zero\n\t"
+                                "daddu %1, $9, $zero" Z
+                             : "=r"(got), "=r"(addr) : "r"(w()) : "$8", "$9");
+        fcsr_reset();
+
+        CHECK_EQ_AT("count", pass, exc.count, 1u);
+        CHECK_EQ_AT("cause", pass, CAUSE_EXC(exc.cause), (u32)EXC_FPE);
+        CHECK_EQ_AT("epc", pass, exc.epc, addr);
+        CHECK_EQ_AT("value", pass, got, v);
+    }
+}
+
 static const struct test tests[] = {
     TEST("fpu/trap_invalid",          t_trap_invalid,                     CPU_ALL),
     TEST("fpu/trap_divide_by_zero",   t_trap_divide_by_zero,              CPU_ALL),
@@ -322,6 +364,7 @@ static const struct test tests[] = {
     TEST("fpu/cause_not_by_moves",    t_loads_and_moves_do_not_write_cause, CPU_ALL),
     TEST("fpu/trap_epc",              t_epc_points_at_the_fp_instruction, CPU_ALL),
     TEST("fpu/trap_delay_slot",       t_trap_in_a_branch_delay_slot,      CPU_ALL),
+    TEST("fpu/trap_behind_a_load",    t_trap_right_behind_a_load,         CPU_ALL),
 };
 
 const struct test_group group_fpu_trap = {
