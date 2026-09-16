@@ -334,6 +334,217 @@ static void t_general_vector_used(void)
     CHECK_EQ(exc.vector, (u32)VECID_GENERAL);
 }
 
+/* ── CP0 is usable only in Kernel mode or with Status.CU0 ─────────────────── */
+
+/*
+ * "The CP0 instructions ... are usable in Kernel mode, or in User and
+ * Supervisor mode when the CU0 bit of the Status register is set; otherwise a
+ * Coprocessor Unusable exception is taken" (R4000 manual, chapter 5, and the
+ * Coprocessor Unusable exception's cause list). Everything else in the suite
+ * runs in Kernel mode, so nothing else can see whether a CPU enforces it.
+ *
+ * To test it the suite has to leave Kernel mode, which it otherwise never
+ * does: KSEG0, where the suite lives, is not addressable from User mode. So a
+ * few words of code go into a scratch page mapped at a kuseg address, ERET
+ * enters them with KSU set, and a `syscall` at the end brings control back.
+ * um_handler (below) is installed as the exception hook for the duration: a
+ * syscall returns to Kernel mode at um_state.return_pc; any other exception
+ * is counted, its Cause kept if it is the first, and stepped over in the mode
+ * it came from. Eight of them and it goes home regardless, so a CPU that
+ * mishandles this cannot hang the suite.
+ *
+ * Derived from the manual, not yet measured on silicon.
+ */
+#define UM_VA        0x00400000ull
+#define UM_TLB_INDEX 12u
+#define ST_KSU_SUPER 0x00000008u
+#define ST_KSU_USER  0x00000010u
+
+extern char _scratch_start[];
+extern void um_handler(void);
+extern struct { u32 faults; u32 first_cause; u64 return_pc; } um_state;
+
+__asm__(
+    "    .text\n"
+    "    .set push; .set mips3; .set noreorder; .set nomacro; .set noat\n"
+    "    .globl um_handler\n"
+    "    .ent um_handler\n"
+    "um_handler:\n"
+    "    lui     $k1, %hi(um_state)\n"
+    "    addiu   $k1, $k1, %lo(um_state)\n"
+    "    mfc0    $k0, $13\n"
+    "    nop\n"
+    "    andi    $k0, $k0, 0x7c\n"
+    "    xori    $k0, $k0, 0x20\n"          /* zero iff ExcCode 8, Sys */
+    "    beqz    $k0, um_to_kernel\n"
+    "    nop\n"
+    "    lw      $k0, 0($k1)\n"
+    "    bnez    $k0, 1f\n"
+    "    nop\n"
+    "    mfc0    $k0, $13\n"
+    "    nop\n"
+    "    sw      $k0, 4($k1)\n"             /* the first fault's Cause */
+    "    lw      $k0, 0($k1)\n"
+    "1:  addiu   $k0, $k0, 1\n"
+    "    sw      $k0, 0($k1)\n"
+    "    sltiu   $k0, $k0, 8\n"
+    "    beqz    $k0, um_to_kernel\n"       /* runaway: go home anyway */
+    "    nop\n"
+    "    dmfc0   $k0, $14\n"
+    "    nop\n"
+    "    daddiu  $k0, $k0, 4\n"             /* step over it, same mode */
+    "    dmtc0   $k0, $14\n"
+    "    nop\n"
+    "    b       um_eret\n"
+    "    nop\n"
+    "um_to_kernel:\n"
+    "    mfc0    $k0, $12\n"
+    "    nop\n"
+    "    ori     $k0, $k0, 0x18\n"
+    "    xori    $k0, $k0, 0x18\n"          /* KSU = Kernel; EXL still set */
+    "    mtc0    $k0, $12\n"
+    "    nop\n"
+    "    ld      $k0, 8($k1)\n"
+    "    dmtc0   $k0, $14\n"
+    "    nop\n"
+    "um_eret:\n"
+    "    lui     $k0, %hi(exc_save)\n"
+    "    addiu   $k0, $k0, %lo(exc_save)\n"
+    "    ld      $at, 0($k0)\n"
+    "    ld      $v0, 8($k0)\n"
+    "    ld      $v1, 16($k0)\n"
+    "    ssnop\n"
+    "    ssnop\n"
+    "    ssnop\n"
+    "    ssnop\n"
+    "    eret\n"
+    "    nop\n"
+    "    .end um_handler\n"
+    "    .set pop\n"
+    "    .section .bss\n"
+    "    .align 3\n"
+    "    .globl um_state\n"
+    "um_state:\n"
+    "    .space 16\n"
+    "    .text\n");
+
+/*
+ * Run `n` words of code at UM_VA with KSU = `ksu` and CU0 as given; the code
+ * must end in a syscall. Returns with Kernel mode, Status, the TLB entry and
+ * the exception hook all put back.
+ */
+static void run_unprivileged(const u32 *code, unsigned n, u32 ksu, u32 cu0)
+{
+    volatile u32 *page = (volatile u32 *)_scratch_start;
+    u64 phys = (u64)((u32)(unsigned long)_scratch_start & 0x1FFFFFFFu);
+    u64 saved_hi = cp0_entryhi();
+    u32 saved_pm = cp0_pagemask();
+    u32 saved_status = cp0_status();
+    u32 status;
+    unsigned i;
+
+    for (i = 0; i < n; i++) page[i] = code[i];
+    SYNC();
+    dcache_wb_invalidate_range(page, n * 4);
+
+    cp0_index_set(UM_TLB_INDEX);
+    cp0_pagemask_set(PM_4K);
+    cp0_entryhi_set(UM_VA);
+    cp0_entrylo0_set(((phys >> 12) << ELO_PFN_SHIFT) |
+                     ((u64)CA_CACHEABLE_NC << ELO_C_SHIFT) | ELO_V | ELO_D | ELO_G);
+    cp0_entrylo1_set(0);
+    tlb_write_indexed();
+    /* The same physical line through the mapping, so no instruction cached
+     * from an earlier use of the scratch page survives into this one. */
+    icache_invalidate_range(page, n * 4);
+    icache_invalidate_range(SEXT_PTR((u32)UM_VA), n * 4);
+
+    um_state.faults = 0;
+    um_state.first_cause = 0;
+    exc_clear();
+    exc_user_handler = (u32)(unsigned long)&um_handler;
+
+    status = (saved_status & ~(ST_CU0 | 0x18u | ST_IE)) | ST_EXL | ksu | (cu0 ? ST_CU0 : 0);
+    __asm__ __volatile__(A
+        "dla    $8, 1f\n\t"
+        "sd     $8, 8(%0)\n\t"             /* um_state.return_pc */
+        "mfc0   $9, $12\n\t"
+        "nop\n\t"
+        "ori    $9, $9, 0x2\n\t"           /* EXL first: still Kernel */
+        "mtc0   $9, $12\n\t"
+        "nop; nop; nop\n\t"
+        "mtc0   %1, $12\n\t"               /* KSU and CU0, EXL kept */
+        "nop; nop; nop\n\t"
+        "daddiu $10, $zero, 0x40\n\t"
+        "dsll   $10, $10, 16\n\t"          /* UM_VA = 0x00400000 */
+        "dmtc0  $10, $14\n\t"
+        "nop; nop; nop\n\t"
+        "eret\n\t"
+        "nop\n\t"
+        "1:" Z
+        :: "r"(&um_state), "r"(status)
+        : "$2", "$8", "$9", "$10", "memory");
+
+    exc_user_handler = 0;
+    cp0_status_set(saved_status);
+
+    cp0_index_set(UM_TLB_INDEX);
+    cp0_pagemask_set(PM_4K);
+    cp0_entryhi_set(0x1FFFE000ull);
+    cp0_entrylo0_set(0);
+    cp0_entrylo1_set(0);
+    tlb_write_indexed();
+    cp0_entryhi_set(saved_hi);
+    cp0_pagemask_set(saved_pm);
+}
+
+#define UM_SYSCALL  0x0000000Cu            /* syscall                */
+#define UM_MFC0_SR  0x40026000u            /* mfc0 $2, $12 (Status)  */
+#define UM_TLBP     0x42000008u            /* tlbp                   */
+#define UM_NOP      0x00000000u
+
+static void t_cp0_unusable_outside_kernel(void)
+{
+    static const u32 control[] = { UM_SYSCALL, UM_NOP };
+    static const u32 mfc0[]    = { UM_MFC0_SR, UM_SYSCALL, UM_NOP };
+    static const u32 tlbp[]    = { UM_TLBP, UM_SYSCALL, UM_NOP };
+
+    /* The control: into User mode and straight back, no fault on the way.
+     * Without it a CPU that cannot enter User mode at all would pass the
+     * rest by faulting for the wrong reason. */
+    run_unprivileged(control, 2, ST_KSU_USER, 0);
+    CHECK_EQ(um_state.faults, 0u);
+    CHECK_EQ(exc.count, 1u);
+    CHECK_EQ(CAUSE_EXC(exc.cause), (u32)EXC_SYS);
+    CHECK_EQ(exc.status & 0x18u, ST_KSU_USER);
+
+    /* MFC0 from User mode, CU0 clear: Coprocessor Unusable, CE = 0. */
+    run_unprivileged(mfc0, 3, ST_KSU_USER, 0);
+    CHECK_EQ(um_state.faults, 1u);
+    CHECK_EQ(CAUSE_EXC(um_state.first_cause), (u32)EXC_CPU);
+    CHECK_EQ((um_state.first_cause & CAUSE_CE_MASK) >> CAUSE_CE_SHIFT, 0u);
+
+    /* A TLB instruction is a CP0 instruction too. */
+    run_unprivileged(tlbp, 3, ST_KSU_USER, 0);
+    CHECK_EQ(um_state.faults, 1u);
+    CHECK_EQ(CAUSE_EXC(um_state.first_cause), (u32)EXC_CPU);
+
+    /* Supervisor mode gets no implicit access either. */
+    run_unprivileged(mfc0, 3, ST_KSU_SUPER, 0);
+    CHECK_EQ(um_state.faults, 1u);
+    CHECK_EQ(CAUSE_EXC(um_state.first_cause), (u32)EXC_CPU);
+}
+
+static void t_cp0_usable_with_cu0(void)
+{
+    static const u32 mfc0[] = { UM_MFC0_SR, UM_SYSCALL, UM_NOP };
+
+    run_unprivileged(mfc0, 3, ST_KSU_USER, 1);
+    CHECK_EQ(um_state.faults, 0u);
+    CHECK_EQ(exc.count, 1u);
+    CHECK_EQ(CAUSE_EXC(exc.cause), (u32)EXC_SYS);
+}
+
 static const struct test tests[] = {
     TEST("excep/syscall",              t_syscall,                            CPU_ALL),
     TEST("excep/break",                t_break,                              CPU_ALL),
@@ -350,6 +561,8 @@ static const struct test tests[] = {
     TEST("excep/epc_is_faulting_insn", t_epc_points_at_faulting_instruction, CPU_ALL),
     TEST("excep/exl_preserves_epc",    t_exception_with_exl_set_preserves_epc, CPU_ALL),
     TEST("excep/general_vector",       t_general_vector_used,                CPU_ALL),
+    TEST("excep/cp0_unusable_user",    t_cp0_unusable_outside_kernel,        CPU_ALL),
+    TEST("excep/cp0_usable_cu0",       t_cp0_usable_with_cu0,                CPU_ALL),
 };
 
 const struct test_group group_excep = {
