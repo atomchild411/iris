@@ -20,6 +20,25 @@ developerx = []     # Extended developer logging: breaks on IBE/DBE/ADEL/ADES/TL
 # reproduces at full JIT speed. Cheap enough to carry in a `lightning` build —
 # a fixed-size direct-mapped table, no allocation, no hashing.
 llstats = []
+# REX3 per-GO activity bits and dispatch counters (`rex status`, `perf
+# snapshot`): the DIAG_LOOP_EXECUTE_GO / DIAG_LOOP_DRAW_BLOCK flips and the
+# jit_go_count / interp_go_count / simd_fill_rows increments.
+#
+# Each is a lock-prefixed read-modify-write, i.e. a full fence on x86, and the
+# per-GO ones fire 3-6 times per primitive on the REX3-Processor thread. After a
+# span that touched dozens of cache lines that fence waits on the tail of those
+# framebuffer RFOs instead of letting them overlap the next primitive's register
+# writes, which at the small-primitive end is a measurable fraction of a GO.
+#
+# On by default so the monitor and the tests keep working. A last-drops build
+# drops it with `--no-default-features` (plus whatever else it wants); the gate
+# is deliberately on this flag ALONE rather than `not(lightning)`, so that
+# `--features lightning,rexdiag` stays expressible and the cost of these RMWs
+# can actually be A/B measured on the build that cares. The per-lock DIAG_LOCK_*
+# bits are once per mutex acquisition rather than per primitive, so they stay
+# live either way. jit_go_count is load-bearing in tests: several JIT tests
+# assert on it to prove they compared compiled code, not the interpreter.
+rexdiag = []
 # Stale-code detector: verify, at execution time, that the instruction word an
 # engine is about to run still matches what memory holds at that VA.
 #
@@ -134,7 +153,7 @@ tcache = ["ppmem"]
 # Panics at the exact diverging access instead of letting corruption surface as
 # a guest crash much later. Very slow; diagnostic only.
 tcache_verify = ["tcache"]
-default = ["tlbvmap"]
+default = ["tlbvmap", "rexdiag"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # JIT v2: physical-page PIC region compiler (see rules/jitv2/jit-v2-design.md).

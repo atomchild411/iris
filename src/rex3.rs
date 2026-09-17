@@ -1817,6 +1817,7 @@ impl Rex3 {
         let pattern_fn = unsafe { *self.px_pattern.get() };
 
         ctx.mid_primitive = true;
+        #[cfg(feature = "rexdiag")]
         self.diag.fetch_or(Self::DIAG_LOOP_DRAW_BLOCK, Ordering::Relaxed);
         loop {
             let x = ctx.xstart >> 11;
@@ -1895,6 +1896,7 @@ impl Rex3 {
         }
 
 
+        #[cfg(feature = "rexdiag")]
         self.diag.fetch_and(!Self::DIAG_LOOP_DRAW_BLOCK, Ordering::Relaxed);
 
         if opcode == DRAWMODE0_OPCODE_READ {
@@ -1935,6 +1937,7 @@ impl Rex3 {
         let pattern_fn = unsafe { *self.px_pattern.get() };
 
         ctx.mid_primitive = true;
+        #[cfg(feature = "rexdiag")]
         self.diag.fetch_or(Self::DIAG_LOOP_DRAW_BLOCK, Ordering::Relaxed);
         let x_end_reached = loop {
             let x = ctx.xstart >> 11;
@@ -1984,6 +1987,7 @@ impl Rex3 {
         }
 
 
+        #[cfg(feature = "rexdiag")]
         self.diag.fetch_and(!Self::DIAG_LOOP_DRAW_BLOCK, Ordering::Relaxed);
 
         if opcode == DRAWMODE0_OPCODE_READ {
@@ -3660,6 +3664,7 @@ impl Rex3 {
     }
 
     pub(crate) fn execute_go(&self) {
+        #[cfg(feature = "rexdiag")]
         self.diag.fetch_or(Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
         let ctx = unsafe { &mut *self.context.get() };
         let opcode = ctx.drawmode0.opcode();
@@ -3767,7 +3772,9 @@ impl Rex3 {
                         let fb_rgb = unsafe { (*self.fb_rgb.get()).as_mut_ptr() };
                         let fb_aux = unsafe { (*self.fb_aux.get()).as_mut_ptr() };
                         unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
+                        #[cfg(feature = "rexdiag")]
                         self.jit_go_count.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "rexdiag")]
                         self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
                         return;
                     }
@@ -3878,7 +3885,9 @@ impl Rex3 {
                 self.draw_span(ctx);
             }
         }
+        #[cfg(feature = "rexdiag")]
         self.interp_go_count.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "rexdiag")]
         self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
     }
 

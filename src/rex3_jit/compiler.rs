@@ -65,6 +65,12 @@ impl Dm0 {
     fn skiplast(&self)    -> bool { self.val & (1 << 11) != 0 }
     fn enzpattern(&self)  -> bool { self.val & (1 << 12) != 0 }
     fn enlspattern(&self) -> bool { self.val & (1 << 13) != 0 }
+    /// LSADVLAST: advance the line-stipple pattern on the primitive's last
+    /// pixel too. When clear, the last pixel does NOT advance the pattern, so
+    /// connected segments of a polyline resume mid-pattern instead of drifting
+    /// one bit per segment (see draw_line_bresenham in rex3.rs: the pattern
+    /// step is `if !is_last || lsadvlast`).
+    fn lsadvlast(&self) -> bool { self.val & (1 << 14) != 0 }
     fn length32(&self)    -> bool { self.val & (1 << 15) != 0 }
     fn zpopaque(&self)    -> bool { self.val & (1 << 16) != 0 }
     fn lsopaque(&self)    -> bool { self.val & (1 << 17) != 0 }
@@ -266,7 +272,6 @@ impl ShaderCompiler {
 struct PixelCtx {
     xywin_v:     Value, // packed: hi=xwin, lo=ywin
     xymove_v:    Value,
-    clipmode_v:  Value,
     wrmask_v:    Value,
     colorback_v: Value,
     colorvram_v: Value,
@@ -615,7 +620,19 @@ fn emit_pixel_write(
     };
 
     // Write: (fb[addr] & !wrmask) | (result & wrmask)
-    let old_val  = b.ins().load(types::I32, *memv, px_ptr, ir::immediates::Offset32::new(0));
+    //
+    // Reuse the destination load above when there was one. `fb_px_raw` is the
+    // same address, loaded with no intervening store, so a second load fetches
+    // a value we already have. (Note this is only the *plane* pixel: the CID
+    // match test reads fb_aux at a different pointer and is a genuinely
+    // separate access, not part of this pair.) Cranelift's redundant-load
+    // elimination will not merge them itself — the loads use `memv`, the
+    // possibly-aliased flag, so it cannot prove nothing wrote in between.
+    let old_val = if needs_dst {
+        fb_px_raw
+    } else {
+        b.ins().load(types::I32, *memv, px_ptr, ir::immediates::Offset32::new(0))
+    };
     let inv_mask = b.ins().bnot(pctx.wrmask_v);
     let kept     = b.ins().band(old_val, inv_mask);
     let written  = b.ins().band(result_val, pctx.wrmask_v);
@@ -667,23 +684,99 @@ fn emit_shader(
     let xsave_v   = ld32!(ctx_off!(xsave));
     let yend_v    = ld32!(ctx_off!(yend));
     let xywin_v   = ld32!(ctx_off!(xywin));
-    let xymove_v  = ld32!(ctx_off!(xymove));
-    let clipmode_v= ld32!(ctx_off!(clipmode));
     let wrmask_v  = ld32!(ctx_off!(wrmask));
-    let colorback_v  = ld32!(ctx_off!(colorback));
-    let colorvram_v  = ld32!(ctx_off!(colorvram));
 
-    // smask fields
-    let smask0x_v = ld32!(ctx_off!(smask0x));
-    let smask0y_v = ld32!(ctx_off!(smask0y));
-    let smask1x_v = ld32!(ctx_off!(smask1x));
-    let smask1y_v = ld32!(ctx_off!(smask1y));
-    let smask2x_v = ld32!(ctx_off!(smask2x));
-    let smask2y_v = ld32!(ctx_off!(smask2y));
-    let smask3x_v = ld32!(ctx_off!(smask3x));
-    let smask3y_v = ld32!(ctx_off!(smask3y));
-    let smask4x_v = ld32!(ctx_off!(smask4x));
-    let smask4y_v = ld32!(ctx_off!(smask4y));
+    // Conditional ctx loads: the JIT key already proves whether these are used,
+    // so loading them unconditionally put dead loads in every shader prologue.
+    // A zero placeholder keeps PixelCtx's shape (it wants a Value per field)
+    // while emitting no memory access on the paths that never read it.
+    let c0_early = b.ins().iconst(types::I32, 0);
+    let xymove_v = if is_scr2scr || dm0.xyoffset() {
+        ld32!(ctx_off!(xymove))
+    } else { c0_early };
+    // fastclear reads colorvram; colorhost beats fastclear (see emit_pixel_write).
+    let colorvram_v = if dm1.fastclear() {
+        ld32!(ctx_off!(colorvram))
+    } else { c0_early };
+    // colorback feeds backblend and the opaque-pattern (zpopaque/lsopaque) select.
+    let colorback_v = if dm1.backblend() || dm0.zpopaque() || dm0.lsopaque() {
+        ld32!(ctx_off!(colorback))
+    } else { c0_early };
+    // Each smask pair is gated by its own ensmask bit; ensmask_key == 0 (the
+    // ordinary unclipped case) now loads none of the ten.
+    let smask0x_v = if ensmask_key & 1 != 0 { ld32!(ctx_off!(smask0x)) } else { c0_early };
+    let smask0y_v = if ensmask_key & 1 != 0 { ld32!(ctx_off!(smask0y)) } else { c0_early };
+    let smask1x_v = if ensmask_key & 2 != 0 { ld32!(ctx_off!(smask1x)) } else { c0_early };
+    let smask1y_v = if ensmask_key & 2 != 0 { ld32!(ctx_off!(smask1y)) } else { c0_early };
+    let smask2x_v = if ensmask_key & 4 != 0 { ld32!(ctx_off!(smask2x)) } else { c0_early };
+    let smask2y_v = if ensmask_key & 4 != 0 { ld32!(ctx_off!(smask2y)) } else { c0_early };
+    let smask3x_v = if ensmask_key & 8 != 0 { ld32!(ctx_off!(smask3x)) } else { c0_early };
+    let smask3y_v = if ensmask_key & 8 != 0 { ld32!(ctx_off!(smask3y)) } else { c0_early };
+    let smask4x_v = if ensmask_key & 16 != 0 { ld32!(ctx_off!(smask4x)) } else { c0_early };
+    let smask4y_v = if ensmask_key & 16 != 0 { ld32!(ctx_off!(smask4y)) } else { c0_early };
+
+
+    // Flat-shade colour, hoisted out of the pixel loop.
+    //
+    // With `!dm0.shade()` the primitive colour is constant for the whole draw,
+    // but the packing (3-4 loads, 3-4 clamps, shifts, ORs) used to be emitted
+    // inside the per-pixel body, so a flat fill re-derived the same 32-bit
+    // value for every pixel. Cranelift will not hoist it itself: loads are
+    // skeleton instructions, and its redundant-load elimination cannot prove
+    // the framebuffer stores do not alias `ctx` (both use the default alias
+    // region). Computing it once here is deterministic and costs nothing when
+    // `shade` is set, where the value comes from loop-carried block params
+    // instead and this is never emitted.
+    let flat_color_v: Option<Value> = if !dm0.shade() && !(is_hostw && dm0.colorhost()) {
+        if dm1.rgbmode() {
+            let r  = ld32!(ctx_off!(colorred));
+            let g  = ld32!(ctx_off!(colorgrn));
+            let bl = ld32!(ctx_off!(colorblue));
+            let r_c  = clamp_color_component(&mut b, r);
+            let g_c  = clamp_color_component(&mut b, g);
+            let b_c  = clamp_color_component(&mut b, bl);
+            let g8   = b.ins().ishl_imm_s(g_c, 8);
+            let bl16 = b.ins().ishl_imm_s(b_c, 16);
+            let rb   = b.ins().bor(r_c, g8);
+            Some(b.ins().bor(rb, bl16))
+        } else {
+            let cr = ld32!(ctx_off!(colorred));
+            let c11_tmp = b.ins().iconst(types::I32, 11);
+            Some(b.ins().sshr(cr, c11_tmp))
+        }
+    } else { None };
+
+    // Flat alpha, same reasoning: constant unless ALPHAHOST feeds it per pixel.
+    let flat_alpha_v: Option<Value> = if !dm0.alphahost() {
+        let ca = ld32!(ctx_off!(coloralpha));
+        let ca_c = clamp_color_component(&mut b, ca);
+        Some(b.ins().ishl_imm_s(ca_c, 24))
+    } else { None };
+
+    // Loop-invariant `ctx` inputs, hoisted to the entry block.
+    //
+    // These are pure inputs for the whole draw: `emit_writeback` stores back
+    // xstart/ystart, the DDA colours, zpat_bit/pat_bit and lsmode, but never
+    // these — so nothing the shader does can change them mid-draw. (Note the
+    // pairing: `lsmode` is mutated and correctly stays loop-carried, while
+    // `lspattern`, the mask itself, is invariant.)
+    //
+    // Cranelift will not hoist them on its own: loads are skeleton
+    // instructions, and its redundant-load elimination cannot prove the
+    // framebuffer stores do not alias `ctx`, since both use the default alias
+    // region. So each was re-issued per pixel. The four slope loads matter
+    // most — they sit directly on the DDA dependency chain.
+    let zpattern_hoisted_v  = if dm0.enzpattern()  { Some(ld32!(ctx_off!(zpattern)))  } else { None };
+    let lspattern_hoisted_v = if dm0.enlspattern() { Some(ld32!(ctx_off!(lspattern))) } else { None };
+    let alpharef_hoisted_v  = ld32!(ctx_off!(alpharef));
+    let slopes_hoisted_v: Option<(Value, Value, Value, Value)> = if dm0.shade() {
+        Some((
+            ld32!(ctx_off!(slopered)),
+            ld32!(ctx_off!(slopegrn)),
+            ld32!(ctx_off!(slopeblue)),
+            ld32!(ctx_off!(slopealpha)),
+        ))
+    } else { None };
 
     // Constants
     let coord_bias = b.ins().iconst(types::I32, REX3_COORD_BIAS as i64);
@@ -991,7 +1084,7 @@ fn emit_shader(
     b.seal_block(pixel_block);
 
     let pctx = PixelCtx {
-        xywin_v, xymove_v, clipmode_v, wrmask_v, colorback_v, colorvram_v,
+        xywin_v, xymove_v, wrmask_v, colorback_v, colorvram_v,
         smask0x_v, smask0y_v, smask1x_v, smask1y_v,
         smask2x_v, smask2y_v, smask3x_v, smask3y_v, smask4x_v, smask4y_v,
         fb_rgb, fb_aux,
@@ -1034,6 +1127,45 @@ fn emit_shader(
         &mut b, x_v, y_v, &pctx, skip_block, clip_skip_args, dm0, dm1, is_scr2scr,
         ensmask_key, coord_bias, c0, c2048, ptr_type,
     );
+
+    // Early transparent-pattern reject.
+    //
+    // Placement is load-bearing. It sits AFTER emit_calculate_fb_address, so
+    // clipped and out-of-bounds pixels have already branched to skip_block and
+    // the pattern test sees exactly the pixel set it saw before — that
+    // ordering is what a first attempt got wrong, by testing above the address
+    // calculation and letting scissor-rejected pixels consume a pattern
+    // position, which put the JIT one bit out of phase with the interpreter.
+    //
+    // It sits BEFORE the CIDMATCH block, which is the part worth skipping: that
+    // reads fb_aux at a second pointer, a whole extra cache line per pixel,
+    // and a transparent miss draws nothing so the CID answer is irrelevant.
+    // Everything after this point (source colour resolution, blend/logicop, the
+    // destination load, the write) is skipped too.
+    //
+    // Correctness of the skip edge: skip_block performs the shade DDA step and
+    // the zpat_bit/pat_bit/lsmode advance itself, so a pixel that leaves here
+    // advances exactly as one that leaves from the in-body pattern test below.
+    // `clip_skip_args` is the same "did not consume a host word" arg set those
+    // in-body pattern skips use (no_fetch_skip_args_buf).
+    //
+    // Only for a transparent miss: with ZPOPAQUE a miss still draws colorback,
+    // so those keep the in-body path. LSPATTERN is excluded because its miss
+    // handling carries the lsrcount repeat counter, and HOSTR reads rather
+    // than writes.
+    let early_zpat_reject = dm0.enzpattern() && !dm0.zpopaque()
+        && !dm0.enlspattern()
+        && !is_hostr;
+    if early_zpat_reject {
+        let zpattern_v   = zpattern_hoisted_v.expect("hoisted when enzpattern");
+        let zpat_bit32   = b.ins().uextend(types::I32, zpat_bit_v);
+        let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
+        let bit_v        = b.ins().band_imm_s(zpat_shifted, 1);
+        let bit_set      = b.ins().icmp_imm_s(IntCC::NotEqual, bit_v, 0);
+        let zpat_ok = b.create_block();
+        b.ins().brif(bit_set, zpat_ok, &[], skip_block, &block_args(clip_skip_args));
+        b.switch_to_block(zpat_ok); b.seal_block(zpat_ok);
+    }
 
     // CIDMATCH selects permitted two-bit CIDs; popup bits are unrelated.
     // Only emitted when cidmatch != 0xF (0xF = disabled).
@@ -1126,20 +1258,9 @@ fn emit_shader(
                 b.ins().bor(rb, bl16)
             } else if is_hostw && dm0.colorhost() {
                 host_pixel_v
-            } else if dm1.rgbmode() {
-                let r  = ld32!(ctx_off!(colorred));
-                let g  = ld32!(ctx_off!(colorgrn));
-                let bl = ld32!(ctx_off!(colorblue));
-                let r_c  = clamp_color_component(&mut b, r);
-                let g_c  = clamp_color_component(&mut b, g);
-                let b_c  = clamp_color_component(&mut b, bl);
-                let g8   = b.ins().ishl_imm_s(g_c, 8);
-                let bl16 = b.ins().ishl_imm_s(b_c, 16);
-                let rb   = b.ins().bor(r_c, g8);
-                b.ins().bor(rb, bl16)
             } else {
-                let cr = ld32!(ctx_off!(colorred));
-                b.ins().sshr(cr, c11)
+                // Hoisted to the entry block — constant for the whole draw.
+                flat_color_v.expect("flat_color_v must exist when !shade && !colorhost")
             };
 
             // Afunction's source alpha is "either DDA or host" (selected by ALPHAHOST),
@@ -1149,9 +1270,8 @@ fn emit_shader(
             let alpha_byte = if dm0.alphahost() {
                 b.ins().band_imm_s(host_pixel_v, 0xFF00_0000u64 as i64)
             } else {
-                let ca = ld32!(ctx_off!(coloralpha));
-                let ca_c = clamp_color_component(&mut b, ca);
-                b.ins().ishl_imm_s(ca_c, 24)
+                // Hoisted to the entry block — constant for the whole draw.
+                flat_alpha_v.expect("flat_alpha_v must exist when !alphahost")
             };
             let color24 = b.ins().band_imm_s(raw_src, 0x00FF_FFFFi64);
             let raw_src = b.ins().bor(color24, alpha_byte);
@@ -1161,11 +1281,14 @@ fn emit_shader(
             b.append_block_param(draw_block, types::I8);
             let mut cur_use_bg: Value = b.ins().iconst(types::I8, 0);
 
-            if dm0.enzpattern() {
+            // Skipped when early_zpat_reject already tested this bit: same
+            // bit, same pixel, and nothing between the two points changes
+            // zpat_bit or zpattern. Re-testing would just re-emit the branch.
+            if dm0.enzpattern() && !early_zpat_reject {
                 let zp_block = b.create_block();
                 let zp_pass  = b.create_block();
                 b.append_block_param(zp_pass, types::I8);
-                let zpattern_v   = ld32!(ctx_off!(zpattern));
+                let zpattern_v   = zpattern_hoisted_v.expect("hoisted when enzpattern");
                 let zpat_bit32   = b.ins().uextend(types::I32, zpat_bit_v);
                 let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
                 let bit_v  = b.ins().band_imm_s(zpat_shifted, 1);
@@ -1188,7 +1311,7 @@ fn emit_shader(
                 let ls_block = b.create_block();
                 let ls_pass  = b.create_block();
                 b.append_block_param(ls_pass, types::I8);
-                let lspattern_v  = ld32!(ctx_off!(lspattern));
+                let lspattern_v  = lspattern_hoisted_v.expect("hoisted when enlspattern");
                 let pat_bit32    = b.ins().uextend(types::I32, pat_bit_v);
                 let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
                 let bit_v  = b.ins().band_imm_s(lspat_shifted, 1);
@@ -1232,7 +1355,7 @@ fn emit_shader(
         } else {
             let sa   = b.ins().ushr_imm_s(src_color, 24);
             let sa8  = b.ins().band_imm_s(sa, 0xFF);
-            let aref_v  = ld32!(ctx_off!(alpharef));
+            let aref_v  = alpharef_hoisted_v;
             let aref8   = b.ins().band_imm_s(aref_v, 0xFF);
             let cc = match afunc_cmp {
                 1 => IntCC::UnsignedLessThan,
@@ -1281,10 +1404,8 @@ fn emit_shader(
 
     // Shade DDA step
     let (new_cr, new_cg, new_cb, new_ca) = if dm0.shade() {
-        let slopered_v   = ld32!(ctx_off!(slopered));
-        let slopegrn_v   = ld32!(ctx_off!(slopegrn));
-        let slopeblue_v  = ld32!(ctx_off!(slopeblue));
-        let slopealpha_v = ld32!(ctx_off!(slopealpha));
+        let (slopered_v, slopegrn_v, slopeblue_v, slopealpha_v) =
+            slopes_hoisted_v.expect("hoisted when shade");
 
         let ncr = b.ins().iadd(colorred_v,   slopered_v);
         let ncg = b.ins().iadd(colorgrn_v,   slopegrn_v);
@@ -1612,21 +1733,53 @@ fn emit_draw_iline(
     let xend_v    = ld32!(ctx_off!(xend));
     let yend_v    = ld32!(ctx_off!(yend));
     let xywin_v   = ld32!(ctx_off!(xywin));
-    let xymove_v  = ld32!(ctx_off!(xymove));
-    let clipmode_v= ld32!(ctx_off!(clipmode));
     let wrmask_v  = ld32!(ctx_off!(wrmask));
-    let colorback_v  = ld32!(ctx_off!(colorback));
-    let colorvram_v  = ld32!(ctx_off!(colorvram));
-    let smask0x_v = ld32!(ctx_off!(smask0x));
-    let smask0y_v = ld32!(ctx_off!(smask0y));
-    let smask1x_v = ld32!(ctx_off!(smask1x));
-    let smask1y_v = ld32!(ctx_off!(smask1y));
-    let smask2x_v = ld32!(ctx_off!(smask2x));
-    let smask2y_v = ld32!(ctx_off!(smask2y));
-    let smask3x_v = ld32!(ctx_off!(smask3x));
-    let smask3y_v = ld32!(ctx_off!(smask3y));
-    let smask4x_v = ld32!(ctx_off!(smask4x));
-    let smask4y_v = ld32!(ctx_off!(smask4y));
+
+    // Conditional ctx loads: the JIT key already proves whether these are used,
+    // so loading them unconditionally put dead loads in every shader prologue.
+    // A zero placeholder keeps PixelCtx's shape (it wants a Value per field)
+    // while emitting no memory access on the paths that never read it.
+    let c0_early = b.ins().iconst(types::I32, 0);
+    let xymove_v = if dm0.xyoffset() {
+        ld32!(ctx_off!(xymove))
+    } else { c0_early };
+    // fastclear reads colorvram; colorhost beats fastclear (see emit_pixel_write).
+    let colorvram_v = if dm1.fastclear() {
+        ld32!(ctx_off!(colorvram))
+    } else { c0_early };
+    // colorback feeds backblend and the opaque-pattern (zpopaque/lsopaque) select.
+    let colorback_v = if dm1.backblend() || dm0.zpopaque() || dm0.lsopaque() {
+        ld32!(ctx_off!(colorback))
+    } else { c0_early };
+    // Each smask pair is gated by its own ensmask bit; ensmask_key == 0 (the
+    // ordinary unclipped case) now loads none of the ten.
+    let smask0x_v = if ensmask_key & 1 != 0 { ld32!(ctx_off!(smask0x)) } else { c0_early };
+    let smask0y_v = if ensmask_key & 1 != 0 { ld32!(ctx_off!(smask0y)) } else { c0_early };
+    let smask1x_v = if ensmask_key & 2 != 0 { ld32!(ctx_off!(smask1x)) } else { c0_early };
+    let smask1y_v = if ensmask_key & 2 != 0 { ld32!(ctx_off!(smask1y)) } else { c0_early };
+    let smask2x_v = if ensmask_key & 4 != 0 { ld32!(ctx_off!(smask2x)) } else { c0_early };
+    let smask2y_v = if ensmask_key & 4 != 0 { ld32!(ctx_off!(smask2y)) } else { c0_early };
+    let smask3x_v = if ensmask_key & 8 != 0 { ld32!(ctx_off!(smask3x)) } else { c0_early };
+    let smask3y_v = if ensmask_key & 8 != 0 { ld32!(ctx_off!(smask3y)) } else { c0_early };
+    let smask4x_v = if ensmask_key & 16 != 0 { ld32!(ctx_off!(smask4x)) } else { c0_early };
+    let smask4y_v = if ensmask_key & 16 != 0 { ld32!(ctx_off!(smask4y)) } else { c0_early };
+
+
+    // Loop-invariant ctx inputs, hoisted — same reasoning as emit_shader's
+    // block: emit_writeback never stores these back, so they cannot change
+    // mid-draw, and Cranelift will not hoist loads across the framebuffer
+    // stores because both use the default alias region.
+    let zpattern_hoisted_v  = if dm0.enzpattern()  { Some(ld32!(ctx_off!(zpattern)))  } else { None };
+    let lspattern_hoisted_v = if dm0.enlspattern() { Some(ld32!(ctx_off!(lspattern))) } else { None };
+    let alpharef_hoisted_v  = ld32!(ctx_off!(alpharef));
+    let slopes_hoisted_v: Option<(Value, Value, Value, Value)> = if dm0.shade() {
+        Some((
+            ld32!(ctx_off!(slopered)),
+            ld32!(ctx_off!(slopegrn)),
+            ld32!(ctx_off!(slopeblue)),
+            ld32!(ctx_off!(slopealpha)),
+        ))
+    } else { None };
 
     // Bresenham state from registers
     let bres_v     = ld32!(ctx_off!(bresoctinc1));
@@ -1812,7 +1965,7 @@ fn emit_draw_iline(
     b.seal_block(pixel_block);
 
     let pctx = PixelCtx {
-        xywin_v, xymove_v, clipmode_v, wrmask_v, colorback_v, colorvram_v,
+        xywin_v, xymove_v, wrmask_v, colorback_v, colorvram_v,
         smask0x_v, smask0y_v, smask1x_v, smask1y_v,
         smask2x_v, smask2y_v, smask3x_v, smask3y_v, smask4x_v, smask4y_v,
         fb_rgb, fb_aux,
@@ -1891,7 +2044,7 @@ fn emit_draw_iline(
             let zp_block = b.create_block();
             let zp_pass  = b.create_block();
             b.append_block_param(zp_pass, types::I8);
-            let zpattern_v   = ld32!(ctx_off!(zpattern));
+            let zpattern_v   = zpattern_hoisted_v.expect("hoisted when enzpattern");
             let zpat_bit32   = b.ins().uextend(types::I32, zpat_bit_v);
             let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
             let bit_v  = b.ins().band_imm_s(zpat_shifted, 1);
@@ -1912,7 +2065,7 @@ fn emit_draw_iline(
             let ls_block = b.create_block();
             let ls_pass  = b.create_block();
             b.append_block_param(ls_pass, types::I8);
-            let lspattern_v  = ld32!(ctx_off!(lspattern));
+            let lspattern_v  = lspattern_hoisted_v.expect("hoisted when enlspattern");
             let pat_bit32    = b.ins().uextend(types::I32, pat_bit_v);
             let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
             let bit_v  = b.ins().band_imm_s(lspat_shifted, 1);
@@ -1947,7 +2100,7 @@ fn emit_draw_iline(
     } else {
         let sa   = b.ins().ushr_imm_s(src_color, 24);
         let sa8  = b.ins().band_imm_s(sa, 0xFF);
-        let aref_v  = ld32!(ctx_off!(alpharef));
+        let aref_v  = alpharef_hoisted_v;
         let aref8   = b.ins().band_imm_s(aref_v, 0xFF);
         let cc = match afunc_cmp {
             1 => IntCC::UnsignedLessThan,
@@ -1975,10 +2128,8 @@ fn emit_draw_iline(
 
     // Shade DDA step (mirrors draw_iline calling shade_fn)
     let (new_cr, new_cg, new_cb, new_ca) = if dm0.shade() {
-        let slopered_v   = ld32!(ctx_off!(slopered));
-        let slopegrn_v   = ld32!(ctx_off!(slopegrn));
-        let slopeblue_v  = ld32!(ctx_off!(slopeblue));
-        let slopealpha_v = ld32!(ctx_off!(slopealpha));
+        let (slopered_v, slopegrn_v, slopeblue_v, slopealpha_v) =
+            slopes_hoisted_v.expect("hoisted when shade");
         let ncr = b.ins().iadd(colorred_v,   slopered_v);
         let ncg = b.ins().iadd(colorgrn_v,   slopegrn_v);
         let ncb = b.ins().iadd(colorblue_v,  slopeblue_v);
@@ -2008,10 +2159,40 @@ fn emit_draw_iline(
 
     // Pattern advance (mirrors pattern_fn in draw_iline) — decrement, reset to
     // 31 on wrap (see emit_shader's identical block for the full rationale).
+    //
+    // LSADVLAST: the interpreter advances the pattern only `if !is_last ||
+    // lsadvlast` (draw_line_bresenham, rex3.rs); the JIT advanced
+    // unconditionally. `advance_pattern` is the runtime predicate; when
+    // LSADVLAST is set it folds to a constant true and the selects below are
+    // optimised away. Applies to I_LINE, F_LINE and A_LINE alike, since all
+    // three run this shader and all three funnel through draw_line_bresenham
+    // on the interpreter side.
+    //
+    // UNVERIFIED AGAINST HARDWARE. This makes the JIT match our interpreter,
+    // which is the invariant we can actually enforce, but no test demonstrates
+    // an observable difference and two attempts failed to construct one:
+    //   - DOSETUP resets pat_bit to 31, and a real connected polyline issues
+    //     DOSETUP per segment (each segment needs its own Bresenham setup), so
+    //     a one-bit pat_bit drift is wiped before the next segment draws.
+    //   - The state that survives DOSETUP is lsrcount (LSREPEAT > 1 only), but
+    //     the LSSAVE/LSRESTORE bracketing GL uses for connected stipples
+    //     round-trips lsrcount and erases the difference too.
+    // MAME is no reference: newport.cpp models the stipple as a local
+    // `bit = 31` per draw with no persistent cursor, no lsrcount, and no
+    // LSADVLAST (it only logs bit 14). Spec text for bit 14 is just "Enables
+    // stipple advance at the end of a line" (docs/rex3.md). To be checked
+    // against a real XL Indy before treating either behaviour as settled.
+    let advance_pattern: Value = if dm0.lsadvlast() || iterate_one {
+        b.ins().iconst(types::I8, 1)
+    } else {
+        b.ins().icmp_imm_s(IntCC::Equal, is_last_v, 0)
+    };
+
     let new_zpat_bit = if dm0.enzpattern() {
         let c1_i8 = b.ins().iconst(types::I8, 1);
         let dec = b.ins().isub(zpat_bit_v, c1_i8);
-        b.ins().band_imm_s(dec, 31)
+        let advanced = b.ins().band_imm_s(dec, 31);
+        b.ins().select(advance_pattern, advanced, zpat_bit_v)
     } else { zpat_bit_v };
 
     let (new_pat_bit, new_lsmode) = if dm0.enlspattern() {
@@ -2039,7 +2220,13 @@ fn emit_draw_iline(
         let new_pb = b.ins().ireduce(types::I8, new_pat32_masked);
         let lsm_cleared = b.ins().band_imm_s(lsmode_v, !0xFF_i64);
         let new_lsm = b.ins().bor(lsm_cleared, new_count);
-        (new_pb, new_lsm)
+        // Hold both pat_bit and the lsrcount in lsmode when the advance is
+        // suppressed — the interpreter skips the whole pattern_fn call, which
+        // leaves both untouched, so suppressing only pat_bit would still drift
+        // the repeat counter.
+        let held_pb  = b.ins().select(advance_pattern, new_pb, pat_bit_v);
+        let held_lsm = b.ins().select(advance_pattern, new_lsm, lsmode_v);
+        (held_pb, held_lsm)
     } else { (pat_bit_v, lsmode_v) };
 
     // ── Bresenham step (mirrors bres_step! macro in draw_iline) ──────────────
