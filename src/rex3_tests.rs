@@ -54,15 +54,34 @@ fn set_addr(offset: u32) -> u32 { REX3_BASE | offset }
 // Compute the GO address (bit 11 set) for a register offset.
 fn go_addr(offset: u32) -> u32  { REX3_BASE | 0x0800 | offset }
 
+/// Bus write that retries on `BUS_BUSY`, the way the CPU re-executes a store
+/// on `EXEC_RETRY`. `Rex3::write32` returns `BUS_BUSY` when the GFIFO is
+/// full; discarding that status silently drops the entry, which turned the
+/// throughput benchmarks below into a measurement of how fast a host thread
+/// can *attempt* pushes (a flat ~18M spans/s at every span length, i.e.
+/// "22 Gpx/s" for 1280-pixel Gouraud spans).
+fn w32(rex: &Rex3, addr: u32, value: u32) {
+    while rex.write32(addr, value) == crate::traits::BUS_BUSY {
+        std::hint::spin_loop();
+    }
+}
+
+/// 64-bit counterpart of `w32`.
+fn w64(rex: &Rex3, addr: u32, value: u64) {
+    while rex.write64(addr, value) == crate::traits::BUS_BUSY {
+        std::hint::spin_loop();
+    }
+}
+
 /// Write a register to the SET space (no draw trigger).
 fn reg(rex: &Rex3, offset: u32, value: u32) {
-    rex.write32(set_addr(offset), value);
+    w32(rex, set_addr(offset), value);
 }
 
 /// Write a register to the GO space (triggers a draw), then wait for idle.
 /// Equivalent to writing to go.reg + REX3WAIT(REX) in SGI diagnostics.
 fn reg_go(rex: &Rex3, offset: u32, value: u32) {
-    rex.write32(go_addr(offset), value);
+    w32(rex, go_addr(offset), value);
     rex.wait_idle();
 }
 
@@ -73,9 +92,21 @@ fn wait(rex: &Rex3) {
 
 /// Read a 32-bit context register.  Blocks until the GFIFO is idle first.
 fn read_reg(rex: &Rex3, offset: u32) -> u32 {
+    // Retry on busy, don't panic. 67 registers are gated behind `busy_or_val!`,
+    // which returns busy whenever gfxbusy is set or the GFIFO is non-empty — so
+    // `wait_idle()` first is necessary but not sufficient: nothing stops the
+    // queue refilling between the wait and the read. Retrying matches what
+    // read_hostrw32 and friends already do; panicking here would surface a
+    // transient queue state as a bogus "bad status" failure.
     rex.wait_idle();
-    let r: BusRead32 = rex.read32(set_addr(offset));
-    if r.is_ok() { r.data } else { panic!("read_reg: bad status for offset {offset:#x}") }
+    loop {
+        let r: BusRead32 = rex.read32(set_addr(offset));
+        if r.is_ok() { return r.data; }
+        if r.status != crate::traits::BUS_BUSY {
+            panic!("read_reg: bad status {:#x} for offset {offset:#x}", r.status);
+        }
+        std::hint::spin_loop();
+    }
 }
 
 /// Read from HOSTRW0 GO space: returns current word, then triggers next batch.
@@ -118,12 +149,12 @@ fn read_hostrw64_last(rex: &Rex3) -> u64 {
 
 /// Write a 32-bit word to HOSTRW0 (CPU→REX draw path).
 fn write_hostrw32(rex: &Rex3, val: u32) {
-    rex.write32(go_addr(REX3_HOSTRW0), val);
+    w32(rex, go_addr(REX3_HOSTRW0), val);
 }
 
 /// Write a 64-bit double to HOSTRW0 (CPU→REX draw path, 64-bit GIO bus).
 fn write_hostrw64(rex: &Rex3, val: u64) {
-    rex.write64(go_addr(REX3_HOSTRW0), val);
+    w64(rex, go_addr(REX3_HOSTRW0), val);
 }
 
 /// Read fb_rgb pixel at screen (x, y) — direct framebuffer access for verification.
@@ -1111,7 +1142,7 @@ fn test_hostrw_gio_bus_walking_ones_32bit() {
 
     for b in 0..32u32 {
         let w = 1u32 << b;
-        rex.write32(set_addr(REX3_HOSTRW0), w);
+        w32(rex, set_addr(REX3_HOSTRW0), w);
         // SET read: wait for GFIFO to drain, then return hostrw register.
         let got = loop {
             let r: BusRead32 = rex.read32(set_addr(REX3_HOSTRW0));
@@ -1130,7 +1161,7 @@ fn test_hostrw_gio_bus_walking_ones_hostrw1() {
 
     for b in 0..32u32 {
         let w = 1u32 << b;
-        rex.write32(set_addr(REX3_HOSTRW1), w);
+        w32(rex, set_addr(REX3_HOSTRW1), w);
         let got = loop {
             let r: BusRead32 = rex.read32(set_addr(REX3_HOSTRW1));
             if r.is_ok() { break r.data; }
@@ -2579,6 +2610,26 @@ mod jit_tests {
         setup: impl Fn(&Rex3),
         dm0: u32, dm1: u32,
     ) {
+        compare_jit_interp_inner(x0, y0, x1, y1, setup, dm0, dm1, false)
+    }
+
+    /// `compare_jit_interp` for cases where drawing nothing IS the expected
+    /// result (LRONLY aborting the primitive, for example), so the
+    /// "interpreter drew nothing" guard must not fire.
+    fn compare_jit_interp_expect_blank(
+        x0: i32, y0: i32, x1: i32, y1: i32,
+        setup: impl Fn(&Rex3),
+        dm0: u32, dm1: u32,
+    ) {
+        compare_jit_interp_inner(x0, y0, x1, y1, setup, dm0, dm1, true)
+    }
+
+    fn compare_jit_interp_inner(
+        x0: i32, y0: i32, x1: i32, y1: i32,
+        setup: impl Fn(&Rex3),
+        dm0: u32, dm1: u32,
+        expect_blank: bool,
+    ) {
         // Interpreter run with JIT dispatch disabled.
         let rex_interp = make_rex3();
         rex3init(rex_interp);
@@ -2630,6 +2681,17 @@ mod jit_tests {
         reg_go(rex_jit, REX3_DRAWMODE0, dm0);
         let fb_jit = dump_region(rex_jit, x0, y0, x1, y1);
 
+        // A comparison of two blank regions passes whatever the shader does.
+        // jit_zpattern_block sat in exactly that state (packed RGB written to
+        // an o12.11 colour register drew black on black), so an inverted
+        // pattern test in the JIT went undetected. Require that something was
+        // actually drawn before trusting the match.
+        assert!(expect_blank || fb_interp.iter().any(|&p| p != 0),
+            "compare_jit_interp: interpreter drew nothing for dm0={dm0:#010x} \
+             dm1={dm1:#010x} — the comparison below would pass vacuously. If a \
+             blank result is genuinely expected, use \
+             compare_jit_interp_expect_blank.");
+
         assert_eq!(fb_interp, fb_jit,
             "JIT/interp mismatch: dm0={dm0:#010x} dm1={dm1:#010x}");
     }
@@ -2671,13 +2733,25 @@ mod jit_tests {
     /// RGB24 XOR logic op block.
     #[test]
     fn jit_logicop_xor_rgb24() {
-        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_LOGICOP_XOR;
+        // COMPARE must be 0x7 (disabled). Without DRAWMODE1_COMPARE_DISABLE the
+        // compare field reads 0, which is an alpha-function test that passes
+        // nothing, so every write was inhibited and this test compared two
+        // untouched regions -- passing for any shader behaviour. Every working
+        // test gets this via DM1_RGB24_SRC; this one open-coded dm1 and lost it.
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+                | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_XOR;
         let dm0 = DM0_DRAW_BLOCK;
         compare_jit_interp(0, 0, 15, 15,
             |rex| {
                 reg(rex, REX3_DRAWMODE1, dm1);
                 reg(rex, REX3_WRMASK,    0xFFFFFF);
-                reg(rex, REX3_COLORRED,  0x00_FF_00_FFu32);
+                // o12.11 components, not a packed RGB24 word (see
+                // jit_zpattern_block): a packed value shifts down to near-zero
+                // and XOR against a cleared framebuffer left the region blank,
+                // so this compared two empty regions and passed regardless.
+                reg(rex, REX3_COLORRED,  200u32 << 11);
+                reg(rex, REX3_COLORGRN,  150u32 << 11);
+                reg(rex, REX3_COLORBLUE, 100u32 << 11);
                 reg(rex, REX3_XYENDI,    xy(15, 15));
                 reg(rex, REX3_XYSTARTI,  xy(0, 0));
             },
@@ -2819,7 +2893,14 @@ mod jit_tests {
             |rex| {
                 reg(rex, REX3_DRAWMODE1, dm1);
                 reg(rex, REX3_WRMASK,    0xFFFFFF);
-                reg(rex, REX3_COLORRED,  0x00_FF_80_40u32);
+                // o12.11 fixed-point components, NOT a packed RGB24 word: the
+                // shader takes colorred >> 11, so a packed value like
+                // 0x00FF8040 shifts down to 0 and the whole region draws black
+                // on black. This test compared two all-zero regions and passed
+                // for any shader behaviour until that was fixed.
+                reg(rex, REX3_COLORRED,  200u32 << 11);
+                reg(rex, REX3_COLORGRN,  150u32 << 11);
+                reg(rex, REX3_COLORBLUE, 100u32 << 11);
                 reg(rex, REX3_ZPATTERN,  0xAAAA_AAAA);  // alternating bits
                 reg(rex, REX3_XYENDI,    xy(7, 7));
                 reg(rex, REX3_XYSTARTI,  xy(0, 0));
@@ -3022,7 +3103,9 @@ mod jit_tests {
         // x_dec=1: xstart > xend, octant has XDEC set by dosetup
         // Use dosetup so octant is derived from coordinates
         let dm0 = dm0 | (1 << 5); // dosetup
-        compare_jit_interp(0, 0, 15, 7,
+        // LRONLY aborts the primitive when xstart > xend, so an empty region is
+        // the expected result here, not a broken test.
+        compare_jit_interp_expect_blank(0, 0, 15, 7,
             |rex| {
                 reg(rex, REX3_DRAWMODE1, dm1);
                 reg(rex, REX3_WRMASK,    0xFFFFFF);
@@ -3102,7 +3185,7 @@ mod jit_tests {
                     reg(rex, REX3_COLORBLUE,  b0 << 11);
                     reg(rex, REX3_XYENDI,     xy(W, y));
                     // XYSTARTI+GO in one write — triggers the draw
-                    rex.write32(go_addr(REX3_XYSTARTI), xy(0, y));
+                    w32(rex, go_addr(REX3_XYSTARTI), xy(0, y));
                 }
                 // Drain after each full frame so we measure throughput not queue depth
                 rex.wait_idle();
@@ -3160,6 +3243,250 @@ mod jit_tests {
         );
     }
 
+    /// ZPATTERN transparent-miss semantics, checked against explicit expected
+    /// pixels rather than an engine-to-engine comparison.
+    ///
+    /// Written because `jit_zpattern_block` could not catch an inverted pattern
+    /// test: it wrote a packed RGB24 word into COLORRED (an o12.11 component
+    /// register, so it shifted down to ~0) and compared two all-black regions,
+    /// passing for any shader behaviour. This asserts which pixels must change
+    /// and which must not, so an inverted or missing test fails loudly.
+    ///
+    /// ZPATTERN walks MSB-first from bit 31 (see advance_zpat). With pattern
+    /// 0xAAAA_AAAA that yields a strict alternation; the phase is taken from the
+    /// interpreter (the reference) rather than derived here, since the cursor's
+    /// starting position depends on DOSETUP/row-start handling in execute_go.
+    /// What this test pins down is the *transparent-miss* contract: missed
+    /// pixels must be left completely untouched, drawn pixels must carry the
+    /// colour, and the two engines must agree pixel for pixel.
+    #[test]
+    fn jit_zpattern_transparent_miss_exact() {
+        const Y: i32 = 400;
+        const N: usize = 32;
+        const SENTINEL: u32 = 0x0012_3456;
+        let dm0 = DM0_DRAW_SPAN | (1 << 12); // + ENZPATTERN, transparent (no ZPOPAQUE)
+        let dm1 = DM1_RGB24_SRC;
+
+        let run = |rex: &Rex3| -> Vec<u32> {
+            // zpat_bit has no register mapping and only resets on DOSETUP,
+            // which DM0_DRAW_SPAN does not set. Without forcing it here the two
+            // engines start the pattern from whatever the previous GO left
+            // behind -- the interpreter ran once and began at 0, the JIT's
+            // compile-triggering GO left it at 31, and every pixel disagreed.
+            // Same harness hazard compare_jit_interp documents.
+            unsafe { (*rex.context.get()).zpat_bit = 31; }
+            // Fill with a sentinel so an untouched pixel is distinguishable
+            // from a pixel drawn black — the flaw that made the old test inert.
+            {
+                let fb = unsafe { &mut *rex.fb_rgb.get() };
+                for x in 0..N { fb[Y as usize * 2048 + x] = SENTINEL; }
+            }
+            reg(rex, REX3_DRAWMODE0,  dm0);
+            reg(rex, REX3_DRAWMODE1,  dm1);
+            reg(rex, REX3_WRMASK,     0xFFFFFF);
+            reg(rex, REX3_ZPATTERN,   0xAAAA_AAAA);
+            reg(rex, REX3_COLORRED,   200u32 << 11);
+            reg(rex, REX3_COLORGRN,   150u32 << 11);
+            reg(rex, REX3_COLORBLUE,  100u32 << 11);
+            reg(rex, REX3_XYENDI,     xy(N as i32 - 1, Y));
+            reg_go(rex, REX3_XYSTARTI, xy(0, Y));
+            rex.wait_idle();
+            let fb = unsafe { &*rex.fb_rgb.get() };
+            (0..N).map(|x| fb[Y as usize * 2048 + x]).collect()
+        };
+
+        let check = |got: &[u32], who: &str| {
+            // Strict alternation, and exactly half the span drawn: a shader that
+            // drew everything, drew nothing, or inverted the test all fail here.
+            let drawn_count = (0..N).filter(|&x| got[x] != SENTINEL).count();
+            assert_eq!(drawn_count, N / 2,
+                "{who}: {drawn_count} of {N} pixels drawn, expected exactly half \
+                 (0xAAAA_AAAA alternates)");
+            // Absolute phase, not derived from the output. Both fixtures enter
+            // the draw with zpat_bit = 31 (set explicitly below), and bit 31 of
+            // 0xAAAA_AAAA is set, so pixel 0 MUST be drawn. Deriving the phase
+            // from got[0] instead made the test blind to an inverted pattern
+            // test: inverting it shifts the alternation by one, both engines
+            // shift together, and every self-calibrating check still passes.
+            for x in 0..N {
+                let drawn = got[x] != SENTINEL;
+                let expect_drawn = x % 2 == 0;
+                assert_eq!(drawn, expect_drawn,
+                    "{who}: pixel {x} {} but should {} (value {:#010x}) — \
+                     alternation broken",
+                    if drawn { "was drawn" } else { "was NOT drawn" },
+                    if expect_drawn { "be drawn" } else { "be left alone" },
+                    got[x]);
+            }
+            // Missed pixels must be untouched, not drawn black: that distinction
+            // is what the sentinel fill exists for.
+            let missed = (0..N).find(|&x| got[x] == SENTINEL).expect("some pixel missed");
+            assert_eq!(got[missed], SENTINEL,
+                "{who}: missed pixel {missed} was modified");
+            // And the drawn pixels must carry the colour, not black.
+            let first_drawn = (0..N).find(|&x| got[x] != SENTINEL).unwrap();
+            assert_ne!(got[first_drawn] & 0xFFFFFF, 0,
+                "{who}: drawn pixels are black — the colour registers were not \
+                 interpreted as o12.11 components and this check is vacuous");
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        unsafe {
+            let ctx = &mut *rex_i.context.get();
+            ctx.zpat_bit = 31;
+            ctx.pat_bit  = 31;
+        }
+        let interp = run(rex_i);
+        check(&interp, "interpreter");
+
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        let _ = run(rex_j); // request compile
+        {
+            let cm = unsafe { (*rex_j.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+            if let Some(ref jit) = rex_j.rex_jit {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !jit.compiled_pairs().iter().any(|&(a, _, c)| a == dm0 && c == cm) {
+                    assert!(std::time::Instant::now() < deadline,
+                        "JIT compile timed out for dm0={dm0:#010x} cm={cm:#x}");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        // Reset the pattern cursor before the measured run. zpat_bit/pat_bit are
+        // internal state with no register mapping, and they only reset on
+        // DOSETUP — which DM0_DRAW_SPAN does not set. The JIT fixture draws
+        // twice (once to request the compile), so without this it enters the
+        // measured draw one bit further along than the interpreter's single
+        // draw, and every pixel mismatches. compare_jit_interp carries the same
+        // fixup for the same reason.
+        unsafe {
+            let ctx = &mut *rex_j.context.get();
+            ctx.zpat_bit = 31;
+            ctx.pat_bit  = 31;
+        }
+        rex_j.jit_go_count.store(0, Ordering::Relaxed);
+        let jit = run(rex_j);
+        assert!(rex_j.jit_go_count.load(Ordering::Relaxed) > 0,
+            "no GO dispatched through the JIT — this would compare interpreter to itself");
+        check(&jit, "jit");
+        assert_eq!(interp, jit, "JIT and interpreter disagree on ZPATTERN span");
+    }
+
+    /// Scissor (SMASK0) clipping must agree between interpreter and JIT.
+    ///
+    /// Written because the JIT's smask loads are now gated on `ensmask_key`
+    /// (the compile-time clipmode bits), so a wrong gate would silently stop
+    /// clipping — and nothing else in this suite draws with clipping enabled:
+    /// SMASK0X appeared only in `rex3init` and a register read/write check, so
+    /// the whole suite passed either way.
+    ///
+    /// Draws a span wider than the scissor rect and requires both engines to
+    /// clip it identically, then repeats with ensmask off to confirm the same
+    /// span is *not* clipped (otherwise a shader that always clips would also
+    /// pass).
+    #[test]
+    fn jit_smask_clip_matches_interpreter() {
+        const Y: i32     = 200;
+        const X0: i32    = 0;
+        const X1: i32    = 120;
+        const CLIP_LO: i32 = 30;
+        const CLIP_HI: i32 = 80;
+        const WIDTH: usize = 140;
+
+        let draw = |rex: &Rex3, clip: bool| -> Vec<u32> {
+            {
+                let fb = unsafe { &mut *rex.fb_rgb.get() };
+                for x in 0..WIDTH { fb[Y as usize * 2048 + x] = 0; }
+            }
+            // SMASK0X/Y pack (min << 16) | max. The comparison in
+            // calculate_fb_address is against x_curr/y_curr, which are the
+            // COORD_BIAS-shifted coordinates (xy() biases them), so the bounds
+            // must be biased too — unbiased values clip everything away.
+            let lo = (CLIP_LO + REX3_COORD_BIAS) as u32 & 0xFFFF;
+            let hi = (CLIP_HI + REX3_COORD_BIAS) as u32 & 0xFFFF;
+            reg(rex, REX3_SMASK0X, (lo << 16) | hi);
+            let ylo = (0 + REX3_COORD_BIAS) as u32 & 0xFFFF;
+            let yhi = (1023 + REX3_COORD_BIAS) as u32 & 0xFFFF;
+            reg(rex, REX3_SMASK0Y, (ylo << 16) | yhi);
+            // Keep cidmatch = 0xF (disabled) as rex3init sets it — writing a
+            // bare 0/1 here zeroes cidmatch, and cidmatch=0 rejects every
+            // pixel, so nothing draws at all and the test looks like it is
+            // clipping when it is really drawing nothing.
+            let cidm = 0xFu32 << CLIPMODE_CIDMATCH_SHIFT;
+            reg(rex, REX3_CLIPMODE, cidm | if clip { 1 } else { 0 });
+            reg(rex, REX3_DRAWMODE0, DM0_DRAW_SPAN);
+            reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+            reg(rex, REX3_WRMASK,    0xFFFFFF);
+            reg(rex, REX3_COLORRED,  255u32 << 11);
+            reg(rex, REX3_COLORGRN,  255u32 << 11);
+            reg(rex, REX3_COLORBLUE, 255u32 << 11);
+            reg(rex, REX3_XYENDI,    xy(X1, Y));
+            reg_go(rex, REX3_XYSTARTI, xy(X0, Y));
+            rex.wait_idle();
+            let fb = unsafe { &*rex.fb_rgb.get() };
+            (0..WIDTH).map(|x| fb[Y as usize * 2048 + x] & 0xFFFFFF).collect()
+        };
+
+        for clip in [true, false] {
+            let rex_i = make_rex3();
+            rex3init(rex_i);
+            let interp = draw(rex_i, clip);
+
+            let rex_j = make_rex3_jit();
+            rex3init(rex_j);
+            let _ = draw(rex_j, clip); // request compile
+            {
+                let cm = unsafe { (*rex_j.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+                if let Some(ref jit) = rex_j.rex_jit {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while !jit.compiled_pairs().iter()
+                        .any(|&(a, _, c)| a == DM0_DRAW_SPAN && c == cm)
+                    {
+                        assert!(std::time::Instant::now() < deadline,
+                            "JIT compile timed out for clip={clip} cm={cm:#x}");
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+            rex_j.jit_go_count.store(0, Ordering::Relaxed);
+            let jit = draw(rex_j, clip);
+
+            assert!(rex_j.jit_go_count.load(Ordering::Relaxed) > 0,
+                "clip={clip}: no GO dispatched through the JIT");
+
+            let lit = |v: &Vec<u32>| (0..WIDTH).filter(|&x| v[x] != 0).count();
+            if clip {
+                // Both engines must clip to the scissor rect, not draw the full span.
+                assert!(lit(&interp) > 0 && lit(&interp) < (X1 - X0) as usize,
+                    "interpreter did not clip: {} px lit of {}", lit(&interp), X1 - X0);
+                for x in 0..WIDTH {
+                    let inside = (x as i32) >= CLIP_LO && (x as i32) <= CLIP_HI;
+                    if !inside {
+                        assert_eq!(interp[x], 0, "interpreter drew outside scissor at x={x}");
+                    }
+                }
+            } else {
+                assert!(lit(&interp) >= (X1 - X0) as usize,
+                    "ensmask off should not clip: only {} px lit", lit(&interp));
+            }
+            assert_eq!(interp, jit,
+                "clip={clip}: JIT scissor result differs from interpreter\n  \
+                 interp lit {} px, jit lit {} px", lit(&interp), lit(&jit));
+        }
+    }
+
+    // NOTE: no LSADVLAST interpreter-vs-JIT test here on purpose. The JIT was
+    // advancing the line stipple on the last pixel unconditionally where the
+    // interpreter gates on LSADVLAST (fixed in rex3_jit/compiler.rs), but two
+    // attempts to build a test that observes the difference both passed with
+    // the bug reinstated: DOSETUP-per-segment resets pat_bit, and the
+    // LSSAVE/LSRESTORE bracketing used for connected stipples round-trips
+    // lsrcount. A test that passes either way is worse than none. Deferred
+    // until a real XL Indy is available to say which behaviour is correct --
+    // see the UNVERIFIED note in compiler.rs's line-shader pattern advance.
+
     /// GFIFO pressure sweep: how much can we draw per second, as primitives shrink?
     ///
     /// `jit_timing_shade_scanlines_fullscreen` already goes through the GFIFO
@@ -3209,6 +3536,11 @@ mod jit_tests {
 
         let dm1 = DM1_RGB24_SRC;
         let dm0_plain = DM0_DRAW_SPAN | (1 << 18);              // shade + stoponx
+        // Flat fill: same span, no SHADE. The primitive colour is then constant
+        // for the whole draw, which is the case the entry-block colour hoist in
+        // rex3_jit/compiler.rs targets -- and the common one in real content
+        // (solid rectangles, window fills), which the Gouraud rows never cover.
+        let dm0_flat  = DM0_DRAW_SPAN;
         // Depth mode as the GL driver actually drives it: ENZPATTERN (bit 12)
         // for the coverage mask AND LENGTH32 (bit 15), which hard-caps the draw
         // at 32 pixels (see execute_go's `length32 && pixel_count > 32`). That
@@ -3219,8 +3551,11 @@ mod jit_tests {
 
         // Draw spans of `len` pixels for BUDGET, through the GFIFO.
         // Returns (pixels drawn, queue entries pushed, elapsed nanos).
-        let run = |rex: &Rex3, len: i32, zpat: bool| -> (u64, u64, u64) {
-            reg(rex, REX3_DRAWMODE0,  if zpat { dm0_zpat } else { dm0_plain });
+        let run = |rex: &Rex3, len: i32, zpat: bool, shade: bool| -> (u64, u64, u64) {
+            let dm0_sel = if zpat { dm0_zpat }
+                          else if shade { dm0_plain }
+                          else { dm0_flat };
+            reg(rex, REX3_DRAWMODE0,  dm0_sel);
             reg(rex, REX3_DRAWMODE1,  dm1);
             reg(rex, REX3_WRMASK,     0xFFFFFF);
             reg(rex, REX3_SLOPERED,   2u32 << 11);
@@ -3245,13 +3580,13 @@ mod jit_tests {
                         // a constant) keeps the per-pixel test honest and stops
                         // the value being hoisted; the alternating-ish patterns
                         // reject roughly half the pixels.
-                        reg(rex, REX3_ZPATTERN, (0xAAAA_AAAAu32 ^ (i as u32).wrapping_mul(2654435761)));
+                        reg(rex, REX3_ZPATTERN, 0xAAAA_AAAAu32 ^ (i as u32).wrapping_mul(2654435761));
                     }
                     reg(rex, REX3_COLORRED,  ((i * 7 % 200) as u32) << 11);
                     reg(rex, REX3_COLORGRN,  ((i * 3 % 180) as u32) << 11);
                     reg(rex, REX3_COLORBLUE, ((i * 5 % 160) as u32) << 11);
                     reg(rex, REX3_XYENDI,    xy(x0 + len - 1, y));
-                    rex.write32(go_addr(REX3_XYSTARTI), xy(x0, y));
+                    w32(rex, go_addr(REX3_XYSTARTI), xy(x0, y));
                     spans += 1;
                 }
                 if start.elapsed() >= BUDGET { break; }
@@ -3270,7 +3605,7 @@ mod jit_tests {
         rex3init(rex_jit);
 
         // Force both shader variants compiled before timing.
-        for dm0 in [dm0_plain, dm0_zpat] {
+        for dm0 in [dm0_flat, dm0_plain, dm0_zpat] {
             reg(rex_jit, REX3_DRAWMODE0, dm0);
             reg(rex_jit, REX3_DRAWMODE1, dm1);
             reg(rex_jit, REX3_XYENDI,    xy(63, 0));
@@ -3287,13 +3622,13 @@ mod jit_tests {
         }
 
         // Median of `SAMPLES` runs, plus the observed min/max, in Mpx/s.
-        let sample = |rex: &Rex3, len: i32, zpat: bool| -> (u64, u64, u64, u64, u64, u64) {
+        let sample = |rex: &Rex3, len: i32, zpat: bool, shade: bool| -> (u64, u64, u64, u64, u64, u64) {
             let mut rates = Vec::with_capacity(SAMPLES);
             let mut entries = 0u64;
             let mut last_ms = 0u64;
             let mut last_spans = 0u64;
             for _ in 0..SAMPLES {
-                let (px, e, ns) = run(rex, len, zpat);
+                let (px, e, ns) = run(rex, len, zpat, shade);
                 entries = e;
                 last_ms = ns / 1_000_000;
                 last_spans = px / if zpat { len.min(32) } else { len } as u64;
@@ -3342,17 +3677,27 @@ mod jit_tests {
 
                 let jit_gos = rex.jit_go_count.load(Ordering::Relaxed) - go_before;
                 let int_gos = rex.interp_go_count.load(Ordering::Relaxed) - int_before;
+                let counters_live = cfg!(feature = "rexdiag");
                 println!("  validate {engine:>6}/{mode:<5}: {changed:>2}/32 px written, \
-                          GOs jit={jit_gos} interp={int_gos}");
+                          GOs jit={jit_gos} interp={int_gos}{}",
+                         if counters_live { "" } else { " (counters disabled: rexdiag off)" });
+                // The dispatch counters live behind `rexdiag`, which `lightning`
+                // turns off (they are lock-prefixed RMWs on the per-GO path).
+                // Under lightning both read 0 because they are compiled out, not
+                // because dispatch failed, so this check would make the sweep
+                // unrunnable on exactly the build it most needs to measure.
+                #[cfg(feature = "rexdiag")]
                 if engine == "jit" {
                     assert!(jit_gos > 0,
                         "{engine}/{mode}: no GO dispatched through the JIT (jit={jit_gos} \
                          interp={int_gos}) — the 'jit' column would just be the interpreter");
                 }
+                #[cfg(not(feature = "rexdiag"))]
+                let _ = (jit_gos, int_gos);
             }
         }
 
-        for (label, zpat) in [("plain Gouraud", false), ("ZPATTERN-masked (LENGTH32: 32px draws)", true)] {
+        for (label, zpat) in [("flat (no SHADE)", false), ("plain Gouraud", false), ("ZPATTERN-masked (LENGTH32: 32px draws)", true)] {
             println!("\n=== GFIFO pressure sweep: {label} ({} ms per cell) ===",
                      BUDGET.as_millis());
             println!("  {:>6}  {:>10}  {:>21}  {:>21}  {:>8}  {:>11}  {:>17}",
@@ -3362,8 +3707,9 @@ mod jit_tests {
             // past that measures nothing new -- one row is the whole story.
             let lens: &[i32] = if zpat { &[32, 16, 8] } else { &SPAN_LENS };
             for &len in lens {
-                let (i_mpx, i_lo, i_hi, entries, i_ms, i_spans) = sample(rex_interp, len, zpat);
-                let (j_mpx, j_lo, j_hi, _, j_ms, j_spans)           = sample(rex_jit,    len, zpat);
+                let shade = label != "flat (no SHADE)";
+                let (i_mpx, i_lo, i_hi, entries, i_ms, i_spans) = sample(rex_interp, len, zpat, shade);
+                let (j_mpx, j_lo, j_hi, _, j_ms, j_spans)           = sample(rex_jit,    len, zpat, shade);
                 let drawn = if zpat { len.min(32) } else { len } as u64;
                 // entries/px uses pixels actually rasterized (LENGTH32 caps
                 // ZPATTERN draws at 32), not the span length requested.

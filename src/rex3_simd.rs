@@ -53,6 +53,7 @@ pub fn try_fastclear_block(rex: &Rex3, ctx: &Rex3Context) -> bool {
         rows += 1;
     }
 
+    #[cfg(feature = "rexdiag")]
     rex.simd_fill_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
     true
 }
@@ -108,6 +109,7 @@ pub fn try_src_span_rgb(rex: &Rex3, ctx: &Rex3Context) -> bool {
             wr_fn(rex, addr, color);
         }
     }
+    #[cfg(feature = "rexdiag")]
     rex.simd_fill_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }
@@ -165,6 +167,7 @@ pub fn try_src_block_rgb(rex: &Rex3, ctx: &Rex3Context) -> bool {
         rows += 1;
     }
 
+    #[cfg(feature = "rexdiag")]
     rex.simd_fill_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
     true
 }

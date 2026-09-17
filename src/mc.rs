@@ -740,7 +740,18 @@ impl MemoryController {
                                         else       { mem_vaddr = mem_vaddr.wrapping_sub(1); }
                                         shift = shift.wrapping_sub(8);
                                     }
-                                    phys.dma_write64(gio_addr, data);
+                                    // Spin on BUS_BUSY, same as the GIO->Mem read
+                                    // path above: the DMA worker has no EXEC_RETRY
+                                    // mechanism, so dropping the status here would
+                                    // silently lose pixel data whenever REX3's GFIFO
+                                    // is full (write64 reports BUS_BUSY rather than
+                                    // blocking, so the CPU can retry — but only a
+                                    // caller that checks it actually retries).
+                                    while phys.dma_write64(gio_addr, data)
+                                        == crate::traits::BUS_BUSY
+                                    {
+                                        std::hint::spin_loop();
+                                    }
                                     byte_count = byte_count.saturating_sub(length);
                                 }
                             }

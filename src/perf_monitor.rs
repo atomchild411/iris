@@ -70,6 +70,18 @@ impl PerfMonitor {
         writeln!(writer, "{}", crate::thread_affinity::status_line()).map_err(|e| e.to_string())?;
 
         if let Some(rex) = &self.rex3 {
+            // The per-GO counters and DIAG_LOOP_* bits are compiled out under
+            // `lightning` (see the `rexdiag` feature). Say so rather than print
+            // the frozen zeros they would otherwise report as measurements.
+            #[cfg(not(feature = "rexdiag"))]
+            writeln!(
+                writer,
+                "REX3 GO: counters disabled in this build (rexdiag off/lightning)  gfifo {}/{}",
+                rex.gfifo.len(), crate::rex3::GFIFO_DEPTH,
+            ).map_err(|e| e.to_string())?;
+
+            #[cfg(feature = "rexdiag")]
+            {
             let jit = rex.jit_go_count.load(Ordering::Relaxed);
             let interp = rex.interp_go_count.load(Ordering::Relaxed);
             let total = jit + interp;
@@ -87,6 +99,7 @@ impl PerfMonitor {
                 diag,
                 rex.gfxbusy.load(Ordering::Relaxed),
             ).map_err(|e| e.to_string())?;
+            }
             #[cfg(feature = "rex-jit")]
             if let Some(ref jit) = rex.rex_jit {
                 writeln!(writer, "REX3 JIT cache: {} shaders", jit.shader_list().len()).map_err(|e| e.to_string())?;
