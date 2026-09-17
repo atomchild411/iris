@@ -209,7 +209,9 @@ pub mod hal2;
 pub mod ps2;
 pub mod ui;
 pub mod rex3;
-pub mod rex3_simd;
+pub mod rex3_generic;
+pub mod rex3_shaders;
+pub mod rex3_shape;
 pub mod compositor;
 pub mod gl_compositor;
 pub mod headless_gl;
@@ -246,6 +248,10 @@ pub mod xz;
 pub mod mgras;
 pub mod ultra_proto;
 pub mod ultra64;
+/// Draw-shape corpus persistence. Deliberately NOT behind `rex-jit`: the corpus
+/// records what the guest draws, and the generated shader table serves draws in
+/// builds with no Cranelift at all.
+pub mod rex3_profile;
 #[cfg(feature = "rex-jit")]
 pub mod rex3_jit;
 #[cfg(feature = "jitv2")]

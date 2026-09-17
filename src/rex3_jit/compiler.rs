@@ -43,6 +43,7 @@ use crate::rex3::{
     DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_CID,
     OCTANT_XDEC, OCTANT_YDEC, OCTANT_XMAJOR,
     REX3_COORD_BIAS, REX3_SCREEN_WIDTH, REX3_SCREEN_HEIGHT,
+    CLIPMODE_CIDMATCH_SHIFT,
 };
 
 // ── Context field offsets (must match #[repr(C)] Rex3Context layout) ─────────
@@ -163,7 +164,7 @@ impl ShaderCompiler {
         // DRAW/SCR2SCR/READ opcodes; SPAN, BLOCK, or I/F/A_LINE adrmode.
         // Lines do not support host modes (READ/colorhost) — guard below.
         let opcode = dm0.opcode();
-        let adrmode = dm0.adrmode() << 2; // match the <<2 convention from rex3.rs
+        let adrmode = dm0.adrmode();
         let is_scr2scr  = opcode == DRAWMODE0_OPCODE_SCR2SCR;
         let is_hostr    = opcode == DRAWMODE0_OPCODE_READ;
         let is_hostw    = opcode == DRAWMODE0_OPCODE_DRAW
@@ -184,11 +185,27 @@ impl ShaderCompiler {
             return None;
         }
 
-        // fastclear takes priority over blend — hardware ignores blend when fastclear=1.
-        // SCR2SCR copies already-quantized pixels — dithering would corrupt them (matches execute_go).
-        let dm1_val = if dm1_val & (1 << 17) != 0 { dm1_val & !(1 << 18) }
-                      else if is_scr2scr          { dm1_val & !(1 << 16) } // clear DITHER
-                      else                        { dm1_val };
+        // Shared with execute_go's dispatch key and interpreter setup key. If this
+        // and the dispatch site ever disagree, shaders compile under a key the draw
+        // path never asks for and every GO silently falls back to the interpreter.
+        let dm1_val = crate::rex3_shape::normalize_dm1(dm1_val, opcode);
+
+        // Hardware disables FASTCLEAR when CID checking is enabled — rex3.pdf
+        // says so in DRAWMODE1 bit 17 ("when CID checking disabled (CLIPMODE
+        // CIDMATCH = 0xF)"), §3.5.5 ("CID checking is not allowed for this
+        // drawing mode") and the programming notes. The interpreter honours this
+        // in its processor selection (`fastclear() && no_cid`); clearing the bit
+        // here is the equivalent, and covers every emit_pixel_write below at
+        // once rather than threading cidmatch through each.
+        //
+        // This was invisible until rex3_simd::try_fastclear_block was removed:
+        // that pre-loop bailout also ignored CID, so both engines wrote
+        // COLORVRAM and agreed. See rules/rex3/fastclear-cid-divergence.md.
+        let dm1_val = if (clipmode_key >> CLIPMODE_CIDMATCH_SHIFT) & 0xF != 0xF {
+            dm1_val & !(1 << 17)
+        } else {
+            dm1_val
+        };
         let dm1 = Dm1 { val: dm1_val };
 
         let name = format!("rex_shader_{:08x}_{:08x}_{:08x}_{}", dm0_val, dm1_val, clipmode_key, self.counter);
@@ -814,7 +831,7 @@ fn emit_shader(
     let y_inc_pos  = b.ins().iconst(types::I32, y_inc_bits);
     let stepy_v    = b.ins().select(y_dec_v, y_inc_neg, y_inc_pos);
 
-    let is_block = dm0.adrmode() << 2 == DRAWMODE0_ADRMODE_BLOCK;
+    let is_block = dm0.adrmode() == DRAWMODE0_ADRMODE_BLOCK;
     let stopony  = dm0.stopony() && is_block; // span has no stopony
 
     // ── Loop blocks ───────────────────────────────────────────────────────────

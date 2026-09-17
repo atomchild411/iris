@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use parking_lot::Mutex;
+use std::collections::HashMap;
+use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use crossbeam_utils::CachePadded;
@@ -152,7 +153,14 @@ pub const REX3_DCBRESET: u32 = 0x1340;
 pub(crate) fn decode_dm0(v: u32) -> String {
     let dm = DrawMode0(v);
     let opcode = match dm.opcode() { 0=>"NOOP", 1=>"READ", 2=>"DRAW", 3=>"SCR2SCR", _=>"?" };
-    let adrmode = match dm.adrmode() { 0=>"SPAN", 1=>"BLOCK", 2=>"ILINE", 3=>"FLINE", 4=>"ALINE", _=>"?" };
+    let adrmode = match dm.adrmode() {
+        DRAWMODE0_ADRMODE_SPAN => "SPAN",
+        DRAWMODE0_ADRMODE_BLOCK => "BLOCK",
+        DRAWMODE0_ADRMODE_I_LINE => "ILINE",
+        DRAWMODE0_ADRMODE_F_LINE => "FLINE",
+        DRAWMODE0_ADRMODE_A_LINE => "ALINE",
+        _ => "?",
+    };
     let mut flags = String::new();
     if dm.dosetup()      { flags.push_str(" DOSETUP"); }
     if dm.colorhost()    { flags.push_str(" COLORHOST"); }
@@ -179,8 +187,20 @@ pub(crate) fn decode_dm0(v: u32) -> String {
 pub(crate) fn decode_dm1(v: u32) -> String {
     let dm = DrawMode1(v);
     let planes = match dm.planes() { 0=>"NONE", 1=>"RGB", 2=>"RGBA", 4=>"OLAY", 5=>"PUP", 6=>"CID", _=>"?" };
-    let depth  = match dm.drawdepth()  { 0=>"4bpp", 1=>"8bpp", 2=>"12bpp", 3=>"24bpp", _=>"?" };
-    let hdepth = match dm.hostdepth()  { 0=>"12bpp", 1=>"8bpp", 2=>"4bpp", 3=>"32bpp", _=>"?" };
+    let depth  = match dm.drawdepth() {
+        DRAWMODE1_DRAWDEPTH_4 => "4bpp",
+        DRAWMODE1_DRAWDEPTH_8 => "8bpp",
+        DRAWMODE1_DRAWDEPTH_12 => "12bpp",
+        DRAWMODE1_DRAWDEPTH_24 => "24bpp",
+        _ => "?",
+    };
+    let hdepth = match dm.hostdepth() {
+        DRAWMODE1_HOSTDEPTH_12 => "12bpp",
+        DRAWMODE1_HOSTDEPTH_8 => "8bpp",
+        DRAWMODE1_HOSTDEPTH_4 => "4bpp",
+        DRAWMODE1_HOSTDEPTH_32 => "32bpp",
+        _ => "?",
+    };
     let logicop = match dm.logicop()   { 0=>"ZERO",1=>"AND",2=>"ANDR",3=>"SRC",4=>"ANDI",5=>"DST",
         6=>"XOR",7=>"OR",8=>"NOR",9=>"XNOR",10=>"NDST",11=>"ORR",12=>"NSRC",13=>"ORI",14=>"NAND",15=>"ONE", _=>"?" };
     // rex3 spec Tables 13/14: SFACTOR 010/011 select the *destination* colour while
@@ -320,11 +340,19 @@ pub const DRAWMODE0_OPCODE_SCR2SCR: u32 = 0x3;
 
 pub const DRAWMODE0_ADRMODE_MASK: u32 = 0x1C;
 pub const DRAWMODE0_ADRMODE_SHIFT: u32 = 2;
-pub const DRAWMODE0_ADRMODE_SPAN: u32 = 0x0 << 2;
-pub const DRAWMODE0_ADRMODE_BLOCK: u32 = 0x1 << 2;
-pub const DRAWMODE0_ADRMODE_I_LINE: u32 = 0x2 << 2;
-pub const DRAWMODE0_ADRMODE_F_LINE: u32 = 0x3 << 2;
-pub const DRAWMODE0_ADRMODE_A_LINE: u32 = 0x4 << 2;
+// ADRMODE field values — what `dm0_adrmode` returns. Compare against these.
+pub const DRAWMODE0_ADRMODE_SPAN: u32 = 0x0;
+pub const DRAWMODE0_ADRMODE_BLOCK: u32 = 0x1;
+pub const DRAWMODE0_ADRMODE_I_LINE: u32 = 0x2;
+pub const DRAWMODE0_ADRMODE_F_LINE: u32 = 0x3;
+pub const DRAWMODE0_ADRMODE_A_LINE: u32 = 0x4;
+
+// Register-position forms (`_SH`), for OR-ing into a DRAWMODE0 word.
+pub const DRAWMODE0_ADRMODE_SPAN_SH: u32 = DRAWMODE0_ADRMODE_SPAN << DRAWMODE0_ADRMODE_SHIFT;
+pub const DRAWMODE0_ADRMODE_BLOCK_SH: u32 = DRAWMODE0_ADRMODE_BLOCK << DRAWMODE0_ADRMODE_SHIFT;
+pub const DRAWMODE0_ADRMODE_I_LINE_SH: u32 = DRAWMODE0_ADRMODE_I_LINE << DRAWMODE0_ADRMODE_SHIFT;
+pub const DRAWMODE0_ADRMODE_F_LINE_SH: u32 = DRAWMODE0_ADRMODE_F_LINE << DRAWMODE0_ADRMODE_SHIFT;
+pub const DRAWMODE0_ADRMODE_A_LINE_SH: u32 = DRAWMODE0_ADRMODE_A_LINE << DRAWMODE0_ADRMODE_SHIFT;
 
 bitfield! {
     #[derive(Clone, Copy, Default)]
@@ -372,6 +400,11 @@ pub const DRAWMODE1_INTERP_SETUP_MASK: u32 =
 /// colour as DFACTOR (BF_SC/BF_MSC). BF_SA/BF_MSA mean source alpha in both.
 pub const DRAWMODE1_BF_ZERO: u32 = 0;
 pub const DRAWMODE1_BF_ONE:  u32 = 1;
+/// The *other* operand's colour: destination when used as SFACTOR, source when
+/// used as DFACTOR. Named BF_DC/BF_SC respectively in the spec tables.
+pub const DRAWMODE1_BF_OC:   u32 = 2;
+/// 255 minus [`DRAWMODE1_BF_OC`] (BF_MDC / BF_MSC).
+pub const DRAWMODE1_BF_MOC:  u32 = 3;
 pub const DRAWMODE1_BF_SA:   u32 = 4;
 pub const DRAWMODE1_BF_MSA:  u32 = 5;
 
@@ -384,24 +417,75 @@ pub const DRAWMODE1_PLANES_CID: u32 = 6;
 
 /// COMPARE=0x7 (all three relations OR'ed) — afunction always passes, i.e. disabled.
 /// Hardware reset default; real drawmode1 words always carry this explicitly.
-pub const DRAWMODE1_COMPARE_DISABLE: u32 = 0x7 << 12;
+/// COMPARE field position in DRAWMODE1.
+pub const DRAWMODE1_COMPARE_SHIFT: u32 = 12;
+/// COMPARE=0x7 (all three relations OR'ed) — afunction always passes.
+// DRAWDEPTH: bits per pixel in the framebuffer plane.
+pub const DRAWMODE1_DRAWDEPTH_4: u32 = 0;
+pub const DRAWMODE1_DRAWDEPTH_8: u32 = 1;
+pub const DRAWMODE1_DRAWDEPTH_12: u32 = 2;
+pub const DRAWMODE1_DRAWDEPTH_24: u32 = 3;
 
-pub const DRAWMODE1_LOGICOP_ZERO: u32 = 0 << 28;
-pub const DRAWMODE1_LOGICOP_AND: u32 = 1 << 28;
-pub const DRAWMODE1_LOGICOP_ANDR: u32 = 2 << 28;
-pub const DRAWMODE1_LOGICOP_SRC: u32 = 3 << 28;
-pub const DRAWMODE1_LOGICOP_ANDI: u32 = 4 << 28;
-pub const DRAWMODE1_LOGICOP_DST: u32 = 5 << 28;
-pub const DRAWMODE1_LOGICOP_XOR: u32 = 6 << 28;
-pub const DRAWMODE1_LOGICOP_OR: u32 = 7 << 28;
-pub const DRAWMODE1_LOGICOP_NOR: u32 = 8 << 28;
-pub const DRAWMODE1_LOGICOP_XNOR: u32 = 9 << 28;
-pub const DRAWMODE1_LOGICOP_NDST: u32 = 10 << 28;
-pub const DRAWMODE1_LOGICOP_ORR: u32 = 11 << 28;
-pub const DRAWMODE1_LOGICOP_NSRC: u32 = 12 << 28;
-pub const DRAWMODE1_LOGICOP_ORI: u32 = 13 << 28;
-pub const DRAWMODE1_LOGICOP_NAND: u32 = 14 << 28;
-pub const DRAWMODE1_LOGICOP_ONE: u32 = 15 << 28;
+// HOSTDEPTH: bits per pixel in a host transfer. **Not the same encoding as
+// DRAWDEPTH** — the order is 12/8/4/32, not 4/8/12/24. Mixing the two silently
+// picks the wrong slot width, which is why both have named constants.
+pub const DRAWMODE1_HOSTDEPTH_12: u32 = 0;
+pub const DRAWMODE1_HOSTDEPTH_8: u32 = 1;
+pub const DRAWMODE1_HOSTDEPTH_4: u32 = 2;
+pub const DRAWMODE1_HOSTDEPTH_32: u32 = 3;
+
+// COMPARE is three OR-able relation bits (spec §3.8.1): LT | EQ | GT. All three
+// set (0x7) means every comparison passes, i.e. afunction disabled.
+pub const DRAWMODE1_COMPARE_NEVER: u32 = 0x0;
+pub const DRAWMODE1_COMPARE_LT:    u32 = 0x1;
+pub const DRAWMODE1_COMPARE_EQ:    u32 = 0x2;
+pub const DRAWMODE1_COMPARE_LE:    u32 = 0x3;
+pub const DRAWMODE1_COMPARE_GT:    u32 = 0x4;
+pub const DRAWMODE1_COMPARE_NE:    u32 = 0x5;
+pub const DRAWMODE1_COMPARE_GE:    u32 = 0x6;
+pub const DRAWMODE1_COMPARE_DISABLE: u32 = 0x7;
+pub const DRAWMODE1_COMPARE_DISABLE_SH: u32 =
+    DRAWMODE1_COMPARE_DISABLE << DRAWMODE1_COMPARE_SHIFT;
+
+/// LOGICOP field position in DRAWMODE1.
+pub const DRAWMODE1_LOGICOP_SHIFT: u32 = 28;
+pub const DRAWMODE1_LOGICOP_MASK: u32 = 0xF << DRAWMODE1_LOGICOP_SHIFT;
+
+// LOGICOP field values — what `dm1_logicop` returns. Compare against these;
+// the `_SH` forms below are for OR-ing into a DRAWMODE1 word.
+pub const DRAWMODE1_LOGICOP_ZERO: u32 = 0;
+pub const DRAWMODE1_LOGICOP_AND: u32 = 1;
+pub const DRAWMODE1_LOGICOP_ANDR: u32 = 2;
+pub const DRAWMODE1_LOGICOP_SRC: u32 = 3;
+pub const DRAWMODE1_LOGICOP_ANDI: u32 = 4;
+pub const DRAWMODE1_LOGICOP_DST: u32 = 5;
+pub const DRAWMODE1_LOGICOP_XOR: u32 = 6;
+pub const DRAWMODE1_LOGICOP_OR: u32 = 7;
+pub const DRAWMODE1_LOGICOP_NOR: u32 = 8;
+pub const DRAWMODE1_LOGICOP_XNOR: u32 = 9;
+pub const DRAWMODE1_LOGICOP_NDST: u32 = 10;
+pub const DRAWMODE1_LOGICOP_ORR: u32 = 11;
+pub const DRAWMODE1_LOGICOP_NSRC: u32 = 12;
+pub const DRAWMODE1_LOGICOP_ORI: u32 = 13;
+pub const DRAWMODE1_LOGICOP_NAND: u32 = 14;
+pub const DRAWMODE1_LOGICOP_ONE: u32 = 15;
+
+pub const DRAWMODE1_LOGICOP_ZERO_SH: u32 = DRAWMODE1_LOGICOP_ZERO << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_AND_SH: u32 = DRAWMODE1_LOGICOP_AND << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_ANDR_SH: u32 = DRAWMODE1_LOGICOP_ANDR << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_SRC_SH: u32 = DRAWMODE1_LOGICOP_SRC << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_ANDI_SH: u32 = DRAWMODE1_LOGICOP_ANDI << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_DST_SH: u32 = DRAWMODE1_LOGICOP_DST << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_XOR_SH: u32 = DRAWMODE1_LOGICOP_XOR << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_OR_SH: u32 = DRAWMODE1_LOGICOP_OR << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_NOR_SH: u32 = DRAWMODE1_LOGICOP_NOR << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_XNOR_SH: u32 = DRAWMODE1_LOGICOP_XNOR << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_NDST_SH: u32 = DRAWMODE1_LOGICOP_NDST << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_ORR_SH: u32 = DRAWMODE1_LOGICOP_ORR << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_NSRC_SH: u32 = DRAWMODE1_LOGICOP_NSRC << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_ORI_SH: u32 = DRAWMODE1_LOGICOP_ORI << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_NAND_SH: u32 = DRAWMODE1_LOGICOP_NAND << DRAWMODE1_LOGICOP_SHIFT;
+pub const DRAWMODE1_LOGICOP_ONE_SH: u32 = DRAWMODE1_LOGICOP_ONE << DRAWMODE1_LOGICOP_SHIFT;
 
 bitfield! {
     #[derive(Clone, Copy, Default)]
@@ -466,6 +550,11 @@ pub const CONFIG_FB_TYPE: u32 = 1 << 20;
 
 // CLIPMODE Register Bits
 pub const CLIPMODE_ENSMASK_MASK: u32 = 0x1F;
+/// SMASK0 enable — the window-relative scissor (bit 0 of ENSMASK).
+pub const CLIPMODE_ENSMASK_SMASK0: u32 = 0x01;
+/// SMASK1-4 enables — the screen-absolute scissors (bits 1-4). A pixel passes
+/// if it is inside *any* enabled one.
+pub const CLIPMODE_ENSMASK_SMASK1_4: u32 = 0x1E;
 pub const CLIPMODE_CIDMATCH_MASK: u32 = 0xF << 9;
 pub const CLIPMODE_CIDMATCH_SHIFT: u32 = 9;
 /// Bits of clipmode that affect JIT shader code generation (ensmask + cidmatch).
@@ -494,7 +583,7 @@ pub const OCTANT_XMAJOR: u32 = 1 << 2;
 // per-pixel walk) — both interpreter code paths, but setup() also gates what the
 // JIT sees (see setup()'s doc comment on why the fractional correction lives there).
 #[rustfmt::skip]
-const REX3_BRES_OCTANTS: [(i32, i32, i32, i32, bool); 8] = [
+pub(crate) const REX3_BRES_OCTANTS: [(i32, i32, i32, i32, bool); 8] = [
     ( 0,  1, -1, -1, true ),  // octant 0
     ( 0,  1,  1,  1, true ),  // octant 1
     ( 0, -1, -1, -1, true ),  // octant 2
@@ -619,7 +708,7 @@ fn to12_4_7(val: i32) -> u32 {
 // get_colori() in CI mode: integer part = bits[22:11], i.e. (colorred >> 11) & 0xFFF.
 
 fn from_color_red(val: u32, drawmode1: DrawMode1) -> u32 {
-    if !drawmode1.rgbmode() && drawmode1.drawdepth() == 2 {
+    if !drawmode1.rgbmode() && drawmode1.drawdepth() == DRAWMODE1_DRAWDEPTH_12 {
         // 12-bit CI mode: bus value is o12.9, shift left 2 to store as o12.11.
         (val << 2) & 0xFFFFFF
     } else {
@@ -855,7 +944,27 @@ pub struct Rex3Context {
     pub stepz: u32,
     pub stall0: u32,
     pub stall1: u32,
+
+    /// Back-pointer to the owning `Rex3`, for host services the draw path needs
+    /// but cannot compute from the context alone (block logging, the host FIFO).
+    ///
+    /// Lets the draw functions take the same arguments the compiled shader does
+    /// — `(ctx, fb_rgb, fb_aux)` — instead of threading a `&Rex3` through every
+    /// call. Null until `Rex3::new` wires it up; the accessors below treat null
+    /// as "no host attached" so a bare `Rex3Context` (tests, snapshots) is still
+    /// usable.
+    ///
+    /// Not part of the register state: excluded from snapshots and never
+    /// compared. `Rex3Context` is `Copy`, and copies share the pointer, which is
+    /// correct — they all refer to the same device.
+    pub host: *const Rex3,
 }
+
+// Safety: `host` is only ever set to the owning Rex3, which outlives every
+// context that points at it, and is only dereferenced from the draw path (the
+// GFIFO consumer thread) for services that take their own locks.
+unsafe impl Send for Rex3Context {}
+unsafe impl Sync for Rex3Context {}
 
 impl Rex3Context {
     /// Power-on/reset state: like `Default::default()`, but with DRAWMODE1.COMPARE
@@ -1063,6 +1172,57 @@ impl GFifo {
         true
     }
 
+    /// Push two consecutive register writes as one atomic unit.
+    ///
+    /// A 64-bit store to REX3 is two register writes, and IRIX/GL issues them
+    /// constantly — coordinate pairs, colour pairs, Bresenham terms. Pushing
+    /// both under one lock acquisition rather than two costs three atomics
+    /// instead of six and skips a second trip through the `write32` register
+    /// match.
+    ///
+    /// **It also fixes a real bug.** The old path called `write32` twice and
+    /// returned the second one's status, so a queue that filled between them
+    /// left the first word pushed and still reported `BUS_BUSY` — and the CPU
+    /// re-executes the *whole* store on retry, pushing that first word a second
+    /// time. Duplicated register writes into the GFIFO, exactly what
+    /// `try_push`'s "commit no other state first" rule exists to prevent. Here
+    /// the capacity check covers both slots before either is written, so the
+    /// pair either lands completely or not at all.
+    #[inline]
+    pub fn try_push2(&self, addr0: u32, val0: u64, addr1: u32, val1: u64) -> bool {
+        if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return false;
+        }
+        let tail = self.tail.load(Ordering::Relaxed);
+        let next = tail.wrapping_add(1) & GFIFO_MASK;
+        let next2 = tail.wrapping_add(2) & GFIFO_MASK;
+        // Room for BOTH before writing either: a partial push is what the old
+        // two-`write32` path got wrong.
+        let mut cached_head = self.shadow_head.get();
+        if next == cached_head || next2 == cached_head {
+            cached_head = self.head.load(Ordering::Acquire);
+            self.shadow_head.set(cached_head);
+            if next == cached_head || next2 == cached_head {
+                self.lock.store(false, Ordering::Release);
+                return false;
+            }
+        }
+        // SAFETY: we hold the lock; no other producer touches these slots.
+        unsafe {
+            let slot0 = self.buf.as_ptr().add(tail) as *mut GFIFOEntry;
+            (*slot0).addr = addr0;
+            (*slot0).val  = val0;
+            let slot1 = self.buf.as_ptr().add(next) as *mut GFIFOEntry;
+            (*slot1).addr = addr1;
+            (*slot1).val  = val1;
+        }
+        // One Release publishes both slots: the consumer's Acquire on tail
+        // orders it after every write above.
+        self.tail.store(next2, Ordering::Release);
+        self.lock.store(false, Ordering::Release);
+        true
+    }
+
     /// Push an entry, spinning until it fits. Safe to call from multiple
     /// producers concurrently.
     ///
@@ -1132,7 +1292,43 @@ impl GFifo {
         self.head.store(self.local_head.get(), Ordering::Release);
     }
 
+    /// Reconcile the published `tail` from a reader thread, under the producer
+    /// lock.
+    ///
+    /// `try_push` publishes `tail` on every push today, so this is a no-op in
+    /// the current topology — but it is the hook a deferred/batched tail needs,
+    /// and taking the lock is what makes it safe to call from a thread that is
+    /// neither the producer nor the consumer. See
+    /// `rules/rex3/gfifo-batching-constraints.md`: a batched producer must
+    /// publish before any `busy_or_val!` or STATUS read, or the reader sees an
+    /// emptier queue than reality and skips the retry it owed.
+    ///
+    /// Returns `false` if the lock was contended — the caller should treat that
+    /// as "busy, retry" rather than spin, for the same reason `try_push` does:
+    /// spinning inside the CPU's load path starves IP7 and dilates guest time.
+    #[inline]
+    pub fn publish_tail(&self) -> bool {
+        if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return false;
+        }
+        // A producer-local tail would be published here. With eager publication
+        // the authoritative `tail` is already current; re-storing it under the
+        // lock is harmless and keeps this the single place that changes when
+        // batching lands.
+        let tail = self.tail.load(Ordering::Relaxed);
+        self.tail.store(tail, Ordering::Release);
+        self.lock.store(false, Ordering::Release);
+        true
+    }
+
     /// True when no entries are pending.
+    ///
+    /// Reads the *published* `head`, which the consumer advances in batches of
+    /// 64 (plus immediately on drain-to-empty, see `consume`). So a `true` here
+    /// is authoritative — the consumer publishes the moment it empties the ring
+    /// — while a `false` may be up to 63 entries pessimistic mid-drain. That
+    /// direction is the safe one for every caller: it over-reports busy, never
+    /// under-reports.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
@@ -1172,31 +1368,6 @@ pub struct Rex3 {
     // Each bit of a pixel represents a plane.
     pub fb_rgb: UnsafeCell<Box<[u32]>>,
     pub fb_aux: UnsafeCell<Box<[u32]>>,
-    pub px_rd: UnsafeCell<fn(&Rex3, u32) -> u32>,
-    pub px_wr: UnsafeCell<fn(&Rex3, u32, u32)>,
-    pub px_amp: UnsafeCell<fn(u32) -> u32>,
-    pub px_logic: UnsafeCell<fn(u32, u32) -> u32>,
-    /// Afunction test: (src_alpha, alpharef) -> pass. Selected in planes_setup from
-    /// DRAWMODE1 COMPARE/RGBMODE; a no-op always-pass fn outside rgbmode or COMPARE==0x7.
-    pub px_afunc: UnsafeCell<fn(u32, u32) -> bool>,
-    /// Pack bayer index into bits [27:24] for dither compress functions (rgbmode=1 only).
-    /// In CI mode this is a no-op (returns color unchanged) — CI values need no dithering.
-    pub px_bayer: UnsafeCell<fn(u32, i32, i32) -> u32>,
-    /// Compress 24-bit BGR → plane-depth pixel (rgbmode=1 only; identity otherwise).
-    pub px_compress: UnsafeCell<fn(u32) -> u32>,
-    /// Expand plane-depth pixel → 24-bit BGR (for blend dst; identity for CI/24bpp).
-    pub px_expand: UnsafeCell<fn(u32) -> u32>,
-    pub px_proc: UnsafeCell<fn(&Rex3, &mut Rex3Context, i32, i32)>,
-    /// Per-pixel shade DDA step + optional clamp.  Called after every pixel (draw_block, draw_iline).
-    pub px_shade: UnsafeCell<fn(&mut Rex3Context)>,
-    /// Per-pixel pattern bit advance for lspattern and/or zpattern.
-    /// Handles lsmode repeat/length for lspattern; simple rotate for zpattern.
-    /// Called after every pixel (draw_block, draw_iline).
-    pub px_pattern: UnsafeCell<fn(&mut Rex3Context)>,
-    pub host_unpack: UnsafeCell<fn(u64) -> u32>,
-    pub host_pack: UnsafeCell<fn(u64, u32) -> u64>,
-    pub host_shift: UnsafeCell<u32>,
-    pub host_count: UnsafeCell<u32>,
     pub gfifo: GFifo,
 
     pub vc2: Mutex<Vc2>,
@@ -1225,8 +1396,6 @@ pub struct Rex3 {
     /// re-uploading the whole framebuffer at 60 Hz on a static screen. Starts
     /// true so the first frame always renders.
     fb_dirty: AtomicBool,
-    /// Rows filled via rex3_simd fastclear path (monitor `perf snapshot`).
-    pub simd_fill_rows: AtomicU64,
     pub screen: Arc<Mutex<Rex3Screen>>,
     /// Drives the real REX3 `VV_INT_N` pin (vertical retrace / Kaleidoscope).
     pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
@@ -1258,6 +1427,24 @@ pub struct Rex3 {
     pub diag: AtomicU64,
     debug_state: Mutex<DebugState>,
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
+    /// Compiled shaders, keyed by `(dm0, dm1_normalized, clipmode_key)`.
+    ///
+    /// Always present, not gated on `rex-jit`: the LLVM-compiled shaders in
+    /// `rex3_shaders` are built into every binary, and they use the same ABI as
+    /// a Cranelift one. Seeded from the static table at construction; with
+    /// `rex-jit` the compiler thread adds to it as new shapes appear.
+    pub shaders: Arc<RwLock<crate::rex3_shape::ShapeMap<crate::rex3_shaders::ShaderFn>>>,
+    /// One-entry memo in front of `shaders`, on the GFIFO consumer thread only.
+    pub shader_last: std::cell::Cell<(u32, u32, u32, Option<crate::rex3_shaders::ShaderFn>)>,
+    /// Every draw shape this run has dispatched — the corpus the shader
+    /// generator consumes.
+    ///
+    /// Lives on `Rex3` rather than `RexJit` because it must be recorded in every
+    /// build: without `rex-jit` the generated table serves draws and Cranelift
+    /// never runs, so a JIT-owned corpus would record nothing and could never
+    /// grow to cover new shapes. Written on the GFIFO consumer thread only when
+    /// a shape is new, which the `shader_last` memo makes rare.
+    pub seen_shapes: Mutex<crate::rex3_shape::ShapeSet>,
     #[cfg(feature = "rex-jit")]
     pub rex_jit: Option<std::sync::Arc<crate::rex3_jit::RexJit>>,
     /// Whether the JIT is enabled for dispatch (can be toggled at runtime via `rex jit on/off`).
@@ -1267,11 +1454,6 @@ pub struct Rex3 {
     /// the same as the previous GO.  Only accessed from the GFIFO consumer thread — no sync needed.
     #[cfg(feature = "rex-jit")]
     pub jit_last: std::cell::Cell<(u32, u32, u32, Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>)>,
-    /// Cached interpreter setup key: (dm0 & DRAWMODE0_INTERP_SETUP_MASK,
-    /// dm1_normalized & DRAWMODE1_INTERP_SETUP_MASK, clipmode_cidmatch).
-    /// When these match the current GO, planes_setup/host_setup and function-pointer
-    /// selection are skipped since nothing they depend on has changed.
-    interp_setup_cache: std::cell::Cell<(u32, u32, u32)>,
     /// Shared activity heartbeat — set by all devices, polled+cleared by the refresh thread.
     /// bit 0 = enet TX, bit 1 = enet RX, bits 2-3 = red/green LED (persistent), bits 8-13 = SCSI IDs 0-5
     pub heartbeat: Arc<AtomicU64>,
@@ -1281,7 +1463,7 @@ pub struct Rex3 {
     /// the CPU exists (`Rex3::new` runs before it does, so this can't be a
     /// constructor parameter; see `MipsCpu::cycles_ptr`) but strictly before
     /// any device thread (including this struct's own refresh thread) is
-    /// spawned, so a plain `Cell` (same as `interp_setup_cache` above) is
+    /// spawned, so a plain `Cell` is
     /// enough — no atomicity needed for the pointer variable itself.
     /// `CyclesPtr::dangling()` until `set_cpu_cycles` runs; its own `get()`
     /// treats that as "not wired up yet" and reports 0.
@@ -1314,8 +1496,36 @@ pub struct Rex3 {
 
 unsafe impl Sync for Rex3 {}
 
+/// One row of `rex jit list`: a draw shape and what serves it.
+pub struct ShaderRow {
+    pub dm0: u32,
+    pub dm1: u32,
+    pub cm: u32,
+    /// `precompiled` (generated Rust), `jit` (Cranelift), `queued`, `failed`,
+    /// `disabled`, or `generic` (no specialised shader — the runtime `DynMode`
+    /// path serves it).
+    pub origin: &'static str,
+    /// Native code size, for Cranelift shaders. 0 for the others: precompiled
+    /// shaders are inlined into the binary and have no separately tracked size.
+    pub bytes: u32,
+}
+
 impl Rex3 {
     pub fn new(heartbeat: Arc<AtomicU64>, fasttick_count: Arc<AtomicU64>, decoded_count: Arc<AtomicU64>, l1i_hit_count: Arc<AtomicU64>, l1i_fetch_count: Arc<AtomicU64>, uncached_fetch_count: Arc<AtomicU64>) -> Self {
+        // The dispatch map, shared with the Cranelift compiler thread so both
+        // shader sources publish into one place.
+        //
+        // Seeded with the generated LLVM shaders — except under cfg(test), where
+        // the JIT-vs-generic comparison tests need Cranelift to actually run:
+        // a pre-seeded LLVM shader would serve those shapes first and the test
+        // would compare the generic path against itself.
+        #[cfg(not(test))]
+        let shaders_shared: Arc<RwLock<crate::rex3_shape::ShapeMap<crate::rex3_shaders::ShaderFn>>> =
+            Arc::new(RwLock::new(crate::rex3_shaders::SHADERS.iter().copied().collect()));
+        #[cfg(test)]
+        let shaders_shared: Arc<RwLock<crate::rex3_shape::ShapeMap<crate::rex3_shaders::ShaderFn>>> =
+            Arc::new(RwLock::new(crate::rex3_shape::ShapeMap::default()));
+
         let config = Rex3Config::default();
         config.config.store(CONFIG_BUSWIDTH | CONFIG_EXTREGXCVR |
                         (8 << CONFIG_BFIFODEPTH_SHIFT) |
@@ -1346,21 +1556,6 @@ impl Rex3 {
             context: UnsafeCell::new(Rex3Context::power_on_default()),
             fb_rgb: UnsafeCell::new(fb_rgb),
             fb_aux: UnsafeCell::new(fb_aux),
-            px_rd: UnsafeCell::new(Self::default_px_rd),
-            px_wr: UnsafeCell::new(Self::default_px_wr),
-            px_amp: UnsafeCell::new(Self::amplify_nop),
-            px_logic: UnsafeCell::new(Self::logic_op_src),
-            px_afunc: UnsafeCell::new(Self::afunc_always),
-            px_bayer: UnsafeCell::new(Self::bayer_pack),
-            px_compress: UnsafeCell::new(Self::identity),
-            px_expand: UnsafeCell::new(Self::identity),
-            px_proc: UnsafeCell::new(Self::process_pixel_noop),
-            px_shade: UnsafeCell::new(Self::iterate_shade_noop),
-            px_pattern: UnsafeCell::new(Self::iterate_pattern_noop),
-            host_unpack: UnsafeCell::new(Self::host_unpack_nop),
-            host_pack: UnsafeCell::new(Self::host_pack_nop),
-            host_shift: UnsafeCell::new(0),
-            host_count: UnsafeCell::new(0),
             gfifo: GFifo::new(),
             vc2: Mutex::new(Vc2::new()),
             xmap0: Mutex::new(Xmap9::new()),
@@ -1378,7 +1573,6 @@ impl Rex3 {
             #[cfg(feature = "idle-pause")]
             processor_unparker: std::sync::OnceLock::new(),
             fb_dirty: AtomicBool::new(true),
-            simd_fill_rows: AtomicU64::new(0),
             screen,
             vblank_cb: Mutex::new(None),
             fifo_full_cb: Mutex::new(None),
@@ -1408,13 +1602,26 @@ impl Rex3 {
             rex_jit: if std::env::var_os("IRIS_NO_JIT").is_some() {
                 None
             } else {
-                Some(std::sync::Arc::new(crate::rex3_jit::RexJit::new()))
+                Some(std::sync::Arc::new(crate::rex3_jit::RexJit::new(
+                    Arc::clone(&shaders_shared),
+                )))
             },
             #[cfg(feature = "rex-jit")]
             jit_enabled: AtomicBool::new(std::env::var_os("IRIS_NO_JIT").is_none()),
+            // Seed with every LLVM-compiled shader. These are available in all
+            // builds; Cranelift only ever adds to this map.
+            //
+            // Not seeded under `cfg(test)`: the JIT-vs-interpreter comparison
+            // tests exist to check that *Cranelift's* output matches the generic
+            // path, and a pre-seeded LLVM shader would serve those shapes first,
+            // so the test would compare the generic path against itself and pass
+            // vacuously. Tests that want the generated table exercise
+            // `rex3_shaders::lookup` directly.
+            shaders: Arc::clone(&shaders_shared),
+            shader_last: std::cell::Cell::new((0, 0, 0, None)),
+            seen_shapes: Mutex::new(crate::rex3_shape::ShapeSet::default()),
             #[cfg(feature = "rex-jit")]
             jit_last: std::cell::Cell::new((0, 0, 0, None)),
-            interp_setup_cache: std::cell::Cell::new((u32::MAX, u32::MAX, u32::MAX)),
             heartbeat,
             cycles: std::cell::Cell::new(crate::mips_core::CyclesPtr::dangling()),
             fasttick_count,
@@ -1469,14 +1676,6 @@ impl Rex3 {
     pub const DIAG_LOOP_GL_RENDER:    u64 = 1 << 23;
     pub const DIAG_LOOP_DRAW_BLOCK:   u64 = 1 << 24;
     pub const DIAG_LOOP_EXECUTE_GO:   u64 = 1 << 25;
-
-    fn default_px_rd(rex: &Rex3, addr: u32) -> u32 {
-        unsafe { (*rex.fb_rgb.get())[addr as usize] }
-    }
-
-    fn default_px_wr(rex: &Rex3, addr: u32, val: u32) {
-        unsafe { (*rex.fb_rgb.get())[addr as usize] = val; }
-    }
 
     pub fn set_vblank_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
         *self.vblank_cb.lock() = Some(cb);
@@ -1593,13 +1792,13 @@ impl Rex3 {
         // correction only in draw_line_bresenham (the old approach) left the JIT
         // silently drawing plain-I_LINE trajectories for F_LINE/A_LINE, since the
         // JIT never reaches that interpreter-only code path.
-        let adrmode = ctx.drawmode0.adrmode() << 2;
+        let adrmode = ctx.drawmode0.adrmode();
         let is_fractional = adrmode == DRAWMODE0_ADRMODE_F_LINE || adrmode == DRAWMODE0_ADRMODE_A_LINE;
         if is_fractional {
             let (_incrx1, incrx2, _incry1, incry2, y_major) = REX3_BRES_OCTANTS[(octant & 7) as usize];
             let mut x = ctx.xstart >> 11;
             let mut y = ctx.ystart >> 11;
-            Self::fline_apply_fract(ctx, &mut d, &mut x, &mut y, incrx2, incry2, y_major);
+            crate::rex3_generic::fline_apply_fract(ctx, &mut d, &mut x, &mut y, incrx2, incry2, y_major);
             ctx.xstart = x << 11;
             ctx.ystart = y << 11;
         }
@@ -1635,10 +1834,10 @@ impl Rex3 {
 
     #[cfg(not(feature = "developer"))]
     #[inline(always)]
-    fn log_block(&self, _ctx: &Rex3Context, _opcode: u32) {}
+    pub(crate) fn log_block(&self, _ctx: &Rex3Context, _opcode: u32) {}
 
     #[cfg(feature = "developer")]
-    fn log_block(&self, ctx: &Rex3Context, opcode: u32) {
+    pub(crate) fn log_block(&self, ctx: &Rex3Context, opcode: u32) {
         let need_block_log = self.block_log.lock().is_some();
         let need_draw_ring = self.draw_debug_active();
         if ctx.mid_primitive || (!need_block_log && !need_draw_ring) { return; }
@@ -1682,7 +1881,13 @@ impl Rex3 {
                     DRAWMODE1_PLANES_OLAY => "OLAY", DRAWMODE1_PLANES_PUP  => "PUP",
                     DRAWMODE1_PLANES_CID  => "CID",  _ => "?"
                 };
-                let bpp = match ctx.drawmode1.drawdepth() { 0=>4, 1=>8, 2=>12, 3=>24, _=>0 };
+                let bpp = match ctx.drawmode1.drawdepth() {
+                    DRAWMODE1_DRAWDEPTH_4 => 4,
+                    DRAWMODE1_DRAWDEPTH_8 => 8,
+                    DRAWMODE1_DRAWDEPTH_12 => 12,
+                    DRAWMODE1_DRAWDEPTH_24 => 24,
+                    _ => 0,
+                };
                 let opcode_str = match opcode {
                     DRAWMODE0_OPCODE_READ    => "READ",
                     DRAWMODE0_OPCODE_DRAW    => "DRAW",
@@ -1768,717 +1973,6 @@ impl Rex3 {
         }
     }
 
-    fn draw_block(&self, ctx: &mut Rex3Context) {
-        if crate::rex3_simd::try_fastclear_block(self, ctx) {
-            return;
-        }
-        if crate::rex3_simd::try_src_block_rgb(self, ctx) {
-            return;
-        }
-
-        let _w = (ctx.xend - ctx.xstart).abs();
-        let _h = (ctx.yend - ctx.ystart).abs();
-
-        let stopony = ctx.drawmode0.stopony();
-        let length32 = ctx.drawmode0.length32();
-        let ystride = ctx.drawmode0.ystride();
-        let opcode = ctx.drawmode0.opcode();
-        let colorhost = ctx.drawmode0.colorhost();
-        let mut first = true;
-        let skipfirst = ctx.drawmode0.skipfirst();
-        let skiplast = ctx.drawmode0.skiplast();
-
-
-        // In host mode (READ or DRAW+colorhost), each GO processes exactly one word's worth
-        // of pixels (host_count pixels). stop_on_word causes the loop to exit after the
-        // word boundary so the next GO picks up where we left off.
-        let stop_on_word = opcode == DRAWMODE0_OPCODE_READ || colorhost;
-
-        // stop_on_word takes priority over stoponx — host mode governs its own stop.
-        let stoponx = ctx.drawmode0.stoponx() || stop_on_word;
-
-        let octant = ctx.bresoctinc1.octant();
-        let lronly = ctx.drawmode0.lronly();
-        let x_dec = (octant & OCTANT_XDEC) != 0;
-        let y_dec = (octant & OCTANT_YDEC) != 0;
-        let lrskip = lronly && x_dec;
-        // it is important to note that lrskip still performs y advance operations otherwise some triangles grow weird tails
-        // Coordinate steps in 21.11 fixed-point: ±1 integer = ±2048
-        let stepx: i32 = if x_dec { -(1 << 11) } else { 1 << 11 };
-        let y_inc: i32 = if ystride { 2 } else { 1 };
-        let stepy: i32 = if y_dec { -(y_inc << 11) } else { y_inc << 11 };
-
-        // length32 only clamps if span is >= 32 pixels wide
-        let span_len = ((ctx.xend - ctx.xstart).abs()) >> 11;
-        let xstop = if length32 && span_len >= 32 { Some(ctx.xstart + stepx * 32) } else { None };
-
-        let proc_fn    = unsafe { *self.px_proc.get() };
-        let shade_fn   = unsafe { *self.px_shade.get() };
-        let pattern_fn = unsafe { *self.px_pattern.get() };
-
-        ctx.mid_primitive = true;
-        #[cfg(feature = "rexdiag")]
-        self.diag.fetch_or(Self::DIAG_LOOP_DRAW_BLOCK, Ordering::Relaxed);
-        loop {
-            let x = ctx.xstart >> 11;
-            let y = ctx.ystart >> 11;
-
-            ctx.xstart += stepx;
-
-            let x_end_reached = if x_dec { ctx.xstart < ctx.xend } else { ctx.xstart > ctx.xend };
-
-            if !(first && skipfirst || x_end_reached && skiplast || lrskip) {
-                proc_fn(self, ctx, x, y);
-            }
-
-            shade_fn(ctx);
-            pattern_fn(ctx);
-
-            if x_end_reached {
-                // advance y, wrap x; reset pattern bits so each row starts at bit 31
-                ctx.ystart += stepy;
-                ctx.xstart = ctx.xsave;
-                ctx.pat_bit  = 31;
-                ctx.zpat_bit = 31;
-                // lsrcount continues across rows — iterate_pattern_ls manages it per-pixel.
-
-                if !stopony {
-                    // Without STOPONY, hardware doesn't auto-advance rows — each row is
-                    // its own complete primitive and the next GO starts a fresh one.
-                    // Mirrors the JIT's emit_shader (!stopony branch in end_x_block),
-                    // which already clears mid_primitive here. Leaving this true (as
-                    // before) permanently wedged log_block()'s "primitive start" guard
-                    // after the first non-stopony block ever ran, hiding every
-                    // subsequent block/READ/DRAW header from block.log.
-                    ctx.mid_primitive = false;
-                    break;
-                }
-
-                let y_end_reached = if y_dec { ctx.ystart < ctx.yend } else { ctx.ystart > ctx.yend };
-
-                if y_end_reached {
-                    // All rows consumed — primitive done.
-                    ctx.mid_primitive = false;
-                    break;
-                }
-
-                // Host mode: a row boundary is always a forced word boundary too,
-                // even if the row's width doesn't divide evenly into host_count
-                // (e.g. a 17px-wide CI8 row's last word only has 1 of 4 slots
-                // filled). Without this, a still-open partial word from this row
-                // would keep accumulating pixels from the next row instead of
-                // being flushed — hardware sends one word per GO in host mode,
-                // full or not. Checked here (not just via the hostcnt==0 check
-                // below) because that check alone never fires for a word that
-                // never reaches host_count pixels.
-                if stop_on_word && ctx.hostcnt > 0 {
-                    break;
-                }
-
-                first = true; // pixel in next row will be first
-            } else if let Some(limit) = xstop {
-                let limit_reached = if x_dec { ctx.xstart <= limit } else { ctx.xstart >= limit };
-                if limit_reached {
-                    break;
-                }
-            }
-
-            // Host mode: stop after one word (after y-advance so row boundary is handled first).
-            // Primitive continues on next GO — mid_primitive stays true.
-            if stop_on_word && ctx.hostcnt == 0 {
-                break;
-            }
-
-            // stoponx/stopony: next GO advances to next step — mid_primitive stays true.
-            if !stoponx {
-                break;
-            }
-        }
-
-
-        #[cfg(feature = "rexdiag")]
-        self.diag.fetch_and(!Self::DIAG_LOOP_DRAW_BLOCK, Ordering::Relaxed);
-
-        if opcode == DRAWMODE0_OPCODE_READ {
-            self.flush_host_pixel(ctx);
-        }
-    }
-
-    fn draw_span(&self, ctx: &mut Rex3Context) {
-        //if crate::rex3_simd::try_src_span_rgb(self, ctx) {
-        //    return;
-        //}
-        if  ctx.drawmode0.lronly() && (ctx.bresoctinc1.octant() & OCTANT_XDEC) != 0{
-            return;
-        }
-        let length32 = ctx.drawmode0.length32();
-        let ystride = ctx.drawmode0.ystride();
-        let opcode = ctx.drawmode0.opcode();
-        let colorhost = ctx.drawmode0.colorhost();
-        let mut first = true;
-        let skipfirst = ctx.drawmode0.skipfirst();
-        let skiplast = ctx.drawmode0.skiplast();
-
-        // In host mode (READ or DRAW+colorhost), each GO processes exactly one word's worth
-        // of pixels (host_count pixels). stop_on_word causes the loop to exit after the
-        // word boundary so the next GO picks up where we left off.
-        let stop_on_word = opcode == DRAWMODE0_OPCODE_READ || colorhost;
-
-        // stop_on_word takes priority over stoponx — host mode governs its own stop.
-        let stoponx = ctx.drawmode0.stoponx() || stop_on_word;
-
-        // Spans always advance left-to-right (+1 in 21.11 fixed-point).
-        // length32 only clamps if span is >= 32 pixels wide.
-        let span_len = (ctx.xend - ctx.xstart) >> 11;
-        let xstop = if length32 && span_len >= 32 { Some(ctx.xstart + (32 << 11)) } else { None };
-
-        let proc_fn    = unsafe { *self.px_proc.get() };
-        let shade_fn   = unsafe { *self.px_shade.get() };
-        let pattern_fn = unsafe { *self.px_pattern.get() };
-
-        ctx.mid_primitive = true;
-        #[cfg(feature = "rexdiag")]
-        self.diag.fetch_or(Self::DIAG_LOOP_DRAW_BLOCK, Ordering::Relaxed);
-        let x_end_reached = loop {
-            let x = ctx.xstart >> 11;
-            let y = ctx.ystart >> 11;
-
-            ctx.xstart += 1 << 11;
-
-            let x_end_reached = ctx.xstart > ctx.xend;
-
-            if !(first && skipfirst || x_end_reached && skiplast) {
-                proc_fn(self, ctx, x, y);
-            }
-
-            shade_fn(ctx);
-            pattern_fn(ctx);
-
-            if x_end_reached {
-                break true;
-            } else if let Some(limit) = xstop {
-                if ctx.xstart >= limit {
-                    break false;
-                }
-            }
-
-            // Host mode: stop after one word.
-            // Primitive continues on next GO — mid_primitive stays true.
-            if stop_on_word && ctx.hostcnt == 0 {
-                break false;
-            }
-
-            // stoponx: next GO advances to next step — mid_primitive stays true.
-            if !stoponx {
-                break false;
-            }
-
-            first = false;
-        };
-
-        if x_end_reached {
-            // Span fully consumed — advance to next row and reset state.
-            //let y_inc: i32 = if ystride { 2 } else { 1 };
-            //ctx.ystart += y_inc << 11;
-            //ctx.xstart = ctx.xsave;
-            ctx.pat_bit  = 31;
-            ctx.zpat_bit = 31;
-            ctx.mid_primitive = false;
-        }
-
-
-        #[cfg(feature = "rexdiag")]
-        self.diag.fetch_and(!Self::DIAG_LOOP_DRAW_BLOCK, Ordering::Relaxed);
-
-        if opcode == DRAWMODE0_OPCODE_READ {
-            self.flush_host_pixel(ctx);
-        }
-    }
-
-    /// Fractional d correction for F_LINE/A_LINE from 21.11 endpoint sub-pixel position.
-    /// Fractional nibble is bits [10:7] of the 21.11 coordinate (16.4(7) layout).
-    fn fline_apply_fract(
-        ctx: &Rex3Context,
-        d: &mut i32,
-        x: &mut i32,
-        y: &mut i32,
-        incrx2: i32,
-        incry2: i32,
-        y_major: bool,
-    ) {
-        let octant = ctx.bresoctinc1.octant() & 7;
-        let x1p = ctx.xstart >> 11;
-        let y1p = ctx.ystart >> 11;
-        let x2p = ctx.xend >> 11;
-        let y2p = ctx.yend >> 11;
-        let mut dx = (x1p - x2p).abs();
-        let mut dy = (y1p - y2p).abs();
-        let mut xf = ((ctx.xstart >> 7) & 0xF) as i32;
-        let mut yf = ((ctx.ystart >> 7) & 0xF) as i32;
-
-        match octant {
-            1 => {
-                std::mem::swap(&mut xf, &mut yf);
-                std::mem::swap(&mut dx, &mut dy);
-            }
-            3 => {
-                xf = 0x10 - xf;
-                std::mem::swap(&mut xf, &mut yf);
-                std::mem::swap(&mut dx, &mut dy);
-            }
-            7 => { xf = 0x10 - xf; }
-            6 => {
-                xf = 0x10 - xf;
-                yf = 0x10 - yf;
-            }
-            2 => {
-                let t = 0x10 - xf;
-                xf = 0x10 - yf;
-                yf = t;
-                std::mem::swap(&mut dx, &mut dy);
-            }
-            0 => {
-                let t = 0x10 - yf;
-                yf = xf;
-                xf = t;
-                std::mem::swap(&mut dx, &mut dy);
-            }
-            4 => { yf = 0x10 - yf; }
-            _ => {}
-        }
-
-        // `*d` arrives holding the I_LINE decision variable (2*minor - major,
-        // computed by setup() and shared by all line adrmodes). The REX3 spec
-        // (rex3_pdf.md 3.6.1.2/3.6.2.1) defines F_LINE/A_LINE's base d as
-        // 3*minor - 2*major instead — confirmed against MAME's do_fline,
-        // which independently derives the same 3dy-2dx formula. The two
-        // formulas differ by exactly (minor - major); apply that correction
-        // before adding the fractional term below. Without it, the fractional
-        // term is added to the wrong baseline and can flip d's sign on the
-        // very first step for near-degenerate (small minor-axis) lines,
-        // producing a spurious extra step in the minor-axis direction that
-        // the line never recovers from (confirmed via a real R4400/REX3
-        // fractional-line test that undershot its endpoint by one row).
-        *d += dy - dx;
-        *d += 2 * (((dx * yf) >> 4) - ((dy * xf) >> 4));
-        let major_delta = if y_major { dy } else { dx };
-        let e = *d - 2 * major_delta;
-        if e > 0 {
-            *d = e;
-            let x_major = !y_major;
-            if x_major {
-                *y -= incry2;
-            } else {
-                *x += incrx2;
-            }
-        }
-    }
-
-    fn draw_iline(&self, ctx: &mut Rex3Context) {
-        self.draw_line_bresenham(ctx, false, false, false);
-    }
-
-    fn draw_fline(&self, ctx: &mut Rex3Context) {
-        self.draw_line_bresenham(ctx, true, false, false);
-    }
-
-    fn draw_aline(&self, ctx: &mut Rex3Context) {
-        let mut extra_skip_first = false;
-        let mut extra_skip_last = false;
-        if ctx.drawmode0.endptfilter() {
-            // Basic endpoint filter: consult AWEIGHT LUT for sub-pixel coverage.
-            let xsf = (ctx.xstart >> 7) & 0xF;
-            let ysf = (ctx.ystart >> 7) & 0xF;
-            let xef = (ctx.xend >> 7) & 0xF;
-            let yef = (ctx.yend >> 7) & 0xF;
-            if xsf != 0 || ysf != 0 {
-                let wi = ((xsf + ysf) as usize).min(15);
-                let w = (ctx.aweight0 >> (wi * 4)) & 0xF;
-                if w == 0 {
-                    extra_skip_first = true;
-                }
-            }
-            if xef != 0 || yef != 0 {
-                let wi = ((xef + yef) as usize).min(15);
-                let w = (ctx.aweight1 >> (wi * 4)) & 0xF;
-                if w == 0 {
-                    extra_skip_last = true;
-                }
-            }
-        }
-        self.draw_line_bresenham(ctx, true, extra_skip_first, extra_skip_last);
-    }
-
-    fn draw_line_bresenham(
-        &self,
-        ctx: &mut Rex3Context,
-        fract: bool,
-        extra_skip_first: bool,
-        extra_skip_last: bool,
-    ) {
-        let octant = (ctx.bresoctinc1.octant() & 7) as usize;
-        let (incrx1, incrx2, incry1, incry2, y_major) = REX3_BRES_OCTANTS[octant];
-
-        let x2 = ctx.xend >> 11;
-        let y2 = ctx.yend >> 11;
-        let mut x = ctx.xstart >> 11;
-        let mut y = ctx.ystart >> 11;
-
-        // All Bresenham state comes from registers — set by setup() or restored across GOs.
-        // incr1: 20-bit, always positive (no sign extension needed).
-        let incr1 = ctx.bresoctinc1.incr1() as i32;
-        // incr2: 21-bit signed — sign-extend from bit 20.
-        let incr2 = {
-            let raw = ctx.bresrndinc2.incr2();
-            if raw & (1 << 20) != 0 { (raw | 0xFFE0_0000) as i32 } else { raw as i32 }
-        };
-        // d: 27-bit signed — sign-extend from bit 26.  Persisted across step-mode GOs.
-        // For F_LINE/A_LINE (fract=true), the fractional-endpoint correction was
-        // already applied in setup() (see setup()'s doc comment) — bresd/xstart/ystart
-        // read here are already correct, no further adjustment needed.
-        let mut d = {
-            let raw = ctx.bresd & 0x7FF_FFFF;
-            if raw & (1 << 26) != 0 { (raw | 0xF800_0000) as i32 } else { raw as i32 }
-        };
-
-        // pixel_count = major_axis_length + 1 (both endpoints inclusive).
-        // max(|dx|,|dy|): continuation GOs (dosetup clear) must still walk the full
-        // segment when persisted octant y_major disagrees with start→end (e.g. a
-        // degenerate setup GO followed by a horizontal stipple continuation).
-        let adx = (x2 - x).abs();
-        let ady = (y2 - y).abs();
-        let major = adx.max(ady);
-        let mut pixel_count = major + 1;
-        if ctx.drawmode0.length32() && pixel_count > 32 {
-            pixel_count = 32;
-        }
-
-        let iterate_one = !ctx.drawmode0.stoponx() && !ctx.drawmode0.stopony();
-        let mut skip_first = ctx.drawmode0.skipfirst() || extra_skip_first;
-        let mut skip_last = ctx.drawmode0.skiplast() || extra_skip_last;
-        if iterate_one {
-            pixel_count = 1;
-            skip_first = false;
-            skip_last = false;
-        }
-
-        let proc_fn    = unsafe { *self.px_proc.get() };
-        let shade_fn   = unsafe { *self.px_shade.get() };
-        let pattern_fn = unsafe { *self.px_pattern.get() };
-        let lsadvlast  = ctx.drawmode0.lsadvlast();
-
-        macro_rules! bres_step {
-            () => {
-                if d < 0 {
-                    x += incrx1; y -= incry1; d += incr1;
-                } else {
-                    x += incrx2; y -= incry2; d += incr2;
-                }
-            };
-        }
-
-        for i in 0..pixel_count {
-            let is_first = i == 0;
-            let is_last  = i == pixel_count - 1;
-
-            // Write pixel unless suppressed by skip_first/skip_last.
-            // iterate_one overrides skip_first so single-step mode always draws.
-            let draw = (!is_first || !skip_first) && (!is_last || !skip_last);
-            if draw {
-                proc_fn(self, ctx, x, y);
-            }
-
-            shade_fn(ctx);
-            if !is_last || lsadvlast {
-                pattern_fn(ctx);
-            }
-
-            // On the last pixel of a full I_LINE draw, verify Bresenham landed on x2,y2 —
-            // integer Bresenham is exact, so this is a real invariant for I_LINE.
-            // F_LINE/A_LINE do NOT get this check: a fractional start biases the initial
-            // error term but the loop still steps by whole pixels along the major axis,
-            // so the minor-axis position at the final major-axis step is the closest
-            // integer approximation to the true (fractional) line, not necessarily the
-            // literal requested endpoint — this is expected behavior for fractional
-            // Bresenham (confirmed independently: real hardware/software fractional-DDA
-            // implementations only guarantee landing in the endpoint's pixel *column/row*,
-            // not its exact minor-axis coordinate).
-            debug_assert!(
-                fract || iterate_one || !is_last || (x == x2 && y == y2),
-                "I_LINE bres mismatch: pos ({},{}) != end ({},{})", x, y, x2, y2
-            );
-
-            // In full-line mode: do NOT step after the last pixel — that would leave
-            // xstart/ystart one position beyond the endpoint, breaking the next XYENDI GO
-            // (dosetup re-derives Bresenham from xstart).
-            // In step mode: always step so the next single-step GO starts at the next position.
-            if !is_last || iterate_one {
-                bres_step!();
-            }
-        }
-
-        ctx.xstart = x << 11;
-        ctx.ystart = y << 11;
-        // Persist d so the next GO (step mode) picks up where we left off.
-        ctx.bresd = (d as u32) & 0x7FF_FFFF;
-    }
-
-    fn identity(val: u32) -> u32 { val }
-
-    fn amplify_rgb_4(val: u32) -> u32 { val | (val << 4) }
-    fn amplify_rgb_8(val: u32) -> u32 { val | (val << 8) }
-    fn amplify_rgb_12(val: u32) -> u32 { val | (val << 12) }
-    fn amplify_rgb_24(val: u32) -> u32 { val }
-    fn amplify_olay(val: u32) -> u32 { (val << 8) | (val << 16) }
-    fn amplify_cid(val: u32) -> u32 { val | (val << 4) }
-    fn amplify_pup(val: u32) -> u32 { (val << 2) | (val << 6) }
-    fn amplify_nop(_val: u32) -> u32 { 0 }
-
-    // ── Shade iterate functions ────────────────────────────────────────────────
-    // Called once per pixel after drawing.  Advance color DDAs and, when
-    // CICLAMP is set, clamp the result to legal range.
-    //
-    // The spec (§3.8 / DRAWMODE0 bit CICLAMP) says:
-    //   • RGB mode: each component is in o12.11 format (integer part bits[22:11]).
-    //     Clamp: if negative (bit 31 set) or integer >= 0x180 → 0; if > 0xFF → 0x7FFFF.
-    //   • CI mode: only colorred clamped; depth-specific overflow bit check.
-    //     8bpp: clamp if bit 19 set.  12bpp: clamp if bit 21 set.
-    //     (4bpp: bit 15; 24bpp: no clamp per spec.)
-
-    #[inline(always)]
-    fn shade_add(ctx: &mut Rex3Context) {
-        ctx.colorred   = ctx.colorred.wrapping_add(ctx.slopered   as u32);
-        ctx.colorgrn   = ctx.colorgrn.wrapping_add(ctx.slopegrn   as u32);
-        ctx.colorblue  = ctx.colorblue.wrapping_add(ctx.slopeblue  as u32);
-        ctx.coloralpha = ctx.coloralpha.wrapping_add(ctx.slopealpha as u32);
-    }
-
-    fn iterate_shade_noop(_ctx: &mut Rex3Context) {}
-
-    /// SHADE only, no clamping (CICLAMP=0).
-    fn iterate_shade_unclamped(ctx: &mut Rex3Context) {
-        Self::shade_add(ctx);
-    }
-
-    /// SHADE + CICLAMP, CI 8bpp: clamp colorred if bit 19 set.
-    fn iterate_shade_ci8_clamp(ctx: &mut Rex3Context) {
-        Self::shade_add(ctx);
-        if ctx.colorred & (1 << 19) != 0 {
-            ctx.colorred = 0x0007_FFFF;
-        }
-    }
-
-    /// SHADE + CICLAMP, CI 12bpp: clamp colorred if bit 21 set.
-    fn iterate_shade_ci12_clamp(ctx: &mut Rex3Context) {
-        Self::shade_add(ctx);
-        if ctx.colorred & (1 << 21) != 0 {
-            ctx.colorred = 0x001F_FFFF;
-        }
-    }
-
-    /// SHADE + RGB mode: clamp R,G,B,A each iteration, this happens even if we dont draw pixel
-    /// integer = bits[22:11] & 0x1FF; negative (bit31) or int >= 0x180 → 0; int > 0xFF → 0x7FFFF.
-    fn iterate_shade_rgb_clamp(ctx: &mut Rex3Context) {
-        Self::shade_add(ctx);
-        #[inline(always)]
-        fn clamp(c: u32) -> u32 {
-            let val = (c >> 11) & 0x1FF;
-            if c & (1 << 31) != 0 || val >= 0x180 { 0 }
-            else if val > 0xFF { 0x0007_FFFF }
-            else { c }
-        }
-        ctx.colorred   = clamp(ctx.colorred);
-        ctx.colorgrn   = clamp(ctx.colorgrn);
-        ctx.colorblue  = clamp(ctx.colorblue);
-        ctx.coloralpha = clamp(ctx.coloralpha);
-    }
-
-    // ── Pattern iterate functions ──────────────────────────────────────────────
-    // Called once per pixel after drawing.  Advance lspattern and/or zpattern
-    // bit counters.
-    //
-    // ZPATTERN: always 32-bit, simple rotate — zpat_bit = (zpat_bit - 1) & 31.
-    //
-    // LSPATTERN (via lsmode):
-    //   LSRCOUNT  (down counter, 0..LSREPEAT-1): decremented each pixel.
-    //   When LSRCOUNT == 0 after decrement → advance pat_bit, reload LSRCOUNT = LSREPEAT-1.
-    //   LSLENGTH  (4 bits): pattern length = lslength + 17 (range 17..32).
-    //   pat_bit wraps: when it would go below (32 - length), reset to 31.
-    //   LSREPEAT==0 is treated as 1 (no-repeat is the degenerate case).
-    //
-    // Cursors start at 31 (MSB) on DOSETUP/row start (see execute_go) and walk
-    // DOWN toward the wrap point — a contiguous MSB-to-LSB sweep. f2d0bff
-    // briefly flipped this to increment-from-31 (+ an lspattern rotate-on-wrap
-    // in place of the reset), but incrementing from 31 immediately wraps to 0
-    // after a single step (`(31+1)&31 == 0`), producing a discontinuous,
-    // backwards bit walk — confirmed as the cause of garbled/mirrored PROM
-    // text. Reverted back to decrement/reset-to-31.
-
-    fn iterate_pattern_noop(_ctx: &mut Rex3Context) {}
-
-    #[inline(always)]
-    fn advance_zpat(ctx: &mut Rex3Context) {
-        ctx.zpat_bit = ctx.zpat_bit.wrapping_sub(1) & 31;
-    }
-
-    #[inline(always)]
-    fn advance_lspat(ctx: &mut Rex3Context) {
-        let lsrepeat = ctx.lsmode.lsrepeat() as u8;
-        let repeat = if lsrepeat == 0 { 1 } else { lsrepeat };
-        if ctx.lsmode.lsrcount() == 0 {
-            // Reload counter, advance bit
-            ctx.lsmode.set_lsrcount((repeat - 1) as u32);
-            let length = ctx.lsmode.lslength() as u8 + 17; // 17..=32
-            let wrap_point = 32u8.saturating_sub(length);  // bit index of pattern end
-            if ctx.pat_bit == wrap_point {
-                ctx.pat_bit = 31; // recirculate
-            } else {
-                ctx.pat_bit = ctx.pat_bit.wrapping_sub(1) & 31;
-            }
-        } else {
-            ctx.lsmode.set_lsrcount(ctx.lsmode.lsrcount() - 1);
-        }
-    }
-
-    fn iterate_pattern_z(ctx: &mut Rex3Context) {
-        Self::advance_zpat(ctx);
-    }
-
-    fn iterate_pattern_ls(ctx: &mut Rex3Context) {
-        Self::advance_lspat(ctx);
-    }
-
-    fn iterate_pattern_both(ctx: &mut Rex3Context) {
-        Self::advance_zpat(ctx);
-        Self::advance_lspat(ctx);
-    }
-
-
-    fn rgb4_to_rgb24(val: u32) -> u32 {
-        let r = if (val & 1) != 0 { 0xFF } else { 0 };
-        let g_raw = (val >> 1) & 3;
-        let g = (g_raw << 6) | (g_raw << 4) | (g_raw << 2) | g_raw;
-        let b = if (val & 8) != 0 { 0xFF } else { 0 };
-        (b << 16) | (g << 8) | r
-    }
-
-    fn rgb24_to_rgb4(val: u32) -> u32 {
-        let r = (val >> 7) & 1;
-        let g = (val >> 14) & 3;
-        let b = (val >> 23) & 1;
-        (b << 3) | (g << 1) | r
-    }
-
-    fn rgb8_to_rgb24(val: u32) -> u32 {
-        let r_raw = val & 7;
-        let r = (r_raw << 5) | (r_raw << 2) | (r_raw >> 1);
-        let g_raw = (val >> 3) & 7;
-        let g = (g_raw << 5) | (g_raw << 2) | (g_raw >> 1);
-        let b_raw = (val >> 6) & 3;
-        let b = (b_raw << 6) | (b_raw << 4) | (b_raw << 2) | b_raw;
-        (b << 16) | (g << 8) | r
-    }
-
-    fn rgb24_to_rgb8(val: u32) -> u32 {
-        let r = (val >> 5) & 7;
-        let g = (val >> 13) & 7;
-        let b = (val >> 22) & 3;
-        (b << 6) | (g << 3) | r
-    }
-
-    fn rgb12_to_rgb24(val: u32) -> u32 {
-        let r_raw = val & 0xF;
-        let r = (r_raw << 4) | r_raw;
-        let g_raw = (val >> 4) & 0xF;
-        let g = (g_raw << 4) | g_raw;
-        let b_raw = (val >> 8) & 0xF;
-        let b = (b_raw << 4) | b_raw;
-        (b << 16) | (g << 8) | r
-    }
-
-    fn rgb24_to_rgb12(val: u32) -> u32 {
-        let r = (val >> 4) & 0xF;
-        let g = (val >> 12) & 0xF;
-        let b = (val >> 20) & 0xF;
-        (b << 8) | (g << 4) | r
-    }
-
-    // Bayer 4x4 dither matrix packed as 16 nibbles in a u64.
-    // Indexed by (y&3)<<2|(x&3): threshold = (BAYER_PACKED >> (idx*4)) & 0xF.
-    // Table: [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
-    const BAYER_PACKED: u64 = 0x5D7F91B36E4CA280;
-
-    /// Pack bayer index into bits 27:24 of color value (top byte unused by 24-bit BGR).
-    /// Encoding: bits[3:2] = y&3, bits[1:0] = x&3 → index = (y&3)<<2|(x&3).
-    /// Non-dither compress variants ignore these bits.
-    #[inline(always)]
-    fn bayer_pack(color: u32, x: i32, y: i32) -> u32 {
-        (color & 0x00FFFFFF) | (((y as u32 & 3) << 2 | (x as u32 & 3)) << 24)
-    }
-    fn bayer_nop(color: u32, _x: i32, _y: i32) -> u32 { color }
-
-    #[inline(always)]
-    fn bayer_threshold(idx: u32) -> u32 {
-        ((Self::BAYER_PACKED >> (idx * 4)) & 0xF) as u32
-    }
-
-    fn rgb24_to_rgb4_dither(val: u32) -> u32 {
-        let bayer = Self::bayer_threshold(val >> 24);
-        let r = (val & 0xFF) as u8;
-        let g = ((val >> 8) & 0xFF) as u8;
-        let b = ((val >> 16) & 0xFF) as u8;
-        // 4bpp: 1-2-1 BGR. Each channel dithered down from 8-bit.
-        let sr = (r >> 3).wrapping_sub(r >> 4);
-        let sg = (g >> 2).wrapping_sub(g >> 4);
-        let sb = (b >> 3).wrapping_sub(b >> 4);
-        let mut dr = (sr >> 4) & 1;
-        let mut dg = (sg >> 4) & 3;
-        let mut db = (sb >> 4) & 1;
-        if (sr & 0xf) as u32 > bayer { dr = (dr + 1).min(1); }
-        if (sg & 0xf) as u32 > bayer { dg = (dg + 1).min(3); }
-        if (sb & 0xf) as u32 > bayer { db = (db + 1).min(1); }
-        ((db << 3) | (dg << 1) | dr) as u32
-    }
-
-    fn rgb24_to_rgb8_dither(val: u32) -> u32 {
-        let bayer = Self::bayer_threshold(val >> 24);
-        let r = (val & 0xFF) as u8;
-        let g = ((val >> 8) & 0xFF) as u8;
-        let b = ((val >> 16) & 0xFF) as u8;
-        // 8bpp: 3-3-2 BGR.
-        let sr = (r >> 1).wrapping_sub(r >> 4);
-        let sg = (g >> 1).wrapping_sub(g >> 4);
-        let sb = (b >> 2).wrapping_sub(b >> 4);
-        let mut dr = (sr >> 4) & 7;
-        let mut dg = (sg >> 4) & 7;
-        let mut db = (sb >> 4) & 3;
-        if (sr & 0xf) as u32 > bayer { dr = (dr + 1).min(7); }
-        if (sg & 0xf) as u32 > bayer { dg = (dg + 1).min(7); }
-        if (sb & 0xf) as u32 > bayer { db = (db + 1).min(3); }
-        ((db << 6) | (dg << 3) | dr) as u32
-    }
-
-    fn rgb24_to_rgb12_dither(val: u32) -> u32 {
-        let bayer = Self::bayer_threshold(val >> 24);
-        let r = (val & 0xFF) as u32;
-        let g = ((val >> 8) & 0xFF) as u32;
-        let b = ((val >> 16) & 0xFF) as u32;
-        // 12bpp: 4-4-4 BGR.
-        let sr = r - (r >> 4);
-        let sg = g - (g >> 4);
-        let sb = b - (b >> 4);
-        let mut dr = (sr >> 4) & 15;
-        let mut dg = (sg >> 4) & 15;
-        let mut db = (sb >> 4) & 15;
-        if (sr & 0xf) > bayer { dr = (dr + 1).min(15); }
-        if (sg & 0xf) > bayer { dg = (dg + 1).min(15); }
-        if (sb & 0xf) > bayer { db = (db + 1).min(15); }
-        (db << 8) | (dg << 4) | dr
-    }
-
-    fn host_unpack_nop(_val: u64) -> u32 { 0 }
-    fn host_pack_nop(acc: u64, _val: u32) -> u64 { acc }
-
     // 4-bit (1-2-1 BGR) expansion
     pub fn expand_4_rgb(val: u32) -> u32 {
         let b = (val >> 3) & 1;
@@ -2523,20 +2017,20 @@ impl Rex3 {
     }
 
     // 32-bit (ABGR) expansion
-    fn expand_32_rgb(val: u32) -> u32 {
+    pub(crate) fn expand_32_rgb(val: u32) -> u32 {
         // ARGB -> ARGB (internal format AABBGGRR)
         val
     }
 
     // Compression functions (Internal -> Host)
-    fn compress_4_rgb(val: u32) -> u32 {
+    pub(crate) fn compress_4_rgb(val: u32) -> u32 {
         let b = (val >> 16) & 0xFF;
         let g = (val >> 8) & 0xFF;
         let r = val & 0xFF;
         ((b >> 7) << 3) | ((g >> 6) << 1) | (r >> 7)
     }
 
-    fn compress_8_rgb(val: u32) -> u32 {
+    pub(crate) fn compress_8_rgb(val: u32) -> u32 {
         let b = (val >> 16) & 0xFF;
         let g = (val >> 8) & 0xFF;
         let r = val & 0xFF;
@@ -2544,531 +2038,144 @@ impl Rex3 {
         ((b >> 6) << 6) | ((g >> 5) << 3) | (r >> 5)
     }
 
-    fn compress_12_rgb(val: u32) -> u32 {
+    pub(crate) fn compress_12_rgb(val: u32) -> u32 {
         let b = (val >> 16) & 0xFF;
         let g = (val >> 8) & 0xFF;
         let r = val & 0xFF;
         ((b >> 4) << 8) | ((g >> 4) << 4) | (r >> 4)
     }
 
-    fn compress_32_rgb(val: u32) -> u32 {
+    pub(crate) fn compress_32_rgb(val: u32) -> u32 {
         val | 0xFF000000 // Set Alpha to 0xFF
     }
 
-    // Host Unpack Functions
-    // All extract from the top of the 64-bit shifter
-    // We left-shift the shifter after each pixel so current pixel is always at the MSB.
-    // 4bpp: 8-bit slot, pixel in low nibble → mask 0xf from bit 56
-    // 8bpp: 8-bit slot → mask 0xff from bit 56
-    // 12bpp: 16-bit slot → mask 0xfff from bit 48
-    // 32bpp: 32-bit slot → bits [63:32]
-    fn host_unpack_4_64(val: u64) -> u32 {
-        Self::expand_4_rgb(((val >> 56) & 0xF) as u32)
-    }
-    fn host_unpack_8_64(val: u64) -> u32 {
-        Self::expand_8_rgb(((val >> 56) & 0xFF) as u32)
-    }
-    fn host_unpack_12_64(val: u64) -> u32 {
-        Self::expand_12_rgb(((val >> 48) & 0xFFF) as u32)
-    }
-    fn host_unpack_32_64(val: u64) -> u32 {
-        Self::expand_32_rgb((val >> 32) as u32)
-    }
+    /// Summary counts for `rex jit status` / `rex jit list`.
+    fn write_shader_summary(&self, writer: &mut Box<dyn Write + Send>) {
+        let rows = self.shader_report();
+        let count = |o: &str| rows.iter().filter(|r| r.origin == o).count();
+        let jit_bytes: u32 = rows.iter().filter(|r| r.origin == "jit").map(|r| r.bytes).sum();
 
-    fn host_unpack_4_64_ci(val: u64) -> u32 {
-        ((val >> 56) & 0xF) as u32
-    }
-    fn host_unpack_8_64_ci(val: u64) -> u32 {
-        ((val >> 56) & 0xFF) as u32
-    }
-    fn host_unpack_12_64_ci(val: u64) -> u32 {
-        ((val >> 48) & 0xFFF) as u32
-    }
-    fn host_unpack_32_64_ci(val: u64) -> u32 {
-        (val >> 32) as u32
-    }
-
-    // Host Pack Functions — inverse of unpack.
-    // Each pixel occupies the same slot size as unpack reads: shift acc left by slot, insert pixel in low bits.
-    // 4bpp: 8-bit slot (shift=8), pixel in low nibble.
-    // 12bpp: 16-bit slot (shift=16), pixel in low 12 bits.
-    fn host_pack_4_rgb(acc: u64, pixel: u32) -> u64 {
-        (acc << 8) | (Self::compress_4_rgb(pixel) as u64)
-    }
-    fn host_pack_8_rgb(acc: u64, pixel: u32) -> u64 {
-        (acc << 8) | (Self::compress_8_rgb(pixel) as u64)
-    }
-    fn host_pack_12_rgb(acc: u64, pixel: u32) -> u64 {
-        (acc << 16) | (Self::compress_12_rgb(pixel) as u64)
-    }
-    fn host_pack_32_rgb(acc: u64, pixel: u32) -> u64 {
-        (acc << 32) | (Self::compress_32_rgb(pixel) as u64)
-    }
-
-    // CI Mode (Direct)
-    fn host_pack_4_ci(acc: u64, pixel: u32) -> u64 {
-        (acc << 8) | ((pixel & 0xF) as u64)
-    }
-    fn host_pack_8_ci(acc: u64, pixel: u32) -> u64 {
-        (acc << 8) | ((pixel & 0xFF) as u64)
-    }
-    fn host_pack_12_ci(acc: u64, pixel: u32) -> u64 {
-        (acc << 16) | ((pixel & 0xFFF) as u64)
-    }
-    fn host_pack_32_ci(acc: u64, pixel: u32) -> u64 {
-        (acc << 32) | (pixel as u64)
-    }
-
-    fn host_setup(&self, drawmode1: DrawMode1) {
-        let depth = drawmode1.hostdepth();
-        let double = drawmode1.rwdouble();
-        let packed = drawmode1.rwpacked();
-        let rgb = drawmode1.rgbmode();
-
-        // 4bpp pixels occupy an 8-bit slot (low nibble); shift is 8 not 4.
-        // Non-packed: shift is 0 (count=1, shift never used).
-        let shift = if packed {
-            match depth { 0 | 1 => 8, 2 => 16, 3 => 32, _ => 0 }
-        } else {
-            0
+        #[cfg(feature = "rex-jit")]
+        let engine = match self.rex_jit {
+            Some(_) if self.jit_enabled.load(Ordering::Relaxed) => "cranelift enabled",
+            Some(_) => "cranelift DISABLED",
+            None => "cranelift not initialised",
         };
+        #[cfg(not(feature = "rex-jit"))]
+        let engine = "cranelift not compiled in";
 
-        // packed+double: 64/shift_bits pixels; packed+!double: 32/shift_bits pixels; non-packed: 1.
-        // depth=0 (4bpp) uses 8-bit slots (shift=8), same counts as depth=1 (8bpp).
-        let count = if packed {
-            if double {
-                match depth { 0 | 1 => 8, 2 => 4, 3 => 2, _ => 1 }
-            } else {
-                match depth { 0 | 1 => 4, 2 => 2, 3 => 1, _ => 1 }
-            }
-        } else {
-            1
-        };
-
-        let unpack: fn(u64) -> u32 = if rgb {
-            match depth {
-                0 => Self::host_unpack_4_64,
-                1 => Self::host_unpack_8_64,
-                2 => Self::host_unpack_12_64,
-                3 => Self::host_unpack_32_64,
-                _ => Self::host_unpack_nop,
-            }
-        } else {
-            match depth {
-                0 => Self::host_unpack_4_64_ci,
-                1 => Self::host_unpack_8_64_ci,
-                2 => Self::host_unpack_12_64_ci,
-                3 => Self::host_unpack_32_64_ci,
-                _ => Self::host_unpack_nop,
-            }
-        };
-
-        let pack: fn(u64, u32) -> u64 = if rgb {
-            match depth {
-                0 => Self::host_pack_4_rgb,
-                1 => Self::host_pack_8_rgb,
-                2 => Self::host_pack_12_rgb,
-                3 => Self::host_pack_32_rgb,
-                _ => Self::host_pack_nop,
-            }
-        } else {
-            match depth {
-                0 => Self::host_pack_4_ci,
-                1 => Self::host_pack_8_ci,
-                2 => Self::host_pack_12_ci,
-                3 => Self::host_pack_32_ci,
-                _ => Self::host_pack_nop,
-            }
-        };
-
-        unsafe {
-            *self.host_unpack.get() = unpack;
-            *self.host_pack.get() = pack;
-            *self.host_shift.get() = shift;
-            *self.host_count.get() = count;
-        }
+        writeln!(writer, "REX3 shaders: {engine}").unwrap();
+        writeln!(
+            writer,
+            "  precompiled={}  jit={} ({} bytes)  generic={}  queued={}  failed={}",
+            count("precompiled"),
+            count("jit"),
+            jit_bytes,
+            count("generic"),
+            count("queued"),
+            count("failed"),
+        ).unwrap();
+        writeln!(
+            writer,
+            "  {} draw shapes seen this session, {} shapes known in total",
+            self.seen_shapes.lock().len(),
+            rows.len(),
+        ).unwrap();
     }
 
-    fn fetch_host_pixel(&self, ctx: &mut Rex3Context) -> u32 {
-        let rwdouble = ctx.drawmode1.rwdouble();
-        let swapendian = ctx.drawmode1.swapendian();
+    /// One row of the shader report.
+    pub fn shader_report(&self) -> Vec<ShaderRow> {
+        use std::collections::BTreeSet;
 
-        if ctx.hostcnt == 0 {
-            // 32-bit writes land in the high half [63:32] via HOSTRW0, so data is already at MSB.
-            ctx.host_shifter = ctx.hostrw;
-            if swapendian {
-                ctx.host_shifter = if rwdouble {
-                    ctx.host_shifter.swap_bytes()
-                } else {
-                    // swap only the high 32-bit word
-                    let hi = (ctx.host_shifter >> 32) as u32;
-                    ((hi.swap_bytes() as u64) << 32) | (ctx.host_shifter & 0xFFFF_FFFF)
-                };
-            }
-            ctx.hostcnt = unsafe { *self.host_count.get() };
-        }
+        let precompiled: std::collections::HashSet<(u32, u32, u32)> =
+            crate::rex3_shaders::SHADERS.iter().map(|(k, _)| *k).collect();
 
-        let unpack = unsafe { *self.host_unpack.get() };
-        let pixel = unpack(ctx.host_shifter);
+        // Every shape worth reporting: what was drawn, what is precompiled, and
+        // (with rex-jit) what Cranelift knows about.
+        let mut keys: BTreeSet<(u32, u32, u32)> =
+            self.seen_shapes.lock().iter().copied().collect();
+        keys.extend(precompiled.iter().copied());
 
-        // Shift for next pixel
-        let shift = unsafe { *self.host_shift.get() };
-        
-        ctx.host_shifter <<= shift;
-        ctx.hostcnt -= 1;
-
-        pixel
-    }
-
-    fn send_host_word(&self, ctx: &mut Rex3Context) {
-        let rwdouble = ctx.drawmode1.rwdouble();
-        let swapendian = ctx.drawmode1.swapendian();
-        let mut val = ctx.host_shifter;
-
-        if swapendian {
-            val = val.swap_bytes();
-        } else if !rwdouble {
-            val <<= 32;
-        }
-
-        ctx.hostrw = val;
-    }
-
-    fn store_host_pixel(&self, ctx: &mut Rex3Context, pixel: u32) {
-        if ctx.hostcnt == 0 {
-            ctx.hostcnt = unsafe { *self.host_count.get() };
-            ctx.host_shifter = 0;
-        }
-
-        let pack = unsafe { *self.host_pack.get() };
-        ctx.host_shifter = pack(ctx.host_shifter, pixel);
-        ctx.hostcnt -= 1;
-
-        if ctx.hostcnt == 0 {
-            self.send_host_word(ctx);
-        }
-    }
-
-    fn flush_host_pixel(&self, ctx: &mut Rex3Context) {
-        if ctx.hostcnt > 0 {
-            // Shift remaining bits to align to MSB (since we pack LSB to MSB)
-            let shift = unsafe { *self.host_shift.get() };
-            ctx.host_shifter <<= ctx.hostcnt * shift;
-            
-            self.send_host_word(ctx);
-            ctx.hostcnt = 0;
-        }
-    }
-
-    fn combine_host_dda(ctx: &Rex3Context, host_pixel: u32) -> u32 {
-        let color = if ctx.drawmode0.colorhost() { host_pixel } else { ctx.get_colori() };
-        // Afunction's source alpha comes from "either DDA or host" (selected by
-        // ALPHAHOST) independent of RGB/CI plane format (rex3 spec §3.8.1) — CI-mode
-        // GL apps can stream a color index alongside a host alpha byte for ALPHAREF
-        // comparison. Always overlay bits 31:24 with the resolved alpha so afunction
-        // sees the right value in both modes; compress_fn/write paths for CI already
-        // mask down to the plane-depth index and never look at these high bits.
-        let a = if ctx.drawmode0.alphahost() {
-            (host_pixel >> 24) & 0xFF
-        } else {
-            Rex3Context::clamp_color_component(ctx.coloralpha)
-        };
-        (color & 0x00FFFFFF) | (a << 24)
-    }
-
-    /// Replicate colorvram to fill plane-depth slots, matching MAME get_default_color() with fastclear=1.
-    pub(crate) fn fastclear_color(ctx: &Rex3Context) -> u32 {
-        let v = ctx.colorvram;
-        match ctx.drawmode1.drawdepth() {
-            0 => { let c = v & 0xf; c | (c << 4) | (c << 8) | (c << 16) }
-            1 => { let c = v & 0xff; c | (c << 8) | (c << 16) }
-            2 => {
-                // 12bpp: in RGB mode use nibbles from colorvram, else lower 12 bits
-                let c = if ctx.drawmode1.rgbmode() {
-                    ((v & 0xf00000) >> 12) | ((v & 0xf000) >> 8) | ((v & 0xf0) >> 4)
-                } else {
-                    v & 0x000fff
-                };
-                c | (c << 12)
-            }
-            _ => v & 0xffffff, // 24bpp
-        }
-    }
-
-    fn blend(&self, ctx: &Rex3Context, src: u32, dst: u32) -> u32 {
-        let s_factor_sel = ctx.drawmode1.sfactor();
-        let d_factor_sel = ctx.drawmode1.dfactor();
-
-        // BLENDALPHA (DRAWMODE1 bit 27) substitutes the SOURCE multiplier only.
-        // Spec §3.8: "When source multiplier is set to source alpha (SFACTOR=4) ...
-        // When BLENDALPHA is set to 0, the source multiplier for blending alpha is
-        // one instead of source alpha AND DESTINATION MULTIPLIER IS DEFINED BY
-        // DFACTOR." The trailing clause is load-bearing: DFACTOR keeps its own
-        // definition, so a DFACTOR of BF_MSA still evaluates 1 - source alpha
-        // against the real alpha. Substituting in both factors would zero BF_MSA
-        // and discard the destination entirely, which the spec does not say.
-        let sa_real = (src >> 24) & 0xFF;
-        let sa_src = if ctx.drawmode1.blendalpha() { sa_real } else { 255 };
-
-        let get_factor = |sel: u32, c: u32, a: u32| -> u32 {
-            match sel {
-                0 => 0,             // BF_ZERO
-                1 => 255,           // BF_ONE
-                2 => c,             // BF_DC (sfactor) / BF_SC (dfactor)
-                3 => 255 - c,       // BF_MDC (sfactor) / BF_MSC (dfactor)
-                4 => a,             // BF_SA
-                5 => 255 - a,       // BF_MSA
-                _ => 0,             // 110/111 undefined by the hardware
-            }
-        };
-
-        let mut res = 0;
-        for i in 0..4 {
-            let shift = i * 8;
-            let s_c = (src >> shift) & 0xFF;
-            let d_c = (dst >> shift) & 0xFF;
-            
-            let sf = get_factor(s_factor_sel, d_c, sa_src);
-            let df = get_factor(d_factor_sel, s_c, sa_real);
-            
-            let val = (s_c * sf + d_c * df) / 255;
-            let val_clamped = if val > 255 { 255 } else { val };
-            
-            res |= val_clamped << shift;
-        }
-        res
-    }
-
-    fn calculate_src_address(&self, x: i32, y: i32, ctx: &Rex3Context) -> Option<u32> {
-        // xymove affects the destination, not the source.
-        // Source is just (x, y) + xywin.
-        let x_win = ((ctx.xywin >> 16) & 0xFFFF) as i16 as i32;
-        let y_win = (ctx.xywin & 0xFFFF) as i16 as i32;
-
-        let x_abs = x + x_win;
-        let y_abs = y + y_win;
-
-        let x_phys = x_abs - REX3_COORD_BIAS;
-        let y_phys = if ctx.drawmode1.yflip() { 0x23FF - y_abs } else { y_abs - REX3_COORD_BIAS };
-
-        if x_phys < 0 || x_phys >= REX3_SCREEN_WIDTH || y_phys < 0 || y_phys >= REX3_SCREEN_HEIGHT {
-            return None;
-        }
-
-        Some((y_phys as u32) * 2048 + (x_phys as u32))
-    }
-
-    fn process_pixel_noop(&self, _ctx: &mut Rex3Context, _x: i32, _y: i32) {}
-
-    fn process_pixel_fastclear(&self, ctx: &mut Rex3Context, x: i32, y: i32) {
-        if let Some(addr) = self.calculate_fb_address(x, y, ctx, true) {
-            let wr_fn = unsafe { *self.px_wr.get() };
-            wr_fn(self, addr, Self::fastclear_color(ctx));
-        }
-    }
-
-    fn process_pixel_read(&self, ctx: &mut Rex3Context, x: i32, y: i32) {
-        let rd_fn = unsafe { *self.px_rd.get() };
-        let expand_fn = unsafe { *self.px_expand.get() };
-        let pixel = if let Some(addr) = self.calculate_fb_address(x, y, ctx, false) {
-            // Expand plane-depth pixel to 24-bit BGR before packing into host buffer.
-            // host_pack_N_rgb expects 24-bit BGR; expand is identity in CI mode.
-            expand_fn(rd_fn(self, addr))
-        } else {
-            0
-        };
-        self.store_host_pixel(ctx, pixel);
-    }
-
-    fn cid_allows_write(&self, ctx: &Rex3Context, addr: u32) -> bool {
-        let enabled = (ctx.clipmode >> CLIPMODE_CIDMATCH_SHIFT) & 0xF;
-        if enabled == 0xF { return true; }
-        // REX3 spec, CLIPMODE table 16: each bit enables one of the four
-        // two-bit CID values. AUX bits 3:2 are popup data, not part of CID.
-        let cid = unsafe { (*self.fb_aux.get())[addr as usize] } & 3;
-        enabled & (1 << cid) != 0
-    }
-
-    fn process_pixel_draw(&self, ctx: &mut Rex3Context, x: i32, y: i32) {
-        let colorhost = ctx.drawmode0.colorhost();
-        let alphahost = ctx.drawmode0.alphahost();
-
-        let mut use_bg = false;
-        let mut check_ls = true;
-
-        // Pattern checks first — host pixel only consumed when the pixel is actually drawn.
-        // MAME: get_host_color() called only inside if(BIT(pattern, bit)), never on skip/opaque paths.
-        if ctx.drawmode0.enzpattern() {
-            let bit = (ctx.zpattern >> ctx.zpat_bit) & 1 != 0;
-            if !bit {
-                if ctx.drawmode0.zpopaque() {
-                    use_bg = true;
-                    check_ls = false;
-                } else {
-                    return;
+        #[cfg(feature = "rex-jit")]
+        let jit_info: std::collections::HashMap<(u32, u32, u32), (&'static str, u32)> =
+            match self.rex_jit {
+                Some(ref jit) => {
+                    let list = jit.shader_list();
+                    keys.extend(list.iter().map(|s| (s.dm0, s.dm1, s.cm)));
+                    list.iter()
+                        .map(|s| ((s.dm0, s.dm1, s.cm), (s.status, s.code_bytes)))
+                        .collect()
                 }
-            }
-        }
-
-        if ctx.drawmode0.enlspattern() {
-            let bit = (ctx.lspattern >> ctx.pat_bit) & 1 != 0;
-            if check_ls && !bit {
-                if ctx.drawmode0.lsopaque() {
-                    use_bg = true;
-                } else {
-                    return;
-                }
-            }
-        }
-
-        // Fetch host pixel only when the pattern passes and we're drawing from host (not colorback).
-        let host_pixel = if !use_bg && (alphahost || colorhost) {
-            self.fetch_host_pixel(ctx)
-        } else {
-            0
-        };
-
-        if let Some(addr) = self.calculate_fb_address(x, y, ctx, true) {
-            if !self.cid_allows_write(ctx, addr) { return; }
-
-            // src color: 24-bit BGR in rgbmode, plane-depth index in CI mode
-            let raw_src = if use_bg {
-                ctx.colorback
-            } else {
-                Self::combine_host_dda(ctx, host_pixel)
+                None => std::collections::HashMap::new(),
             };
 
-            // Afunction: inhibit the write unless source alpha (raw_src bits 31:24)
-            // passes the DRAWMODE1 COMPARE relation against ALPHAREF. px_afunc is
-            // selected once per mode change in planes_setup (see afunc_* below);
-            // it's a no-op always-pass function outside rgbmode or when COMPARE==0x7.
-            let afunc_fn = unsafe { *self.px_afunc.get() };
-            if !afunc_fn(raw_src >> 24 & 0xFF, ctx.alpharef & 0xFF) {
-                return;
-            }
-
-            let rd_fn = unsafe { *self.px_rd.get() };
-            let wr_fn = unsafe { *self.px_wr.get() };
-            let compress_fn = unsafe { *self.px_compress.get() };
-
-            let res = if ctx.drawmode1.blend() {
-                // Blend path: work in 24-bit BGR space throughout.
-                // src is already 24-bit BGR (rgbmode) or CI index (expand=identity).
-                // dst is read as plane-depth then expanded to 24-bit BGR.
-                let expand_fn = unsafe { *self.px_expand.get() };
-                let dst_raw = if ctx.drawmode1.backblend() {
-                    ctx.colorback
-                } else {
-                    expand_fn(rd_fn(self, addr))
-                };
-                let blended = self.blend(ctx, raw_src, dst_raw);
-                // Compress blended 24-bit result back to plane-depth, then amplify for
-                // dblsrc packing exactly as the logic-op path below does: at 12bpp two
-                // pixels share a 24-bit word, so compress leaves the value in bits 11:0
-                // and whichever slot WRMASK selects must be fed by amplify. Without it
-                // every WRMASK that covers the high slot (0xfff000, or 0xffffff for both)
-                // writes zeros there — i.e. black.
-                let bayer_fn = unsafe { *self.px_bayer.get() };
-                let amp_fn = unsafe { *self.px_amp.get() };
-                amp_fn(compress_fn(bayer_fn(blended, x, y)))
-            } else {
-                // Logic op path: compress src to plane-depth, amplify for dblsrc, then logic op.
-                // dst also needs amplify: rd_fn shifts the value down (e.g. bits 15:8 → 7:0 for
-                // dblsrc slot 1), so we must shift it back up to match the write mask position.
-                let bayer_fn = unsafe { *self.px_bayer.get() };
-                let amp_fn = unsafe { *self.px_amp.get() };
-                let logic_fn = unsafe { *self.px_logic.get() };
-                let src = amp_fn(compress_fn(bayer_fn(raw_src, x, y)));
-                let dst = amp_fn(rd_fn(self, addr));
-                logic_fn(src, dst)
-            };
-            wr_fn(self, addr, res);
-        }
+        keys.into_iter()
+            .map(|(dm0, dm1, cm)| {
+                // Precompiled wins: the dispatch map is seeded with those, so a
+                // shape covered by Rust is never sent to Cranelift.
+                if precompiled.contains(&(dm0, dm1, cm)) {
+                    return ShaderRow { dm0, dm1, cm, origin: "precompiled", bytes: 0 };
+                }
+                #[cfg(feature = "rex-jit")]
+                if let Some((status, bytes)) = jit_info.get(&(dm0, dm1, cm)) {
+                    let origin = match *status {
+                        "compiled" => "jit",
+                        other => other, // queued / failed / disabled
+                    };
+                    return ShaderRow { dm0, dm1, cm, origin, bytes: *bytes };
+                }
+                ShaderRow { dm0, dm1, cm, origin: "generic", bytes: 0 }
+            })
+            .collect()
     }
 
-    /// Specialization for character/glyph drawing: zpattern test only, SRC logicop,
-    /// no blend, no colorhost, no CID check. Skips pixel on zpattern bit=0.
-    /// Selected when: DRAW + enzpattern + !enlspattern + !zpopaque + !blend + !colorhost + !alphahost
-    ///                + CID==0xF + logicop==SRC.
-    fn process_pixel_zpattern(&self, ctx: &mut Rex3Context, x: i32, y: i32) {
-        if (ctx.zpattern >> ctx.zpat_bit) & 1 == 0 {
+    /// Write the draw-shape corpus to disk.
+    ///
+    /// Unions this run's shapes with whatever the profile already held, so a run
+    /// can only ever add. The generated shader table's keys go in too: those
+    /// shapes are served by compiled-in Rust and may never reach Cranelift, and
+    /// without them a regeneration would emit a smaller table than the one it
+    /// replaced.
+    fn save_shape_corpus(&self) {
+        let drawn: std::collections::HashSet<(u32, u32, u32)> =
+            self.seen_shapes.lock().iter().copied().collect();
+        let on_disk = crate::rex3_profile::load_profile_quiet();
+
+        // Union of three sources. A run can only ever add: a session that drew
+        // two shapes must not shrink a corpus collected over many.
+        let mut all: std::collections::HashSet<(u32, u32, u32)> = drawn.clone();
+        all.extend(on_disk.iter().copied());
+        // The generated table's keys: those shapes are served by compiled-in
+        // Rust and may never reach Cranelift, so without this a regeneration
+        // would emit a smaller table than the one it replaced.
+        all.extend(crate::rex3_shaders::SHADERS.iter().map(|(k, _)| *k));
+
+        if all.is_empty() {
             return;
         }
-        if let Some(addr) = self.calculate_fb_address(x, y, ctx, true) {
-            let wr_fn       = unsafe { *self.px_wr.get() };
-            let amp_fn      = unsafe { *self.px_amp.get() };
-            let bayer_fn    = unsafe { *self.px_bayer.get() };
-            let compress_fn = unsafe { *self.px_compress.get() };
-            // SRC logicop: result = src, no dst read needed.
-            wr_fn(self, addr, amp_fn(compress_fn(bayer_fn(ctx.get_colori(), x, y))));
-        }
-    }
 
-    /// Specialization for common solid draws: no blend, no colorhost, no alphahost, no CID check.
-    /// Handles patterns (use_bg) and any logicop, but skips the blend and host-fetch paths.
-    /// Selected when: DRAW + !blend + !colorhost + !alphahost + CID==0xF.
-    fn process_pixel_noblend(&self, ctx: &mut Rex3Context, x: i32, y: i32) {
-        let mut use_bg = false;
+        // How much this session actually contributed, which is the number worth
+        // seeing: a run that discovers nothing new should say so.
+        let known: std::collections::HashSet<(u32, u32, u32)> = on_disk
+            .iter()
+            .copied()
+            .chain(crate::rex3_shaders::SHADERS.iter().map(|(k, _)| *k))
+            .collect();
+        let new_this_run = drawn.difference(&known).count();
 
-        if ctx.drawmode0.enzpattern() {
-            let bit = (ctx.zpattern >> ctx.zpat_bit) & 1 != 0;
-            if !bit {
-                if ctx.drawmode0.zpopaque() { use_bg = true; } else { return; }
-            }
-        }
+        let mut triples: Vec<(u32, u32, u32)> = all.into_iter().collect();
+        triples.sort_unstable();
 
-        if ctx.drawmode0.enlspattern() {
-            let bit = (ctx.lspattern >> ctx.pat_bit) & 1 != 0;
-            if !bit {
-                if ctx.drawmode0.lsopaque() { use_bg = true; } else { return; }
-            }
-        }
-
-        if let Some(addr) = self.calculate_fb_address(x, y, ctx, true) {
-            let raw_src = if use_bg { ctx.colorback } else { ctx.get_colori() };
-            let rd_fn       = unsafe { *self.px_rd.get() };
-            let wr_fn       = unsafe { *self.px_wr.get() };
-            let amp_fn      = unsafe { *self.px_amp.get() };
-            let bayer_fn    = unsafe { *self.px_bayer.get() };
-            let compress_fn = unsafe { *self.px_compress.get() };
-            let logic_fn    = unsafe { *self.px_logic.get() };
-            let src = amp_fn(compress_fn(bayer_fn(raw_src, x, y)));
-            let dst = amp_fn(rd_fn(self, addr));
-            wr_fn(self, addr, logic_fn(src, dst));
-        }
-    }
-
-    fn process_pixel_scr2scr(&self, ctx: &mut Rex3Context, x: i32, y: i32) {
-        let rd_fn = unsafe { *self.px_rd.get() };
-        let amp_fn = unsafe { *self.px_amp.get() };
-        let expand_fn = unsafe { *self.px_expand.get() };
-        let compress_fn = unsafe { *self.px_compress.get() };
-
-        // src: read plane-depth pixel, expand to 24-bit (rgbmode) or leave as-is (CI), amplify.
-        let raw_src = if let Some(src_addr) = self.calculate_src_address(x, y, ctx) {
-            expand_fn(rd_fn(self, src_addr))
-        } else {
-            0
-        };
-
-        if let Some(dst_addr) = self.calculate_fb_address(x, y, ctx, true) {
-            if !self.cid_allows_write(ctx, dst_addr) { return; }
-            let wr_fn = unsafe { *self.px_wr.get() };
-
-            let res = if ctx.drawmode1.blend() {
-                let dst_raw = if ctx.drawmode1.backblend() {
-                    ctx.colorback
-                } else {
-                    expand_fn(rd_fn(self, dst_addr))
-                };
-                compress_fn(self.blend(ctx, raw_src, dst_raw))
-            } else {
-                let logic_fn = unsafe { *self.px_logic.get() };
-                let src = amp_fn(compress_fn(raw_src));
-                let dst = amp_fn(rd_fn(self, dst_addr));
-                logic_fn(src, dst)
-            };
-            wr_fn(self, dst_addr, res);
+        eprintln!(
+            "REX3 corpus: {} drawn this session ({} new), {} on disk, {} precompiled -> saving {}",
+            drawn.len(),
+            new_this_run,
+            on_disk.len(),
+            crate::rex3_shaders::SHADERS.len(),
+            triples.len(),
+        );
+        if let Err(e) = crate::rex3_profile::save_profile(&triples) {
+            eprintln!("REX3: failed to save shape corpus: {e}");
         }
     }
 
@@ -3281,144 +2388,64 @@ impl Rex3 {
         val
     }
 
-    fn logic_op_zero(_src: u32, _dst: u32) -> u32 { 0 }
-    fn logic_op_and(src: u32, dst: u32) -> u32 { src & dst }
-    fn logic_op_andr(src: u32, dst: u32) -> u32 { src & !dst }
-    fn logic_op_src(src: u32, _dst: u32) -> u32 { src }
-    fn logic_op_andi(src: u32, dst: u32) -> u32 { !src & dst }
-    fn logic_op_dst(_src: u32, dst: u32) -> u32 { dst }
-    fn logic_op_xor(src: u32, dst: u32) -> u32 { src ^ dst }
-    fn logic_op_or(src: u32, dst: u32) -> u32 { src | dst }
-    fn logic_op_nor(src: u32, dst: u32) -> u32 { !(src | dst) }
-    fn logic_op_xnor(src: u32, dst: u32) -> u32 { !(src ^ dst) }
-    fn logic_op_ndst(_src: u32, dst: u32) -> u32 { !dst }
-    fn logic_op_orr(src: u32, dst: u32) -> u32 { src | !dst }
-    fn logic_op_nsrc(src: u32, _dst: u32) -> u32 { !src }
-    fn logic_op_ori(src: u32, dst: u32) -> u32 { !src | dst }
-    fn logic_op_nand(src: u32, dst: u32) -> u32 { !(src & dst) }
-    fn logic_op_one(_src: u32, _dst: u32) -> u32 { !0 }
 
-    // Afunction: (src_alpha, alpharef) -> pass.  COMPARE is three OR'ed enable
-    // bits — src>ref(2), src=ref(1), src<ref(0) — selected once in planes_setup.
-    fn afunc_always(_sa: u32, _aref: u32) -> bool { true }
-    fn afunc_never(_sa: u32, _aref: u32) -> bool { false }
-    fn afunc_lt(sa: u32, aref: u32) -> bool { sa < aref }
-    fn afunc_eq(sa: u32, aref: u32) -> bool { sa == aref }
-    fn afunc_le(sa: u32, aref: u32) -> bool { sa <= aref }
-    fn afunc_gt(sa: u32, aref: u32) -> bool { sa > aref }
-    fn afunc_ne(sa: u32, aref: u32) -> bool { sa != aref }
-    fn afunc_ge(sa: u32, aref: u32) -> bool { sa >= aref }
 
-    fn read_rgb_4_0(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_rgb.get())[addr as usize] };
-        val & 0xF
+
+    /// The `(shift, mask)` a plane read applies, derived from
+    /// `(planes, drawdepth, dblsrc)`.
+    ///
+    /// `None` means the read yields zero (unmapped plane).
+    #[inline(always)]
+    pub(crate) const fn plane_read_shift_mask(
+        planes: u32,
+        drawdepth: u32,
+        dblsrc: bool,
+    ) -> Option<(u32, u32)> {
+        match planes {
+            DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => match drawdepth {
+                0 => Some((if dblsrc { 4 } else { 0 }, 0xF)),
+                1 => Some((if dblsrc { 8 } else { 0 }, 0xFF)),
+                2 => Some((if dblsrc { 12 } else { 0 }, 0xFFF)),
+                3 => Some((0, 0xFFFFFF)),
+                _ => None,
+            },
+            DRAWMODE1_PLANES_OLAY => Some((if dblsrc { 16 } else { 8 }, 0xFF)),
+            DRAWMODE1_PLANES_PUP => Some((if dblsrc { 6 } else { 2 }, 0x3)),
+            DRAWMODE1_PLANES_CID => Some((if dblsrc { 4 } else { 0 }, 0x3)),
+            _ => None,
+        }
     }
 
-    fn read_rgb_4_1(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_rgb.get())[addr as usize] };
-        (val >> 4) & 0xF
+    /// True when this plane selection reads from `fb_aux` rather than `fb_rgb`.
+    #[inline(always)]
+    pub(crate) const fn plane_is_aux(planes: u32) -> bool {
+        matches!(
+            planes,
+            DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID
+        )
     }
 
-    fn read_rgb_8_0(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_rgb.get())[addr as usize] };
-        val & 0xFF
+    /// Masked read-modify-write of one framebuffer word.
+    ///
+    /// The single implementation behind every plane write: the variants differed
+    /// only in which framebuffer they touched, and each re-derived `wrmask` from
+    /// `rex.context` even though every caller already held the context. Taking
+    /// the mask as an argument removes that second route to the same data, which
+    /// is what lets the generic draw path hold `&mut Rex3Context` across a pixel
+    /// write.
+    #[inline(always)]
+    pub(crate) fn write_masked(fb: &mut [u32], addr: u32, val: u32, mask: u32) {
+        let slot = &mut fb[addr as usize];
+        *slot = (*slot & !mask) | (val & mask);
     }
 
-    fn read_rgb_8_1(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_rgb.get())[addr as usize] };
-        (val >> 8) & 0xFF
-    }
-
-    fn read_rgb_12_0(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_rgb.get())[addr as usize] };
-        val & 0xFFF
-    }
-
-    fn read_rgb_12_1(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_rgb.get())[addr as usize] };
-        (val >> 12) & 0xFFF
-    }
-
-    fn read_rgb_24(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_rgb.get())[addr as usize] };
-        val & 0xFFFFFF
-    }
-
-    fn read_olay_0(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_aux.get())[addr as usize] };
-        (val >> 8) & 0xFF
-    }
-
-    fn read_olay_1(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_aux.get())[addr as usize] };
-        (val >> 16) & 0xFF
-    }
-
-    fn read_cid_0(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_aux.get())[addr as usize] };
-        val & 0x3
-    }
-
-    fn read_cid_1(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_aux.get())[addr as usize] };
-        (val >> 4) & 0x3
-    }
-
-    fn read_pup_0(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_aux.get())[addr as usize] };
-        (val >> 2) & 0x3
-    }
-
-    fn read_pup_1(rex: &Rex3, addr: u32) -> u32 {
-        let val = unsafe { (*rex.fb_aux.get())[addr as usize] };
-        (val >> 6) & 0x3
-    }
-
-    fn read_zero(_rex: &Rex3, _addr: u32) -> u32 { 0 }
-
-    fn write_rgb_4(rex: &Rex3, addr: u32, val: u32) {
-        let mask = unsafe { (*rex.context.get()).wrmask };
-        let fb = unsafe { &mut *rex.fb_rgb.get() };
-        fb[addr as usize] = (fb[addr as usize] & !mask) | (val & mask);
-    }
-
-    fn write_rgb_8(rex: &Rex3, addr: u32, val: u32) {
-        let mask = unsafe { (*rex.context.get()).wrmask };
-        let fb = unsafe { &mut *rex.fb_rgb.get() };
-        fb[addr as usize] = (fb[addr as usize] & !mask) | (val & mask);
-    }
-
-    fn write_rgb_12(rex: &Rex3, addr: u32, val: u32) {
-        let mask = unsafe { (*rex.context.get()).wrmask };
-        let fb = unsafe { &mut *rex.fb_rgb.get() };
-        fb[addr as usize] = (fb[addr as usize] & !mask) | (val & mask);
-    }
-
-    fn write_rgb_24(rex: &Rex3, addr: u32, val: u32) {
-        let mask = unsafe { (*rex.context.get()).wrmask };
-        let fb = unsafe { &mut *rex.fb_rgb.get() };
-        fb[addr as usize] = (fb[addr as usize] & !mask) | (val & mask);
-    }
-
-    fn write_olay(rex: &Rex3, addr: u32, val: u32) {
-        let mask = unsafe { (*rex.context.get()).wrmask };
-        let fb = unsafe { &mut *rex.fb_aux.get() };
-        fb[addr as usize] = (fb[addr as usize] & !mask) | (val & mask);
-    }
-
-    fn write_cid(rex: &Rex3, addr: u32, val: u32) {
-        let mask = unsafe { (*rex.context.get()).wrmask };
-        let fb = unsafe { &mut *rex.fb_aux.get() };
-        fb[addr as usize] = (fb[addr as usize] & !mask) | (val & mask);
-    }
-
-    fn write_pup(rex: &Rex3, addr: u32, val: u32) {
-        let mask = unsafe { (*rex.context.get()).wrmask };
-        let fb = unsafe { &mut *rex.fb_aux.get() };
-        fb[addr as usize] = (fb[addr as usize] & !mask) | (val & mask);
-    }
-
-    fn write_nop(_rex: &Rex3, _addr: u32, _val: u32) {}
+    // ── Shims for the generic draw path (src/rex3_generic.rs) ────────────────
+    // The generic path selects among these bodies by decoded shape instead of
+    // through the px_* function pointers. They are re-exported rather than
+    // reimplemented: the colour packings are irregular (1-2-1 at 4bpp, 3-3-2 at
+    // 8bpp), the dither variants carry a specific error-diffusion form, and
+    // blend has spec-cited factor semantics — all of which a second copy would
+    // get subtly wrong.
 
     fn gfifo_push(&self, addr: u32, val: u64) {
         #[cfg(feature = "developer")]
@@ -3469,101 +2496,51 @@ impl Rex3 {
         true
     }
 
+    /// Does this register offset need handling on the CPU thread rather than
+    /// through the queue? Mirrors `write32`'s match arms.
+    #[inline(always)]
+    fn reg_needs_cpu_side_effect(reg_offset: u32) -> bool {
+        matches!(
+            reg_offset & !0x0800,
+            REX3_CONFIG | REX3_DCBMODE | REX3_DCBDATA0 | REX3_DCBDATA1 | REX3_DCBRESET
+        )
+    }
+
+    /// Two-entry `gfifo_try_push`, for a 64-bit store's register pair.
+    #[must_use]
+    fn gfifo_try_push2(&self, addr0: u32, val0: u64, addr1: u32, val1: u64) -> bool {
+        #[cfg(feature = "developer")]
+        {
+            let len = self.gfifo.len() + 2;
+            let _ = self.gfifo_hwm.try_update(Ordering::Relaxed, Ordering::Relaxed, |hwm| {
+                if len > hwm { Some(len) } else { None }
+            });
+        }
+        if !self.gfifo.try_push2(addr0, val0, addr1, val1) {
+            return false;
+        }
+        #[cfg(feature = "idle-pause")]
+        if self.processor_parked.load(Ordering::Acquire) {
+            if let Some(t) = self.processor_unparker.get() {
+                t.unpark();
+            }
+        }
+        true
+    }
+
     fn wait_idle(&self) {
         loop {
+            // Publish before testing: unlike the bus read paths this one has no
+            // retry escape — it spins here until the queue reports empty — so a
+            // queue that looks emptier or fuller than it is turns into a hang
+            // rather than an extra round trip.
+            self.gfifo.publish_tail();
             // Acquire load: when gfxbusy goes false, all execute_go() writes become visible.
             let busy = self.gfxbusy.load(Ordering::Acquire);
             if !busy && self.gfifo.is_empty() { break; }
             if !self.running.load(Ordering::Relaxed) { break; }
             std::hint::spin_loop();
         }
-    }
-
-    pub fn calculate_fb_address(&self, x: i32, y: i32, ctx: &Rex3Context, is_write: bool) -> Option<u32> {
-        // 1. XYOFFSET (Draw only, not SCR2SCR source)
-        let opcode = ctx.drawmode0.opcode();
-        let is_scr2scr = opcode == DRAWMODE0_OPCODE_SCR2SCR;
-        
-        let mut x_curr = x;
-        let mut y_curr = y;
-
-        // In scr2scr mode xymove is unconditional (it offsets the destination).
-        // In regular paint mode it is conditional on the xyoffset flag.
-        let apply_xymove = is_scr2scr || ctx.drawmode0.xyoffset();
-        if apply_xymove {
-            let x_move = (ctx.xymove >> 16) as i16 as i32;
-            let y_move = (ctx.xymove & 0xFFFF) as i16 as i32;
-            x_curr += x_move;
-            y_curr += y_move;
-        }
-
-        // Apply XYWIN offset
-        // XYWIN is 16,16. Assuming High=X, Low=Y.
-        // Treated as signed 16-bit integers for coordinate biasing.
-        let x_off = ((ctx.xywin >> 16) & 0xFFFF) as i16 as i32;
-        let y_off = (ctx.xywin & 0xFFFF) as i16 as i32;
-
-        let x_abs = x_curr + x_off;
-        let y_abs = y_curr + y_off;
-
-        if is_write {
-            let clipmode = ctx.clipmode;
-            let ensmask = clipmode & CLIPMODE_ENSMASK_MASK;
-
-            // SMASK0 (Window Relative) — high16=min, low16=max
-            if (ensmask & 1) != 0 {
-                let min_x = ((ctx.smask0x >> 16) & 0xFFFF) as i16 as i32;
-                let max_x = (ctx.smask0x & 0xFFFF) as i16 as i32;
-                let min_y = ((ctx.smask0y >> 16) & 0xFFFF) as i16 as i32;
-                let max_y = (ctx.smask0y & 0xFFFF) as i16 as i32;
-
-                if x_curr < min_x || x_curr > max_x || y_curr < min_y || y_curr > max_y {
-                    return None;
-                }
-            }
-
-            // SMASK1-4 (Screen Absolute, unaffected by XYWIN per spec).
-            // Host pre-biases smask values with the 4K,4K offset. The equivalent
-            // pixel coordinate is x_phys + 0x1000 = (x_abs - 0x1000) + 0x1000 = x_abs.
-            // So compare x_abs/y_abs directly against raw smask values. high16=min, low16=max.
-            // Logic: pixel must be inside at least one enabled mask.
-            let smask_enabled = (ensmask & 0x1E) != 0;
-            if smask_enabled {
-                let smasks = [
-                    (ctx.smask1x, ctx.smask1y),
-                    (ctx.smask2x, ctx.smask2y),
-                    (ctx.smask3x, ctx.smask3y),
-                    (ctx.smask4x, ctx.smask4y),
-                ];
-                let mut inside_any = false;
-                for (bit, (sx, sy)) in smasks.iter().enumerate() {
-                    if (ensmask & (1 << (bit + 1))) == 0 { continue; }
-                    let min_x = (sx >> 16) as i16 as i32;
-                    let max_x = (sx & 0xFFFF) as i16 as i32;
-                    let min_y = (sy >> 16) as i16 as i32;
-                    let max_y = (sy & 0xFFFF) as i16 as i32;
-                    if x_abs >= min_x && x_abs <= max_x && y_abs >= min_y && y_abs <= max_y {
-                        inside_any = true;
-                        break;
-                    }
-                }
-                if !inside_any {
-                    return None;
-                }
-            }
-        }
-        // Physical Address Calculation
-        let x_phys = x_abs - REX3_COORD_BIAS;
-        let y_phys = if ctx.drawmode1.yflip() { 0x23FF - y_abs } else { y_abs - REX3_COORD_BIAS };
-
-        // Sector Clipping (VRAM bounds)
-        // Reads are not culled (but must be within VRAM allocation)
-        let width_limit = if is_write { REX3_SCREEN_WIDTH } else { 2048 };
-        if x_phys < 0 || x_phys >= width_limit || y_phys < 0 || y_phys >= REX3_SCREEN_HEIGHT {
-            return None;
-        }
-
-        Some((y_phys as u32) * 2048 + (x_phys as u32))
     }
 
     fn register_processor(&self) {
@@ -3690,7 +2667,7 @@ impl Rex3 {
         } else {
             // Continuation GO: re-derive Bresenham when the segment axis disagrees with
             // the persisted octant (e.g. degenerate setup point, then horizontal cont).
-            let adrmode = ctx.drawmode0.adrmode() << 2;
+            let adrmode = ctx.drawmode0.adrmode();
             let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
                 || adrmode == DRAWMODE0_ADRMODE_F_LINE
                 || adrmode == DRAWMODE0_ADRMODE_A_LINE;
@@ -3729,292 +2706,112 @@ impl Rex3 {
                 ctx.xend as f32 / 2048.0, ctx.yend as f32 / 2048.0);
         }
 
-        #[cfg(feature = "rex-jit")]
+        // ── Shader dispatch ──────────────────────────────────────────────
+        //
+        // One map, two producers. LLVM-compiled shaders (rex3_shaders) are built
+        // into every binary and seeded at construction; Cranelift adds to the
+        // same map when `rex-jit` is on. Both use the identical ABI, so the call
+        // below does not care which compiled the entry it found.
+        //
+        // Only the *compile request* is gated on `rex-jit` — the lookup, the
+        // memo and the call are unconditional, which is what lets the generated
+        // table work in the default build.
         {
-            if self.jit_enabled.load(Ordering::Relaxed) {
-            if let Some(ref jit) = self.rex_jit {
-                let dm0 = ctx.drawmode0.0;
-                // Normalize dm1 key to match compile_shader's normalization:
-                // fastclear clears blend; scr2scr clears dither (copies quantized pixels).
-                let dm1_raw = ctx.drawmode1.0;
-                let dm1 = if dm1_raw & (1 << 17) != 0 { dm1_raw & !(1 << 18) }       // fastclear→no blend
-                          else if opcode == DRAWMODE0_OPCODE_SCR2SCR { dm1_raw & !(1 << 16) } // scr2scr→no dither
-                          else { dm1_raw };
-                let adrmode = ctx.drawmode0.adrmode() << 2;
-                let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
-                    || adrmode == DRAWMODE0_ADRMODE_F_LINE
-                    || adrmode == DRAWMODE0_ADRMODE_A_LINE;
-                let is_jittable = (opcode == DRAWMODE0_OPCODE_DRAW
-                        || opcode == DRAWMODE0_OPCODE_SCR2SCR
-                        || opcode == DRAWMODE0_OPCODE_READ)
-                    && (adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN || is_line);
-                if is_jittable {
-                    let cm = ctx.clipmode & CLIPMODE_JIT_KEY_MASK;
-                    // Fast path: same (dm0, dm1, cm) as last GO — skip the HashMap lookup.
-                    let last = self.jit_last.get();
-                    let entry = if last.0 == dm0 && last.1 == dm1 && last.2 == cm && last.3.is_some() {
-                        last.3
-                    } else {
-                        let e = jit.lookup(dm0, dm1, cm);
-                        if let Some(_) = e { self.jit_last.set((dm0, dm1, cm, e)); }
-                        else { jit.request_compile(dm0, dm1, cm); }
-                        e
-                    };
-                    if let Some(entry) = entry {
-                        // Mirror the interpreter's log_block() calls (see bottom of this
-                        // function) so block/span primitives are traced identically whether
-                        // dispatched via JIT or interpreter — block_debug/draw_debug were
-                        // previously silent for JIT-compiled GOs since this path returns
-                        // before ever reaching the interpreter's log_block() calls.
-                        if adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN {
-                            self.log_block(ctx, opcode);
-                        }
-                        let fb_rgb = unsafe { (*self.fb_rgb.get()).as_mut_ptr() };
-                        let fb_aux = unsafe { (*self.fb_aux.get()).as_mut_ptr() };
-                        unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
-                        #[cfg(feature = "rexdiag")]
-                        self.jit_go_count.fetch_add(1, Ordering::Relaxed);
-                        #[cfg(feature = "rexdiag")]
-                        self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
-                        return;
-                    }
-                    // fall through to interpreter
+            let dm0 = ctx.drawmode0.0;
+            // Shared with compile_shader and the interpreter setup key below —
+            // all three must agree or shaders get filed under a key nobody looks up.
+            let dm1 = crate::rex3_shape::normalize_dm1(ctx.drawmode1.0, opcode);
+            let adrmode = ctx.drawmode0.adrmode();
+            let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
+                || adrmode == DRAWMODE0_ADRMODE_F_LINE
+                || adrmode == DRAWMODE0_ADRMODE_A_LINE;
+            let is_shadeable = (opcode == DRAWMODE0_OPCODE_DRAW
+                    || opcode == DRAWMODE0_OPCODE_SCR2SCR
+                    || opcode == DRAWMODE0_OPCODE_READ)
+                && (adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN || is_line);
+
+            #[cfg(feature = "rex-jit")]
+            let dispatch_on = self.jit_enabled.load(Ordering::Relaxed);
+            #[cfg(not(feature = "rex-jit"))]
+            let dispatch_on = true;
+
+            if is_shadeable {
+                let cm = ctx.clipmode & CLIPMODE_JIT_KEY_MASK;
+                // Record the shape: this is the corpus, and it has to reflect
+                // what the guest draws regardless of which engine serves it.
+                // Skipped when the memo already holds this key, so a run of
+                // same-shape GOs costs one compare rather than a lock.
+                let last = self.shader_last.get();
+                if (last.0, last.1, last.2) != (dm0, dm1, cm) {
+                    self.seen_shapes.lock().insert((dm0, dm1, cm));
                 }
             }
-            } // jit_enabled
+
+            if is_shadeable && dispatch_on {
+                let cm = ctx.clipmode & CLIPMODE_JIT_KEY_MASK;
+                // Fast path: same key as the last GO — skip the map lookup.
+                let last = self.shader_last.get();
+                let entry = if last.0 == dm0 && last.1 == dm1 && last.2 == cm && last.3.is_some() {
+                    last.3
+                } else {
+                    let e = self.shaders.read().get(&(dm0, dm1, cm)).copied();
+                    if e.is_some() {
+                        self.shader_last.set((dm0, dm1, cm, e));
+                    } else {
+                        // Nothing precompiled for this shape. Ask Cranelift to
+                        // build one (if it is compiled in) and run the generic
+                        // path meanwhile; without rex-jit the generic path is
+                        // simply what always runs for uncovered shapes.
+                        #[cfg(feature = "rex-jit")]
+                        if let Some(ref jit) = self.rex_jit {
+                            jit.request_compile(dm0, dm1, cm);
+                        }
+                    }
+                    e
+                };
+                if let Some(entry) = entry {
+                    // Mirror the interpreter's log_block() calls so block/span
+                    // primitives trace identically whichever engine ran them.
+                    if adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN {
+                        self.log_block(ctx, opcode);
+                    }
+                    let fb_rgb = unsafe { (*self.fb_rgb.get()).as_mut_ptr() };
+                    let fb_aux = unsafe { (*self.fb_aux.get()).as_mut_ptr() };
+                    unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
+                    #[cfg(feature = "rexdiag")]
+                    self.jit_go_count.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "rexdiag")]
+                    self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
+                    return;
+                }
+                // fall through to the generic draw path
+            }
         }
 
         // Interpreter-only setup: function pointer selection and host/planes dispatch tables.
         // Skipped when JIT handles the draw (returned above) or when nothing affecting these
         // tables has changed since the last GO.
         let cidmatch_bits = (ctx.clipmode >> CLIPMODE_CIDMATCH_SHIFT) & 0xF;
-        // SCR2SCR: normalize dm1 key the same way planes_setup does (clear dither bit).
-        let dm1_norm = if opcode == DRAWMODE0_OPCODE_SCR2SCR {
-            ctx.drawmode1.0 & !(1 << 16)
-        } else {
-            ctx.drawmode1.0
-        };
+        // Same normalization as the JIT dispatch key above and compile_shader.
+        // Previously this did only the SCR2SCR half, so a fastclear draw that
+        // toggled BLEND re-ran planes_setup for a bit planes_setup ignores.
+        // Folding it out here is safe — see planes_setup: BLEND is not among the
+        // fields it reads — and it keeps the three keys identical, which the
+        // generated draw table will depend on.
+        let dm1_norm = crate::rex3_shape::normalize_dm1(ctx.drawmode1.0, opcode);
         let setup_key = (
             ctx.drawmode0.0 & DRAWMODE0_INTERP_SETUP_MASK,
             dm1_norm        & DRAWMODE1_INTERP_SETUP_MASK,
             cidmatch_bits,
         );
-        if self.interp_setup_cache.get() != setup_key {
-            self.interp_setup_cache.set(setup_key);
-
-            self.planes_setup(DrawMode1(dm1_norm));
-
-            let proc = match opcode {
-                DRAWMODE0_OPCODE_READ    => Self::process_pixel_read,
-                DRAWMODE0_OPCODE_DRAW    => {
-                    let no_cid      = cidmatch_bits == 0xF;
-                    let no_host     = !ctx.drawmode0.colorhost() && !ctx.drawmode0.alphahost();
-                    let is_src_op   = ctx.drawmode1.logicop() == DRAWMODE1_LOGICOP_SRC >> 28;
-                    let no_blend    = !ctx.drawmode1.blend();
-                    let en_z        = ctx.drawmode0.enzpattern();
-                    let en_ls       = ctx.drawmode0.enlspattern();
-                    let no_zpopaque = !ctx.drawmode0.zpopaque();
-                    // Afunction (alpha-vs-ALPHAREF compare) applies regardless of rgbmode;
-                    // only inhibits writes when COMPARE != 0x7 (always-pass/disabled).
-                    let no_afunction = ctx.drawmode1.compare() == 0x7;
-
-                    if ctx.drawmode1.fastclear() && no_cid && no_host {
-                        Self::process_pixel_fastclear
-                    } else if no_cid && no_host && no_blend && no_afunction && en_z && !en_ls && no_zpopaque && is_src_op {
-                        // Character/glyph: zpattern kill only, SRC logicop — no dst read needed.
-                        Self::process_pixel_zpattern
-                    } else if no_cid && no_host && no_blend && no_afunction {
-                        // Common solid fills, spans, lines: no blend, no host FIFO.
-                        Self::process_pixel_noblend
-                    } else {
-                        Self::process_pixel_draw
-                    }
-                }
-                DRAWMODE0_OPCODE_SCR2SCR => Self::process_pixel_scr2scr,
-                _                        => Self::process_pixel_noop,
-            };
-            unsafe { *self.px_proc.get() = proc; }
-
-            // Select shade iterate fn.
-            // RGB mode: always clamp (spec §3.8: "DDA values of R,G,B,A are clamped each
-            // iteration before sending down the pipeline").
-            // CI mode: clamp only when CICLAMP is set (DRAWMODE0 bit 21 = ENCICLAMP).
-            let shade_fn: fn(&mut Rex3Context) = if ctx.drawmode0.shade() {
-                if ctx.drawmode1.rgbmode() {
-                    Self::iterate_shade_rgb_clamp
-                } else if ctx.drawmode0.ciclamp() {
-                    match ctx.drawmode1.drawdepth() {
-                        1 => Self::iterate_shade_ci8_clamp,
-                        2 => Self::iterate_shade_ci12_clamp,
-                        _ => Self::iterate_shade_unclamped, // 4bpp / 24bpp: no CI clamp per spec
-                    }
-                } else {
-                    Self::iterate_shade_unclamped
-                }
-            } else {
-                Self::iterate_shade_noop
-            };
-            unsafe { *self.px_shade.get() = shade_fn; }
-
-            // Select pattern iterate fn.
-            let en_z  = ctx.drawmode0.enzpattern();
-            let en_ls = ctx.drawmode0.enlspattern();
-            let pat_fn: fn(&mut Rex3Context) = match (en_z, en_ls) {
-                (false, false) => Self::iterate_pattern_noop,
-                (true,  false) => Self::iterate_pattern_z,
-                (false, true)  => Self::iterate_pattern_ls,
-                (true,  true)  => Self::iterate_pattern_both,
-            };
-            unsafe { *self.px_pattern.get() = pat_fn; }
-
-        } // interp_setup_cache miss
-
-        if opcode != DRAWMODE0_OPCODE_NOOP {
-            let adrmode = ctx.drawmode0.adrmode() << 2;
-            if adrmode == DRAWMODE0_ADRMODE_I_LINE {
-                self.draw_iline(ctx);
-            } else if adrmode == DRAWMODE0_ADRMODE_F_LINE {
-                self.draw_fline(ctx);
-            } else if adrmode == DRAWMODE0_ADRMODE_A_LINE {
-                self.draw_aline(ctx);
-            } else if adrmode == DRAWMODE0_ADRMODE_BLOCK {
-                self.log_block(ctx, opcode);
-                self.draw_block(ctx);
-            } else if adrmode == DRAWMODE0_ADRMODE_SPAN {
-                self.log_block(ctx, opcode);
-                self.draw_span(ctx);
-            }
-        }
+        // One decode, one entry point. rex3_generic::draw fans out to the
+        // per-adrmode walkers; every shape-selecting field reaches it as its own
+        // argument, which is the list stage 5 promotes to const generics.
+        crate::rex3_generic::draw_primitive(ctx);
         #[cfg(feature = "rexdiag")]
         self.interp_go_count.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "rexdiag")]
         self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
-    }
-
-    fn planes_setup(&self, drawmode1: DrawMode1) {
-        let planes = drawmode1.planes();
-        let depth = drawmode1.drawdepth();
-        let dblsrc = drawmode1.dblsrc();
-
-        let (rd, wr, amp): (fn(&Rex3, u32) -> u32, fn(&Rex3, u32, u32), fn(u32) -> u32) = match planes {
-            DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => {
-                match depth {
-                    0 => ( // 4-bit
-                        if dblsrc { Self::read_rgb_4_1 } else { Self::read_rgb_4_0 },
-                        Self::write_rgb_4,
-                        Self::amplify_rgb_4
-                    ),
-                    1 => ( // 8-bit
-                        if dblsrc { Self::read_rgb_8_1 } else { Self::read_rgb_8_0 },
-                        Self::write_rgb_8,
-                        Self::amplify_rgb_8
-                    ),
-                    2 => ( // 12-bit
-                        if dblsrc { Self::read_rgb_12_1 } else { Self::read_rgb_12_0 },
-                        Self::write_rgb_12,
-                        Self::amplify_rgb_12
-                    ),
-                    3 => ( // 24-bit
-                        Self::read_rgb_24,
-                        Self::write_rgb_24,
-                        Self::amplify_rgb_24
-                    ),
-                    _ => (Self::read_zero, Self::write_nop, Self::amplify_nop)
-                }
-            },
-            DRAWMODE1_PLANES_OLAY => (
-                if dblsrc { Self::read_olay_1 } else { Self::read_olay_0 },
-                Self::write_olay,
-                Self::amplify_olay
-            ),
-            DRAWMODE1_PLANES_PUP => (
-                if dblsrc { Self::read_pup_1 } else { Self::read_pup_0 },
-                Self::write_pup,
-                Self::amplify_pup
-            ),
-            DRAWMODE1_PLANES_CID => (
-                if dblsrc { Self::read_cid_1 } else { Self::read_cid_0 },
-                Self::write_cid,
-                Self::amplify_cid
-            ),
-            _ => (Self::read_zero, Self::write_nop, Self::amplify_nop)
-        };
-
-        let logic_op = drawmode1.logicop();
-        let logic_fn = match logic_op {
-            0 => Self::logic_op_zero,
-            1 => Self::logic_op_and,
-            2 => Self::logic_op_andr,
-            3 => Self::logic_op_src,
-            4 => Self::logic_op_andi,
-            5 => Self::logic_op_dst,
-            6 => Self::logic_op_xor,
-            7 => Self::logic_op_or,
-            8 => Self::logic_op_nor,
-            9 => Self::logic_op_xnor,
-            10 => Self::logic_op_ndst,
-            11 => Self::logic_op_orr,
-            12 => Self::logic_op_nsrc,
-            13 => Self::logic_op_ori,
-            14 => Self::logic_op_nand,
-            15 => Self::logic_op_one,
-            _ => Self::logic_op_src,
-        };
-
-        let rgbmode = drawmode1.rgbmode();
-        let dither = drawmode1.dither();
-        // compress: 24-bit BGR → plane-depth pixel (only when rgbmode=1; CI src already plane-depth)
-        // Dither variants expect bayer index packed in bits 27:24 via bayer_pack().
-        let compress: fn(u32) -> u32 = if rgbmode {
-            match depth {
-                0 => if dither { Self::rgb24_to_rgb4_dither  } else { Self::rgb24_to_rgb4  },
-                1 => if dither { Self::rgb24_to_rgb8_dither  } else { Self::rgb24_to_rgb8  },
-                2 => if dither { Self::rgb24_to_rgb12_dither } else { Self::rgb24_to_rgb12 },
-                _ => Self::identity, // 24bpp: no dithering needed
-            }
-        } else {
-            Self::identity
-        };
-        // expand: plane-depth pixel → 24-bit BGR (for blend dst in RGB planes mode)
-        let expand: fn(u32) -> u32 = if rgbmode {
-            match depth {
-                0 => Self::rgb4_to_rgb24,
-                1 => Self::rgb8_to_rgb24,
-                2 => Self::rgb12_to_rgb24,
-                _ => Self::identity,
-            }
-        } else {
-            Self::identity
-        };
-
-        let bayer_fn: fn(u32, i32, i32) -> u32 = if rgbmode { Self::bayer_pack } else { Self::bayer_nop };
-
-        // Afunction: "source alpha (either from DDA or host)" vs ALPHAREF — applies in
-        // both RGB and CI mode (spec doesn't scope it to RGB; combine_host_dda leaves
-        // raw_src bits 31:24 as 0 in CI/DDA mode, so afunc_eq there degenerates to
-        // "alpharef==0", which is the correct behavior, not a special case).
-        let afunc_fn: fn(u32, u32) -> bool = match drawmode1.compare() {
-            0b000 => Self::afunc_never,
-            0b001 => Self::afunc_lt,
-            0b010 => Self::afunc_eq,
-            0b011 => Self::afunc_le,
-            0b100 => Self::afunc_gt,
-            0b101 => Self::afunc_ne,
-            0b110 => Self::afunc_ge,
-            _      => Self::afunc_always, // 0b111: disabled
-        };
-
-        unsafe {
-            *self.px_rd.get() = rd;
-            *self.px_wr.get() = wr;
-            *self.px_amp.get() = amp;
-            *self.px_logic.get() = logic_fn;
-            *self.px_afunc.get() = afunc_fn;
-            *self.px_bayer.get() = bayer_fn;
-            *self.px_compress.get() = compress;
-            *self.px_expand.get() = expand;
-            self.host_setup(drawmode1);
-        }
     }
 
     fn refresh_loop(&self) {
@@ -4583,10 +3380,10 @@ impl Device for Rex3 {
             let _ = handle.join();
         }
 
-        #[cfg(feature = "rex-jit")]
-        if let Some(ref jit) = self.rex_jit {
-            jit.save_profile();
-        }
+        // Save the corpus in every build. `seen_shapes` is device state, so this
+        // works with or without `rex-jit` and with IRIS_NO_JIT set — the cases
+        // where the old JIT-owned save wrote nothing at all.
+        self.save_shape_corpus();
 
         if let Some(handle) = self.refresh_thread.lock().take() {
             let _ = handle.join();
@@ -4601,6 +3398,12 @@ impl Device for Rex3 {
         if self.running.swap(true, Ordering::SeqCst) { return; }
 
         let rex3 = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
+
+        // Wire the context's back-pointer now that `self` is at its final
+        // address. The draw path reaches host services (block logging, the host
+        // FIFO) through this, which is what lets its functions take the same
+        // arguments the compiled shader does instead of a `&Rex3`.
+        unsafe { (*self.context.get()).host = rex3 as *const Rex3; }
 
         *self.processor_thread.lock() = Some(thread::Builder::new().name("REX3-Processor".to_string()).spawn(move || {
             crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::Rex3Processor);
@@ -4853,6 +3656,31 @@ impl Device for Rex3 {
             return Err("rex buslog is only available in developer builds".to_string());
         }
 
+        // Shader reporting works in every build: the precompiled table serves
+        // draws with no Cranelift present, so `rex jit status` being gated on
+        // rex-jit hid exactly the case worth inspecting.
+        if cmd == "rex" && (args[0] == "shaders" || args[0] == "shader") {
+            match args.get(1).copied() {
+                Some("list") => {
+                    self.write_shader_summary(&mut writer);
+                    let rows = self.shader_report();
+                    if rows.is_empty() {
+                        writeln!(writer, "No draw shapes seen yet.").unwrap();
+                    } else {
+                        writeln!(writer, "{:>11}  {:>10}  {:>10}  {:>10}  {:>6}  {}",
+                            "origin", "dm0", "dm1", "cm", "bytes", "description").unwrap();
+                        for r in &rows {
+                            writeln!(writer, "{:>11}  {:#010x}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
+                                r.origin, r.dm0, r.dm1, r.cm, r.bytes,
+                                decode_dm0(r.dm0), decode_dm1(r.dm1)).unwrap();
+                        }
+                    }
+                }
+                _ => self.write_shader_summary(&mut writer),
+            }
+            return Ok(());
+        }
+
         #[cfg(feature = "rex-jit")]
         if cmd == "rex" && args[0] == "jit" {
             match args.get(1).copied() {
@@ -4863,52 +3691,20 @@ impl Device for Rex3 {
                     writeln!(writer, "REX JIT dispatch: {}", if val { "enabled" } else { "disabled" }).unwrap();
                 }
                 Some("status") => {
-                    if let Some(ref jit) = self.rex_jit {
-                        let enabled = self.jit_enabled.load(Ordering::Relaxed);
-                        let shaders = jit.shader_list();
-                        let compiled: Vec<_> = shaders.iter().filter(|s| s.status == "compiled" || s.status == "disabled").collect();
-                        let total_bytes: u32 = compiled.iter().map(|s| s.code_bytes).sum();
-                        writeln!(writer, "REX3 JIT: {}  compiled={}  queued={}  failed={}  code={} bytes",
-                            if enabled { "enabled" } else { "DISABLED" },
-                            compiled.len(), jit.queued_count(),
-                            shaders.iter().filter(|s| s.status == "failed").count(),
-                            total_bytes).unwrap();
-                        if !compiled.is_empty() {
-                            #[cfg(feature = "developer")]
-                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>10}  {:>6}  {:>8}  {}",
-                                "status", "dm0", "dm1", "cm", "bytes", "hits", "description").unwrap();
-                            #[cfg(not(feature = "developer"))]
-                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>10}  {:>6}  {}",
-                                "status", "dm0", "dm1", "cm", "bytes", "description").unwrap();
-                            for s in &shaders {
-                                if s.status == "compiled" || s.status == "disabled" {
-                                    #[cfg(feature = "developer")]
-                                    writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:#010x}  {:>6}  {:>8}  {}  |  {}",
-                                        s.status, s.dm0, s.dm1, s.cm, s.code_bytes, s.hit_count,
-                                        decode_dm0(s.dm0), decode_dm1(s.dm1)).unwrap();
-                                    #[cfg(not(feature = "developer"))]
-                                    writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
-                                        s.status, s.dm0, s.dm1, s.cm, s.code_bytes,
-                                        decode_dm0(s.dm0), decode_dm1(s.dm1)).unwrap();
-                                }
-                            }
-                        }
-                    } else {
-                        writeln!(writer, "REX JIT: not initialised").unwrap();
-                    }
+                    self.write_shader_summary(&mut writer);
                 }
                 Some("list") => {
-                    if let Some(ref jit) = self.rex_jit {
-                        let shaders = jit.shader_list();
-                        if shaders.is_empty() {
-                            writeln!(writer, "No shaders compiled yet.").unwrap();
-                        } else {
-                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>10}  {:>6}  {}", "status", "dm0", "dm1", "cm", "bytes", "description").unwrap();
-                            for s in &shaders {
-                                writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
-                                    s.status, s.dm0, s.dm1, s.cm, s.code_bytes,
-                                    decode_dm0(s.dm0), decode_dm1(s.dm1)).unwrap();
-                            }
+                    self.write_shader_summary(&mut writer);
+                    let rows = self.shader_report();
+                    if rows.is_empty() {
+                        writeln!(writer, "No draw shapes seen yet.").unwrap();
+                    } else {
+                        writeln!(writer, "{:>11}  {:>10}  {:>10}  {:>10}  {:>6}  {}",
+                            "origin", "dm0", "dm1", "cm", "bytes", "description").unwrap();
+                        for r in &rows {
+                            writeln!(writer, "{:>11}  {:#010x}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
+                                r.origin, r.dm0, r.dm1, r.cm, r.bytes,
+                                decode_dm0(r.dm0), decode_dm1(r.dm1)).unwrap();
                         }
                     }
                 }
@@ -5067,6 +3863,14 @@ impl BusDevice for Rex3 {
         // Used for registers that require the GFIFO to be drained before reading.
         macro_rules! busy_or_val {
             ($val:expr) => {{
+                // Publish any producer-side pending entries before testing
+                // emptiness: a read must see the queue as it really is, or it
+                // skips the retry it owed and returns pre-write register state.
+                // Contention here means a producer is mid-push, which is itself
+                // "not empty" — report busy and let the CPU retry.
+                if !self.gfifo.publish_tail() {
+                    return BusRead32::busy();
+                }
                 if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
                     return BusRead32::busy();
                 }
@@ -5078,6 +3882,11 @@ impl BusDevice for Rex3 {
             REX3_CONFIG => BusRead32::ok(self.config.config.load(Ordering::Relaxed) & 0x1FFFFF),
 
             REX3_STATUS | REX3_USER_STATUS => {
+                // STATUS is the guest's flow control — it reports queue depth and
+                // GFXBUSY, and the driver throttles on it. An under-reported depth
+                // is worse than a stale register read: the guest concludes the
+                // engine is idle and keeps writing. Publish before sampling.
+                self.gfifo.publish_tail();
                 let mut val = self.config.status.load(Ordering::Relaxed) & 0xFFFFF;
                 val |= 3 << STATUS_VERSION_SHIFT;
                 let pending = self.gfifo.len();
@@ -5375,6 +4184,10 @@ impl BusDevice for Rex3 {
         let is_go64r = (offset & 0x0800) != 0;
         let reg_offset64r = offset & !0x0800;
         if reg_offset64r == REX3_HOSTRW0 {
+            // Same rule as busy_or_val! on the 32-bit path: publish, then test.
+            if !self.gfifo.publish_tail() {
+                return BusRead64::busy();
+            }
             if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
                 return BusRead64::busy();
             }
@@ -5449,14 +4262,36 @@ impl BusDevice for Rex3 {
             return BUS_OK;
         }
 
-        // Two-register 64-bit write: write high word first WITHOUT go, then low word with go.
+        // Two-register 64-bit write: high word first WITHOUT go, then low word
+        // with go. Pushed as one atomic pair.
+        //
+        // This used to be two `write32` calls returning the second's status,
+        // which was wrong twice over: six atomics where three suffice, and a
+        // queue that filled between the two left the high word pushed while
+        // still reporting BUS_BUSY — so the CPU's retry re-pushed it. See
+        // `GFifo::try_push2`.
         let high = (val >> 32) as u32;
         let low = val as u32;
-        match self.write32(addr & !0x0800, high) {
-            BUS_OK => self.write32(addr + 4, low),
-            status => status,
+        let off_hi = offset & !0x0800;
+        let off_lo = off_hi + 4;
+
+        // Registers with CPU-thread side effects cannot take the queue path;
+        // they are rare (CONFIG, DCB*) and never part of a hot pair.
+        if Self::reg_needs_cpu_side_effect(off_hi) || Self::reg_needs_cpu_side_effect(off_lo) {
+            return match self.write32(addr & !0x0800, high) {
+                BUS_OK => self.write32(addr + 4, low),
+                status => status,
+            };
         }
+
+        // `is_go` puts the GO bit on the low word, matching the two-write order.
+        let go_lo = if is_go { off_lo | 0x0800 } else { off_lo };
+        if !self.gfifo_try_push2(off_hi, high as u64, go_lo, low as u64) {
+            return BUS_BUSY;
+        }
+        BUS_OK
     }
+
 }
 
 // ============================================================================
