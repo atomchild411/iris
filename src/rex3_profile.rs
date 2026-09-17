@@ -25,8 +25,17 @@ pub fn profile_path() -> PathBuf {
     }
 }
 
+/// Load without the informational message, for the exit-time merge.
+pub fn load_profile_quiet() -> Vec<(u32, u32, u32)> {
+    load_profile_inner(false)
+}
+
 /// Load (dm0, dm1, clipmode_key) triples from disk. Returns empty vec on any error.
 pub fn load_profile() -> Vec<(u32, u32, u32)> {
+    load_profile_inner(true)
+}
+
+fn load_profile_inner(verbose: bool) -> Vec<(u32, u32, u32)> {
     let path = profile_path();
     let file = match fs::File::open(&path) {
         Ok(f) => f,
@@ -64,7 +73,9 @@ pub fn load_profile() -> Vec<(u32, u32, u32)> {
         entries.push((dm0, dm1, cm));
     }
 
-    eprintln!("REX JIT profile: loaded {} entries from {:?}", entries.len(), path);
+    if verbose {
+        eprintln!("REX3 corpus: loaded {} draw shapes from {:?}", entries.len(), path);
+    }
     entries
 }
 
@@ -90,6 +101,7 @@ pub fn save_profile(entries: &[(u32, u32, u32)]) -> io::Result<()> {
     }
 
     writer.flush()?;
-    eprintln!("REX JIT profile: saved {} entries to {:?}", entries.len(), path);
+    eprintln!("REX3 corpus: saved {} draw shapes to {:?}", entries.len(), path);
     Ok(())
 }
+

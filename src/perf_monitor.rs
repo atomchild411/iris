@@ -89,9 +89,8 @@ impl PerfMonitor {
             let diag = rex.diag.load(Ordering::Relaxed);
             writeln!(
                 writer,
-                "REX3 GO: {} total  JIT {}%  gfifo {}/{}  simd_fills {}",
+                "REX3 GO: {} total  JIT {}%  gfifo {}/{}",
                 total, pct, rex.gfifo.len(), crate::rex3::GFIFO_DEPTH,
-                rex.simd_fill_rows.load(Ordering::Relaxed),
             ).map_err(|e| e.to_string())?;
             writeln!(
                 writer,

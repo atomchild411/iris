@@ -218,8 +218,8 @@ fn write_yendf(rex: &Rex3, screen_y: i32, frac4: i32) {
 // DRAWMODE1 combinations. COMPARE is included at its disabled value (0x7) — real
 // drawmode1 words always carry it explicitly; omitting it would leave COMPARE=0
 // (afunction always-kill) since DrawMode1's bitfield default zero-inits.
-const DM1_CI8_SRC: u32   = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
-const DM1_RGB24_SRC: u32 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+const DM1_CI8_SRC: u32   = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
+const DM1_RGB24_SRC: u32 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
 
 // DRAWMODE1 host-depth fields (bits [4:3] = hostdepth, bit 16 = rwpacked, bit 17 = rwdouble)
 // hostdepth: 0=4bpp, 1=8bpp, 2=12bpp, 3=32bpp
@@ -235,13 +235,13 @@ const DM0_STOPONXY:   u32 = DM0_STOPONX | DM0_STOPONY;
 const DM0_DOSETUP:    u32 = 1 << 5;
 const DM0_COLORHOST:  u32 = 1 << 6;  // pixel data comes from / goes to host FIFO (bit 6)
 
-const DM0_DRAW_BLOCK:  u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
-const DM0_DRAW_SPAN:   u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_SPAN  | DM0_STOPONX;
-const DM0_SCR2SCR:     u32 = DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK | DM0_DOSETUP | DM0_STOPONXY;
+const DM0_DRAW_BLOCK:  u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONXY;
+const DM0_DRAW_SPAN:   u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_SPAN_SH  | DM0_STOPONX;
+const DM0_SCR2SCR:     u32 = DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_DOSETUP | DM0_STOPONXY;
 // DRAW with COLORHOST: pixels come from host write FIFO
-const DM0_HOSTW_BLOCK: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY | DM0_COLORHOST;
+const DM0_HOSTW_BLOCK: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONXY | DM0_COLORHOST;
 // READ with COLORHOST: reads fb → host read FIFO
-const DM0_READ_BLOCK:  u32 = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY | DM0_COLORHOST | DM0_DOSETUP;
+const DM0_READ_BLOCK:  u32 = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONXY | DM0_COLORHOST | DM0_DOSETUP;
 
 /// Initialise REX3 to a known baseline — matches rex3init() from rex3.c.
 /// XYWIN is left at 0 (no hardware xbias correction needed in emulation).
@@ -290,7 +290,7 @@ fn check_cid_write_masks(rex: &Rex3, compiled: bool) {
     let jit_before = rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
     let src = 10 * 2048 + 10;
     let dst = 20 * 2048 + 10;
-    for dm0 in [DM0_DRAW_BLOCK, DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE | DM0_DOSETUP | DM0_STOPONXY, DM0_SCR2SCR] {
+    for dm0 in [DM0_DRAW_BLOCK, DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH | DM0_DOSETUP | DM0_STOPONXY, DM0_SCR2SCR] {
         for mask in 0..16_u32 {
             let cm = mask << CLIPMODE_CIDMATCH_SHIFT;
             #[cfg(feature = "rex-jit")]
@@ -751,7 +751,7 @@ fn test_logicop_zero_clears() {
     assert_ne!(read_pixel(&rex, 4, 4) & 0xFF, 0);
 
     // Clear with ZERO logicop
-    let dm1_zero = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_ZERO;
+    let dm1_zero = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_ZERO_SH;
     reg(&rex, REX3_DRAWMODE1, dm1_zero);
     reg(&rex, REX3_COLORI, 0xFF);
     reg(&rex, REX3_XYENDI,   xy(4, 4));
@@ -765,7 +765,7 @@ fn test_logicop_zero_clears() {
 fn test_logicop_xor_roundtrip() {
     let rex = make_rex3();
     rex3init(&rex);
-    let dm1_xor = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_XOR;
+    let dm1_xor = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_XOR_SH;
 
     reg(&rex, REX3_DRAWMODE1, dm1_xor);
     reg(&rex, REX3_WRMASK, 0xFF);
@@ -821,7 +821,7 @@ fn test_noop_opcode_draws_nothing() {
     reg(&rex, REX3_COLORI, 0xFF);
     reg(&rex, REX3_XYENDI,   xy(5, 5));
     reg(&rex, REX3_XYSTARTI, xy(0, 0));
-    let dm0_noop = DRAWMODE0_OPCODE_NOOP | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
+    let dm0_noop = DRAWMODE0_OPCODE_NOOP | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONXY;
     reg_go(&rex, REX3_DRAWMODE0, dm0_noop);
     for y in 0..=5 {
         for x in 0..=5 {
@@ -1119,12 +1119,12 @@ fn test_patterns_gouraud_shade_span() {
 // DM1 values with host-depth and packed/double flags
 // CI8: hostdepth=1 (8bpp), rwpacked (bit 7), same draw-plane config as DM1_CI8_SRC
 const DM1_CI8_HOSTRW: u32 =
-    DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC | (1 << 8) | (1 << 7);
+    DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH | (1 << 8) | (1 << 7);
 // CI8 64-bit: same as CI8 + rwdouble (bit 10) → 8 CI8 pixels per 64-bit word
 const DM1_CI8_HOSTRW64: u32 = DM1_CI8_HOSTRW | (1 << 10);
 // RGB24: hostdepth=3 (32bpp), rwpacked (bit 7), same draw-plane as DM1_RGB24_SRC
 const DM1_RGB24_HOSTRW: u32 =
-    DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC | (3 << 8) | (1 << 7);
+    DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH | (3 << 8) | (1 << 7);
 // RGB24 64-bit: same as above + rwdouble (bit 10)
 const DM1_RGB24_HOSTRW64: u32 = DM1_RGB24_HOSTRW | (1 << 10);
 
@@ -1748,16 +1748,16 @@ fn test_hostw_rgb24_multiline_64bit_unpacked() {
 // ============================================================================
 
 // DM0 for a full I_LINE draw (stoponx+stopony so the whole line runs in one GO).
-const DM0_DRAW_ILINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE | DM0_DOSETUP | DM0_STOPONXY;
+const DM0_DRAW_ILINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
 // DM0 for I_LINE single-step mode (no stoponx/stopony — one pixel per GO).
-const DM0_DRAW_ILINE_STEP: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE | DM0_DOSETUP;
+const DM0_DRAW_ILINE_STEP: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH | DM0_DOSETUP;
 // DM0 for a full F_LINE draw — fractional-endpoint Bresenham correction.
-const DM0_DRAW_FLINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_F_LINE | DM0_DOSETUP | DM0_STOPONXY;
+const DM0_DRAW_FLINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_F_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
 // DM0 for a full A_LINE draw — F_LINE plus AWEIGHT-LUT endpoint suppression (needs ENDPTFILTER, bit 22, set separately).
 // A_LINE tests are out of scope for this pass (see rules/testing/rex3-fline-fractional-bresenham.md) —
 // kept for a future session, not yet exercised by any test.
 #[allow(dead_code)]
-const DM0_DRAW_ALINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_A_LINE | DM0_DOSETUP | DM0_STOPONXY;
+const DM0_DRAW_ALINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_A_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
 #[allow(dead_code)]
 const DM0_ENDPTFILTER: u32 = 1 << 22;
 
@@ -1820,7 +1820,7 @@ fn draw_iline_step(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32, color: u8) ->
     reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_ILINE_STEP);
 
     // Subsequent GOs without DOSETUP — each draws one more pixel.
-    let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE;
+    let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH;
     for _ in 1..pixel_count {
         reg_go(rex, REX3_DRAWMODE0, dm0_cont);
     }
@@ -2270,7 +2270,7 @@ fn test_iline_all_octants_step() {
         reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_ILINE_STEP);
 
         // Subsequent GOs — one pixel each.
-        let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE;
+        let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH;
         for _ in 1..pixel_count {
             reg_go(&rex, REX3_DRAWMODE0, dm0_cont);
         }
@@ -2441,7 +2441,7 @@ fn test_iline_line_loop_rect() {
     rex3init(&rex);
 
     // DM0: DRAW | I_LINE | DOSETUP | STOPONXY | SKIPLAST
-    let dm0_loop: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE
+    let dm0_loop: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH
         | DM0_DOSETUP | DM0_STOPONXY | (1 << 11); // bit11 = skiplast
 
     reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
@@ -2545,6 +2545,28 @@ mod jit_tests {
     }
 
     /// Build a Rex3 with JIT enabled.
+    /// A Rex3 with the generated LLVM shaders loaded.
+    ///
+    /// `Rex3::new` deliberately does not seed them under `cfg(test)` — the
+    /// JIT-vs-generic comparison tests need Cranelift to actually run — so a
+    /// benchmark that wants to measure the precompiled path has to load them
+    /// explicitly.
+    fn make_rex3_precompiled() -> &'static Rex3 {
+        let rex = make_rex3();
+        {
+            let mut map = rex.shaders.write();
+            for (k, f) in crate::rex3_shaders::SHADERS {
+                map.insert(*k, *f);
+            }
+        }
+        // make_rex3 turns dispatch off so ordinary tests exercise the generic
+        // path; this fixture exists to measure the precompiled one, so turn it
+        // back on.
+        #[cfg(feature = "rex-jit")]
+        rex.jit_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+        rex
+    }
+
     fn make_rex3_jit() -> &'static Rex3 {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
@@ -2561,7 +2583,11 @@ mod jit_tests {
                     (*rex.fb_rgb.get()).fill(0);
                     (*rex.fb_aux.get()).fill(0);
                 }
-                rex.rex_jit = Some(std::sync::Arc::new(RexJit::new()));
+                // Share the dispatch map so compiled shaders land where execute_go
+                // looks for them.
+                rex.rex_jit = Some(std::sync::Arc::new(RexJit::new(
+                    std::sync::Arc::clone(&rex.shaders),
+                )));
                 rex.start();
                 rex
             })
@@ -2648,9 +2674,12 @@ mod jit_tests {
             let ctx = unsafe { &*rex_jit.context.get() };
             ctx.clipmode & CLIPMODE_JIT_KEY_MASK
         };
-        // First GO: triggers compile + interpreter fallback
+        // First GO: triggers compile + generic fallback.
         reg_go(rex_jit, REX3_DRAWMODE0, dm0);
-        // Wait for JIT compile
+
+        // Test builds do not seed the generated LLVM shaders (see Rex3::new), so
+        // this shape reaches Cranelift and the comparison below really is
+        // JIT-vs-generic rather than generic-vs-itself.
         let compiled = if let Some(ref jit) = rex_jit.rex_jit {
             jit.wait_compiled(dm0, dm1, cm)
         } else { false };
@@ -2733,13 +2762,13 @@ mod jit_tests {
     /// RGB24 XOR logic op block.
     #[test]
     fn jit_logicop_xor_rgb24() {
-        // COMPARE must be 0x7 (disabled). Without DRAWMODE1_COMPARE_DISABLE the
+        // COMPARE must be 0x7 (disabled). Without DRAWMODE1_COMPARE_DISABLE_SH the
         // compare field reads 0, which is an alpha-function test that passes
         // nothing, so every write was inhibited and this test compared two
         // untouched regions -- passing for any shader behaviour. Every working
         // test gets this via DM1_RGB24_SRC; this one open-coded dm1 and lost it.
         let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
-                | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_XOR;
+                | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_XOR_SH;
         let dm0 = DM0_DRAW_BLOCK;
         compare_jit_interp(0, 0, 15, 15,
             |rex| {
@@ -2763,7 +2792,7 @@ mod jit_tests {
     #[test]
     fn jit_fastclear_rgb24() {
         // fastclear = DM1 bit 17; cidmatch must be 0xF for fastclear to activate in interpreter
-        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_LOGICOP_SRC | (1 << 17);
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_LOGICOP_SRC_SH | (1 << 17);
         let dm0 = DM0_DRAW_BLOCK;
         compare_jit_interp(0, 0, 31, 31,
             |rex| {
@@ -3601,6 +3630,10 @@ mod jit_tests {
 
         let rex_interp = make_rex3();
         rex3init(rex_interp);
+        // Same device, but with the generated LLVM shaders loaded — the path a
+        // shipping build actually takes for a covered shape.
+        let rex_pre = make_rex3_precompiled();
+        rex3init(rex_pre);
         let rex_jit = make_rex3_jit();
         rex3init(rex_jit);
 
@@ -3644,7 +3677,19 @@ mod jit_tests {
         // than no number: it looks like a fast configuration. Likewise a "JIT"
         // column that is really the interpreter. Check both before reporting,
         // on both engines and both modes, rather than trusting the setup.
-        for (rex, engine) in [(rex_interp, "interp"), (rex_jit, "jit")] {
+        // Report the exact keys this benchmark draws, so the generated table
+        // can be built for them: the corpus comes from real IRIX drawing and
+        // does not otherwise contain these synthetic shapes.
+        {
+            let cm = unsafe { (*rex_interp.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+            for (name, d0) in [("flat", dm0_flat), ("plain", dm0_plain), ("zpat", dm0_zpat)] {
+                let nd1 = crate::rex3_shape::normalize_dm1(dm1, DRAWMODE0_OPCODE_DRAW);
+                println!("  bench shape {name:<5}: dm0={d0:#010x} dm1={nd1:#010x} cm={cm:#010x}  \
+                          precompiled={}", crate::rex3_shaders::lookup(d0, nd1, cm).is_some());
+            }
+        }
+
+        for (rex, engine) in [(rex_interp, "generic"), (rex_pre, "precomp"), (rex_jit, "jit")] {
             for (zpat, mode) in [(false, "plain"), (true, "zpat")] {
                 // Clear a known region, draw one span into it, confirm it moved.
                 let probe_y = 700;
@@ -3700,15 +3745,18 @@ mod jit_tests {
         for (label, zpat) in [("flat (no SHADE)", false), ("plain Gouraud", false), ("ZPATTERN-masked (LENGTH32: 32px draws)", true)] {
             println!("\n=== GFIFO pressure sweep: {label} ({} ms per cell) ===",
                      BUDGET.as_millis());
-            println!("  {:>6}  {:>10}  {:>21}  {:>21}  {:>8}  {:>11}  {:>17}",
-                     "span", "entries/px", "interp Mpx/s [min-max]", "jit Mpx/s [min-max]",
-                     "jit x", "ms i/j", "spans i/j");
+            println!("  {:>6}  {:>10}  {:>7}  {:>7}  {:>7}  {:>9}  {:>9}",
+                     "span", "entries/px", "generic", "precomp", "jit",
+                     "precomp x", "jit x");
+            println!("  {:>6}  {:>10}  {:>7}  {:>7}  {:>7}",
+                     "", "", "Mpx/s", "Mpx/s", "Mpx/s");
             // ZPATTERN draws are capped at 32 pixels, so sweeping span length
             // past that measures nothing new -- one row is the whole story.
             let lens: &[i32] = if zpat { &[32, 16, 8] } else { &SPAN_LENS };
             for &len in lens {
                 let shade = label != "flat (no SHADE)";
                 let (i_mpx, i_lo, i_hi, entries, i_ms, i_spans) = sample(rex_interp, len, zpat, shade);
+                let (p_mpx, _p_lo, _p_hi, _, _p_ms, _p_spans)      = sample(rex_pre,    len, zpat, shade);
                 let (j_mpx, j_lo, j_hi, _, j_ms, j_spans)           = sample(rex_jit,    len, zpat, shade);
                 let drawn = if zpat { len.min(32) } else { len } as u64;
                 // entries/px uses pixels actually rasterized (LENGTH32 caps
@@ -3721,12 +3769,12 @@ mod jit_tests {
                 // ~1.00 by construction and says nothing. (It printed a
                 // reassuring "1.00x" next to cells where the JIT was doing
                 // half the interpreter's work.)
-                println!("  {:>6}  {:>10.3}  {:>6}[{:>5}-{:>6}]  {:>6}[{:>5}-{:>6}]  {:>7.2}x  {:>5}/{:<5} {:>8}/{:<8}",
+                println!("  {:>6}  {:>10.3}  {:>7}  {:>7}  {:>7}  {:>8.2}x {:>8.2}x",
                          len, per_px,
-                         i_mpx, i_lo, i_hi,
-                         j_mpx, j_lo, j_hi,
-                         j_mpx as f64 / i_mpx.max(1) as f64,
-                         i_ms, j_ms, i_spans, j_spans);
+                         i_mpx, p_mpx, j_mpx,
+                         p_mpx as f64 / i_mpx.max(1) as f64,
+                         j_mpx as f64 / i_mpx.max(1) as f64);
+                let _ = (i_lo, i_hi, j_lo, j_hi, i_ms, j_ms, i_spans, j_spans);
             }
         }
         println!("\n  For comparison: guest-side gltest --bench ~44 Mpx/s,\n                    \x20 --bench --depth ~20 Mpx/s.\n");
@@ -3946,7 +3994,7 @@ mod jit_tests {
     fn jit_iline_step_mode() {
         let dm1 = DM1_CI8_SRC;
         // step mode dm0: same adrmode but no stoponx/stopony/dosetup
-        let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE;
+        let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH;
         // We compare a single continuation step (after DOSETUP already set up Bresenham state).
         // Setup: issue the DOSETUP GO first (interpreter-only, not JIT), then compare one step.
         compare_jit_interp(0, 0, 14, 8,
@@ -4216,7 +4264,7 @@ mod jit_tests {
     #[test]
     fn jit_hostr_ci8_block_32bit() {
         // DM0 for READ
-        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
+        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONXY;
         let dm1 = DM1_CI8_HOSTRW;
 
         // Fill 4 pixels with known CI8 values using interpreter
@@ -4274,7 +4322,7 @@ mod jit_tests {
     /// Mirrors test_hostr_rgb24_read_block_32bit.
     #[test]
     fn jit_hostr_rgb24_block_32bit() {
-        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_STOPONXY;
+        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONXY;
         let dm1 = DM1_RGB24_HOSTRW;
         let pixels_in: &[u32] = &[0x112233, 0x445566, 0x778899, 0xAABBCC];
         let width = pixels_in.len() as i32;
@@ -4349,7 +4397,7 @@ mod jit_tests {
     /// no-STOPONY shape — the gap that let this bug ship.
     #[test]
     fn jit_hostr_ci8_block_multirow_no_stopony() {
-        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | DM0_COLORHOST;
+        let dm0_read = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_COLORHOST;
         let dm1 = DM1_CI8_HOSTRW; // 8bpp packed, 4 pixels/word
         let width = 6i32;  // 2 words/row (ceil(6/4))
         let height = 3i32;
@@ -4651,11 +4699,11 @@ mod jit_tests {
     fn jit_blend_blendalpha_matches_interp() {
         for blendalpha in [false, true] {
             let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
-                | DRAWMODE1_COMPARE_DISABLE | (1 << 18)
+                | DRAWMODE1_COMPARE_DISABLE_SH | (1 << 18)
                 | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
-                | ((blendalpha as u32) << 27) | DRAWMODE1_LOGICOP_SRC;
+                | ((blendalpha as u32) << 27) | DRAWMODE1_LOGICOP_SRC_SH;
             let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
-                | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+                | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
             let dm0 = DM0_DRAW_BLOCK;
             let alphas: [u32; 5] = [0, 8, 64, 128, 255];
 
@@ -4713,6 +4761,52 @@ mod jit_tests {
         }
     }
 
+
+    /// FASTCLEAR with CID checking ENABLED must draw as an ordinary draw.
+    ///
+    /// rex3.pdf says so three times — DRAWMODE1 bit 17 ("when CID checking
+    /// disabled (CLIPMODE CIDMATCH = 0xF)"), §3.5.5 ("CID checking is not
+    /// allowed for this drawing mode"), and the programming notes ("REX3 will
+    /// disable FASTCLEAR mode if CID checking is enabled ... host must setup
+    /// fast clear operation by writing COLORVRAM and also setting up DRAWMODE
+    /// and COLORI"). The COLORI advice is the tell: COLORI is what gets used
+    /// when the window system turns CID checking on behind GL's back.
+    ///
+    /// jit_fastclear_rgb24 cannot catch this — it pins cidmatch to 0xF, where
+    /// the question does not arise. This was invisible for another reason too:
+    /// rex3_simd::try_fastclear_block intercepted BLOCK draws before
+    /// execute_go's processor selection and never checked CID, so BOTH engines
+    /// wrote COLORVRAM and agreed. Removing that path exposed the real
+    /// divergence. See rules/rex3/fastclear-cid-divergence.md.
+    ///
+    /// Colour registers are o12.11 DDA values (get_colori shifts right by 11),
+    /// so they are written as `component << 11`, not as packed RGB24 — writing
+    /// packed bytes here clamps to black and makes the test vacuous.
+    #[test]
+    fn jit_fastclear_with_cid_checking_matches_interp() {
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+            | DRAWMODE1_LOGICOP_SRC_SH | (1 << 17) | DRAWMODE1_COMPARE_DISABLE_SH;
+        let dm0 = DM0_DRAW_BLOCK;
+        compare_jit_interp(0, 0, 7, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                // Distinct from the COLORI-derived colour so the two colour
+                // sources cannot be confused.
+                reg(rex, REX3_COLORVRAM, 0xABCDEF);
+                reg(rex, REX3_COLORRED,  0x40u32 << 11);
+                reg(rex, REX3_COLORGRN,  0x50u32 << 11);
+                reg(rex, REX3_COLORBLUE, 0x60u32 << 11);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                // CID checking ON, permitting CID 0. make_rex3 zeroes fb_aux, so
+                // every pixel has CID 0 and passes — isolating the colour-source
+                // question from write suppression.
+                reg(rex, REX3_CLIPMODE,  0x1 << 9);
+                reg(rex, REX3_XYENDI,    xy(7, 7));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4836,11 +4930,11 @@ mod gfifo_tests {
 const DM1_RGB12_BLEND: u32 = DRAWMODE1_PLANES_RGB
     | (2 << 3)
     | (1 << 15)
-    | DRAWMODE1_COMPARE_DISABLE
+    | DRAWMODE1_COMPARE_DISABLE_SH
     | (1 << 18)
     | (4 << 19)
     | (5 << 22)
-    | DRAWMODE1_LOGICOP_SRC;
+    | DRAWMODE1_LOGICOP_SRC_SH;
 
 /// Write an opaque blended pixel into the HIGH 12-bit slot and read it back.
 /// Before the fix the high slot received 0 while the low slot kept whatever was
@@ -4898,7 +4992,7 @@ fn test_blend_opaque_matches_logicop_src() {
     let rex = make_rex3();
     rex3init(&rex);
     let dm1_src = DRAWMODE1_PLANES_RGB | (2 << 3) | (1 << 15)
-        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+        | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
 
     for (x, dm1) in [(20, dm1_src), (21, DM1_RGB12_BLEND)] {
         reg(&rex, REX3_DRAWMODE1, dm1);
@@ -4928,7 +5022,7 @@ fn test_blend_alpha_test_discards_zero_alpha() {
     let rex = make_rex3();
     rex3init(&rex);
     // compare = 0b101 (!=) instead of the disable pattern.
-    let dm1 = (DM1_RGB12_BLEND & !DRAWMODE1_COMPARE_DISABLE) | (0b101 << 12);
+    let dm1 = (DM1_RGB12_BLEND & !DRAWMODE1_COMPARE_DISABLE_SH) | (0b101 << 12);
     reg(&rex, REX3_DRAWMODE1, dm1);
     reg(&rex, REX3_WRMASK, 0xffffff);
     reg(&rex, REX3_ALPHAREF, 0);
@@ -4959,9 +5053,9 @@ fn test_blend_alpha_test_discards_zero_alpha() {
 
 /// Build a 24bpp RGB blend DRAWMODE1 with the given factors and BLENDALPHA.
 fn dm1_blend24(sfactor: u32, dfactor: u32, blendalpha: bool) -> u32 {
-    DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE
+    DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE_SH
         | (1 << 18) | (sfactor << 19) | (dfactor << 22)
-        | ((blendalpha as u32) << 27) | DRAWMODE1_LOGICOP_SRC
+        | ((blendalpha as u32) << 27) | DRAWMODE1_LOGICOP_SRC_SH
 }
 
 /// Paint a single pixel with the given mode/colour and return what landed.
@@ -4999,7 +5093,7 @@ fn test_blendalpha0_sa_one_is_additive() {
     rex3init(&rex);
     // Lay down a destination first, with blending off.
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
-        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+        | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
     blend_one(&rex, 32, 40, dm1_src, 255, 0x202020);
     // Now blend additively over it.
     let px = blend_one(&rex, 32, 40,
@@ -5017,7 +5111,7 @@ fn test_blendalpha0_substitutes_sfactor_only() {
     let rex = make_rex3();
     rex3init(&rex);
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
-        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+        | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
     // Destination 0x404040, source 0x101010 at alpha 8.
     blend_one(&rex, 50, 50, dm1_src, 255, 0x404040);
     let px = blend_one(&rex, 50, 50,
@@ -5036,7 +5130,7 @@ fn test_blendalpha1_uses_alpha_in_both_factors() {
     let rex = make_rex3();
     rex3init(&rex);
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
-        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+        | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
     blend_one(&rex, 51, 50, dm1_src, 255, 0x404040);
     let px = blend_one(&rex, 51, 50,
         dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_MSA, true), 8, 0x101010);
@@ -5056,7 +5150,7 @@ fn test_afunction_uses_real_alpha_not_blendalpha() {
     let rex = make_rex3();
     rex3init(&rex);
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
-        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+        | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
 
     for (i, blendalpha) in [false, true].iter().enumerate() {
         let x = 60 + i as i32;
@@ -5064,7 +5158,7 @@ fn test_afunction_uses_real_alpha_not_blendalpha() {
         blend_one(&rex, x, 55, dm1_src, 255, 0x123456);
         // COMPARE = 0b101 ("!="), ALPHAREF = 0, source alpha = 0 -> must be killed.
         let dm1 = (dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_MSA, *blendalpha)
-            & !DRAWMODE1_COMPARE_DISABLE) | (0b101 << 12);
+            & !DRAWMODE1_COMPARE_DISABLE_SH) | (0b101 << 12);
         let px = blend_one(&rex, x, 55, dm1, 0, 0xFFFFFF);
         assert_eq!(
             px, 0x123456,
@@ -5072,4 +5166,364 @@ fn test_afunction_uses_real_alpha_not_blendalpha() {
              destination should be untouched; got {px:#08x}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plane access: data form must match the function-pointer form
+// ---------------------------------------------------------------------------
+
+/// `plane_read_shift_mask` is the single source for how a plane read slices a
+/// framebuffer word. Pin every `(planes, drawdepth, dblsrc)` combination against
+/// the shift and mask it is required to produce, so a wrong bit offset is a test
+/// failure rather than silently wrong pixels in every specialised read.
+///
+/// The expected values are written out literally on purpose: checking the table
+/// against a second implementation of the same table only proves the two copies
+/// agree, not that either is right.
+#[test]
+fn plane_read_shift_mask_is_correct() {
+    // (planes, drawdepth, dblsrc) -> (shift, mask)
+    let cases: &[(u32, u32, bool, u32, u32)] = &[
+        // RGB/RGBA: dblsrc selects the high half of the packed pair.
+        (DRAWMODE1_PLANES_RGB, 0, false, 0, 0xF),
+        (DRAWMODE1_PLANES_RGB, 0, true, 4, 0xF),
+        (DRAWMODE1_PLANES_RGB, 1, false, 0, 0xFF),
+        (DRAWMODE1_PLANES_RGB, 1, true, 8, 0xFF),
+        (DRAWMODE1_PLANES_RGB, 2, false, 0, 0xFFF),
+        (DRAWMODE1_PLANES_RGB, 2, true, 12, 0xFFF),
+        // 24bpp fills the word, so there is no second slot to select.
+        (DRAWMODE1_PLANES_RGB, 3, false, 0, 0xFFFFFF),
+        (DRAWMODE1_PLANES_RGB, 3, true, 0, 0xFFFFFF),
+        (DRAWMODE1_PLANES_RGBA, 1, false, 0, 0xFF),
+        // Aux planes live at fixed offsets in the aux word, depth-independent.
+        (DRAWMODE1_PLANES_OLAY, 0, false, 8, 0xFF),
+        (DRAWMODE1_PLANES_OLAY, 0, true, 16, 0xFF),
+        (DRAWMODE1_PLANES_PUP, 0, false, 2, 0x3),
+        (DRAWMODE1_PLANES_PUP, 0, true, 6, 0x3),
+        (DRAWMODE1_PLANES_CID, 0, false, 0, 0x3),
+        (DRAWMODE1_PLANES_CID, 0, true, 4, 0x3),
+    ];
+
+    for &(planes, depth, dblsrc, want_shift, want_mask) in cases {
+        let got = Rex3::plane_read_shift_mask(planes, depth, dblsrc);
+        assert_eq!(
+            got,
+            Some((want_shift, want_mask)),
+            "planes={planes} depth={depth} dblsrc={dblsrc}: \
+             expected (>>{want_shift} & {want_mask:#x}), got {got:?}"
+        );
+    }
+}
+
+/// The aux/rgb split must agree with which framebuffer a plane actually lives
+/// in — getting this backwards is the "JIT scr2scr aux plane" bug class.
+#[test]
+fn plane_is_aux_matches_framebuffer() {
+    for planes in [DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_CID] {
+        assert!(Rex3::plane_is_aux(planes), "planes={planes} should be aux");
+    }
+    for planes in [DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA] {
+        assert!(!Rex3::plane_is_aux(planes), "planes={planes} should be rgb");
+    }
+}
+
+/// `write_masked` is now the single implementation behind all seven writers;
+/// confirm the mask semantics it centralises (untouched bits preserved).
+#[test]
+fn write_masked_preserves_unmasked_bits() {
+    let mut fb = vec![0xAAAA_AAAAu32; 4];
+    Rex3::write_masked(&mut fb, 2, 0x5555_5555, 0x0000_FFFF);
+    assert_eq!(fb[2], 0xAAAA_5555, "masked bits replaced, others preserved");
+    assert_eq!(fb[1], 0xAAAA_AAAA, "neighbours untouched");
+    Rex3::write_masked(&mut fb, 2, 0xFFFF_FFFF, 0);
+    assert_eq!(fb[2], 0xAAAA_5555, "zero mask writes nothing");
+}
+
+/// The draw-shape corpus must be recorded in every build, not only when
+/// Cranelift is compiled in.
+///
+/// This was broken until the corpus moved from `RexJit` to `Rex3`: without
+/// `rex-jit` there is no `RexJit`, so nothing recorded and nothing saved — the
+/// generated shader table could never learn about new shapes from ordinary
+/// runs, which is precisely the build most users have.
+#[test]
+fn corpus_records_shapes_without_jit() {
+    let rex = make_rex3();
+    rex3init(rex);
+
+    reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+    reg(rex, REX3_WRMASK, 0xFFFFFF);
+    reg(rex, REX3_COLORRED, 0x40u32 << 11);
+    reg(rex, REX3_XYENDI, xy(4, 4));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    wait(rex);
+
+    let seen = rex.seen_shapes.lock();
+    assert!(
+        !seen.is_empty(),
+        "no draw shapes recorded — the corpus cannot grow in this build"
+    );
+
+    // The recorded key must be the canonical one the table is keyed on, or a
+    // regenerated shader would be filed under something the dispatch never asks
+    // for.
+    let dm1 = crate::rex3_shape::normalize_dm1(DM1_RGB24_SRC, DRAWMODE0_OPCODE_DRAW);
+    // cm carries the clipmode key, which rex3init leaves at CIDMATCH=0xF
+    // (checking disabled) — read it back rather than assuming zero.
+    let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+    let expect = (DM0_DRAW_BLOCK, dm1, cm);
+    assert!(
+        seen.contains(&expect),
+        "expected {expect:?} in the corpus, got {:?}",
+        seen.iter().collect::<Vec<_>>()
+    );
+}
+
+/// What does a single GFIFO register write cost?
+///
+/// The draw backend is now fast enough that the sweep's small-span rows are
+/// dominated by queue traffic rather than rasterisation: flat fill runs at
+/// 645 Mpx/s across 1280-pixel spans (0.005 entries/px) and 49 Mpx/s across
+/// 8-pixel spans (0.75 entries/px) — same pixels, 13x slower, purely entry
+/// density. This isolates the push itself so that cost has a number.
+///
+/// Measures the real bus entry point (`write32`), which is what the CPU store
+/// path actually calls, including the register match and the BUS_BUSY retry.
+/// The consumer runs concurrently, as it does in practice.
+#[test]
+#[ignore = "benchmark: runs for several seconds of wall clock"]
+fn gfifo_push_cost() {
+    use std::time::{Duration, Instant};
+
+    let rex = make_rex3();
+    rex3init(rex);
+
+    const BUDGET: Duration = Duration::from_millis(500);
+
+    // A register that is pure queue traffic: no CPU-thread side effect, so the
+    // write32 default arm runs and the entry lands in the fifo.
+    let push_one = |r: &Rex3| {
+        // Retry on BUS_BUSY exactly as the CPU does.
+        while r.write32(REX3_COLORRED, 0x40 << 11) == crate::traits::BUS_BUSY {
+            std::hint::spin_loop();
+        }
+    };
+
+    // Warm up: let the consumer thread reach steady state.
+    for _ in 0..10_000 { push_one(rex); }
+    wait(rex);
+
+    let start = Instant::now();
+    let mut pushes: u64 = 0;
+    while start.elapsed() < BUDGET {
+        for _ in 0..1_000 { push_one(rex); }
+        pushes += 1_000;
+    }
+    let elapsed = start.elapsed();
+    wait(rex);
+
+    let ns_per = elapsed.as_nanos() as f64 / pushes as f64;
+    println!("\n=== GFIFO push cost ===");
+    println!("  {pushes} pushes in {:?}", elapsed);
+    println!("  {:.1} ns/entry  ({:.1} M entries/s)", ns_per, 1000.0 / ns_per);
+    println!();
+    println!("  For scale: a GL triangle of ~32px costs tens of entries, so at");
+    println!("  this rate the queue alone caps small-primitive throughput.");
+    assert!(pushes > 0);
+}
+
+/// A 64-bit store is two register writes. Does pushing them as one atomic pair
+/// beat two separate pushes?
+///
+/// IRIX/GL issues 64-bit stores constantly (coordinate pairs, colour pairs,
+/// Bresenham terms), so this is the common case, not a corner.
+#[test]
+#[ignore = "benchmark: runs for several seconds of wall clock"]
+fn gfifo_push64_cost() {
+    use std::time::{Duration, Instant};
+
+    let rex = make_rex3();
+    rex3init(rex);
+    const BUDGET: Duration = Duration::from_millis(500);
+
+    // COLORRED/COLORGRN are adjacent and neither has a CPU-thread side effect,
+    // so a 64-bit store to the pair takes the queue path.
+    let push64 = |r: &Rex3| {
+        while r.write64(REX3_COLORRED, 0x0000_0040_0000_0050) == crate::traits::BUS_BUSY {
+            std::hint::spin_loop();
+        }
+    };
+    let push32x2 = |r: &Rex3| {
+        while r.write32(REX3_COLORRED, 0x40) == crate::traits::BUS_BUSY {
+            std::hint::spin_loop();
+        }
+        while r.write32(REX3_COLORRED + 4, 0x50) == crate::traits::BUS_BUSY {
+            std::hint::spin_loop();
+        }
+    };
+
+    for _ in 0..10_000 { push64(rex); }
+    wait(rex);
+
+    let run = |f: &dyn Fn(&Rex3)| -> f64 {
+        let start = Instant::now();
+        let mut n: u64 = 0;
+        while start.elapsed() < BUDGET {
+            for _ in 0..1_000 { f(rex); }
+            n += 1_000;
+        }
+        let e = start.elapsed();
+        wait(rex);
+        // Nanoseconds per *entry pair*, so the two are directly comparable.
+        e.as_nanos() as f64 / n as f64
+    };
+
+    let ns_pair = run(&push64);
+    let ns_two  = run(&push32x2);
+
+    println!("\n=== GFIFO 64-bit store: paired vs two separate pushes ===");
+    println!("  write64 (one try_push2): {:>6.1} ns/pair", ns_pair);
+    println!("  two write32 calls:       {:>6.1} ns/pair", ns_two);
+    println!("  speedup:                 {:>6.2}x", ns_two / ns_pair.max(0.001));
+    println!();
+    println!("  Three atomics per pair instead of six, and one trip through the");
+    println!("  write32 register match instead of two.");
+    assert!(ns_pair > 0.0);
+}
+
+/// What does the consumer-side dispatch lookup cost?
+///
+/// With the backend at ~169 Mpx/s for Gouraud, a small-span GO spends far more
+/// time in queue traffic and dispatch than in rasterisation. This isolates the
+/// per-GO lookup: SipHash over a 12-byte key plus an RwLock read acquire, both
+/// on the hot path, against the memo that is supposed to hide them.
+#[test]
+#[ignore = "benchmark"]
+fn dispatch_lookup_cost() {
+    use std::time::{Duration, Instant};
+    use std::collections::HashMap;
+
+    const N: usize = 4096;
+    let keys: Vec<(u32, u32, u32)> =
+        (0..N).map(|i| (0x306 + i as u32, 0x3000_f019, (i as u32 % 16) << 9)).collect();
+
+    let map: HashMap<(u32, u32, u32), u32> =
+        keys.iter().enumerate().map(|(i, k)| (*k, i as u32)).collect();
+    let locked = parking_lot::RwLock::new(map.clone());
+
+    const BUDGET: Duration = Duration::from_millis(300);
+    let bench = |name: &str, mut f: Box<dyn FnMut(usize) -> u32>| {
+        let start = Instant::now();
+        let mut n = 0usize;
+        let mut acc = 0u32;
+        while start.elapsed() < BUDGET {
+            for _ in 0..1000 { acc = acc.wrapping_add(f(n % N)); n += 1; }
+        }
+        let ns = start.elapsed().as_nanos() as f64 / n as f64;
+        println!("  {name:<38} {ns:>6.1} ns   (acc {acc})");
+        ns
+    };
+
+    println!("\n=== dispatch lookup cost ===");
+    let m = map.clone();
+    let ks = keys.clone();
+    let hash_only = bench("std HashMap (SipHash), no lock", Box::new(move |i| *m.get(&ks[i]).unwrap()));
+    let ks2 = keys.clone();
+    let locked_ref = &locked;
+    let with_lock = bench("RwLock<HashMap> read + lookup", Box::new(move |i| *locked_ref.read().get(&ks2[i]).unwrap()));
+    let fxmap: crate::rex3_shape::ShapeMap<u32> =
+        keys.iter().enumerate().map(|(i, k)| (*k, i as u32)).collect();
+    let ks_fx = keys.clone();
+    let fx = bench("ShapeMap (FxHash), no lock", Box::new(move |i| *fxmap.get(&ks_fx[i]).unwrap()));
+    let fxlocked = parking_lot::RwLock::new({
+        let m: crate::rex3_shape::ShapeMap<u32> =
+            keys.iter().enumerate().map(|(i, k)| (*k, i as u32)).collect();
+        m
+    });
+    let ks_fxl = keys.clone();
+    let fxl_ref = &fxlocked;
+    let fxl = bench("RwLock<ShapeMap> read + lookup", Box::new(move |i| *fxl_ref.read().get(&ks_fxl[i]).unwrap()));
+    let _ = (fx, fxl);
+    let ks3 = keys.clone();
+    let sorted: Vec<((u32, u32, u32), u32)> = {
+        let mut v: Vec<_> = keys.iter().enumerate().map(|(i, k)| (*k, i as u32)).collect();
+        v.sort_unstable_by_key(|(k, _)| *k);
+        v
+    };
+    let bsearch = bench("sorted slice binary_search", Box::new(move |i| {
+        let k = ks3[i];
+        sorted.binary_search_by_key(&k, |(kk, _)| *kk).map(|j| sorted[j].1).unwrap()
+    }));
+    println!();
+    println!("  lock overhead: {:.1} ns", with_lock - hash_only);
+    println!("  binary search vs hashmap+lock: {:.2}x", with_lock / bsearch.max(0.001));
+    assert!(hash_only > 0.0);
+}
+
+/// Where do the 73 ns of a GFIFO push actually go?
+///
+/// Three atomics on an uncontended cache line should be ~15-20 ns. Measuring
+/// 73 means something else dominates — most likely producer/consumer contention
+/// on the ring's head/tail lines, which no amount of instruction-shaving fixes.
+/// This separates the cases.
+#[test]
+#[ignore = "benchmark"]
+fn gfifo_push_breakdown() {
+    use std::time::{Duration, Instant};
+    const BUDGET: Duration = Duration::from_millis(400);
+
+    let bench = |name: &str, f: &dyn Fn()| {
+        let start = Instant::now();
+        let mut n: u64 = 0;
+        while start.elapsed() < BUDGET {
+            for _ in 0..1000 { f(); }
+            n += 1000;
+        }
+        let ns = start.elapsed().as_nanos() as f64 / n as f64;
+        println!("  {name:<44} {ns:>6.1} ns");
+        ns
+    };
+
+    println!("\n=== GFIFO push breakdown ===");
+
+    // 1. The ring alone, no consumer running at all.
+    let quiet = crate::rex3::GFifo::new();
+    let a = bench("try_push, NO consumer thread", &|| {
+        // Drain by hand so the ring never fills.
+        if !quiet.try_push(0x100, 0) {
+            while quiet.peek().is_some() { quiet.consume(); }
+        }
+    });
+
+    // 2. Same ring, but a consumer thread spinning on it — the real topology.
+    let live: &'static crate::rex3::GFifo = Box::leak(Box::new(crate::rex3::GFifo::new()));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let h = std::thread::spawn(move || {
+        while !stop2.load(Ordering::Relaxed) {
+            while live.peek().is_some() { live.consume(); }
+            std::hint::spin_loop();
+        }
+    });
+    let b = bench("try_push, consumer thread draining", &|| {
+        while !live.try_push(0x100, 0) { std::hint::spin_loop(); }
+    });
+    stop.store(true, Ordering::Relaxed);
+    let _ = h.join();
+
+    // 3. Through the real bus entry point, for reference.
+    let rex = make_rex3();
+    rex3init(rex);
+    let c = bench("write32 (full bus path + consumer)", &|| {
+        while rex.write32(REX3_COLORRED, 0x40 << 11) == crate::traits::BUS_BUSY {
+            std::hint::spin_loop();
+        }
+    });
+
+    println!();
+    println!("  ring alone:                {:>6.1} ns", a);
+    println!("  + concurrent consumer:     {:>6.1} ns  (+{:.1} contention)", b, b - a);
+    println!("  + bus/register dispatch:   {:>6.1} ns  (+{:.1} overhead)", c, c - b);
+    assert!(a > 0.0);
 }
