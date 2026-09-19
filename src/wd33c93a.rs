@@ -1030,6 +1030,13 @@ impl Wd33c93a {
                     let tc = if tc == 0 { state.set_transfer_count(1); 1 } else { tc };
                     dlog!(state.log_module(), "WD33C93A({}): XFER_INFO PIO deferred phase=0x{:02x} tc={}", state.id, phase, tc);
                     state.fifo.clear();
+                    // These three phases are outbound by definition (MESG_OUT,
+                    // then the CDB), so bytes the host writes to DATA belong in
+                    // the fifo. `xfer_direction_in` is DMA transfer state that
+                    // survives the command that set it; left true, the DATA
+                    // write path discards every byte as an abort-flush and the
+                    // worker sees an empty CDB.
+                    state.xfer_direction_in = false;
                     state.update_asr(asr::CIP | asr::INT, asr::DBR);
                     return BUS_OK;
                 }
@@ -2432,5 +2439,54 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "Wd33c93a save_state mismatch after load_state round-trip");
+    }
+}
+#[cfg(test)]
+mod pio_direction_tests {
+    use super::*;
+
+    /// A device left holding `xfer_direction_in` from an earlier DMA transfer,
+    /// which is where that flag is set and cleared -- nothing resets it when a
+    /// new command starts.
+    fn scsi_after_a_data_in_transfer() -> Wd33c93a {
+        let dev = Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)));
+        {
+            let mut s = dev.state.lock();
+            s.xfer_direction_in = true;
+            s.regs[regs::COMMAND_PHASE as usize] = command_phase::IDENTIFY_SENT;
+            s.advanced_mode = true;
+        }
+        dev
+    }
+
+    /// A driver that drives the bus phase by phase -- NetBSD's `wd33c93` does
+    /// this -- sends the CDB a byte at a time through the DATA register during
+    /// COMMAND phase, after a Transfer Info. Those bytes must reach the fifo:
+    /// the phase is outbound, whatever an earlier transfer's direction was.
+    #[test]
+    fn a_cdb_written_during_command_phase_reaches_the_fifo() {
+        let dev = scsi_after_a_data_in_transfer();
+        // Transfer Info, six bytes.
+        {
+            let mut s = dev.state.lock();
+            s.set_transfer_count(6);
+        }
+        dev.write(0, regs::COMMAND);
+        dev.write(1, cmd::TRANSFER_INFO);
+
+        // INQUIRY, the command NetBSD sends here.
+        for b in [0x12u8, 0x00, 0x00, 0x00, 0x24, 0x00] {
+            dev.write(0, regs::DATA);
+            dev.write(1, b);
+        }
+
+        let s = dev.state.lock();
+        assert_eq!(
+            s.fifo.len(),
+            6,
+            "the CDB was discarded: the DATA write path treats a stale \
+             xfer_direction_in as data-in mode and drops outbound bytes"
+        );
+        assert_eq!(s.fifo[0], 0x12, "first CDB byte is the INQUIRY opcode");
     }
 }
