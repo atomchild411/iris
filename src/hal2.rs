@@ -95,7 +95,8 @@ const DMA_EN_CODECB: u16 = 0x10;
 
 // Codec CTRL1 bitfield positions
 const CTRL1_CHAN_MASK:  u16 = 0x0007; // bits 2:0 – HPC3 DMA channel
-const CTRL1_CLOCK_SHIFT: u32 = 3;    // bits 4:3 – BRES clock index (0-based → BRES1..3)
+const CTRL1_CLOCK_SHIFT: u32 = 3;    // bits 4:3 – CLKID: the BRES generator
+                                     // NUMBER, 1..3 (0 = none). Not an index.
 const CTRL1_CLOCK_MASK:  u16 = 0x0003;
 const CTRL1_MODE_SHIFT:  u32 = 8;    // bits 9:8 – channel mode
 const CTRL1_MODE_MASK:   u16 = 0x0003;
@@ -241,6 +242,7 @@ struct AesRxState {
 
 // ─── HAL2 register state ──────────────────────────────────────────────────────
 
+#[derive(Default)]
 struct Hal2State {
     isr: u16,
     iar: u16,
@@ -265,8 +267,14 @@ struct Hal2State {
 }
 
 impl Hal2State {
+    /// Rate of the generator a codec's CLKID selects. CLKID is the generator
+    /// NUMBER (1..3) while `bres_clock_rate` is 0-based, so it needs the shift.
+    /// CLKID 0 selects nothing; report 0 rather than inventing a rate.
     fn bres_rate(&self, clk: usize) -> u32 {
-        if clk < 3 { self.bres_clock_rate[clk] } else { 44100 }
+        match clk {
+            1..=3 => self.bres_clock_rate[clk - 1],
+            _ => 0,
+        }
     }
     fn codeca_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.codeca_ctrl[0]) }
     fn codecb_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.codecb_ctrl[0]) }
@@ -460,7 +468,9 @@ impl Hal2 {
             let rate = s.bres_rate(clk);
             let (_, cb_clk, _) = s.codecb_cfg();
             let cb_rate = s.bres_rate(cb_clk);
-            let pitch_rate = if cb_rate > 0 { cb_rate } else { 44100 };
+            // Codec A is the DAC, so playback is paced by codec A's own
+            // clock. Codec B is the ADC and has no say in playback pitch.
+            let pitch_rate = if rate > 0 { rate } else if cb_rate > 0 { cb_rate } else { 44100 };
             (ch, mode, rate, pitch_rate)
         };
 
@@ -888,7 +898,9 @@ impl Hal2 {
                     };
                     if changed {
                         drop(state);
-                        self.reclock_active(idx);
+                        // reclock_active compares against codec CLKIDs, which
+                        // are generator numbers, so pass the 1-based value.
+                        self.reclock_active(bres_idx);
                         return;
                     }
                 }
@@ -897,7 +909,8 @@ impl Hal2 {
         }
     }
 
-    /// Re-arm any active channels that use BRES clock `bres_idx` (0-based).
+    /// Re-arm any active channels using generator `bres_idx` (1..3, the same
+    /// basis as a codec CTRL1 CLKID).
     fn reclock_active(&self, bres_idx: usize) {
         // Read current clock indices and active mask under lock, then re-arm outside lock.
         let (ca_clk, cb_clk, at_clk, ar_clk, dma_enable) = {
@@ -909,9 +922,9 @@ impl Hal2 {
             (ca_clk, cb_clk, at_clk, ar_clk, s.dma_enable)
         };
 
-        // Rearm codec A if its own clock changed, or if codec B's clock changed
-        // (codec A's timer period uses codec B's rate as pitch_rate).
-        if (dma_enable & DMA_EN_CODECA) != 0 && (ca_clk == bres_idx || cb_clk == bres_idx) {
+        // Codec A re-arms when the generator it selected is reprogrammed. It
+        // no longer re-arms on a codec B change: its period is its own now.
+        if (dma_enable & DMA_EN_CODECA) != 0 && ca_clk == bres_idx {
             self.arm_codeca();
         }
         if (dma_enable & DMA_EN_CODECB) != 0 && cb_clk == bres_idx {
@@ -1101,21 +1114,22 @@ impl Device for Hal2 {
                 }
 
                 let mode_str = |m| match m { 1 => "mono", 2 => "stereo", 3 => "quad", _ => "off" };
+                // bres=0 means CLKID 0: no generator selected.
 
                 let (ca_ch, ca_clk, ca_mode) = s.codeca_cfg();
                 writeln!(writer, "Codec A: ch={} bres={} rate={}Hz mode={}",
-                    ca_ch, ca_clk + 1, s.bres_rate(ca_clk), mode_str(ca_mode)).unwrap();
+                    ca_ch, ca_clk, s.bres_rate(ca_clk), mode_str(ca_mode)).unwrap();
                 writeln!(writer, "  ctrl1=0x{:04x} ctrl2=[0x{:04x} 0x{:04x}]",
                     s.codeca_ctrl[0], s.codeca_ctrl[1], s.codeca_ctrl[2]).unwrap();
 
                 let (cb_ch, cb_clk, cb_mode) = s.codecb_cfg();
                 writeln!(writer, "Codec B: ch={} bres={} rate={}Hz mode={}",
-                    cb_ch, cb_clk + 1, s.bres_rate(cb_clk), mode_str(cb_mode)).unwrap();
+                    cb_ch, cb_clk, s.bres_rate(cb_clk), mode_str(cb_mode)).unwrap();
 
                 let (at_ch, at_clk, _) = s.aestx_cfg();
                 let (ar_ch, ar_clk, _) = s.aesrx_cfg();
-                writeln!(writer, "AES TX: ch={} bres={} rate={}Hz", at_ch, at_clk + 1, s.bres_rate(at_clk)).unwrap();
-                writeln!(writer, "AES RX: ch={} bres={} rate={}Hz", ar_ch, ar_clk + 1, s.bres_rate(ar_clk)).unwrap();
+                writeln!(writer, "AES TX: ch={} bres={} rate={}Hz", at_ch, at_clk, s.bres_rate(at_clk)).unwrap();
+                writeln!(writer, "AES RX: ch={} bres={} rate={}Hz", ar_ch, ar_clk, s.bres_rate(ar_clk)).unwrap();
                 drop(s);
 
                 let ca = self.ca_state.lock();
@@ -1195,5 +1209,56 @@ mod tests {
         // 48000 → 44100: ratio ~0.919, so 48000 in → 44100 out
         let out = resample(48000, 44100, 48000);
         assert_eq!(out, 44100, "48000→44100: expected 44100 frames, got {}", out);
+    }
+}
+
+#[cfg(test)]
+mod clkid_tests {
+    use super::*;
+
+    /// Three generators at distinguishable rates, so an off-by-one shows up as
+    /// a wrong number rather than a coincidence.
+    fn state_with_rates() -> Hal2State {
+        let mut s = Hal2State::default();
+        s.bres_clock_rate = [48000, 44100, 32000];
+        s
+    }
+
+    #[test]
+    fn clkid_is_a_generator_number_not_an_index() {
+        let s = state_with_rates();
+        // CLKID n selects BRESn, so it indexes the array at n-1.
+        assert_eq!(s.bres_rate(1), 48000, "CLKID 1 is BRES1");
+        assert_eq!(s.bres_rate(2), 44100, "CLKID 2 is BRES2");
+        assert_eq!(s.bres_rate(3), 32000, "CLKID 3 is BRES3");
+        // 0 selects no generator — reporting a rate here is inventing one.
+        assert_eq!(s.bres_rate(0), 0, "CLKID 0 selects nothing");
+    }
+
+    #[test]
+    fn a_codec_reads_the_generator_its_driver_programmed() {
+        // What NetBSD's haltwo and Linux's hal2 both do for playback: program
+        // BRES1 to the wanted rate, then point the DAC at it with CLKID 1.
+        // ctrl1 = 0x0208 is what NetBSD 10.2 and 11.0 actually write.
+        let mut s = state_with_rates();
+        s.codeca_ctrl[0] = 0x0208;
+        let (_, clk, _) = s.codeca_cfg();
+        assert_eq!(clk, 1, "ctrl1 0x0208 carries CLKID 1");
+        assert_eq!(
+            s.bres_rate(clk),
+            48000,
+            "codec A must read BRES1, the generator the driver configured"
+        );
+    }
+
+    #[test]
+    fn the_adc_reads_its_own_generator_too() {
+        // Linux records on BRES2 with CLKID 2 ("2nd Bresenham clock generator
+        // for record"), which must not resolve to BRES3.
+        let mut s = state_with_rates();
+        s.codecb_ctrl[0] = (2 << CTRL1_CLOCK_SHIFT) as u16;
+        let (_, clk, _) = s.codecb_cfg();
+        assert_eq!(clk, 2);
+        assert_eq!(s.bres_rate(clk), 44100, "CLKID 2 is BRES2, not BRES3");
     }
 }
