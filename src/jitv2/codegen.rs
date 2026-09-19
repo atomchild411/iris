@@ -365,23 +365,6 @@ impl Codegen {
         CODEGEN_OPT_LEVEL_SPEED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Host mmap page granularity `ArenaMemoryProvider` rounds every
-    /// function's segment up to (`memory/arena.rs`'s own `align_up(size,
-    /// page::size())`, via the `region` crate — a transitive dependency of
-    /// `cranelift-jit`, not depended on directly here, so this is a named
-    /// assumption rather than a call to `region::page::size()`). 4KiB is
-    /// correct for every platform this project actually targets
-    /// (`target-cpu=native` x86-64/aarch64 Linux and macOS) — if that ever
-    /// changes, this is the one place to update, not a magic number buried
-    /// in `code_bytes_used`'s arithmetic.
-    ///
-    /// `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s own doc comment already derived
-    /// this fact independently (confirmed live: the arena exhausts at
-    /// *exactly* `ARENA_RESERVE_SIZE / HOST_PAGE_SIZE` functions, not a
-    /// byte-size estimate) — this constant makes that same fact available
-    /// to `Jitv2::code_bytes_used`'s per-entry accounting instead of just
-    /// the flush-threshold math.
-    pub const HOST_PAGE_SIZE: u64 = 4096;
 
     /// `cranelift_jit`'s default `SystemMemoryProvider` mmaps (or
     /// `alloc::alloc`s, which on Linux still routes through mmap for

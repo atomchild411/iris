@@ -1513,35 +1513,30 @@ impl Jitv2 {
         self.capacity
     }
 
-    /// Sum, across every published entry in every pooled page, of each
-    /// entry's `JitEntry::code_size` **rounded up to
-    /// `Codegen::HOST_PAGE_SIZE`** — dev-only diagnostic (`j2 stats`), the
-    /// best available proxy for the shared `Codegen`'s actual Cranelift
-    /// memory-arena usage (see `JitEntry::code_size`'s doc comment for why
-    /// nothing more direct is available). Rounding matters: `code_size` is
-    /// raw compiled-machine-code bytes (~215 bytes/function observed for a
-    /// single-instruction region), but `ArenaMemoryProvider` gives every
-    /// function its own segment, always rounded up to a full host page
-    /// regardless of actual size (`CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s doc
-    /// comment — confirmed live: the arena exhausted at exactly
-    /// `ARENA_RESERVE_SIZE / HOST_PAGE_SIZE` functions, not the ~2.4M a
-    /// byte-size-only estimate would predict) — summing raw `code_size`
-    /// alone would under-report real arena consumption by roughly 19x at
-    /// that average function size, which is exactly the gap that made the
-    /// original OOM investigation confusing (small `code_bytes_used`
-    /// numbers right up until the arena actually exhausted). O(pages ×
-    /// ENTRIES_PER_PAGE); fine for an on-demand monitor command, not called
-    /// from any hot path.
+    /// Sum of `JitEntry::code_size` across every published entry in every
+    /// pooled page — dev-only diagnostic (`j2 stats`), a proxy for the shared
+    /// `Codegen`'s arena usage for the case `packing_stats()` cannot be read
+    /// (it is only legible while the compile pool is idle).
+    ///
+    /// Not rounded. `PagedArenaMemoryProvider` packs allocations back to back
+    /// at cranelift's requested alignment, so a function costs about its own
+    /// `code_size`; host pages only bound what is *committed*, not what each
+    /// function occupies. This used to round every entry up to a hardcoded
+    /// 4 KiB, which suited the `ArenaMemoryProvider` that gave each function
+    /// its own page-rounded segment — that provider no longer exists, and on
+    /// a 16 KiB-page host the rounding over-reported a ~215-byte function by
+    /// about 76x.
+    ///
+    /// O(pages × ENTRIES_PER_PAGE); fine for an on-demand monitor command,
+    /// not called from any hot path.
     #[cfg(feature = "developer")]
     pub fn code_bytes_used(&self) -> u64 {
-        let page_size = crate::jitv2::codegen::Codegen::HOST_PAGE_SIZE;
         self.pages.iter()
             .map(|page| {
                 (0..ENTRIES_PER_PAGE)
                     .filter(|&off| page.is_published(off))
                     .map(|off| {
-                        let raw = page.entries[off].code_size as u64;
-                        raw.div_ceil(page_size) * page_size
+                        page.entries[off].code_size as u64
                     })
                     .sum::<u64>()
             })
@@ -2759,6 +2754,33 @@ impl CompileQueue {
 
 #[cfg(test)]
 mod tests {
+
+    /// `code_bytes_used` must report what the arena actually consumes. The
+    /// arena packs allocations back to back, so a function costs about its own
+    /// `code_size` -- it used to be rounded up to a hardcoded 4 KiB page,
+    /// which described a provider that no longer exists and over-reported a
+    /// ~215-byte function by 19x there and 76x on a 16 KiB-page host.
+    #[cfg(feature = "developer")]
+    #[test]
+    fn code_bytes_used_is_not_page_rounded() {
+        let page_gen = AtomicU64::new(0);
+        let mut jit = Jitv2::new(1);
+        jit.pages[0].claim(1, &page_gen as *const AtomicU64);
+
+        let func = code_bytes_used_is_not_page_rounded as *const ();
+        let sizes = [215u32, 300, 48];
+        for (i, sz) in sizes.iter().enumerate() {
+            assert!(jit.pages[0].publish(i, func, 0, 1, *sz, false));
+        }
+
+        let expected: u64 = sizes.iter().map(|s| *s as u64).sum();
+        assert_eq!(
+            jit.code_bytes_used(),
+            expected,
+            "must sum raw code_size; page-rounding would report {} instead",
+            sizes.len() as u64 * region::page::size() as u64
+        );
+    }
     use super::*;
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64};
 
@@ -5423,18 +5445,12 @@ impl Jitv2 {
     }
 
     /// Sum, across every pooled page with a published function, of the
-    /// page's `code_size` **rounded up to `Codegen::HOST_PAGE_SIZE`** —
-    /// dev-only diagnostic (`j2 stats`), the best available proxy for the
-    /// shared `Codegen`'s actual Cranelift memory-arena usage. Rounding
-    /// matters: `code_size` is raw compiled-machine-code bytes, but
-    /// `ArenaMemoryProvider` gives every function its own segment, always
-    /// rounded up to a full host page regardless of actual size — summing
-    /// raw `code_size` alone would under-report real arena consumption.
-    /// §13: page-granular now (one function per page), not per-offset — see
-    /// `PhysicalCodePage::code_size`'s own field doc.
+    /// Sum of each published entry's `code_size` — dev-only diagnostic
+    /// (`j2 stats`), the j2wp counterpart of the paged implementation's
+    /// `code_bytes_used`. Not rounded: the arena packs allocations back to
+    /// back, so a function costs about its own `code_size`.
     #[cfg(feature = "developer")]
     pub fn code_bytes_used(&self) -> u64 {
-        let page_size = crate::jitv2::codegen::Codegen::HOST_PAGE_SIZE;
         self.pages.iter()
             .filter(|page| !page.func().is_null())
             .map(|page| {

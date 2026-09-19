@@ -13468,8 +13468,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         #[cfg(feature = "developer")]
                         {
                             let code_bytes = jit.code_bytes_used();
-                            writeln!(writer, "arena bytes (host-page-rounded, ~{}KiB/fn floor): {} ({:.1} KiB) across published entries — best-effort proxy for actual Cranelift arena size, not the arena's own byte count (cranelift_jit::Memory exposes none)",
-                                crate::jitv2::codegen::Codegen::HOST_PAGE_SIZE / 1024, code_bytes, code_bytes as f64 / 1024.0).unwrap();
+                            writeln!(writer, "arena bytes (sum of published code_size): {} ({:.1} KiB) — proxy for the Cranelift arena, for when `packing_stats` cannot be read (pool busy); the arena packs, so this is close but excludes alignment padding",
+                                code_bytes, code_bytes as f64 / 1024.0).unwrap();
                             let compiles = jit.stats.compiles.load(Ordering::Relaxed);
                             let failed = jit.stats.failed_compiles.load(Ordering::Relaxed);
                             let kills = jit.stats.kill_entry_calls.load(Ordering::Relaxed);
