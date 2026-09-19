@@ -70,6 +70,30 @@ and upstream still resolves it to `bres=2 rate=44100Hz`. Two independently
 maintained releases a year apart agree, so this is a property of our decode,
 not of one version's quirks.
 
+## Linux says the same thing, in prose
+
+`sound/mips/hal2.c` pairs each generator with its CLKID value explicitly, and
+comments which is which:
+
+    /* We are using 1st Bresenham clock generator for playback */
+    hal2_i_write16(hal2, H2I_DAC_C1, ... | (1 << H2I_C1_CLKID_SHIFT) | ...);
+
+    /* We are using 2nd Bresenham clock generator for record */
+    hal2_i_write16(hal2, H2I_ADC_C1, ... | (2 << H2I_C1_CLKID_SHIFT) | ...);
+
+with `H2I_BRES1_*` written at line 339 and `H2I_BRES2_*` at line 350. BRES1
+pairs with CLKID 1 and BRES2 with CLKID 2.
+
+So **two independent drivers agree**, and one of them states it in a comment.
+The triage note recorded this fix's weakness as "inference from Linux's
+`hal2.c` and our own trace, not a datasheet". That was over-cautious: it is
+not inference, it is two paired assignments and a comment naming the
+generator.
+
+Linux itself cannot be used as a *runtime* check here -- the Debian installer
+kernel carries no hal2 driver -- so NetBSD GENERIC remains the boot-time
+oracle.
+
 ## Aside
 
 `haltwo` attaching at all is its own result -- it reads our HAL2 as

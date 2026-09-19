@@ -96,6 +96,43 @@ NetBSD 11.0 aborts at the same point with the same values -- `asr 0xc0
 csr 0x40`, `COMMAND = 0x20`, `CMD_PHASE = 0x00`, CDB registers all zero --
 and traps to `db>` exactly as 10.2 does. Not a version-specific quirk.
 
+## Linux confirms the gate from the other side -- and finds a DMA sibling
+
+A register trace of Debian 7 (`log scsi on` to a file, from the monitor before
+booting) shows Linux issuing the *same* `XFER_INFO` command, and our PIO path
+**accepting** it:
+
+    Read Reg 10 -> 20                        CMD_PHASE = IDENTIFY_SENT
+    Write Reg 12/13/14 <- 00 00 06           count = 6
+    Write Reg 18 <- 20                       XFER_INFO
+    XFER_INFO PIO deferred phase=0x20 tc=6   our gate accepts
+    Read ASR -> 01                           DBR
+    Write Reg 19 <- 12                       CDB byte 0 = 0x12 INQUIRY
+    Write Reg 19 <- 00  ...                  six bytes
+
+Linux arrives from `IDENTIFY_SENT` (0x20), one of the three phases the gate
+allows, so the CDB flows. NetBSD arrives from `DISCONNECTED` (0x00) and is
+refused. Same command, same mechanism, different entry phase -- which confirms
+the diagnosis from both directions.
+
+Linux also uses `SEL_ATN_XFER` (0x08) elsewhere, the register-CDB path we
+already serve, which is why it gets further overall.
+
+### The 20 second timeout is a different defect: the DMA path
+
+    Command 20 (CmdPhase: 10, Tgt: 1, ASR: 10)      SELECTED
+      Regs: CTRL=2d DST_ID=01 SRC_ID=80             CTRL 0x2d = DMA
+    TRANSFER_INFO scsi_status=8e cmd_phase=10
+    XFER_INFO MESG_OUT count=6 dma=true             DMA path, not PIO
+    queue_interrupt phase=Some(20) status=8a
+    Read Reg 17 (SCSI_STATUS) -> 8a   (x3)
+    Write Reg 18 <- 01                              ABORT
+
+The PIO deferral requires `!state.use_dma()`, so in DMA mode it is skipped
+entirely. We answer 0x8a, Linux reads it three times and aborts. So the
+CDB-over-DATA-port work has a DMA-mode sibling, and that -- not the phase
+gate -- is what costs Linux 20 seconds.
+
 ## Status
 
 Not yet reported upstream; it sits behind the timer bug, which is also not yet
