@@ -1596,6 +1596,20 @@ impl MipsCore {
     /// returns the identical value (jitv2_lockstep runs the same instruction
     /// on both engines and compares the resulting GPR state).
     pub fn count_now(&mut self) -> u32 {
+        self.materialize_count(true)
+    }
+
+    /// Materialize Count from the clock, optionally delivering IP7 for a
+    /// Compare this advance stepped over.
+    ///
+    /// `deliver_crossing` is false on exactly one path: the Compare *write*.
+    /// A crossing raised there is cleared two lines later by that write's own
+    /// acknowledgement, so the guest never sees it -- and `claim_ip7` consumes
+    /// the ticket the write is about to arm its one-shot with, leaving that
+    /// one-shot unable to claim and self-deleting on its first fire, which
+    /// ends the timer. An overrun deadline is already the write's own case 2
+    /// below, which delivers after the ack with a live ticket.
+    fn materialize_count(&mut self, deliver_crossing: bool) -> u32 {
         #[cfg(not(feature = "ci_clock"))]
         if self.count_paused {
             return self.cp0_count as u32;
@@ -1654,7 +1668,7 @@ impl MipsCore {
             // here: the crossing already happened before the ack cleared it,
             // and the next crossing is a full wrap away.
             let dist_to_compare = (self.cp0_compare as u32).wrapping_sub(before);
-            if dist_to_compare != 0 && (dist_to_compare as u64) <= ticks {
+            if deliver_crossing && dist_to_compare != 0 && (dist_to_compare as u64) <= ticks {
                 // Same ticket the armed one-shot holds: whichever of us gets
                 // here first delivers, the other is a no-op.
                 let won = claim_ip7(
@@ -1913,7 +1927,7 @@ impl MipsCore {
                 // holds a stale ticket and can no longer assert IP7 over the
                 // acknowledgement we are about to perform.
                 let ticket = self.arm_ip7_sequence();
-                let count_before = self.count_now();
+                let count_before = self.materialize_count(false);
                 self.cp0_compare = value as u32 as u64;
 
                 // Writing Compare always acknowledges the pending timer
@@ -2480,5 +2494,72 @@ impl PrivilegeMode {
 impl Default for MipsCore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod ip7_ticket_tests {
+    use super::*;
+
+    /// A core whose Compare deadline is already behind Count, which is what a
+    /// guest produces when it writes Compare from a Count it read a tick ago.
+    /// Count is materialized from the clock at ~33 MHz, so a couple of
+    /// milliseconds puts it tens of thousands of ticks past a low Compare --
+    /// the margin here is enormous, not a race.
+    fn core_past_its_compare() -> MipsCore {
+        let mut core = MipsCore::default();
+        core.cp0_compare = 0x40;
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        // `materialize_count` memoizes per cycle count: a core that has never
+        // executed has `hot.cycles == count_read_cycle == 0` and short-circuits
+        // before materializing anything, so Count would stay 0 and no crossing
+        // could ever be detected. Make it look like it has run.
+        core.hot.cycles = 1;
+        core
+    }
+
+    /// The ticket `schedule_compare_timer` arms its one-shot with is
+    /// `self.ip7_seq`. If something consumed the shared sequence in the
+    /// meantime, that one-shot can never claim: on its first fire `claim_ip7`
+    /// fails, it returns `TimerReturn::Delete`, and nothing re-arms it -- the
+    /// guest's timer is gone for the rest of the run.
+    ///
+    /// A crossing detected inside the Compare write used to do exactly that.
+    #[test]
+    fn a_compare_write_leaves_its_one_shots_ticket_claimable() {
+        let mut core = core_past_its_compare();
+        let before = core.cp0_count as u32;
+        core.write_cp0(11, (before.wrapping_add(330_000)) as u64);
+
+        let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
+        assert_ne!(
+            shared, IP7_SEQ_CONSUMED,
+            "the Compare write consumed its own ticket; the one-shot it just \
+             armed can never claim and will delete itself"
+        );
+        assert_eq!(
+            shared, core.ip7_seq,
+            "the armed one-shot's ticket must be the live sequence"
+        );
+    }
+
+    /// The overrun case still delivers -- suppressing the crossing must not
+    /// cost us the interrupt the guest is owed. `write_cp0` classifies a
+    /// deadline it blew through and raises IP7 itself, after the ack.
+    #[test]
+    fn a_deadline_already_past_still_raises_ip7() {
+        let mut core = core_past_its_compare();
+        let now = core.count_peek();
+        // A deadline behind Count, and not equal to the last value the guest
+        // read, so it classifies as a missed deadline rather than an ack.
+        core.count_last_guest_read = now.wrapping_sub(1_000);
+        core.write_cp0(11, now.wrapping_sub(500) as u64);
+
+        let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
+        assert_ne!(
+            pending & CAUSE_IP7, 0,
+            "a Compare written behind Count is an overrun deadline: IP7 is \
+             owed now, not a full 32-bit wrap from now"
+        );
     }
 }
