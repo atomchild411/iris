@@ -2538,24 +2538,25 @@ impl Jitv2 {
         self.capacity
     }
 
-    /// Sum, across every pooled page with a published function, of the
-    /// page's `code_size` **rounded up to `Codegen::HOST_PAGE_SIZE`** —
-    /// dev-only diagnostic (`j2 stats`), the best available proxy for the
-    /// shared `Codegen`'s actual Cranelift memory-arena usage. Rounding
-    /// matters: `code_size` is raw compiled-machine-code bytes, but
-    /// `ArenaMemoryProvider` gives every function its own segment, always
-    /// rounded up to a full host page regardless of actual size — summing
-    /// raw `code_size` alone would under-report real arena consumption.
-    /// §13: page-granular now (one function per page), not per-offset — see
-    /// `PhysicalCodePage::code_size`'s own field doc.
+    /// Sum, across every pooled page with a published function, of that
+    /// page's `code_size` — diagnostic for `j2 status`.
+    ///
+    /// **Not rounded.** The page-rounding this used to do modelled
+    /// `ArenaMemoryProvider`, which gave every function its own
+    /// page-rounded segment; that provider no longer exists. The live
+    /// `PagedArenaMemoryProvider` packs allocations back to back, so a
+    /// function costs about its own `code_size`, and on a 16 KiB-page host
+    /// the old rounding over-reported a ~215-byte function by about 76x.
+    ///
+    /// NOT `#[cfg(feature = "developer")]`, though the commit this came
+    /// from added that: `j2 status` is read on `lightning` builds, and
+    /// gating a statistic to `developer` is how `last_code_size` came to
+    /// report 0 bytes in the only build worth measuring (see
+    /// rules/build/the-three-builds-we-actually-use.md).
     pub fn code_bytes_used(&self) -> u64 {
-        let page_size = crate::jitv2::codegen::Codegen::HOST_PAGE_SIZE;
         self.pages.iter()
             .filter(|page| !page.func().is_null())
-            .map(|page| {
-                let raw = page.code_size.load(Ordering::Relaxed) as u64;
-                raw.div_ceil(page_size) * page_size
-            })
+            .map(|page| page.code_size.load(Ordering::Relaxed) as u64)
             .sum()
     }
 
