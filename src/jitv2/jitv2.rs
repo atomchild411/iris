@@ -1085,6 +1085,14 @@ impl PhysicalCodePage {
         if threshold == 0 {
             return true;
         }
+        // A published entry's `gen` is its staleness marker, not a spare
+        // counter: incrementing it walks a stale entry's recorded gen toward
+        // the page's current gen, and the moment they coincide `is_runnable`
+        // waves the stale `func` through. Such an entry was already hot enough
+        // to compile once, so ask for the recompile rather than counting.
+        if self.is_published(offset_word) {
+            return true;
+        }
         let prev = self.entries[offset_word].gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         prev + 1 >= threshold
     }
@@ -2759,6 +2767,39 @@ impl CompileQueue {
 
 #[cfg(test)]
 mod tests {
+
+    /// `gen` is both the staleness marker and the warm-up counter. Without a
+    /// guard, dispatching a published-but-stale entry walks its recorded gen
+    /// back up to the page's current gen, and `is_runnable` then waves the
+    /// stale function pointer through. Three dispatches were enough.
+    #[test]
+    fn dispatching_a_stale_entry_does_not_resurrect_it() {
+        let page_gen = AtomicU64::new(0);
+        let mut page = PhysicalCodePage::new(0, &page_gen as *const AtomicU64);
+
+        // Publish an entry at the page's current generation.
+        let func = dispatching_a_stale_entry_does_not_resurrect_it as *const ();
+        assert!(page.publish(4, func, page_gen.load(Ordering::Relaxed), 1, 4, false));
+        assert!(page.is_runnable(4), "just published, so runnable");
+
+        // The page's bytes change: bump the generation. The entry is now
+        // published but stale, and must never be run again as-is.
+        page_gen.fetch_add(3, Ordering::Relaxed);
+        assert!(page.is_published(4), "still flagged valid");
+        assert!(!page.is_runnable(4), "but stale, so not runnable");
+
+        // Now dispatch it the way the gate does for a published-but-stale
+        // entry: is_runnable() is false, so it falls through to the counter.
+        for _ in 0..3 {
+            page.count_dispatch_and_check_threshold(4, 1000);
+        }
+
+        assert!(
+            !page.is_runnable(4),
+            "a stale entry became runnable again just by being dispatched -- \
+             the warm-up counter walked its gen back up to the page's"
+        );
+    }
     use super::*;
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64};
 
