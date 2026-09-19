@@ -260,6 +260,12 @@ struct Wd33c93aState {
     xfer_data: Vec<u8>,         // full data buffer for current SCSI command
     xfer_offset: usize,         // bytes already transferred
     xfer_direction_in: bool,    // true=send to host (READ cmd), false=receive from host (WRITE cmd)
+    /// A CDB that has been received in COMMAND phase but not yet executed,
+    /// because it is a write and the driver must arm DMA (or start feeding the
+    /// DATA register) before we may pull its data-out bytes. Non-empty exactly
+    /// between raising `TRANSFER_DATA_OUT` and the driver's next
+    /// `TRANSFER_INFO`, which is that data-out transfer — *not* another CDB.
+    pending_cdb: Vec<u8>,
     // IRQ status FIFO (mirrors MAME wd33c9x irq_fifo).
     // Statuses are pushed here; update_irq() pops the front into SCSI_STATUS and
     // sets ASR.INT. On SCSI_STATUS read (INT ack), update_irq() is called again —
@@ -348,6 +354,7 @@ impl Wd33c93a {
                 xfer_data: Vec::new(),
                 xfer_offset: 0,
                 xfer_direction_in: false,
+                pending_cdb: Vec::new(),
                 irq_fifo: VecDeque::new(),
                 callback,
                 last_read_asr: None,
@@ -1471,6 +1478,7 @@ impl Resettable for Wd33c93a {
         state.irq_fifo.clear();
         state.xfer_data.clear();
         state.xfer_offset = 0;
+        state.pending_cdb.clear();
         state.regs[regs::COMMAND_PHASE as usize] = command_phase::DISCONNECTED;
         state.set_asr(asr::INT);
         state.target_id = 0;
@@ -1652,6 +1660,9 @@ impl Wd33c93aState {
         match cmd {
             cmd::SELECT_ATN | cmd::SELECT_ATN_XFER | cmd::SELECT | cmd::SELECT_XFER => {
                 self.target_id = (self.regs[regs::DESTINATION_ID as usize] & 0x7) as usize;
+                // A fresh selection abandons any write whose data never arrived,
+                // so its CDB must not survive into the new command.
+                self.pending_cdb.clear();
             }
             _ => {}
         }
@@ -1676,6 +1687,7 @@ impl Wd33c93aState {
             self.pending_command = None;
             self.xfer_data.clear();
             self.xfer_offset = 0;
+            self.pending_cdb.clear();
 
             // Registers 0x01 through 0x16 are reset to zero.
             for i in 0x01..=0x16 {
@@ -1834,13 +1846,29 @@ impl Wd33c93aState {
                         let _msg = self.receive_data(count, dma);
                         self.queue_interrupt(Some(command_phase::IDENTIFY_SENT), scsi_status::REQ_CMD_PHASE);
                     }
+                    // The driver's TRANSFER_INFO after we raised TRANSFER_DATA_OUT
+                    // is the data-out transfer for the CDB we are holding, so the
+                    // bytes behind it are write data and must not be read as a new
+                    // CDB. `process_scsi_command` pulls them itself, using the
+                    // transfer count the driver has just programmed.
+                    //
+                    // Reading them as a CDB is how a NetBSD `disklabel -w` used to
+                    // fail: the 512-byte data-out of the WRITE(6) was decoded as a
+                    // command, its first byte (0x0b, from the SGI volume header
+                    // magic 0x0be5a941) as an opcode and its second (0xe5) as a
+                    // LUN, so the disk answered CHECK CONDITION / LUN NOT SUPPORTED
+                    // and the label was never written.
+                    command_phase::COMMAND_START if !self.pending_cdb.is_empty() => {
+                        let cdb = std::mem::take(&mut self.pending_cdb);
+                        dlog!(self.log_module(), "WD33C93A({}): DATA OUT phase for CDB 0x{:02x}, tc={}", self.id, cdb[0], self.get_transfer_count());
+                        self.process_scsi_command(&cdb, false, dma);
+                    }
                     command_phase::IDENTIFY_SENT | command_phase::COMMAND_START => {
                         // IDENTIFY_SENT (0x20): MESG_OUT done, now in CMD phase.
-                        // COMMAND_START (0x30): re-issued TRANSFER_INFO for write CDB.
-                        // In both cases: read CDB bytes via receive_data() (DMA or PIO fifo),
-                        // store into CDB registers, then execute.
-                        // Write commands raise TRANSFER_DATA_OUT first; re-issue lands here
-                        // with TC=0 and executes from registers (no receive_data needed).
+                        // COMMAND_START (0x30): the driver re-issued TRANSFER_INFO
+                        // without us holding a CDB — still a command transfer.
+                        // Read CDB bytes via receive_data() (DMA or PIO fifo), then
+                        // either execute, or park the CDB and ask for its data.
                         // PIO: TC was decremented to 0 by DATA writes; use fifo.len().
                         // DMA: TC holds the byte count set by driver; use it.
                         let count = if self.use_dma() {
@@ -1860,6 +1888,10 @@ impl Wd33c93aState {
                             scsi_cmd::MODE_SELECT_6 | scsi_cmd::FORMAT_UNIT | scsi_cmd::SEND_DIAGNOSTIC);
                         if is_write && count > 0 {
                             // First pass: driver needs to arm DMA/PIO for write data.
+                            // Hold the CDB — the next TRANSFER_INFO carries the data,
+                            // and without this the CDB would be lost and those data
+                            // bytes decoded as a command.
+                            self.pending_cdb = cdb_bytes;
                             self.queue_interrupt(Some(command_phase::COMMAND_START), scsi_status::TRANSFER_DATA_OUT);
                         } else {
                             self.process_scsi_command(&cdb_bytes, false, dma);
@@ -2488,5 +2520,98 @@ mod pio_direction_tests {
              xfer_direction_in as data-in mode and drops outbound bytes"
         );
         assert_eq!(s.fifo[0], 0x12, "first CDB byte is the INQUIRY opcode");
+    }
+}
+
+#[cfg(test)]
+mod data_out_phase_tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    /// A DMA channel holding exactly the bytes the host would feed the chip,
+    /// so a `receive_data*` call sees them in order and then runs dry.
+    struct FedDma(Mutex<VecDeque<u8>>);
+    impl FedDma {
+        fn new(bytes: &[u8]) -> Self {
+            Self(Mutex::new(bytes.iter().copied().collect()))
+        }
+    }
+    impl DmaClient for FedDma {
+        fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
+            self.0.lock().pop_front().map(|b| (b as u32, DmaStatus::ok(), None))
+        }
+        fn write(&self, _val: u32, _eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
+            (DmaStatus::ok(), None)
+        }
+    }
+
+    /// A chip mid-command: IDENTIFY sent, DMA selected, one disk at target 2 —
+    /// the state NetBSD's `wd33c93` driver is in when it hands over a CDB.
+    fn chip_in_command_phase_with_a_disk() -> (Wd33c93a, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("iris-wd33c93a-dataout-{}.img", std::process::id()));
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true)
+            .open(&path).expect("temp disk");
+        file.set_len(1 << 20).expect("size temp disk");
+        let dev = Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)));
+        {
+            let mut s = dev.state.lock();
+            s.devices[2] = Some(ScsiDevice::new(
+                scsi::DiskBackend::Direct(file), 1 << 20, false, path.display().to_string(), Vec::new()));
+            s.advanced_mode = true;
+            s.target_id = 2;
+            s.regs[regs::DESTINATION_ID as usize] = 2;
+            s.regs[regs::CONTROL as usize] = 0x20; // DMA mode
+            s.regs[regs::COMMAND_PHASE as usize] = command_phase::IDENTIFY_SENT;
+        }
+        (dev, path)
+    }
+
+    /// The sequence in the NetBSD trace: a six-byte WRITE(6) through one
+    /// Transfer Info, then a second Transfer Info carrying the 512 data bytes.
+    /// Nothing distinguishes the two at the register level except that the chip
+    /// asked for data — so a chip that re-reads a CDB here decodes the sector
+    /// instead, and `disklabel -w` dies on the volume header's own magic.
+    #[test]
+    fn the_transfer_after_a_write_cdb_is_its_data_not_another_command() {
+        let (dev, path) = chip_in_command_phase_with_a_disk();
+
+        // WRITE(6), LBA 0, one block.
+        let cdb = FedDma::new(&[0x0a, 0x00, 0x00, 0x00, 0x01, 0x00]);
+        {
+            let mut s = dev.state.lock();
+            s.set_transfer_count(6);
+            s.process_wd_command(cmd::TRANSFER_INFO, Some(&cdb));
+            // The driver learns the phase and status by taking the interrupt,
+            // which is what moves both into their registers.
+            s.update_irq();
+            assert_eq!(
+                s.regs[regs::SCSI_STATUS as usize], scsi_status::TRANSFER_DATA_OUT,
+                "the chip must ask the driver for data-out after a write CDB",
+            );
+            assert_eq!(s.regs[regs::COMMAND_PHASE as usize], command_phase::COMMAND_START);
+        }
+
+        // An SGI volume header: first byte 0x0b is a valid-looking opcode and
+        // the second, 0xe5, a non-zero LUN field — which is what made the disk
+        // answer ILLEGAL REQUEST / LUN NOT SUPPORTED instead of writing.
+        let mut sector = vec![0u8; 512];
+        sector[..4].copy_from_slice(&[0x0b, 0xe5, 0xa9, 0x41]);
+        for (i, b) in sector.iter_mut().enumerate().skip(4) {
+            *b = (i % 251) as u8;
+        }
+        let data = FedDma::new(&sector);
+        {
+            let mut s = dev.state.lock();
+            s.set_transfer_count(512);
+            s.process_wd_command(cmd::TRANSFER_INFO, Some(&data));
+            assert_eq!(s.pending_status, 0x00, "the WRITE(6) should have succeeded");
+        }
+
+        let mut written = vec![0u8; 512];
+        let mut f = std::fs::File::open(&path).expect("reopen temp disk");
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_exact(&mut written).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written, sector, "the sector never reached the disk");
     }
 }
