@@ -42,6 +42,10 @@ is easiest to understand by reading the commit.
   and Count/IP7 frequency inference are gone; a constant rate proved more stable.
   IRIX reports it as a 66 MHz CPU. `[clock] fixed_mhz` / `--clock-fixed-mhz`
   override it.
+- **Guest clock offset** (`[rtc_offset]`, iris-gui General → Real-time clock).
+  Start the DS1386 RTC shifted from host time by signed years, months, days,
+  hours, minutes and seconds, e.g. `years = -18`. Applied only when the RTC is
+  seeded from the host at startup; clamped to the chip's 1970–2039 range.
 - IP7 delivery improved for Linux guests' timer checks and calibration.
 - Misaligned-fetch exception, and Config.K0 cache modes including the reserved
   ones (`rules/irix/cache-attributes-and-fetch-alignment.md`).

@@ -6,7 +6,7 @@ use std::io::Write as IoWrite;
 use crate::devlog::{LogModule, devlog_mask};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
-use crate::config::{AudioConfig, NetworkConfig};
+use crate::config::{AudioConfig, NetworkConfig, RtcOffset};
 use crate::eeprom_93c56::Eeprom93c56;
 use crate::ioc::Ioc;
 use crate::ds1x86::Ds1x86;
@@ -1045,14 +1045,15 @@ pub struct Hpc3 {
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, AudioConfig::default(), "nvram.bin".to_string(), true)
+        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, AudioConfig::default(), "nvram.bin".to_string(), RtcOffset::default(), true)
     }
 
     /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
     /// `--headless`, which can't run audio in CI).
     /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
-    /// target for `iris-ci rtc-save`).
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, scsi_deferred_int: bool) -> Self {
+    /// target for `iris-ci rtc-save`); `rtc_offset` shifts the RTC's
+    /// host-time seed (`[rtc_offset]`).
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, rtc_offset: RtcOffset, scsi_deferred_int: bool) -> Self {
         let nfs = net.nfs;
         let port_forwards = net.port_forward;
         let subnet = net.nat_subnet.unwrap_or_default();
@@ -1060,7 +1061,7 @@ impl Hpc3 {
         let pcap_interface = net.pcap_interface;
         let nfs_pcap_ip = net.nfs_pcap_ip;
         let tftp_dir = net.tftp_dir.clone();
-        let rtc = Arc::new(Ds1x86::new(8192, nvram_path));
+        let rtc = Arc::new(Ds1x86::new(8192, nvram_path, rtc_offset));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
         let state = Arc::new(Mutex::new(Hpc3State {
@@ -2233,6 +2234,7 @@ mod tests {
             AudioConfig::default(),
             // Empty path: nothing on disk to load, and nothing written back.
             String::new(),
+            RtcOffset::default(),
             true,
         )
     }

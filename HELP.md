@@ -441,6 +441,11 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 [clock]
 # fixed_mhz = 33            # CP0 Count rate in MHz (default 33, IRIX shows 66 MHz)
 
+# [rtc_offset]              # guest clock start, relative to host time (all signed)
+# years   = -18             # years/months step the calendar (Mar 31 -1 month = Feb 28/29)
+# days    = -2              # days/hours/minutes/seconds add as plain time
+# hours   = +3
+
 # ── SCSI ─────────────────────────────────────────────────────────────────────
 
 # Valid IDs: 1–7. For a hard disk, set cdrom = false.
@@ -803,7 +808,7 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `pdma dump <on\|off\|hal\|scsi\|enet\|MASK>` | PDMA trace **[DEV]** |
 | `pdma chain <addr>` | Decode DMA descriptor chain at physical address |
 | `ioc status` | IOC interrupt controller state |
-| `rtc status` / `rtc dump` | Real-time clock registers / NVRAM dump |
+| `rtc status` / `rtc dump` | Real-time clock registers (and any `[rtc_offset]`) / NVRAM dump |
 | `rtc save [file]` | Save RTC NVRAM to file |
 | `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |

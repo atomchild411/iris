@@ -636,6 +636,134 @@ impl Default for ClockConfig {
     }
 }
 
+/// Earliest time the DS1386 can hold: 1970-01-01 00:00:00 UTC. The emulated
+/// chip counts centiseconds since the Unix epoch, so it cannot go below this.
+pub const RTC_MIN_UNIX: i64 = 0;
+/// Latest time the DS1386 can hold: 2039-12-31 23:59:59 UTC. The year register
+/// is two BCD digits read as 1940 + n, and years before 1970 are unusable
+/// (see `RTC_MIN_UNIX`), so 2039 is the last year that round-trips.
+pub const RTC_MAX_UNIX: i64 = 2_208_988_799;
+
+fn is_zero_i64(v: &i64) -> bool { *v == 0 }
+
+/// `[rtc_offset]` section — where the guest's real-time clock starts,
+/// relative to the host's current time. Every field is a signed amount, so
+/// `years = -18` alone sets the clock back 18 years to the day.
+///
+/// Applied once, when the RTC is seeded from the host clock at startup; the
+/// clock then runs forward normally. Snapshots keep the time they were saved
+/// with, and IRIX setting the time itself still works as usual.
+///
+/// Years and months are calendar steps (applied first, day clamped to the
+/// target month, so Mar 31 − 1 month is Feb 28/29). Days, hours, minutes and
+/// seconds are then added as a plain duration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RtcOffset {
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub years: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub months: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub days: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub hours: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub minutes: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub seconds: i64,
+}
+
+impl RtcOffset {
+    pub fn is_zero(&self) -> bool { *self == Self::default() }
+
+    /// Shift a host Unix time (seconds, UTC) by this offset. Not clamped to
+    /// what the RTC can hold; see [`RtcOffset::apply_clamped`].
+    pub fn apply(&self, unix_secs: i64) -> i64 {
+        let days = unix_secs.div_euclid(86_400);
+        let secs_of_day = unix_secs.rem_euclid(86_400);
+        let (y, m, d) = civil_from_days(days);
+
+        // Calendar step. Clamp the year to something the day arithmetic can't
+        // overflow on; anything that far out is clamped to the RTC range anyway.
+        let total_months = (y * 12 + (m - 1))
+            .saturating_add(self.years.saturating_mul(12))
+            .saturating_add(self.months)
+            .clamp(0, 10_000 * 12);
+        let (y, m) = (total_months / 12, total_months % 12 + 1);
+        let d = d.min(days_in_month(y, m));
+
+        (days_from_civil(y, m, d) * 86_400 + secs_of_day)
+            .saturating_add(self.days.saturating_mul(86_400))
+            .saturating_add(self.hours.saturating_mul(3_600))
+            .saturating_add(self.minutes.saturating_mul(60))
+            .saturating_add(self.seconds)
+    }
+
+    /// [`RtcOffset::apply`], clamped to what the DS1386 can represent. The
+    /// bool is true when clamping changed the result.
+    pub fn apply_clamped(&self, unix_secs: i64) -> (i64, bool) {
+        let t = self.apply(unix_secs);
+        let c = t.clamp(RTC_MIN_UNIX, RTC_MAX_UNIX);
+        (c, c != t)
+    }
+
+    /// Compact form for logs, e.g. `-3y -4mo -2d -13h -4m -27s`; `+0` if zero.
+    pub fn describe(&self) -> String {
+        let parts: Vec<String> = [
+            (self.years, "y"), (self.months, "mo"), (self.days, "d"),
+            (self.hours, "h"), (self.minutes, "m"), (self.seconds, "s"),
+        ]
+        .iter()
+        .filter(|(v, _)| *v != 0)
+        .map(|(v, unit)| format!("{:+}{}", v, unit))
+        .collect();
+        if parts.is_empty() { "+0".to_string() } else { parts.join(" ") }
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS` for a Unix time in seconds (UTC).
+pub fn format_unix_utc(unix_secs: i64) -> String {
+    let (y, m, d) = civil_from_days(unix_secs.div_euclid(86_400));
+    let s = unix_secs.rem_euclid(86_400);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, s / 3600, s / 60 % 60, s % 60)
+}
+
+fn is_leap_year(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        2 if is_leap_year(y) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+// Proleptic Gregorian date <-> days since 1970-01-01 (Howard Hinnant's
+// `days_from_civil` / `civil_from_days`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+}
+
 /// Host-side performance tuning (`[perf]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -903,6 +1031,10 @@ pub struct MachineConfig {
     #[serde(default)]
     pub clock: ClockConfig,
 
+    /// Guest real-time clock offset from host time (`[rtc_offset]` section).
+    #[serde(default, skip_serializing_if = "RtcOffset::is_zero")]
+    pub rtc_offset: RtcOffset,
+
     /// N64 development board (Ultra64) — GIO slot 0 + shm IPC.
     #[cfg(feature = "ultra64")]
     #[serde(default)]
@@ -1014,6 +1146,7 @@ impl Default for MachineConfig {
             jitv2: Jitv2Config::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
+            rtc_offset: RtcOffset::default(),
             #[cfg(feature = "ultra64")]
             ultra64: Ultra64Config::default(),
         }
@@ -1656,5 +1789,94 @@ mod export_tests {
         cfg.validate().expect("indigo2_ip22 should validate on default build");
         assert!(cfg.machine.profile.supported());
         assert!(!cfg.machine.profile.guinness());
+    }
+}
+
+#[cfg(test)]
+mod rtc_offset_tests {
+    use super::*;
+
+    /// Unix time for a UTC date, via the same helper the offset uses.
+    fn t(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
+        days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s
+    }
+
+    #[test]
+    fn civil_round_trip_and_known_epochs() {
+        assert_eq!(t(1970, 1, 1, 0, 0, 0), 0);
+        assert_eq!(t(2000, 3, 1, 0, 0, 0), 951_868_800);
+        assert_eq!(t(2039, 12, 31, 23, 59, 59), RTC_MAX_UNIX);
+        for days in [-1_000_000i64, -1, 0, 59, 60, 11_016, 25_567, 1_000_000] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
+    }
+
+    #[test]
+    fn zero_offset_is_identity() {
+        let now = t(2026, 9, 19, 14, 22, 5);
+        assert_eq!(RtcOffset::default().apply(now), now);
+        assert!(RtcOffset::default().is_zero());
+    }
+
+    #[test]
+    fn years_back_keeps_date_and_time() {
+        let off = RtcOffset { years: -18, ..Default::default() };
+        assert_eq!(off.apply(t(2026, 9, 19, 14, 22, 5)), t(2008, 9, 19, 14, 22, 5));
+    }
+
+    #[test]
+    fn mixed_offset() {
+        let off = RtcOffset { years: -3, months: -4, days: -2, hours: -13, minutes: -4, seconds: -27 };
+        // 2026-09-19 14:22:05 → 2023-05-19 14:22:05 → minus 2d 13:04:27
+        assert_eq!(off.apply(t(2026, 9, 19, 14, 22, 5)), t(2023, 5, 17, 1, 17, 38));
+        assert_eq!(off.describe(), "-3y -4mo -2d -13h -4m -27s");
+    }
+
+    #[test]
+    fn month_step_clamps_day() {
+        let back1 = RtcOffset { months: -1, ..Default::default() };
+        assert_eq!(back1.apply(t(2024, 3, 31, 12, 0, 0)), t(2024, 2, 29, 12, 0, 0));
+        assert_eq!(back1.apply(t(2023, 3, 31, 12, 0, 0)), t(2023, 2, 28, 12, 0, 0));
+        let fwd1y = RtcOffset { years: 1, ..Default::default() };
+        assert_eq!(fwd1y.apply(t(2024, 2, 29, 0, 0, 0)), t(2025, 2, 28, 0, 0, 0));
+        // Months roll the year in both directions.
+        let m = RtcOffset { months: 5, ..Default::default() };
+        assert_eq!(m.apply(t(2026, 9, 19, 0, 0, 0)), t(2027, 2, 19, 0, 0, 0));
+        let m = RtcOffset { months: -10, ..Default::default() };
+        assert_eq!(m.apply(t(2026, 9, 19, 0, 0, 0)), t(2025, 11, 19, 0, 0, 0));
+    }
+
+    #[test]
+    fn positive_small_units_carry() {
+        let off = RtcOffset { hours: 30, minutes: 90, seconds: 3_700, ..Default::default() };
+        assert_eq!(off.apply(t(2026, 12, 31, 20, 0, 0)), t(2027, 1, 2, 4, 31, 40));
+    }
+
+    #[test]
+    fn clamped_to_rtc_range() {
+        let now = t(2026, 9, 19, 0, 0, 0);
+        let (v, c) = RtcOffset { years: 20, ..Default::default() }.apply_clamped(now);
+        assert_eq!((v, c), (RTC_MAX_UNIX, true));
+        let (v, c) = RtcOffset { years: -60, ..Default::default() }.apply_clamped(now);
+        assert_eq!((v, c), (RTC_MIN_UNIX, true));
+        // Absurd values saturate instead of overflowing.
+        let (v, c) = RtcOffset { years: i64::MAX, seconds: i64::MIN, ..Default::default() }.apply_clamped(now);
+        assert!(c && (RTC_MIN_UNIX..=RTC_MAX_UNIX).contains(&v));
+        let (_, c) = RtcOffset { years: -18, ..Default::default() }.apply_clamped(now);
+        assert!(!c);
+    }
+
+    #[test]
+    fn toml_section_parses_and_omits_when_zero() {
+        let cfg: MachineConfig = toml::from_str("[rtc_offset]\nyears = -18\nhours = +2\n").unwrap();
+        assert_eq!(cfg.rtc_offset, RtcOffset { years: -18, hours: 2, ..Default::default() });
+        let out = toml::to_string(&MachineConfig::default()).unwrap();
+        assert!(!out.contains("rtc_offset"));
+        assert!(toml::from_str::<MachineConfig>("[rtc_offset]\nyear = 1\n").is_err());
+        let mut cfg = MachineConfig::default();
+        cfg.rtc_offset = RtcOffset { years: -3, seconds: 27, ..Default::default() };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert_eq!(toml::from_str::<MachineConfig>(&text).unwrap().rtc_offset, cfg.rtc_offset);
     }
 }

@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, u8_slice_to_toml, load_u8_slice};
+use crate::config::{format_unix_utc, RtcOffset};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::fs::File;
 use std::io::{Read, Write as IoWrite};
@@ -37,10 +38,13 @@ pub struct Ds1x86 {
     /// `MachineConfig::nvram` so different toml configs can use
     /// independent NVRAM files.
     nvram_path: String,
+    /// Shift applied to host time whenever the clock is seeded from it
+    /// (`[rtc_offset]`). Only the seed moves; the clock then runs normally.
+    offset: RtcOffset,
 }
 
 impl Ds1x86 {
-    pub fn new(size: usize, nvram_path: String) -> Self {
+    pub fn new(size: usize, nvram_path: String, offset: RtcOffset) -> Self {
         // DS1286: 64 bytes, regs at 0
         // DS1386: 8K/32K, regs at 0 (first 16 bytes)
         let rtc = Self {
@@ -51,7 +55,17 @@ impl Ds1x86 {
             }),
             size,
             nvram_path,
+            offset,
         };
+
+        if !offset.is_zero() {
+            let host = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let (guest, clamped) = offset.apply_clamped(host);
+            eprintln!("RTC: clock offset {} from host time; guest clock starts at {} UTC", offset.describe(), format_unix_utc(guest));
+            if clamped {
+                eprintln!("RTC: warning: offset lands outside what the DS1386 can hold (1970-2039); clamped");
+            }
+        }
 
         // Initialize with current time
         let mut data = rtc.data.lock();
@@ -172,10 +186,11 @@ impl Ds1x86 {
         ((days * 24 + hours) * 60 + minutes) * 60 * 100 + seconds * 100 + centiseconds
     }
 
-    // Set registers to current system time
+    // Set registers to current system time, shifted by the configured offset
     fn set_current_time(&self, regs: &mut [u8]) {
         if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
-            let centiseconds = duration.as_secs() * 100 + (duration.subsec_nanos() / 10_000_000) as u64;
+            let (secs, _) = self.offset.apply_clamped(duration.as_secs() as i64);
+            let centiseconds = secs as u64 * 100 + (duration.subsec_nanos() / 10_000_000) as u64;
             self.centiseconds_to_regs(centiseconds, regs, 0);
         }
     }
@@ -338,6 +353,9 @@ impl Device for Ds1x86 {
                         self.update_time(&mut data);
                     }
                     writeln!(writer, "RTC Status:").unwrap();
+                    if !self.offset.is_zero() {
+                        writeln!(writer, "  Offset from host at startup: {}", self.offset.describe()).unwrap();
+                    }
                     writeln!(writer, "  Time: {:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:02}",
                         Self::from_bcd(data.regs[0x0A]) as u16 + 1940, Self::from_bcd(data.regs[0x09] & 0x1f), Self::from_bcd(data.regs[0x08]),
                         Self::from_bcd(data.regs[0x04]), Self::from_bcd(data.regs[0x02]), Self::from_bcd(data.regs[0x01]), Self::from_bcd(data.regs[0x00])).unwrap();
@@ -480,7 +498,7 @@ mod tests {
     /// into regs when TE is set, so we clear TE first to make the test stable.
     #[test]
     fn save_load_round_trip() {
-        let src = Ds1x86::new(8192, "nvram.bin".to_string());
+        let src = Ds1x86::new(8192, "nvram.bin".to_string(), RtcOffset::default());
         // Disable transfer-enable so save_state doesn't tick the clock between
         // calls; mutate a few NVRAM bytes outside the time-keeping registers.
         {
@@ -492,7 +510,7 @@ mod tests {
         }
         let v1 = src.save_state();
 
-        let dst = Ds1x86::new(8192, "nvram.bin".to_string());
+        let dst = Ds1x86::new(8192, "nvram.bin".to_string(), RtcOffset::default());
         dst.load_state(&v1).expect("load_state");
         // Same: clear TE on dst before re-serializing so its save_state path
         // matches src's behavior. (load_state preserves the TE bit from v1, so
@@ -506,13 +524,26 @@ mod tests {
         assert_eq!(v1, v2, "Ds1x86 save_state mismatch after load_state round-trip");
     }
 
+    /// `[rtc_offset]` moves the host-time seed: the time registers must read
+    /// back as the offset date, not the host's.
+    #[test]
+    fn offset_shifts_seeded_time() {
+        let off = RtcOffset { years: -18, days: -3, ..Default::default() };
+        let rtc = Ds1x86::new(8192, "test_rtc_offset_missing.bin".to_string(), off);
+        let host = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let want = off.apply(host);
+        let d = rtc.data.lock();
+        let got = rtc.regs_to_centiseconds(&d.regs, 0) as i64 / 100;
+        assert!((got - want).abs() <= 2, "RTC seeded {} want {}", format_unix_utc(got), format_unix_utc(want));
+    }
+
     /// The MAC backdoor must land on the exact bytes SGI's documented
     /// `fill -w -v 0xbfbe04e8 ...` RTC-recovery procedure pokes: physical
     /// 0x1fbe04e8..0x1fbe04fc, i.e. HPC3 PBUS_BBRAM offset 0x4e8, byte_index
     /// 0x4e8>>2 = 0x13a = 314 (see hpc3.rs's PBUS_BBRAM sparse-packing decode).
     #[test]
     fn backdoor_mac_offset_matches_prom_fill_addresses() {
-        let rtc = Ds1x86::new(8192, "test_backdoor_mac_offset.bin".to_string());
+        let rtc = Ds1x86::new(8192, "test_backdoor_mac_offset.bin".to_string(), RtcOffset::default());
         let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
         assert!(rtc.backdoor_set_mac_if_blank(mac));
         let regs = &rtc.data.lock().regs;
@@ -521,7 +552,7 @@ mod tests {
 
     #[test]
     fn backdoor_mac_does_not_clobber_existing_eaddr() {
-        let rtc = Ds1x86::new(8192, "test_backdoor_mac_no_clobber.bin".to_string());
+        let rtc = Ds1x86::new(8192, "test_backdoor_mac_no_clobber.bin".to_string(), RtcOffset::default());
         let guest_mac = [0x08, 0x00, 0x69, 0xde, 0xad, 0x01];
         rtc.data.lock().regs[MAC_REGS_OFFSET..MAC_REGS_OFFSET + 6].copy_from_slice(&guest_mac);
 

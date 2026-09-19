@@ -229,6 +229,17 @@ mode           = "nat"
 #[clock]
 #fixed_mhz = 33
 
+# Start the guest's real-time clock offset from the host's current time. Every
+# field is optional and signed (-n or +n). Years/months step the calendar, the
+# rest add as time. Applied once at startup; the RTC holds 1970-2039.
+#[rtc_offset]
+#years   = -18
+#months  = -4
+#days    = -2
+#hours   = -13
+#minutes = -4
+#seconds = -27
+
 # HAL2 audio output buffering.
 #[audio]
 #prebuf_ms          = 20

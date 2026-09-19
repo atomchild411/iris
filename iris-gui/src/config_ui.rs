@@ -2,9 +2,9 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, U
 use iris::build_features;
 use std::path::Path;
 use iris::config::{
-    CpuModel, ForwardBind, ForwardProto, GraphicsBoard, MachineConfig, MachineProfile, NetMode,
-    NfsConfig, PortForwardConfig, ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard,
-    VALID_BANK_SIZES,
+    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, MachineConfig,
+    MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset, ScsiDeviceConfig, ScsiKind,
+    VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
 use iris::nfsudp::NfsVersion;
 use iris::vc2_timings::NewportResolution;
@@ -330,6 +330,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         ui.end_row();
     });
 
+    show_rtc_offset(ui, &mut cfg.rtc_offset, mem_ctx.running);
+
     // N64 development board (Ultra64). A single runtime toggle — the GIO device
     // and POSIX shm bridge (/iris_n64_bridge) are only created when this is on,
     // read once at VM start. The toggle exists only in builds that carry the
@@ -361,6 +363,68 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     }
 
     action
+}
+
+/// `[rtc_offset]`: six signed fields, shown and typed as `-n` / `+n`, with a
+/// live preview of where the guest clock would start right now.
+fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
+    ui.separator();
+    ui.heading("Real-time clock");
+    ui.label(
+        RichText::new(
+            "Start the guest clock offset from the host's current time. Type -n or +n in any \
+             field (e.g. Years -18). Years and months step the calendar; the rest add up as time.",
+        )
+        .weak()
+        .small(),
+    );
+
+    fn signed(ui: &mut Ui, v: &mut i64) {
+        ui.add(
+            DragValue::new(v)
+                .speed(0.1)
+                .custom_formatter(|n, _| format!("{:+}", n as i64))
+                .custom_parser(|s| s.trim().parse::<i64>().ok().map(|n| n as f64)),
+        );
+    }
+    Grid::new("rtc_offset_grid").num_columns(6).show(ui, |ui| {
+        ui.label("Years");   signed(ui, &mut off.years);
+        ui.label("Months");  signed(ui, &mut off.months);
+        ui.label("Days");    signed(ui, &mut off.days);
+        ui.end_row();
+        ui.label("Hours");   signed(ui, &mut off.hours);
+        ui.label("Minutes"); signed(ui, &mut off.minutes);
+        ui.label("Seconds"); signed(ui, &mut off.seconds);
+        ui.end_row();
+    });
+
+    let host = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (guest, clamped) = off.apply_clamped(host);
+    ui.horizontal(|ui| {
+        ui.label(format!("Guest clock would start at {} UTC", format_unix_utc(guest)));
+        if ui.add_enabled(!off.is_zero(), egui::Button::new("Reset")).clicked() {
+            *off = RtcOffset::default();
+        }
+    });
+    if clamped {
+        ui.label(
+            RichText::new("Outside what the RTC chip can hold (1970–2039); the clock will be clamped.")
+                .color(Color32::from_rgb(220, 170, 90)),
+        );
+    }
+    ui.label(
+        RichText::new(if running {
+            "The running guest keeps its clock; this applies at the next Start. \
+             Restored snapshots keep the time they were saved with."
+        } else {
+            "Applied at next Start. Restored snapshots keep the time they were saved with."
+        })
+        .weak()
+        .small(),
+    );
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
