@@ -225,6 +225,10 @@ fn check_testdev_slot_free(#[cfg(feature = "ultra64")] ultra64_present: bool) {
 
 impl Machine {
     pub fn new(cfg: MachineConfig) -> Self {
+        // Host calls (iris-hostcall): the self-test service is always there
+        // when the feature is built in, so a guest can prove the trap works.
+        #[cfg(feature = "hostcall")]
+        iris_hostcall::register(iris_hostcall::SELFTEST, Box::new(iris_hostcall::SelfTest));
         Self::new_with_testdev(cfg, None)
     }
 

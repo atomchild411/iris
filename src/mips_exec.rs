@@ -5353,7 +5353,39 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.write_gpr(rd_reg, self.core.pc + 8);
         self.branch_delay(target)
     }
+    /// Answer a host call (system calls 3000-3009, see iris-hostcall) if this
+    /// `syscall` is one and a service is registered for it. Only from user
+    /// mode and outside a delay slot; anything else goes to IRIX as usual.
+    #[cfg(feature = "hostcall")]
+    fn host_call(&mut self) -> Option<ExecStatus> {
+        if self.core.get_privilege_mode() != PrivilegeMode::User || self.core.in_delay_slot {
+            return None;
+        }
+        let v0 = self.core.read_gpr(2);
+        let n = v0 as u32;
+        if !(iris_hostcall::FIRST..=iris_hostcall::LAST).contains(&n) && n != iris_hostcall::SYS_SYSCALL {
+            return None;
+        }
+        let mut regs = [0u64; 8];
+        for (i, r) in regs.iter_mut().enumerate() {
+            *r = self.core.read_gpr(4 + i as u32);
+        }
+        let (number, args) = iris_hostcall::decode(v0, &regs)?;
+        let reply = iris_hostcall::dispatch(number, &mut HostMemory { exec: self }, &args)?;
+        let (rv0, rv1, ra3) = iris_hostcall::registers(reply);
+        self.core.write_gpr(2, rv0);
+        self.core.write_gpr(3, rv1);
+        self.core.write_gpr(7, ra3);
+        Some(self.handle_exec_complete())
+    }
+
     fn exec_syscall(&mut self, _d: &DecodedInstr) -> ExecStatus {
+        // A host call (iris-hostcall) is answered here and never becomes an
+        // exception: the program resumes at the next instruction.
+        #[cfg(feature = "hostcall")]
+        if let Some(status) = self.host_call() {
+            return status;
+        }
         // Compile-worthy on entry too, symmetric with exec_eret's
         // syscall_pending-gated trigger on return — see MipsCore's own doc
         // comment on that field for why neither can rely on the general
@@ -14558,6 +14590,73 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
         self.stop_state.get()
     }
 }
+
+
+/// A host call's view of the calling program's memory, a page at a time: its
+/// virtual addresses, translated through the TLB under the current
+/// address-space id with the access actually needed, and no CPU state touched.
+/// A page that would fault -- no TLB entry, invalid, or not dirty for a write
+/// -- is reported for the caller to fault in (see `iris_hostcall`).
+#[cfg(feature = "hostcall")]
+struct HostMemory<'a, T: Tlb, C: CpuModel> {
+    exec: &'a mut MipsExecutor<T, C>,
+}
+
+#[cfg(feature = "hostcall")]
+impl<T: Tlb, C: CpuModel> HostMemory<'_, T, C> {
+    /// Sign-extend like a 32-bit register holds an address.
+    fn canon(addr: u64) -> u64 {
+        addr as u32 as i32 as i64 as u64
+    }
+
+    /// Can the program itself make this access to `page`? User addresses only
+    /// -- DEBUG translation runs with kernel privilege, so this range check is
+    /// what keeps a program from handing us a kernel address -- and the TLB
+    /// entry must be there, valid, and dirty for a write.
+    fn usable(&mut self, page: u64, write: bool) -> Result<(), iris_hostcall::Fault> {
+        let fault = iris_hostcall::Fault { page, write };
+        if page >= 0x8000_0000 {
+            return Err(fault);
+        }
+        let access = if write { AccessType::Write } else { AccessType::Read };
+        if self.exec.translate_impl::<true>(Self::canon(page), access).is_exception() {
+            return Err(fault);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "hostcall")]
+impl<T: Tlb, C: CpuModel> iris_hostcall::PageAccess for HostMemory<'_, T, C> {
+    fn space(&self) -> u64 {
+        self.exec.core.cp0_entryhi & 0xFF
+    }
+
+    fn read_page(&mut self, page: u64, buf: &mut [u8; iris_hostcall::PAGE as usize]) -> Result<(), iris_hostcall::Fault> {
+        self.usable(page, false)?;
+        for (i, chunk) in buf.chunks_exact_mut(8).enumerate() {
+            let v = self.exec.read_data_impl::<true, 8>(Self::canon(page + (i as u64) * 8))
+                .map_err(|_| iris_hostcall::Fault { page, write: false })?;
+            // The host buffer is guest bytes: this is the edge where a guest
+            // word becomes bytes in guest (big-endian) order.
+            chunk.copy_from_slice(&v.to_be_bytes());
+        }
+        Ok(())
+    }
+
+    fn write_in_page(&mut self, addr: u64, data: &[u8]) -> Result<(), iris_hostcall::Fault> {
+        let page = addr & !(iris_hostcall::PAGE - 1);
+        debug_assert!(addr + data.len() as u64 <= page + iris_hostcall::PAGE);
+        self.usable(page, true)?;
+        for (i, &b) in data.iter().enumerate() {
+            if self.exec.write_data_impl::<true, 1>(Self::canon(addr + i as u64), b as u64) != EXEC_COMPLETE {
+                return Err(iris_hostcall::Fault { page, write: true });
+            }
+        }
+        Ok(())
+    }
+}
+
 
 #[cfg(test)]
 mod round_to_int_mode_tests {

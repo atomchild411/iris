@@ -1,5 +1,5 @@
 [workspace]
-members = ["iris-gui"]
+members = ["iris-gui", "iris-hostcall"]
 
 [package]
 name = "iris"
@@ -256,6 +256,14 @@ ultra64 = ["dep:shared_memory", "dep:raw_sync"]
 # it at runtime with `kind = "daynaport"` in an `[scsi.N]` section.
 daynaport = []
 
+# Host services for IRIX programs, reached through the private system calls
+# 3000-3009 (iris-hostcall/): the trap in `exec_syscall` and the self-test
+# service. The trap answers only user-mode `syscall`s outside a delay slot,
+# and only for a number a service is registered for; everything else goes to
+# IRIX untouched. Off by default -- a guest that never issues one cannot tell
+# the difference.
+hostcall = ["dep:iris-hostcall"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
@@ -296,6 +304,8 @@ libchdman-rs = { version = "0.289", features = ["prebuilt"], optional = true }
 pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12", optional = true }
 raw_sync      = { version = "0.1",  optional = true }
+iris-hostcall = { path = "iris-hostcall", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }
 
