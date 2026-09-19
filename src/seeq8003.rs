@@ -753,6 +753,7 @@ impl Device for Seeq8003 {
                         writeln!(w, "Gateway IP  : {}", self.config.gateway_ip).ok();
                         writeln!(w, "Client IP   : {}", self.config.client_ip).ok();
                         writeln!(w, "Netmask     : {}", self.config.netmask).ok();
+                        writeln!(w, "intpend={}", st.intpend).ok();
                         writeln!(w, "rx_cmd={:#04x} rx_stat={:#04x} tx_cmd={:#04x} tx_stat={:#04x}",
                                  st.rx_cmd, st.rx_stat, st.tx_cmd, st.tx_stat).ok();
                         writeln!(w, "threads: {}", if self.is_running() { "running" } else { "stopped" }).ok();
