@@ -1769,7 +1769,7 @@ impl NatEngine {
 
         match dport {
             UDP_PORT_BOOTP_SERVER => self.handle_bootp(src_mac, sport, payload),
-            UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, sport, payload),
+            UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, dst_ip, sport, payload),
             UDP_PORT_PORTMAP if self.config.nfs.is_some()
                               => self.handle_portmap_udp(src_mac, src_ip, sport, payload),
             NFS_VM_PORT | MOUNTD_VM_PORT if self.nfs.is_some() && dst_ip == self.config.gateway_ip
@@ -1903,17 +1903,24 @@ impl NatEngine {
     }
 
     // ── DNS forwarding ────────────────────────────────────────────────────────
-    fn forward_dns(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr, client_port: u16, query: &[u8]) {
-        dlog_dev!(LogModule::Net, "NAT DNS forward len={}", query.len());
+    /// `server_ip` is the resolver the guest addressed. The reply must come
+    /// back from it, not from the gateway: a resolver that checks — NetBSD's
+    /// `res_send` does, IRIX's does not — discards an answer arriving from an
+    /// address it never queried, and every lookup then fails while ping and
+    /// TCP to the same host work. We intercept port 53 to *any* destination,
+    /// so this is the only thing that keeps the interception transparent.
+    fn forward_dns(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr, server_ip: Ipv4Addr,
+                   client_port: u16, query: &[u8]) {
+        dlog_dev!(LogModule::Net, "NAT DNS forward len={} server={}", query.len(), server_ip);
         let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return; };
         let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
         if sock.send_to(query, self.dns_upstream()).is_err() { return; }
         let mut buf = [0u8; 512];
         if let Ok((n, _)) = sock.recv_from(&mut buf) {
-            let udp = udp_packet(self.config.gateway_ip, client_ip,
+            let udp = udp_packet(server_ip, client_ip,
                                  UDP_PORT_DNS, client_port, &buf[..n]);
             let frame = ip_frame(client_mac, &self.config.gateway_mac,
-                                 self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
+                                 server_ip, client_ip, IP_PROTO_UDP, &udp);
             self.enqueue_rx(frame);
         }
     }
@@ -2754,6 +2761,33 @@ mod dns_nat_tests {
         let frame = rx.pop().expect("guest DNS response");
         assert_eq!(r16(&frame, 36), 4321);
         assert_eq!(&frame[42..], &answer[..]);
+    }
+
+    /// DHCP hands the guest a resolver address that is not the gateway, and we
+    /// intercept the query on the way there. A resolver that checks where the
+    /// answer came from -- NetBSD's does -- drops anything not from the address
+    /// it asked, so every lookup fails while ping and TCP to the same host work.
+    #[test]
+    fn a_dns_reply_comes_back_from_the_resolver_the_guest_addressed() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let upstream = server.local_addr().unwrap();
+        let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            buf[2] |= 0x80;
+            server.send_to(&buf[..n], peer).unwrap();
+        });
+        let (mut e, mut rx) = engine(GatewayConfig { dns_upstream: Some(upstream), ..GatewayConfig::default() });
+        let client = e.config.client_ip;
+        // DNS_FALLBACK is what DHCP advertises, so it is where a guest asks.
+        e.handle_udp(&[1; 6], client, DNS_FALLBACK, &udp_packet(client, DNS_FALLBACK, 4321, 53, query));
+        responder.join().unwrap();
+        let frame = rx.pop().expect("guest DNS response");
+        assert_eq!(
+            &frame[26..30], &DNS_FALLBACK.octets(),
+            "the reply must appear to come from the resolver the guest queried",
+        );
     }
 
     #[test]
