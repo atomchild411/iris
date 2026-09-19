@@ -39,13 +39,56 @@ through IDENTIFY rather than the legacy CDB LUN field, so this chip's
 driver-specific paths are known to vary. NetBSD's is a third one we do not
 handle.
 
-## Next step
+## The CDB path, found
 
-Re-run with `IRIS_DEBUG_LOG=scsi` to confirm the "Empty CDB!" line and capture
-the register writes NetBSD makes before the command, then compare against
-`wd33c93.c`'s command issue path (`wd33c93_select` / `SEND_CMD` and the
-`SBIC_CMD_SEL_ATN_XFER` auto-transfer path). The question to answer is which
-register sequence NetBSD uses to deliver CDB bytes that we are not collecting.
+`scsi regs` from the monitor at the abort:
+
+    03-0E CDB       : 00 00 00 00 00 00  00 00 00 00 00 00
+    10 CMD_PHASE    : 00
+    15 DEST_ID      : 01
+    17 SCSI_STATUS  : 40      (SBIC_CSR_CMD_ERR -- the csr NetBSD reported)
+    18 COMMAND      : 20
+
+Command `0x20` is `SBIC_CMD_XFER_INFO` (`wd33c93reg.h:326`), the initiator
+level-II "Transfer Info". So NetBSD is **not** using `SBIC_CMD_SEL_ATN_XFER`
+(0x08), the combined select-and-transfer that reads the CDB out of registers
+0x03-0x0E. It drives the bus phase by phase and pushes CDB bytes through the
+DATA register during COMMAND phase -- which is why the CDB registers are zero.
+
+We do implement that: `wd33c93a.rs` has a PIO/DBR path for exactly this. Its
+gate is the problem:
+
+    if cmd == cmd::TRANSFER_INFO
+        && (phase == command_phase::SELECTED          // 0x10
+            || phase == command_phase::IDENTIFY_SENT  // 0x20
+            || phase == command_phase::COMMAND_START) // 0x30
+        && !state.use_dma()
+
+Those three values are IRIX's state sequence -- the comment above the block
+says so ("SELECTED (MESG_OUT), IDENTIFY_SENT (CDB after 0x8a), COMMAND_START
+(write CDB re-issue)"). The dump shows `CMD_PHASE = 0x00`
+(`command_phase::DISCONNECTED`), which is none of them, so the block is
+skipped, the command falls through to the worker, and the worker looks for a
+CDB nobody assembled.
+
+**So the CDB-over-DATA-port path exists but its phase gate is cut to IRIX's
+sequence.** NetBSD's does not match it.
+
+Caveat on the evidence: `scsi regs` was read *after* the abort, so
+`CMD_PHASE = 0x00` may be post-reset rather than the value at the moment of
+the command. Confirming that wants the phase captured at the command write --
+`log scsi on` from the monitor before booting the kernel, which enables the
+`XFER_INFO PIO deferred phase=...` line in that same block.
+
+### A false step worth recording
+
+A first attempt used `IRIS_DEBUG_LOG=scsi` and found zero "Empty CDB!" lines,
+which looked like the empty-CDB theory collapsing. It was not: `dlog!` is
+**runtime**-gated on `devlog_is_active`, and `IRIS_DEBUG_LOG` had silently
+done nothing -- `main.rs` wraps the whole thing in
+`if let Some(dl) = DEVLOG.get()`, so when the `OnceLock` is unset the variable
+is ignored without a word. Absence of a log line proves nothing until you have
+checked the logging is on. Use `log scsi on` from the monitor instead.
 
 ## Status
 
