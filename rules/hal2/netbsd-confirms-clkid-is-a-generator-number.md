@@ -62,6 +62,14 @@ compare Codec A's decoded rate against the rate NetBSD prints at attach.
 Still not established by this: the `reclock_active` mirror half of that commit,
 which remains untested. Do not describe the whole commit as proven.
 
+## Reproduced on two major releases
+
+NetBSD 11.0 (GENERIC32_IP2x, built 2026-07-30) behaves identically to 10.2:
+same `HAL2 revision 4.1.0`, same `48000Hz` announcement, same `ctrl1=0x0208`,
+and upstream still resolves it to `bres=2 rate=44100Hz`. Two independently
+maintained releases a year apart agree, so this is a property of our decode,
+not of one version's quirks.
+
 ## Aside
 
 `haltwo` attaching at all is its own result -- it reads our HAL2 as

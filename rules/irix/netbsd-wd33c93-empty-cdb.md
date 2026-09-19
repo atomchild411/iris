@@ -90,6 +90,12 @@ done nothing -- `main.rs` wraps the whole thing in
 is ignored without a word. Absence of a log line proves nothing until you have
 checked the logging is on. Use `log scsi on` from the monitor instead.
 
+## Reproduced on two major releases
+
+NetBSD 11.0 aborts at the same point with the same values -- `asr 0xc0
+csr 0x40`, `COMMAND = 0x20`, `CMD_PHASE = 0x00`, CDB registers all zero --
+and traps to `db>` exactly as 10.2 does. Not a version-specific quirk.
+
 ## Status
 
 Not yet reported upstream; it sits behind the timer bug, which is also not yet
