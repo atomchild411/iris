@@ -210,16 +210,16 @@ pub(crate) struct LiveCheckpoint {
     rex3_head1: Option<toml::Value>,
 }
 
-/// The test device and the ultra64 dev board both decode GIO expansion slot 0,
-/// so only one of them can exist. Panics rather than exiting: `Machine::new`
-/// already panics on bad input, and a host that embeds IRIS catches that
-/// (`iris-gui`'s worker wraps construction in `catch_unwind`) — killing the
-/// application over a configuration mistake is not a choice a library gets to
-/// make for its caller.
-fn check_testdev_slot_free(#[cfg(feature = "ultra64")] ultra64_present: bool) {
-    #[cfg(feature = "ultra64")]
-    if ultra64_present {
-        panic!("--test-device and the ultra64 dev board both claim GIO slot 0");
+/// Take a GIO slot for `who`, or panic naming whatever holds it.
+///
+/// Panics rather than exiting: `Machine::new` already panics on bad input, and
+/// a host that embeds IRIS catches that (`iris-gui`'s worker wraps
+/// construction in `catch_unwind`) — killing the application over a
+/// configuration mistake is not a choice a library gets to make for its
+/// caller.
+fn claim_slot(claims: &mut crate::gio::SlotClaims, slot: crate::gio::ExpansionSlot, who: &'static str) {
+    if let Err(conflict) = claims.claim(slot, who) {
+        panic!("{conflict}");
     }
 }
 
@@ -563,9 +563,19 @@ impl Machine {
             None
         };
 
+        // Who holds which GIO slot. Every expansion device claims as it is
+        // built; a second claimant is refused by name. See `crate::gio`.
+        let mut slots = crate::gio::SlotClaims::new();
+        for slot in crate::gio::ExpansionSlot::ALL {
+            if let Some(card) = crate::gio::installed(slot) {
+                claim_slot(&mut slots, slot, card.name());
+            }
+        }
+
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
         #[cfg(feature = "ultra64")]
         let ultra64: Option<Arc<crate::ultra64::Ultra64>> = if cfg.ultra64.enabled {
+            claim_slot(&mut slots, crate::gio::ExpansionSlot::Slot0, "the ultra64 dev board");
             match crate::ultra64::Ultra64::new(ioc.clone()) {
                 Ok(dev) => Some(Arc::new(dev)),
                 Err(e)  => {
@@ -596,16 +606,10 @@ impl Machine {
         // Bare-metal test device (--test-device): default off, and refused
         // alongside the ultra64 dev board, which claims the same GIO slot.
         let testdev = if let Some(dev) = testdev_override {
-            check_testdev_slot_free(
-                #[cfg(feature = "ultra64")]
-                ultra64.is_some(),
-            );
+            claim_slot(&mut slots, crate::gio::ExpansionSlot::Slot0, "--test-device");
             Some(dev)
         } else if cfg.test_device {
-            check_testdev_slot_free(
-                #[cfg(feature = "ultra64")]
-                ultra64.is_some(),
-            );
+            claim_slot(&mut slots, crate::gio::ExpansionSlot::Slot0, "--test-device");
             let path = cfg.test_device_dump.clone()
                 .unwrap_or_else(|| crate::testdev::DEFAULT_DUMP_PATH.to_string());
             eprintln!("iris: test device enabled at {:#010x}, dumps to {}",

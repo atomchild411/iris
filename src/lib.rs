@@ -239,6 +239,7 @@ pub mod registry;
 pub mod thread_affinity;
 pub mod perf_monitor;
 pub mod ci;
+pub mod gio;
 pub mod hptimer;
 pub mod hptimer_tests;
 #[cfg(feature = "idle-pause")]

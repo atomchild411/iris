@@ -262,6 +262,9 @@ pub struct Physical {
     pub ultra64: Option<Arc<Ultra64>>,
     /// Bare-metal test device (`--test-device`), in GIO expansion slot 0.
     pub testdev: Option<Arc<crate::testdev::TestDevice>>,
+    /// Cards installed from outside via `crate::gio::install`, by slot. Held
+    /// here so the pointers in `device_map` stay valid for the machine's life.
+    expansion: [Option<Arc<dyn crate::gio::ExpansionCard>>; 3],
     pub vino: Vino,
     mc: MemoryController,
     hpc3: Hpc3,
@@ -402,6 +405,11 @@ impl Physical {
             #[cfg(feature = "ultra64")]
             ultra64,
             testdev,
+            expansion: [
+                crate::gio::installed(crate::gio::ExpansionSlot::Graphics),
+                crate::gio::installed(crate::gio::ExpansionSlot::Slot0),
+                crate::gio::installed(crate::gio::ExpansionSlot::Slot1),
+            ],
             vino,
             mc,
             hpc3,
@@ -540,6 +548,17 @@ impl Physical {
             use crate::testdev::{TEST_DEV_BASE, TEST_DEV_SIZE};
             for i in (TEST_DEV_BASE >> 16)..((TEST_DEV_BASE + TEST_DEV_SIZE - 1) >> 16) + 1 {
                 self.device_map[i as usize] = td_ptr;
+            }
+        }
+
+        // Cards installed from outside (`crate::gio`). Mapped last of the GIO
+        // arms, so a built-in device in the same slot still wins -- the slot
+        // ledger is what refuses that pairing in the first place.
+        for card in self.expansion.iter().flatten() {
+            let ptr: *const dyn BusDevice = Arc::as_ptr(card) as *const dyn BusDevice;
+            let (base, size) = (card.base(), card.size());
+            for i in (base >> 16)..((base + size - 1) >> 16) + 1 {
+                self.device_map[i as usize] = ptr;
             }
         }
 
