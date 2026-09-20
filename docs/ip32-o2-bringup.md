@@ -670,6 +670,44 @@ A device model that needs its constants tuned away from the specification is
 usually telling you something about the clock, not about the device. It said
 so for three sessions and was not listened to.
 
+### What it reports about itself
+
+Taking the menu into the command monitor over the serial port:
+
+```text
+> version
+VERSION 4.18
+O2 R5K/R7K/R10K/R12K
+IRIX 6.5.x IP32prom IP32PROM-v4
+
+> hinv -v
+                   System: IP32
+                Processor: 195 Mhz R5000, with FPU
+     Primary I-cache size: 32 Kbytes
+     Primary D-cache size: 32 Kbytes
+              Memory size: 128 Mbytes
+
+> printenv
+console=g
+eaddr=08:00:69:12:34:56
+ConsoleOut=serial(0)
+ConsoleIn=serial(0)
+...
+```
+
+`eaddr` is the end-to-end proof: that address is not configured anywhere the
+PROM can see it. It was programmed into the DS2502's EPROM, and the firmware
+bit-banged it off the 1-Wire line one pulse width at a time. The bring-up test
+asserts it, along with the menu, the monitor, and the inventory, so any one of
+those devices regressing fails the test with the console attached.
+
+### Diagnostics need a disk
+
+`3) Run Diagnostics` answers `No SystemPartition set`. The IDE suite is a
+standalone program loaded from the system disk's volume header, not something
+held in the PROM, so running it needs block storage on MACE's PCI bus. That is
+the obvious next milestone and a substantial one.
+
 ### Still cosmetic
 
 - `Cannot connect to keyboard` — correct; nothing is attached, and the menu
