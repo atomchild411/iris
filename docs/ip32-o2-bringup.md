@@ -1135,7 +1135,52 @@ chosen with.
 The device now records which path a driver used rather than assuming, and the
 on-chip layout is captured for decoding.
 
-### The loader bug that gates everything else
+### The loader bug was ours: a scatter-gather list cut short
+
+**Found and fixed.** `SG_MAX` was 32 — a plausible-looking bound with nothing
+behind it. A single 264-block read scatters into **33** pages, so the walk
+stopped one entry short, dropped the tail, and reported success.
+
+The symptom was a hole. Mapping every scatter target of the `sashARCS` load:
+
+```text
+0x07f85350 +  3248 -> 0x07f86000
+0x07f86000 +  4096 -> 0x07f87000        (31 more pages...)
+0x07fa4000 +  4096 -> 0x07fa5000
+0x07fa6550 +  2736 -> 0x07fa7000   <-- GAP 5456 bytes
+```
+
+Exactly 32 entries, then a gap — and `sashARCS`'s entry point,
+`0x87fa5fa0`, sits inside it. The PROM read the whole file (438 blocks, every
+one of them), printed the right sizes and the right entry address, jumped, and
+executed whatever had been in that memory beforehand.
+
+Two instruments found it, and neither existed a day ago: session totals that
+survive a chip reset (219322 bytes read, against ~161 KB of loadable
+sections — so the file was arriving), and a DMA watch on the entry point
+(zero writes — so it was not arriving *there*). "The data is read but not
+written where it should be" is a much smaller problem than "the PROM cannot
+load files".
+
+With the bound raised:
+
+```text
+> boot -f dksc(0,1,8)sashARCS
+135632+22592+3216+341792+49040d+4528+6784 entry: 0x87fa5fa0
+Standalone Shell SGI Version 6.5 ARCS   Jan 20, 2000 (32 Bit)
+sash:
+```
+
+IRIX's standalone shell, from SGI's own install media, running on the
+emulated O2.
+
+The lesson is the ordinary one: a bound invented for safety became a silent
+data-loss bug because the operation still reported success. The bound is now
+large enough to be unreachable in practice and exists only so a corrupt list
+cannot spin forever — the real terminators are running out of data or hitting
+a null entry, and both come first in any healthy list.
+
+### The old account of the loader bug
 
 A 54 KB bootloader loads perfectly. A 340 KB `sashARCS` and an 8 MB kernel do
 not: the PROM prints correct sizes and an entry point, jumps, and executes

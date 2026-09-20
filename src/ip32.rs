@@ -3579,8 +3579,17 @@ mod bringup {
         if let Some(scsi) = bus.scsi.lock().unwrap().as_ref() {
             eprintln!("ip32: SCSI controller: {} bytes of sequencer program downloaded",
                       scsi.seqram_len());
+            let (c, bi, bo) = scsi.totals();
+            eprintln!("   {c} commands all session: {bi} bytes read, {bo} written");
+            let hits = scsi.dma_hits();
+            if !hits.is_empty() {
+                eprintln!("   {} DMA writes in the watched range, first few:", hits.len());
+                for (a, v) in hits.iter().take(8) {
+                    eprintln!("      0x{a:08x} <- 0x{v:02x}");
+                }
+            }
             eprintln!("   sequencer paused/restarted {} times", scsi.pauses());
-            for n in scsi.notes().iter().rev().take(40).rev() {
+            for n in scsi.notes().iter() {
                 eprintln!("   {n}");
             }
             let ex = scsi.executed();
