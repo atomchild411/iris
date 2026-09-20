@@ -1331,6 +1331,49 @@ the obvious next milestone and a substantial one.
 - `time invalid, resetting clock to epoch` — the RTC answers, but not with
   anything the firmware accepts as a valid time.
 
+## NetBSD 11 boots to multi-user on the emulated O2
+
+2026-09-20.
+
+```text
+NetBSD/sgimips (o2-nbsd) (constty)
+
+login: root
+o2-nbsd# uname -a; sysctl hw.model; df -h /
+NetBSD o2-nbsd 11.0 NetBSD 11.0 (GENERIC32_IP3x) #0: Thu Jul 30 15:23:12 UTC 2026
+    mkrepro@mkrepro.NetBSD.org:/usr/src/sys/arch/sgimips/compile/GENERIC32_IP3x sgimips
+hw.model = SGI-IP32
+Filesystem     Size   Used  Avail %Cap Mounted on
+/dev/sd0a      3.9G   231M   3.5G   7% /
+```
+
+`/etc/rc` runs, generates host keys, and reaches a login prompt; root logs in
+on the serial console.
+
+### Reproducing it
+
+```bash
+IRIS_IP32_SCSI=1 IRIS_IP32_FAST=1 \
+IRIS_IP32_DISK=/path/to/nbsd-o2.raw \
+IRIS_IP32_INPUT='5\rboot -f dksc(0,1,8)boot\r' \
+IRIS_IP32_SCRIPT='Enter pathname=>\r;;# =>exit\r;;CLEAN? [yn]=>y\r;;login:=>root\r' \
+IRIS_IP32_CONSOLE=/tmp/o2.log IRIS_IP32_STEPS=40000000000 \
+cargo test --release --lib ip32::bringup -- --nocapture
+```
+
+The `CLEAN? [yn]` step is there because killing a run leaves the filesystem
+dirty and `/etc/rc` stops to ask. A guest shut down properly does not need it.
+
+### What is still wrong
+
+- `mec0: device timeout`, repeatedly. Ethernet is not emulated; the driver
+  attaches because the MAC address is readable and then finds no hardware.
+- `/etc/rc.d/mountall` reports a failure — the non-root entries in `fstab`.
+- `WARNING: preposterous TOD clock time`. The RTC answers but not with a time
+  anything believes, so the clock comes from the filesystem.
+- One disk still answers at one address only because it is told to; the PROM's
+  SCBs carry no target, so that path answers for anything.
+
 ## A shell
 
 ```text
