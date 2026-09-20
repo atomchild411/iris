@@ -845,6 +845,89 @@ The next step is the one that worked for the identity chip: **read the
 driver's own code**. It is at PC `0x81025870` in the loaded firmware, and
 `IRIS_IP32_DIS` will disassemble it.
 
+### The submission contract, read out of the driver
+
+The guess in the previous section was wrong in an interesting way, and reading
+the code settled it in twenty minutes. The queue write comes from
+`0x8101d84c`, and just before it:
+
+```asm
+addiu a0, s5, 12
+and   s0, a0, 0x1fffffff      ; virtual -> physical
+or    s0, s0, 0x40000000      ; -> the address the device sees
+jal   <flush 32 bytes>        ; so the device can see it
+...
+lbu   v0, 59(sp)              ; the SCB tag
+lw    t6, 0(s2)               ; base of a host-memory array
+sll   v0, v0, 2
+sw    s0, 0(t7)               ; array[tag] = the SCB's bus address
+jal   <write QINFIFO>         ; and hand the chip the tag
+```
+
+So the SCB is **not** written through the register window at all. It lives in
+host memory and the sequencer fetches it. The register window is only used
+during initialisation, which is why the SCB we saw queued was empty.
+
+The chip is told where things are through its scratch RAM, and the values are
+plainly visible once dumped:
+
+```text
+        20: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        30: 00 00 00 00 00 00 00 00 00 00 ff ff 00 78 3d 07
+        40: 41 00 01 00 ad 0b 7f 7f 7f 7f 7f 7f 7f 7f 7f 7f
+        50: 7f 7f 7f 7f 7f 7f 00 3e 07 41 03 00 ad 0b 00 00
+```
+
+Two little-endian addresses in RAM: `0x41073d78` at scratch `0x3d`, and
+`0x41073e00` at scratch `0x56`. Dumping both says what they are:
+
+```text
+0x41073d78  00000000 410752fc 00000000 00000000   <- SCB bus addresses by tag
+0x41073e00  ffffffff ffffffff ffffffff ffffffff   <- the queue-out FIFO
+```
+
+`array[1] = 0x410752fc`, exactly the tag the driver queued. The second is 256
+bytes of `0xff`, which is the loop the driver runs just before queueing.
+
+And the SCB itself:
+
+```text
+0x410752fc  01064010 410741e0 0107532c 00000000
+0x4107531c  ...      4107531c 00000000
+0x4107532c  12000000 40000000 ...                 <- the CDB
+```
+
+`12 00 00 00 40 00` is a SCSI **INQUIRY** with a 64-byte allocation length —
+the first command anything sends to a new target.
+
+So the contract, end to end:
+
+1. Scratch `0x3d..0x40` holds the bus address of an array of SCB bus
+   addresses, indexed by tag.
+2. Scratch `0x56..0x59` holds the bus address of a 256-entry queue-out FIFO in
+   host memory, pre-filled with `0xff`.
+3. The driver builds a 32-byte SCB in host memory with pointers to its CDB and
+   scatter-gather list, stores its bus address in `array[tag]`, flushes, and
+   writes the tag to `QINFIFO`.
+4. The sequencer is expected to fetch the SCB, run the command, put the tag
+   into the host queue-out FIFO, and raise `CMDCMPLT`.
+
+None of that is guessable from the chip's documentation, because none of it is
+the chip — it is the program the driver downloaded. That is exactly the cost
+option 2 was chosen with, and reading it out of the driver is the price.
+
+### What implementing it needs
+
+- The device needs to reach host memory, which means handing `Aic7880` a way
+  to read and write the bus rather than only answering register accesses.
+- A SCSI target to run the CDB against, and a disk image behind it. IRIS
+  already models SCSI targets for the Indy's WD33C93A; that is the part worth
+  reusing rather than rewriting.
+- The SCB's field layout beyond the two pointers — data pointer, transfer
+  length, scatter-gather count, status — which the same technique will settle:
+  the driver reads status back out of the SCB after completion, so the fields
+  it reads name themselves.
+
 ### The honest state of the trade
 
 Option 2 was chosen knowing it is a contract with what a driver observes
