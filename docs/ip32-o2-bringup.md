@@ -916,6 +916,66 @@ None of that is guessable from the chip's documentation, because none of it is
 the chip — it is the program the driver downloaded. That is exactly the cost
 option 2 was chosen with, and reading it out of the driver is the price.
 
+### It works: the PROM reads a disk
+
+Implemented, and the whole path runs. In order, and every step of it was
+found by watching rather than assumed:
+
+1. **Host memory.** The controller was given the RAM handle directly rather
+   than a route back through the bus that owns it.
+2. **The low-memory alias.** The driver uses both forms in one breath: the
+   SCB's own address is `0x410752fc` while the CDB pointer *inside* it is
+   `0x0107532c`, the same bytes. Resolving only one reads the SCB correctly
+   and then finds an all-zero command, which is exactly what happened first.
+3. **Byte order.** The SCB and its pointers are built with ordinary
+   big-endian stores, so they are read that way; the chip's scratch RAM is
+   filled a register at a time, least significant byte first, so it is read
+   the other way. Both are settled by observation and they sit side by side.
+4. **Status write-back.** With commands completing, the PROM still said
+   `media not loaded`. The driver pre-fills SCB byte 2 with `0x40` — not a
+   valid SCSI status — so it is plainly waiting for somebody to overwrite it.
+   Writing the status there made the driver go straight on to `MODE SENSE`
+   and then `READ(10)`.
+
+The conversation now, against a 64 MB image with an SGI volume header:
+
+```text
+CDB 12 00 00 00 40 00   INQUIRY    -> status 0, 36 bytes into [0x01075250+64]
+CDB 1b 00 00 00 01 00   START UNIT -> status 0
+CDB 00 00 00 00 00 00   TEST UNIT READY -> status 0
+CDB 1a 00 3f 00 fe 00   MODE SENSE -> status 0, 4 bytes into [0x01076160+254]
+CDB 28 00 00 00 00 00 00 00 01 00   READ(10) LBA 0
+                                   -> status 0, 512 bytes into [0x01076300+512]
+```
+
+**512 bytes of our disk image, read by the PROM into its own buffer.** Before
+this the same command produced `dks0d1s0: volume header not valid` off a
+zeroed image, which was the first proof the read path worked at all.
+
+What the SCB layout is now known to be:
+
+| offset | meaning |
+|---|---|
+| 0 | control |
+| 1 | target/lun — varies per command (`0x06`, `0x0a`) |
+| 2 | **SCSI status, written back**; pre-filled `0x40` |
+| 3 | tag << 4 |
+| 4..7 | bus address of the scatter-gather list |
+| 8..11 | bus address of the CDB |
+
+Scatter-gather entries are `(bus address, length)` pairs, the length masked to
+24 bits. CDB length is taken from the opcode group rather than from a field,
+which is how SCSI defines it and one less piece of layout to guess at.
+
+### What is left
+
+- The PROM reads the volume header but has not yet been given a bootable one.
+  `sash` for IP32 has to come from IRIX media.
+- Writes are not implemented; only the read path is exercised.
+- `tcl` is not decoded, so every command is answered by the one disk
+  regardless of which target it names. That is why the PROM finds a disk at
+  more than one address.
+
 ### What implementing it needs
 
 - The device needs to reach host memory, which means handing `Aic7880` a way
