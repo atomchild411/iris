@@ -1331,6 +1331,23 @@ the obvious next milestone and a substantial one.
 - `time invalid, resetting clock to epoch` — the RTC answers, but not with
   anything the firmware accepts as a valid time.
 
+## Driving the machine: `IRIS_IP32_SCRIPT`
+
+Booting to multi-user means answering three different things in turn — the
+PROM's menu, then the bootloader, then init — and each prompt only exists once
+the previous answer has been given. Feeding everything at once does not work:
+the bytes queue in the UART and the later consumer never sees them, because
+the earlier one has already drained the line.
+
+`IRIS_IP32_SCRIPT` takes `wait-for=>type-this` steps separated by `;;`. Each
+step arms only after the one before it has fired, and only matches output
+produced *since* then, so a prompt that appears twice does not consume two
+steps.
+
+```bash
+IRIS_IP32_SCRIPT='Enter pathname=>\r;;#=>exit\r'
+```
+
 ## Instrumentation worth keeping
 
 All of this came out of the harness, and none of it out of reading the PROM

@@ -715,6 +715,10 @@ impl BusDevice for PciNativeView {
 /// rather than going anywhere.
 pub struct Com16550 {
     out: Mutex<Vec<u8>>,
+    /// A live copy of everything transmitted, flushed as it arrives.
+    /// A guest that takes half an hour to boot cannot be watched through a
+    /// dump printed at the end of the run.
+    log: Mutex<Option<std::fs::File>>,
     /// Characters waiting to be read by the guest. The PROM polls LSR for
     /// data-ready and then reads the receive register, so an empty queue simply
     /// means "nobody has typed anything".
@@ -766,9 +770,16 @@ impl Com16550 {
     pub fn new() -> Self {
         Self {
             out: Mutex::new(Vec::new()),
+            log: Mutex::new(None),
             input: Mutex::new(Default::default()),
             regs: Mutex::new([0u8; 8]),
         }
+    }
+
+    /// Mirror everything transmitted to a file as it happens.
+    pub fn log_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        *self.log.lock().unwrap() = Some(std::fs::File::create(path)?);
+        Ok(())
     }
 
     /// Queue characters for the guest to read.
@@ -858,6 +869,11 @@ impl Com16550 {
                 self.input.lock().unwrap().push_back(val);
             } else {
                 self.out.lock().unwrap().push(val);
+                if let Some(f) = self.log.lock().unwrap().as_mut() {
+                    use std::io::Write;
+                    let _ = f.write_all(&[val]);
+                    let _ = f.flush();
+                }
             }
             return;
         }
@@ -2973,6 +2989,12 @@ mod bringup {
         // (step, vector, ExcCode, EPC, BadVAddr)
         let mut exceptions: Vec<(u64, u32, u32, u64, u64)> = Vec::new();
         let mut last_exc_pc = 0u32;
+        // IRIS_IP32_FAST drops the per-instruction instrumentation -- the
+        // stall detector's set operations, the loop map lookup and the
+        // clock's mutex -- which together cost more than the emulation. For
+        // a run whose point is "does it boot" rather than "where did it
+        // stop", that is several times the throughput.
+        let fast = std::env::var("IRIS_IP32_FAST").is_ok();
         // A loaded kernel lives in kseg0 well above the PROM's own use of it.
         // Track when we get there and what the last thing before leaving was.
         let mut kernel_entered = 0u64;
@@ -2995,8 +3017,31 @@ mod bringup {
         // What to wait for before typing. The sloader prompt was the only
         // thing that ever appeared; now that the PROM reaches its menu,
         // "Option?" is the interesting one.
+        if let Ok(path) = std::env::var("IRIS_IP32_CONSOLE") {
+            if let Err(e) = bus.com0.log_to(std::path::Path::new(&path)) {
+                eprintln!("ip32: console log {path}: {e}");
+            }
+        }
         let expect = std::env::var("IRIS_IP32_EXPECT")
             .unwrap_or_else(|_| "Option?".to_string());
+        // A whole conversation, not one line: IRIS_IP32_SCRIPT is
+        // `wait-for=>type-this` steps separated by `;;`, each armed only once
+        // the one before it has fired. Booting to multi-user means answering
+        // the PROM, then the bootloader, then init, and each prompt only
+        // exists after the previous answer.
+        let mut script: Vec<(String, Vec<u8>)> = std::env::var("IRIS_IP32_SCRIPT")
+            .ok()
+            .map(|v| {
+                v.split(";;")
+                    .filter_map(|step| {
+                        let (w, t) = step.split_once("=>")?;
+                        Some((w.to_string(), t.replace("\\r", "\r").into_bytes()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        script.reverse();
+        let mut script_seen = 0usize;
         // post1 contains real timed delays — one of them waits a full second
         // of UST, which at UST_TICKS_DEN instructions per tick is 100M steps
         // on its own. The default budget clears that with room to spare;
@@ -3079,7 +3124,11 @@ mod bringup {
             // instruction is about to make.
             bus.pc.set(pc);
             bus.pc.set_ra(exec.core.gpr[31] as u32);
-            bus.ust.advance_to(steps);
+            // The clock only has to be right when something reads it, and
+            // the readers are all on the periodic path below.
+            if !fast || steps % TIMER_POLL_STEPS == 0 {
+                bus.ust.advance_to(steps);
+            }
 
             ring[ring_at % RING] = pc;
             ring_at += 1;
@@ -3143,9 +3192,10 @@ mod bringup {
             }
 
             // Once a spin loop has been recognised, keep counting the time
-            // spent in it. A loop that costs half the run is the thing to
+            // spent in it.
+            // A loop that costs half the run is the thing to
             // fix, whether or not it ever exits.
-            if let Some(&key) = loop_of.get(&pc) {
+            if !fast { if let Some(&key) = loop_of.get(&pc) {
                 *loop_cost.entry(key).or_insert(0u64) += 1;
                 // Count entries, not just time: a delay loop re-entered a
                 // thousand times is progress, the same loop entered once is
@@ -3182,8 +3232,8 @@ mod bringup {
                 in_loop = true;
             } else {
                 in_loop = false;
-            }
-            if let Some(body) = stall.step(pc) {
+            } }
+            if !fast { if let Some(body) = stall.step(pc) {
                 for &p in &body {
                     loop_of.entry(p).or_insert(body[0]);
                 }
@@ -3193,12 +3243,20 @@ mod bringup {
                     stalls.push((steps, body, cause, exec.core.cp0_epc, exec.core.cp0_badvaddr,
                                  g));
                 }
-            }
+            } }
 
             // Optionally answer sloader's prompt, for experimenting with what
             // it accepts. Off unless IRIS_IP32_INPUT is set, and `contains` is
             // only evaluated while it is: scanning the output buffer on every
             // instruction is not something to do by default.
+            // Script steps fire in order, each waiting for its own prompt.
+            if let Some((wait, text)) = script.last() {
+                if bus.com0.output()[script_seen..].contains(wait.as_str()) {
+                    bus.com0.feed(text);
+                    script_seen = bus.com0.output().len();
+                    script.pop();
+                }
+            }
             if let Some(feed) = feed_bytes.as_ref() {
                 if !fed && bus.com0.output().contains(expect.as_str()) {
                     bus.com0.feed(feed);
