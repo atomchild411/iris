@@ -96,15 +96,12 @@ Open, and the next thing to work on. What is known:
 - It never issues `Index_Load_Data` either. It stores data by index and must be
   reading it back by ordinary load — which only works if the line's tag and
   state make that load hit.
-- Implementing `Index_Store_Data` as a direct write into `l2.data` made things
-  **worse**, not better: the PROM now stalls part-way through printing the
-  failure message. The likely cause is ours — writing walking-1s patterns into
-  slots backing lines the CPU still considers valid corrupts cached PROM code.
-  Whatever the real semantics are, they cannot be "scribble on the data array
-  and leave the tags alone".
+- Implementing `Index_Store_Data` as a direct write into `l2.data` appeared to
+  make things worse — the PROM started stalling part-way through its failure
+  message. It did not; see below.
 
-The apparent *regression* from implementing `Index_Store_Data` was a
-misreading. The PROM does not hang: it reaches a deliberate dead stop.
+That apparent regression was a misreading. The PROM does not hang: it reaches a
+deliberate dead stop.
 
 ```
 bfc012cc: beq fp, zero, 5   -> bfc012e4    ; no continuation registered?
@@ -156,7 +153,8 @@ from shape. It used to be inferred from `IC_WAYS == 2`, which held only while
 
 ## Open questions
 
-- `Index_Store_Data` semantics (above) — the live blocker.
+- `Index_Store_Data` semantics. Still unverified: nothing has yet confirmed
+  what state it should leave a line in.
 - The CP0 `Config` `SS` (secondary size) encoding. The layout is from NetBSD's
   `MIPS4_CONFIG_*`; the other fields are `4096 << field`, but `SS` is not
   decoded anywhere to hand, so its base is unknown. `IRIS_IP28_SS` overrides it
