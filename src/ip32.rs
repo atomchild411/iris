@@ -480,6 +480,11 @@ pub struct Ip32Bus {
     pub pci_view: PciNativeView,
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write)`.
     unmapped: Mutex<Vec<(u32, bool)>>,
+    /// 64-bit RAM accesses at the addresses POST's memory sizing uses, as
+    /// `(addr, is_write, value)`. The test writes `(!a << 32) | a` to each and
+    /// reads it back, so seeing both halves is what tells us whether the store
+    /// or the load is the one going wrong.
+    sizemem: Mutex<Vec<(u32, bool, u64)>>,
 }
 
 impl Ip32Bus {
@@ -496,6 +501,31 @@ impl Ip32Bus {
             nic_trace: NicTrace::new(),
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
+            sizemem: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The addresses POST's sizing test probes.
+    pub const SIZEMEM_PROBES: [u32; 4] =
+        [0x0000_0000, 0x01ff_fff8, 0x0200_0000, 0x07ff_fff8];
+
+    pub fn sizemem_trace(&self) -> Vec<(u32, bool, u64)> {
+        self.sizemem.lock().unwrap().clone()
+    }
+
+    /// True for POST's address/complement signature, `(!a << 32) | a`.
+    fn is_probe_pattern(val: u64) -> bool {
+        let lo = val as u32;
+        let hi = (val >> 32) as u32;
+        hi == !lo
+    }
+
+    fn note_sizemem(&self, addr: u32, write: bool, val: u64) {
+        if Self::SIZEMEM_PROBES.contains(&addr) || Self::is_probe_pattern(val) {
+            let mut t = self.sizemem.lock().unwrap();
+            if t.len() < 64 {
+                t.push((addr, write, val));
+            }
         }
     }
 
@@ -690,7 +720,9 @@ impl BusDevice for Ip32Bus {
         if self.in_mace(addr) {
             return self.mace.read64(addr);
         }
-        bus_read!(self, addr, 8, BusRead64::ok, |v: u64| v)
+        let r = bus_read!(self, addr, 8, BusRead64::ok, |v: u64| v);
+        self.note_sizemem(addr, false, r.data);
+        r
     }
 
     fn write8(&self, addr: u32, val: u8) -> u32 {
@@ -772,6 +804,7 @@ impl BusDevice for Ip32Bus {
         if self.in_mace(addr) {
             return self.mace.write64(addr, val);
         }
+        self.note_sizemem(addr, true, val);
         if self.write_bytes(addr, 8, val) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
 }
@@ -977,6 +1010,20 @@ mod bringup {
         eprintln!("ip32: CRIME registers touched ({}):", touched.len());
         for (off, write) in &touched {
             eprintln!("   0x{:04x} {}", off, if *write { "W" } else { "R" });
+        }
+
+        let sm = bus.sizemem_trace();
+        eprintln!("ip32: SizeMEM probe traffic ({} events):", sm.len());
+        for (a, w, v) in sm.iter().take(24) {
+            // An access inside the PROM window is the firmware reading its own
+            // expected-value table, not a probe of RAM. Only RAM traffic here
+            // is evidence about memory.
+            let where_ = if (PROM_BASE..PROM_BASE + PROM_SIZE).contains(a) {
+                "prom table"
+            } else {
+                "RAM"
+            };
+            eprintln!("   0x{:08x} {} 0x{:016x}  ({})", a, if *w { "W" } else { "R" }, v, where_);
         }
 
         eprintln!("ip32: CRIME writes in order:");
