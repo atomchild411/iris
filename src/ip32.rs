@@ -30,6 +30,20 @@ pub const CRIME_SIZE: u32 = 0x0000_1000;
 /// taking a bus error — none of it is implemented yet.
 pub const MACE_BASE: u32 = 0x1f00_0000;
 pub const MACE_SIZE: u32 = 0x0080_0000;
+/// MACE's ISA-block register holding the flash write-enable and the Dallas
+/// 1-Wire ("NIC") data line. The PROM bit-bangs the serial-ID chip here.
+pub const MACE_ISA_FLASH_NIC_REG: u32 = MACE_BASE + 0x0031_0008;
+
+/// Bits in [`MACE_ISA_FLASH_NIC_REG`], as named by NetBSD's `macereg.h`.
+pub mod nic_bit {
+    /// 1 => flash writes enabled.
+    pub const FLASH_WE: u8 = 0x01;
+    /// Release the 1-Wire line (let it float high).
+    pub const DEASSERT: u8 = 0x04;
+    /// The 1-Wire data line itself.
+    pub const DATA: u8 = 0x08;
+}
+
 /// MACE's free-running timer (`MACE_UST_MSC`, i.e. `MACE_PERIF + 0x40000`).
 /// The PROM busy-waits on this; a constant hangs it forever.
 pub const MACE_UST_MSC: u32 = MACE_BASE + 0x0034_0000;
@@ -93,6 +107,9 @@ pub struct Crime {
     /// whether it was read or written. This is the actual product of the first
     /// milestone: the list of CRIME registers POST depends on.
     trace: Mutex<Vec<(u32, bool)>>,
+    /// Values written, in order, as `(offset, value)` — the bank programming
+    /// is only meaningful if you can see what it was told.
+    writes: Mutex<Vec<(u32, u64)>>,
     revision: u64,
 }
 
@@ -107,6 +124,7 @@ impl Crime {
         Self {
             regs: Mutex::new(vec![0u64; (CRIME_SIZE / 8) as usize]),
             trace: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
             revision: CRIME_REV_DEFAULT,
         }
     }
@@ -146,6 +164,15 @@ impl Crime {
 
     fn store(&self, off: u32, val: u64) {
         self.regs.lock().unwrap()[(off / 8) as usize] = val;
+        let mut w = self.writes.lock().unwrap();
+        if w.len() < 256 {
+            w.push((off, val));
+        }
+    }
+
+    /// Values written, in order.
+    pub fn written(&self) -> Vec<(u32, u64)> {
+        self.writes.lock().unwrap().clone()
     }
 }
 
@@ -304,6 +331,29 @@ impl BusDevice for PciNativeView {
     fn write64(&self, _a: u32, _v: u64) -> u32 { *self.writes.lock().unwrap() += 1; BUS_OK }
 }
 
+/// Records what the PROM does to the 1-Wire register and when, so the protocol
+/// can be reconstructed from its own behaviour rather than guessed at.
+pub struct NicTrace {
+    events: Mutex<Vec<(u64, bool, u8)>>,
+}
+
+impl Default for NicTrace {
+    fn default() -> Self { Self::new() }
+}
+
+impl NicTrace {
+    pub fn new() -> Self { Self { events: Mutex::new(Vec::new()) } }
+    pub fn record(&self, t: u64, write: bool, val: u8) {
+        let mut e = self.events.lock().unwrap();
+        if e.len() < 4096 {
+            e.push((t, write, val));
+        }
+    }
+    pub fn events(&self) -> Vec<(u64, bool, u8)> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
 /// MACE's UST/MSC counter: unadjusted system time, free-running.
 ///
 /// Every read advances it by [`UST_STRIDE`]. Real hardware ticks off a clock
@@ -346,9 +396,13 @@ impl BusDevice for MaceUst {
     fn write64(&self, _a: u32, _v: u64) -> u32 { BUS_OK }
 }
 
-/// Reads as zero, absorbs writes, and counts both. Stands in for MACE until
-/// there is a reason to build it: a probe that bus-errors tells us nothing,
-/// whereas one that reads zero lets POST proceed to whatever it does next.
+/// A register file that remembers what it is told, and counts accesses per
+/// offset. Stands in for MACE until there is a reason to build it properly.
+///
+/// Storing matters more than it looks: the PROM does read-modify-write on
+/// several of these (the LED register among them), and a register that always
+/// reads back zero silently discards every bit the firmware thought it had
+/// set.
 pub struct Stub {
     pub name: &'static str,
     reads: Mutex<u64>,
@@ -356,6 +410,8 @@ pub struct Stub {
     /// Per-offset access counts. A stub that is being polled hard is the guest
     /// waiting on a bit we are not setting, and the offset says which.
     hot: Mutex<std::collections::BTreeMap<u32, (u64, u64)>>,
+    /// Per-offset stored value.
+    cells: Mutex<std::collections::BTreeMap<u32, u64>>,
 }
 
 impl Stub {
@@ -365,6 +421,7 @@ impl Stub {
             reads: Mutex::new(0),
             writes: Mutex::new(0),
             hot: Mutex::new(std::collections::BTreeMap::new()),
+            cells: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
     pub fn counts(&self) -> (u64, u64) {
@@ -383,9 +440,13 @@ impl Stub {
     fn w(&self) {
         *self.writes.lock().unwrap() += 1;
     }
+    fn cell(&self, addr: u32) -> u64 {
+        *self.cells.lock().unwrap().get(&(addr & 0x007f_ffff & !7)).unwrap_or(&0)
+    }
+    fn set_cell(&self, addr: u32, val: u64) {
+        self.cells.lock().unwrap().insert(addr & 0x007f_ffff & !7, val);
+    }
     fn hit(&self, addr: u32, write: bool) {
-        let e = self.hot.lock().unwrap();
-        drop(e);
         let mut h = self.hot.lock().unwrap();
         let e = h.entry(addr & 0x007f_ffff & !3).or_insert((0, 0));
         if write { e.1 += 1 } else { e.0 += 1 }
@@ -393,14 +454,14 @@ impl Stub {
 }
 
 impl BusDevice for Stub {
-    fn read8(&self, a: u32) -> BusRead8 { self.r(); self.hit(a, false); BusRead8::ok(0) }
-    fn read16(&self, a: u32) -> BusRead16 { self.r(); self.hit(a, false); BusRead16::ok(0) }
-    fn read32(&self, a: u32) -> BusRead32 { self.r(); self.hit(a, false); BusRead32::ok(0) }
-    fn read64(&self, a: u32) -> BusRead64 { self.r(); self.hit(a, false); BusRead64::ok(0) }
-    fn write8(&self, a: u32, _v: u8) -> u32 { self.w(); self.hit(a, true); BUS_OK }
-    fn write16(&self, a: u32, _v: u16) -> u32 { self.w(); self.hit(a, true); BUS_OK }
-    fn write32(&self, a: u32, _v: u32) -> u32 { self.w(); self.hit(a, true); BUS_OK }
-    fn write64(&self, a: u32, _v: u64) -> u32 { self.w(); self.hit(a, true); BUS_OK }
+    fn read8(&self, a: u32) -> BusRead8 { self.r(); self.hit(a, false); BusRead8::ok(self.cell(a) as u8) }
+    fn read16(&self, a: u32) -> BusRead16 { self.r(); self.hit(a, false); BusRead16::ok(self.cell(a) as u16) }
+    fn read32(&self, a: u32) -> BusRead32 { self.r(); self.hit(a, false); BusRead32::ok(self.cell(a) as u32) }
+    fn read64(&self, a: u32) -> BusRead64 { self.r(); self.hit(a, false); BusRead64::ok(self.cell(a)) }
+    fn write8(&self, a: u32, v: u8) -> u32 { self.w(); self.hit(a, true); self.set_cell(a, v as u64); BUS_OK }
+    fn write16(&self, a: u32, v: u16) -> u32 { self.w(); self.hit(a, true); self.set_cell(a, v as u64); BUS_OK }
+    fn write32(&self, a: u32, v: u32) -> u32 { self.w(); self.hit(a, true); self.set_cell(a, v as u64); BUS_OK }
+    fn write64(&self, a: u32, v: u64) -> u32 { self.w(); self.hit(a, true); self.set_cell(a, v); BUS_OK }
 }
 
 /// The IP32 physical bus for bring-up: RAM, CRIME, a MACE stub and the PROM.
@@ -415,6 +476,7 @@ pub struct Ip32Bus {
     pub mace: Stub,
     pub macepci: MacePci,
     pub ust: MaceUst,
+    pub nic_trace: NicTrace,
     pub pci_view: PciNativeView,
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write)`.
     unmapped: Mutex<Vec<(u32, bool)>>,
@@ -431,6 +493,7 @@ impl Ip32Bus {
             mace: Stub::new("mace"),
             macepci: MacePci::new(),
             ust: MaceUst::new(),
+            nic_trace: NicTrace::new(),
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
         }
@@ -465,6 +528,10 @@ impl Ip32Bus {
 
     fn in_mace(&self, addr: u32) -> bool {
         addr >= MACE_BASE && addr < MACE_BASE + MACE_SIZE
+    }
+
+    fn is_nic_reg(&self, addr: u32) -> bool {
+        (addr & !3) == MACE_ISA_FLASH_NIC_REG
     }
 
     fn in_ust(&self, addr: u32) -> bool {
@@ -551,6 +618,11 @@ impl BusDevice for Ip32Bus {
         if self.in_pci_view(addr) {
             return self.pci_view.read8(addr);
         }
+        if self.is_nic_reg(addr) {
+            let v = self.mace.read8(addr).data;
+            self.nic_trace.record(self.ust.now(), false, v);
+            return BusRead8::ok(v);
+        }
         if self.in_mace(addr) {
             return self.mace.read8(addr);
         }
@@ -586,6 +658,11 @@ impl BusDevice for Ip32Bus {
         if self.in_pci_view(addr) {
             return self.pci_view.read32(addr);
         }
+        if self.is_nic_reg(addr) {
+            let v = self.mace.read32(addr).data;
+            self.nic_trace.record(self.ust.now(), false, v as u8);
+            return BusRead32::ok(v);
+        }
         if self.in_mace(addr) {
             return self.mace.read32(addr);
         }
@@ -605,6 +682,11 @@ impl BusDevice for Ip32Bus {
         if self.in_pci_view(addr) {
             return self.pci_view.read64(addr);
         }
+        if self.is_nic_reg(addr) {
+            let v = self.mace.read64(addr).data;
+            self.nic_trace.record(self.ust.now(), false, v as u8);
+            return BusRead64::ok(v);
+        }
         if self.in_mace(addr) {
             return self.mace.read64(addr);
         }
@@ -620,6 +702,10 @@ impl BusDevice for Ip32Bus {
         }
         if self.in_pci_view(addr) {
             return self.pci_view.write8(addr, val);
+        }
+        if self.is_nic_reg(addr) {
+            self.nic_trace.record(self.ust.now(), true, val);
+            return self.mace.write8(addr, val);
         }
         if self.in_mace(addr) {
             return self.mace.write8(addr, val);
@@ -656,6 +742,10 @@ impl BusDevice for Ip32Bus {
         if self.in_pci_view(addr) {
             return self.pci_view.write32(addr, val);
         }
+        if self.is_nic_reg(addr) {
+            self.nic_trace.record(self.ust.now(), true, val as u8);
+            return self.mace.write32(addr, val);
+        }
         if self.in_mace(addr) {
             return self.mace.write32(addr, val);
         }
@@ -674,6 +764,10 @@ impl BusDevice for Ip32Bus {
         }
         if self.in_pci_view(addr) {
             return self.pci_view.write64(addr, val);
+        }
+        if self.is_nic_reg(addr) {
+            self.nic_trace.record(self.ust.now(), true, val as u8);
+            return self.mace.write64(addr, val);
         }
         if self.in_mace(addr) {
             return self.mace.write64(addr, val);
@@ -885,8 +979,26 @@ mod bringup {
             eprintln!("   0x{:04x} {}", off, if *write { "W" } else { "R" });
         }
 
+        eprintln!("ip32: CRIME writes in order:");
+        for (off, val) in bus.crime.written().iter().take(20) {
+            eprintln!("   0x{:04x} <- 0x{:016x}", off, val);
+        }
+
         let (mr, mw) = bus.mace.counts();
         eprintln!("ip32: MACE accesses: {mr} reads, {mw} writes");
+
+        let ev = bus.nic_trace.events();
+        eprintln!("ip32: 1-Wire register activity, first 40 of {} events:", ev.len());
+        let mut prev = 0u64;
+        for (t, w, v) in ev.iter().take(40) {
+            let dt = t.saturating_sub(prev);
+            prev = *t;
+            eprintln!("   +{:>8}  {}  0x{:02x}  [we={} deassert={} data={}]",
+                      dt, if *w { "W" } else { "R" }, v,
+                      v & nic_bit::FLASH_WE != 0,
+                      v & nic_bit::DEASSERT != 0,
+                      v & nic_bit::DATA != 0);
+        }
 
         eprintln!("ip32: busiest MACE offsets:");
         for (off, r, w) in bus.mace.hottest().into_iter().take(8) {

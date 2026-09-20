@@ -199,16 +199,60 @@ so a constant hangs forever. Giving it a counter that advances (currently a
 coarse `UST_STRIDE` per read — see the caveat in `ip32.rs`) dropped MACE reads
 from 393,307 to 6 and let it run on.
 
-It then went straight to hammering `MACE + 0x310008` — `MACE_ISA_FLASH_NIC_REG`
-— 20,331 paired read-modify-writes, interleaved with those same delay loops.
-The bits there are `MACE_ISA_NIC_DATA` (0x08) and `MACE_ISA_NIC_DEASSERT`
-(0x04): Dallas **1-Wire**. The PROM is bit-banging the serial-ID chip that
-holds the O2's serial number and Ethernet address, and our stub answers with a
-constant, so it retries forever.
+It then went straight to hammering `MACE + 0x310008` —
+`MACE_ISA_FLASH_NIC_REG` — 20,331 paired read-modify-writes between delays.
 
-**That is the current gate.** It is the IP32 counterpart of the Indy's
-`eeprom_93c56`, which IRIS already emulates — the protocol differs but the role
-is identical, so there is a model to follow.
+**That register is shared, and the first reading of it was wrong.** It does
+carry the Dallas 1-Wire data line (`NIC_DATA` 0x08, `NIC_DEASSERT` 0x04), which
+is what the name suggests and what I assumed. But capturing the actual values
+written settled it: every write is **0x30**, and
+
+```c
+#define MACE_ISA_LED_RED    0x10
+#define MACE_ISA_LED_GREEN  0x20
+```
+
+It is blinking the front-panel LED, not bit-banging a serial ID. The loop is
+
+    bfc05e70:  lui  s0, 0xbf31          # s0 = 0xbf310008, the LED register
+    bfc05e80:  ori  s1, s1, 0xa120      # delay = 0x7a120 = 500000
+    bfc05e8c:  jal  0xbfc058b0          # delay(s1)
+    bfc05e94:  ld   t7, 0(s0)
+    bfc05e98:  xori t6, t7, 0x30        # toggle RED|GREEN
+    bfc05e9c:  b    0xbfc05e8c          # forever
+
+a panic blinker at 2 Hz. **Lesson: name the register by the bits that are
+actually set, not by the name of the register.** Watching values, not
+addresses, is what caught it.
+
+## The real gate: `Error, no SIMM in bank0`
+
+The blinker is entered from `bnez s1, ...` — `s1` is a size, and zero means
+failure. Just before it, the PROM prints a string, and the string is in the
+image at 0xbfc06d14:
+
+    Error, no SIMM in bank0
+
+So POST's **memory sizing** is what fails. The test itself is at 0xbfc05dc8:
+three 64-bit patterns written into RAM and compared against constants held in
+the PROM at 0xbfc06f90/f98/fa0, with any mismatch branching to the blinker.
+
+What CRIME is told beforehand is the clue:
+
+    0x0008 <- 0x0
+    0x0208 <- 0x100      } all eight bank-control
+    0x0210 <- 0x100      } registers get the same
+    ...                  } value
+    0x0240 <- 0x100
+
+Eight banks, all programmed identically, then probed. Our RAM is flat at
+physical 0 and ignores the bank registers entirely, so every bank aliases onto
+the same store — which is exactly what a sizing algorithm is designed to detect
+and report as "nothing there". That is the likely cause and the next thing to
+test: **make CRIME's bank controls actually place memory.**
+
+Note also that nothing went unmapped during the run, so this is not a missing
+device. It is a device that answers, but lies.
 
 ## Gates found so far, in the order the PROM hits them
 
@@ -217,7 +261,7 @@ is identical, so there is a model to follow.
 | 1 | CRIME | nearly free — `CONTROL` plus eight bank-control qwords |
 | 2 | MACE PCI | an **empty** bus is accepted, provided config reads are all-ones |
 | 3 | `MACE_UST_MSC` timer | required, trivial — must advance |
-| 4 | 1-Wire serial-ID chip | **current gate** |
+| 4 | memory sizing | **current gate** — `Error, no SIMM in bank0` |
 
 Everything up to here took one evening, which is the useful signal: the early
 PROM is far less demanding than the device list suggests.
@@ -227,9 +271,11 @@ PROM is far less demanding than the device list suggests.
 - ~~How much does `post1` insist on?~~ Answered: CRIME is cheap, MACE PCI is
   the gate. See above.
 - ~~What does the PROM expect to find on PCI?~~ Answered: an empty bus is fine.
-- What will the PROM do when 1-Wire answers? It wants a serial number and a MAC.
-  Whether a plausible synthetic reply satisfies it, or whether it checksums
-  against something, is the next unknown.
+- What do CRIME's bank-control bits mean? `0x100` is written to all eight. The
+  sizing test's three patterns and their expected values are in the PROM at
+  0xbfc06f90..fa0, so the test can be read directly rather than guessed at.
+- 1-Wire is still there and still unimplemented; the PROM simply has not
+  reached it yet.
 - `UST_STRIDE` is a bring-up shortcut: the counter advances per read rather
   than with time. If the PROM ever derives a clock rate from it, that has to
   become time-based.
