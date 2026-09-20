@@ -1364,6 +1364,61 @@ cargo test --release --lib ip32::bringup -- --nocapture
 The `CLEAN? [yn]` step is there because killing a run leaves the filesystem
 dirty and `/etc/rc` stops to ask. A guest shut down properly does not need it.
 
+## Where IRIX stands, and where it stops
+
+The installer works end to end: `2) Install System Software` finds the
+emulated CD-ROM, copies the miniroot to the target disk's swap partition, and
+boots it.
+
+```text
+Copying installation program to disk.
+......... 100%
+Copy complete
+IRIX Release 6.5 IP32 Version 01200452 System V
+Copyright 1987-2000 Silicon Graphics, Inc.
+```
+
+And then it stops, after the banner, every time.
+
+What is ruled out, from the harness rather than from reasoning:
+
+- **Not a fault.** The exception log shows two entries all session, both at
+  PROM startup. Nothing after the banner.
+- **Not a missing device region.** The run asserts on unmapped accesses and
+  does not trip.
+- **Not the console.** `console=d` and `nogfxkbd=1` set and persisted in
+  flash, with the PROM autoboot disabled, changes nothing.
+- **Not the second controller.** Adding the O2's second AIC-7880 at PCI dev 2
+  (which is right regardless — CRIME has a separate interrupt line for each)
+  changes nothing.
+
+So it is a tight loop on a register that is mapped and never changes. The
+`busiest MACE offsets` report names it; that run had not finished when this
+work was paused.
+
+One flaw found while looking, and fixed: the console interrupt hack
+*overwrote* the whole of `MACE_ISA_INT_STATUS` on every poll rather than
+setting and clearing its own bits. Anything a guest wrote there -- another
+device's pending bit, or an acknowledgement in progress -- was erased under
+it. That is exactly the shape of failure that leaves a kernel spinning, and it
+should be re-tested first when this resumes.
+
+### Setting up an IRIX install
+
+The target disk needs an SGI label before the PROM will install to it, because
+`fx` only exists inside the miniroot that needs the swap partition to boot:
+
+```bash
+mkvh build target.raw --size 4G \
+  --part 8:0:0:4096 --part 1:3:4096:262144 \
+  --part 0:10:266240:8122368 --part 10:6:0:8388608
+# then set vh_swappt to 1 (offset 6, big-endian) and fix the header checksum
+```
+
+`vh_swappt` matters: the PROM copies the miniroot to whichever partition it
+names, and mkvh leaves it at 0, which produces
+"swap partition (0) is not a valid swap area".
+
 ### What is still wrong
 
 - `mec0: device timeout`, repeatedly. Ethernet is not emulated; the driver
