@@ -2522,16 +2522,29 @@ mod bringup {
         let mut path_to_console: Vec<u32> = Vec::new();
         let mut fed = false;
         let mut fed_at = 0u64;
-        let feed_bytes: Option<Vec<u8>> = std::env::var("IRIS_IP32_INPUT")
-            .ok()
-            .map(|v| v.replace("\\r", "\r").into_bytes());
+        // By default, drive the machine the way a person would: take the
+        // menu into the command monitor and ask it what it thinks it is.
+        // That turns the trace into an end-to-end check -- the answer comes
+        // back through the serial port, and the Ethernet address in it came
+        // off the 1-Wire chip.
+        let feed_bytes: Option<Vec<u8>> = Some(
+            std::env::var("IRIS_IP32_INPUT")
+                .unwrap_or_else(|_| "5\\rversion\\rhinv -v\\rprintenv\\r".to_string())
+                .replace("\\r", "\r")
+                .into_bytes(),
+        );
+        // What to wait for before typing. The sloader prompt was the only
+        // thing that ever appeared; now that the PROM reaches its menu,
+        // "Option?" is the interesting one.
+        let expect = std::env::var("IRIS_IP32_EXPECT")
+            .unwrap_or_else(|_| "Option?".to_string());
         // post1 contains real timed delays — one of them waits a full second
         // of UST, which at UST_TICKS_DEN instructions per tick is 100M steps
         // on its own. The default budget clears that with room to spare;
         // IRIS_IP32_STEPS raises it for longer explorations.
         let limit: u64 = std::env::var("IRIS_IP32_STEPS").ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(300_000_000);
+            .unwrap_or(500_000_000);
         #[allow(non_snake_case)]
         let LIMIT = limit;
 
@@ -2691,7 +2704,7 @@ mod bringup {
             // only evaluated while it is: scanning the output buffer on every
             // instruction is not something to do by default.
             if let Some(feed) = feed_bytes.as_ref() {
-                if !fed && bus.com0.output().contains(SLOADER_PROMPT) {
+                if !fed && bus.com0.output().contains(expect.as_str()) {
                     bus.com0.feed(feed);
                     fed = true;
                     fed_at = steps;
@@ -2971,5 +2984,27 @@ mod bringup {
             exec.core.pc as u32,
         );
         assert!(un.is_empty(), "unmapped accesses: {un:x?}");
+
+        // The milestone, stated as a check. Each of these is a different part
+        // of the machine answering, and the trace above says which one gave
+        // up if any of them stops being true.
+        let out = bus.com0.output();
+        for want in [
+            // POST finished and the PROM took over the console.
+            "System Maintenance Menu",
+            // It accepted input on the serial port and ran a command.
+            "Command Monitor",
+            // It knows what it is.
+            "System: IP32",
+            "Memory size: 128 Mbytes",
+            // And this came off the 1-Wire identity chip.
+            "eaddr=08:00:69:12:34:56",
+        ] {
+            assert!(out.contains(want), "PROM console never said {want:?}");
+        }
+        assert!(
+            !out.contains("ds2502"),
+            "the identity chip reported a failure: the console is above"
+        );
     }
 }
