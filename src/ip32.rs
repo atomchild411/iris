@@ -21,8 +21,15 @@ use std::sync::Mutex;
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR};
 
 // ── IP32 physical map (the part this milestone needs) ───────────────────────
-/// RAM. Unlike the Indy, an O2's memory starts at physical zero.
-pub const RAM_BASE: u32 = 0x0000_0000;
+/// RAM base.
+///
+/// **Not zero.** The PROM's SizeMEM writes its probe patterns at `base + 0`,
+/// `+0x01fffff8`, `+0x02000000` and `+0x07fffff8`, and the physical address
+/// those land on is 0x40000000 — visible as the target of the `sd` at
+/// 0xbfc05c9c. This is the "RAM at a non-zero base address" the O2 is known
+/// for, and it collides with what `macereg.h` calls `MACE_PCI_NATIVE_VIEW`;
+/// main memory wins that address, so the PCI window is not mapped here.
+pub const RAM_BASE: u32 = 0x4000_0000;
 /// CRIME: memory controller, interrupt controller and video DMA.
 pub const CRIME_BASE: u32 = 0x1400_0000;
 pub const CRIME_SIZE: u32 = 0x0000_1000;
@@ -506,8 +513,12 @@ impl Ip32Bus {
     }
 
     /// The addresses POST's sizing test probes.
-    pub const SIZEMEM_PROBES: [u32; 4] =
-        [0x0000_0000, 0x01ff_fff8, 0x0200_0000, 0x07ff_fff8];
+    pub const SIZEMEM_PROBES: [u32; 4] = [
+        RAM_BASE,
+        RAM_BASE + 0x01ff_fff8,
+        RAM_BASE + 0x0200_0000,
+        RAM_BASE + 0x07ff_fff8,
+    ];
 
     pub fn sizemem_trace(&self) -> Vec<(u32, bool, u64)> {
         self.sizemem.lock().unwrap().clone()
@@ -548,6 +559,11 @@ impl Ip32Bus {
         addr >= RAM_BASE && addr < RAM_BASE.wrapping_add(self.ram_len())
     }
 
+    /// Offset of `addr` within RAM, if it is in RAM.
+    pub fn ram_offset(&self, addr: u32) -> Option<u32> {
+        self.in_ram(addr).then(|| addr - RAM_BASE)
+    }
+
     fn in_prom(&self, addr: u32) -> bool {
         addr >= PROM_BASE && addr < PROM_BASE + PROM_SIZE
     }
@@ -572,9 +588,13 @@ impl Ip32Bus {
         addr >= MACEPCI_BASE && addr < MACEPCI_BASE + MACEPCI_SIZE
     }
 
-    fn in_pci_view(&self, addr: u32) -> bool {
-        addr >= PCI_NATIVE_VIEW_BASE
-            && addr < PCI_NATIVE_VIEW_BASE.wrapping_add(PCI_NATIVE_VIEW_SIZE)
+    /// Always false for now: the address `macereg.h` gives for the PCI native
+    /// view is where main memory actually lives on this machine, and RAM has
+    /// the stronger claim — POST writes its sizing patterns there. Kept as a
+    /// hook so the window can be restored somewhere else once its real
+    /// placement is known.
+    fn in_pci_view(&self, _addr: u32) -> bool {
+        false
     }
 
     fn read_bytes(&self, addr: u32, n: usize) -> Option<u64> {
@@ -889,10 +909,10 @@ mod tests {
     }
 
     #[test]
-    fn ram_starts_at_physical_zero_unlike_the_indy() {
+    fn ram_is_reachable_at_its_non_zero_base() {
         let bus = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
-        assert_eq!(bus.write32(0, 0xdead_beef), BUS_OK);
-        assert_eq!(bus.read32(0).data, 0xdead_beef);
+        assert_eq!(bus.write32(RAM_BASE, 0xdead_beef), BUS_OK);
+        assert_eq!(bus.read32(RAM_BASE).data, 0xdead_beef);
     }
 
     #[test]
