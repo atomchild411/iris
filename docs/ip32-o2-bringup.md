@@ -170,13 +170,69 @@ and a control register is all POST asked for. The gate is the MACE PCI host
 bridge. That is a much better position than the assessment above assumed, and
 it changes the order of work: PCI config space next, not more CRIME.
 
+## Second run: the empty PCI bus works
+
+Adding a MACE PCI host bridge whose config reads return **all ones**, plus a
+PCI native-view window that does the same, cleared it completely: **no bus
+error, and zero unmapped accesses**. The PROM accepts a bus with nothing on it.
+
+It never used `CONFIG_ADDR`/`CONFIG_DATA` at all — 0 config cycles. It only
+touched the native-view window (1 read, 7 writes). So at this stage it is not
+enumerating PCI so much as poking at where a device would be.
+
+The bug that mattered was in the stub, not the bridge: returning **0** for an
+absent device reads back as vendor ID 0x0000, which firmware takes for a
+present-but-broken device. `0xffffffff` is the architectural "nobody home".
+
+## Third and fourth gates: two timers and a 1-Wire chip
+
+With PCI answered, the PROM spun 393,301 times on `MACE + 0x340000` —
+`MACE_UST_MSC`, the free-running system timer. Its delay loops are
+
+    ld   v1, 0(0xbf340000)      # now
+    daddu v1, v1, a0            # target = now + delay
+    1:  ld t0, 0(0xbf340000)
+        sltu at, t0, v1
+        bnezl at, 1b
+
+so a constant hangs forever. Giving it a counter that advances (currently a
+coarse `UST_STRIDE` per read — see the caveat in `ip32.rs`) dropped MACE reads
+from 393,307 to 6 and let it run on.
+
+It then went straight to hammering `MACE + 0x310008` — `MACE_ISA_FLASH_NIC_REG`
+— 20,331 paired read-modify-writes, interleaved with those same delay loops.
+The bits there are `MACE_ISA_NIC_DATA` (0x08) and `MACE_ISA_NIC_DEASSERT`
+(0x04): Dallas **1-Wire**. The PROM is bit-banging the serial-ID chip that
+holds the O2's serial number and Ethernet address, and our stub answers with a
+constant, so it retries forever.
+
+**That is the current gate.** It is the IP32 counterpart of the Indy's
+`eeprom_93c56`, which IRIS already emulates — the protocol differs but the role
+is identical, so there is a model to follow.
+
+## Gates found so far, in the order the PROM hits them
+
+| # | gate | verdict |
+|---|---|---|
+| 1 | CRIME | nearly free — `CONTROL` plus eight bank-control qwords |
+| 2 | MACE PCI | an **empty** bus is accepted, provided config reads are all-ones |
+| 3 | `MACE_UST_MSC` timer | required, trivial — must advance |
+| 4 | 1-Wire serial-ID chip | **current gate** |
+
+Everything up to here took one evening, which is the useful signal: the early
+PROM is far less demanding than the device list suggests.
+
 ## Open questions
 
 - ~~How much does `post1` insist on?~~ Answered: CRIME is cheap, MACE PCI is
   the gate. See above.
-- What does the PROM expect to find on PCI? An empty bus may be acceptable if
-  config reads return all-ones for absent devices, which is the next thing to
-  try — cheaper than emulating `ahc`.
+- ~~What does the PROM expect to find on PCI?~~ Answered: an empty bus is fine.
+- What will the PROM do when 1-Wire answers? It wants a serial number and a MAC.
+  Whether a plausible synthetic reply satisfies it, or whether it checksums
+  against something, is the next unknown.
+- `UST_STRIDE` is a bring-up shortcut: the counter advances per read rather
+  than with time. If the PROM ever derives a clock rate from it, that has to
+  become time-based.
 - Does the PROM require a framebuffer to be present even with `console=d`? The
   Indy PROM does not; the O2's `crt_option=1` in the default env suggests it at
   least looks.

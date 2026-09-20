@@ -30,6 +30,19 @@ pub const CRIME_SIZE: u32 = 0x0000_1000;
 /// taking a bus error — none of it is implemented yet.
 pub const MACE_BASE: u32 = 0x1f00_0000;
 pub const MACE_SIZE: u32 = 0x0080_0000;
+/// MACE's free-running timer (`MACE_UST_MSC`, i.e. `MACE_PERIF + 0x40000`).
+/// The PROM busy-waits on this; a constant hangs it forever.
+pub const MACE_UST_MSC: u32 = MACE_BASE + 0x0034_0000;
+pub const MACE_UST_MSC_SIZE: u32 = 0x0001_0000;
+
+/// MACE's PCI host bridge register block, at MACE + 0x080000.
+pub const MACEPCI_BASE: u32 = MACE_BASE + 0x0008_0000;
+pub const MACEPCI_SIZE: u32 = 0x0001_0000;
+/// The window where PCI memory appears 1:1 (`MACE_PCI_NATIVE_VIEW`). An O2
+/// PROM walks this while looking for the Adaptec SCSI controller.
+pub const PCI_NATIVE_VIEW_BASE: u32 = 0x4000_0000;
+pub const PCI_NATIVE_VIEW_SIZE: u32 = 0x0800_0000;
+
 /// Boot PROM. Same address as the Indy's, which is the one thing that carries
 /// over: the MIPS reset vector is 0xbfc00000 on both.
 pub const PROM_BASE: u32 = 0x1fc0_0000;
@@ -174,6 +187,165 @@ impl BusDevice for Crime {
     }
 }
 
+/// MACE's PCI host bridge, with nothing plugged into it.
+///
+/// Config cycles go through an address/data register pair, exactly like a PC's
+/// 0xcf8/0xcfc. The detail that matters for an empty bus: a config read of an
+/// absent device must return **all ones**, not zero. Zero reads back as vendor
+/// ID 0x0000, which firmware takes for a device that is present but broken;
+/// 0xffffffff is the architectural "nobody home".
+pub struct MacePci {
+    config_addr: Mutex<u32>,
+    regs: Mutex<[u32; (MACEPCI_SIZE / 4) as usize]>,
+    /// Distinct config addresses the guest selected, in order.
+    probed: Mutex<Vec<u32>>,
+}
+
+pub mod macepci_reg {
+    pub const ERROR_ADDR: u32 = 0x0000;
+    pub const ERROR_FLAGS: u32 = 0x0004;
+    pub const CONTROL: u32 = 0x0008;
+    pub const REVISION: u32 = 0x000c;
+    pub const CONFIG_ADDR: u32 = 0x0cf8;
+    pub const CONFIG_DATA: u32 = 0x0cfc;
+}
+
+/// What a MACE PCI bridge reports for itself. Zero here would make the PROM
+/// conclude the bridge is missing.
+pub const MACEPCI_REVISION_VALUE: u32 = 1;
+
+impl Default for MacePci {
+    fn default() -> Self { Self::new() }
+}
+
+impl MacePci {
+    pub fn new() -> Self {
+        Self {
+            config_addr: Mutex::new(0),
+            regs: Mutex::new([0u32; (MACEPCI_SIZE / 4) as usize]),
+            probed: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Config addresses selected so far, in first-touch order.
+    pub fn probed(&self) -> Vec<u32> {
+        self.probed.lock().unwrap().clone()
+    }
+}
+
+impl BusDevice for MacePci {
+    fn read32(&self, addr: u32) -> BusRead32 {
+        let off = addr & (MACEPCI_SIZE - 1) & !3;
+        match off {
+            macepci_reg::CONFIG_DATA => {
+                // Empty bus: every device is absent.
+                BusRead32::ok(0xffff_ffff)
+            }
+            macepci_reg::CONFIG_ADDR => BusRead32::ok(*self.config_addr.lock().unwrap()),
+            macepci_reg::REVISION => BusRead32::ok(MACEPCI_REVISION_VALUE),
+            _ => BusRead32::ok(self.regs.lock().unwrap()[(off / 4) as usize]),
+        }
+    }
+
+    fn write32(&self, addr: u32, val: u32) -> u32 {
+        let off = addr & (MACEPCI_SIZE - 1) & !3;
+        match off {
+            macepci_reg::CONFIG_ADDR => {
+                *self.config_addr.lock().unwrap() = val;
+                let mut p = self.probed.lock().unwrap();
+                if val != 0 && !p.contains(&val) {
+                    p.push(val);
+                }
+            }
+            macepci_reg::CONFIG_DATA => { /* writes to an absent device evaporate */ }
+            _ => self.regs.lock().unwrap()[(off / 4) as usize] = val,
+        }
+        BUS_OK
+    }
+
+    fn read64(&self, addr: u32) -> BusRead64 {
+        let hi = self.read32(addr).data as u64;
+        let lo = self.read32(addr.wrapping_add(4)).data as u64;
+        BusRead64::ok((hi << 32) | lo)
+    }
+
+    fn write64(&self, addr: u32, val: u64) -> u32 {
+        self.write32(addr, (val >> 32) as u32);
+        self.write32(addr.wrapping_add(4), val as u32)
+    }
+}
+
+/// The PCI memory window with nothing behind it. Reads all-ones, absorbs
+/// writes, and counts both so we can tell whether the PROM keeps poking.
+pub struct PciNativeView {
+    reads: Mutex<u64>,
+    writes: Mutex<u64>,
+}
+
+impl Default for PciNativeView {
+    fn default() -> Self { Self::new() }
+}
+
+impl PciNativeView {
+    pub fn new() -> Self { Self { reads: Mutex::new(0), writes: Mutex::new(0) } }
+    pub fn counts(&self) -> (u64, u64) {
+        (*self.reads.lock().unwrap(), *self.writes.lock().unwrap())
+    }
+}
+
+impl BusDevice for PciNativeView {
+    fn read8(&self, _a: u32) -> BusRead8 { *self.reads.lock().unwrap() += 1; BusRead8::ok(0xff) }
+    fn read16(&self, _a: u32) -> BusRead16 { *self.reads.lock().unwrap() += 1; BusRead16::ok(0xffff) }
+    fn read32(&self, _a: u32) -> BusRead32 { *self.reads.lock().unwrap() += 1; BusRead32::ok(0xffff_ffff) }
+    fn read64(&self, _a: u32) -> BusRead64 { *self.reads.lock().unwrap() += 1; BusRead64::ok(u64::MAX) }
+    fn write8(&self, _a: u32, _v: u8) -> u32 { *self.writes.lock().unwrap() += 1; BUS_OK }
+    fn write16(&self, _a: u32, _v: u16) -> u32 { *self.writes.lock().unwrap() += 1; BUS_OK }
+    fn write32(&self, _a: u32, _v: u32) -> u32 { *self.writes.lock().unwrap() += 1; BUS_OK }
+    fn write64(&self, _a: u32, _v: u64) -> u32 { *self.writes.lock().unwrap() += 1; BUS_OK }
+}
+
+/// MACE's UST/MSC counter: unadjusted system time, free-running.
+///
+/// Every read advances it by [`UST_STRIDE`]. Real hardware ticks off a clock
+/// independently of who is looking; the PROM's delay loops
+/// (`while (ust() < start + n)`) therefore spin at whatever rate we choose.
+/// Advancing one per read makes an `n`-tick delay cost `n` loop iterations,
+/// which for a millisecond-scale delay is millions of instructions. A coarse
+/// stride keeps those loops honest — they still terminate in order — without
+/// making bring-up runs take minutes.
+pub struct MaceUst {
+    ticks: Mutex<u64>,
+}
+
+/// Ticks added per read. Nothing derives a wall-clock figure from this yet; if
+/// something ever does, this has to become time-based instead.
+pub const UST_STRIDE: u64 = 1024;
+
+impl Default for MaceUst {
+    fn default() -> Self { Self::new() }
+}
+
+impl MaceUst {
+    pub fn new() -> Self { Self { ticks: Mutex::new(0) } }
+    fn tick(&self) -> u64 {
+        let mut t = self.ticks.lock().unwrap();
+        *t = t.wrapping_add(UST_STRIDE);
+        *t
+    }
+    pub fn now(&self) -> u64 { *self.ticks.lock().unwrap() }
+}
+
+impl BusDevice for MaceUst {
+    fn read32(&self, addr: u32) -> BusRead32 {
+        let t = self.tick();
+        // 64-bit counter presented as two 32-bit halves.
+        BusRead32::ok(if addr & 4 == 0 { (t >> 32) as u32 } else { t as u32 })
+    }
+    fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::ok(self.tick()) }
+    fn write32(&self, _a: u32, _v: u32) -> u32 { BUS_OK }
+    fn write64(&self, _a: u32, _v: u64) -> u32 { BUS_OK }
+}
+
 /// Reads as zero, absorbs writes, and counts both. Stands in for MACE until
 /// there is a reason to build it: a probe that bus-errors tells us nothing,
 /// whereas one that reads zero lets POST proceed to whatever it does next.
@@ -181,14 +353,29 @@ pub struct Stub {
     pub name: &'static str,
     reads: Mutex<u64>,
     writes: Mutex<u64>,
+    /// Per-offset access counts. A stub that is being polled hard is the guest
+    /// waiting on a bit we are not setting, and the offset says which.
+    hot: Mutex<std::collections::BTreeMap<u32, (u64, u64)>>,
 }
 
 impl Stub {
     pub fn new(name: &'static str) -> Self {
-        Self { name, reads: Mutex::new(0), writes: Mutex::new(0) }
+        Self {
+            name,
+            reads: Mutex::new(0),
+            writes: Mutex::new(0),
+            hot: Mutex::new(std::collections::BTreeMap::new()),
+        }
     }
     pub fn counts(&self) -> (u64, u64) {
         (*self.reads.lock().unwrap(), *self.writes.lock().unwrap())
+    }
+    /// Offsets by access count, busiest first: `(offset, reads, writes)`.
+    pub fn hottest(&self) -> Vec<(u32, u64, u64)> {
+        let mut v: Vec<(u32, u64, u64)> =
+            self.hot.lock().unwrap().iter().map(|(&o, &(r, w))| (o, r, w)).collect();
+        v.sort_by_key(|&(_, r, w)| std::cmp::Reverse(r + w));
+        v
     }
     fn r(&self) {
         *self.reads.lock().unwrap() += 1;
@@ -196,17 +383,24 @@ impl Stub {
     fn w(&self) {
         *self.writes.lock().unwrap() += 1;
     }
+    fn hit(&self, addr: u32, write: bool) {
+        let e = self.hot.lock().unwrap();
+        drop(e);
+        let mut h = self.hot.lock().unwrap();
+        let e = h.entry(addr & 0x007f_ffff & !3).or_insert((0, 0));
+        if write { e.1 += 1 } else { e.0 += 1 }
+    }
 }
 
 impl BusDevice for Stub {
-    fn read8(&self, _a: u32) -> BusRead8 { self.r(); BusRead8::ok(0) }
-    fn read16(&self, _a: u32) -> BusRead16 { self.r(); BusRead16::ok(0) }
-    fn read32(&self, _a: u32) -> BusRead32 { self.r(); BusRead32::ok(0) }
-    fn read64(&self, _a: u32) -> BusRead64 { self.r(); BusRead64::ok(0) }
-    fn write8(&self, _a: u32, _v: u8) -> u32 { self.w(); BUS_OK }
-    fn write16(&self, _a: u32, _v: u16) -> u32 { self.w(); BUS_OK }
-    fn write32(&self, _a: u32, _v: u32) -> u32 { self.w(); BUS_OK }
-    fn write64(&self, _a: u32, _v: u64) -> u32 { self.w(); BUS_OK }
+    fn read8(&self, a: u32) -> BusRead8 { self.r(); self.hit(a, false); BusRead8::ok(0) }
+    fn read16(&self, a: u32) -> BusRead16 { self.r(); self.hit(a, false); BusRead16::ok(0) }
+    fn read32(&self, a: u32) -> BusRead32 { self.r(); self.hit(a, false); BusRead32::ok(0) }
+    fn read64(&self, a: u32) -> BusRead64 { self.r(); self.hit(a, false); BusRead64::ok(0) }
+    fn write8(&self, a: u32, _v: u8) -> u32 { self.w(); self.hit(a, true); BUS_OK }
+    fn write16(&self, a: u32, _v: u16) -> u32 { self.w(); self.hit(a, true); BUS_OK }
+    fn write32(&self, a: u32, _v: u32) -> u32 { self.w(); self.hit(a, true); BUS_OK }
+    fn write64(&self, a: u32, _v: u64) -> u32 { self.w(); self.hit(a, true); BUS_OK }
 }
 
 /// The IP32 physical bus for bring-up: RAM, CRIME, a MACE stub and the PROM.
@@ -219,6 +413,9 @@ pub struct Ip32Bus {
     prom: Vec<u8>,
     pub crime: Crime,
     pub mace: Stub,
+    pub macepci: MacePci,
+    pub ust: MaceUst,
+    pub pci_view: PciNativeView,
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write)`.
     unmapped: Mutex<Vec<(u32, bool)>>,
 }
@@ -232,6 +429,9 @@ impl Ip32Bus {
             prom,
             crime: Crime::new(),
             mace: Stub::new("mace"),
+            macepci: MacePci::new(),
+            ust: MaceUst::new(),
+            pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
         }
     }
@@ -265,6 +465,19 @@ impl Ip32Bus {
 
     fn in_mace(&self, addr: u32) -> bool {
         addr >= MACE_BASE && addr < MACE_BASE + MACE_SIZE
+    }
+
+    fn in_ust(&self, addr: u32) -> bool {
+        addr >= MACE_UST_MSC && addr < MACE_UST_MSC + MACE_UST_MSC_SIZE
+    }
+
+    fn in_macepci(&self, addr: u32) -> bool {
+        addr >= MACEPCI_BASE && addr < MACEPCI_BASE + MACEPCI_SIZE
+    }
+
+    fn in_pci_view(&self, addr: u32) -> bool {
+        addr >= PCI_NATIVE_VIEW_BASE
+            && addr < PCI_NATIVE_VIEW_BASE.wrapping_add(PCI_NATIVE_VIEW_SIZE)
     }
 
     fn read_bytes(&self, addr: u32, n: usize) -> Option<u64> {
@@ -332,6 +545,12 @@ impl BusDevice for Ip32Bus {
         if self.in_crime(addr) {
             return BusRead8::ok(self.crime.read32(addr & !3).data as u8);
         }
+        if self.in_macepci(addr) {
+            return BusRead8::ok(self.macepci.read32(addr & !3).data as u8);
+        }
+        if self.in_pci_view(addr) {
+            return self.pci_view.read8(addr);
+        }
         if self.in_mace(addr) {
             return self.mace.read8(addr);
         }
@@ -341,6 +560,12 @@ impl BusDevice for Ip32Bus {
     fn read16(&self, addr: u32) -> BusRead16 {
         if self.in_crime(addr) {
             return BusRead16::ok(self.crime.read32(addr & !3).data as u16);
+        }
+        if self.in_macepci(addr) {
+            return BusRead16::ok(self.macepci.read32(addr & !3).data as u16);
+        }
+        if self.in_pci_view(addr) {
+            return self.pci_view.read16(addr);
         }
         if self.in_mace(addr) {
             return self.mace.read16(addr);
@@ -352,6 +577,15 @@ impl BusDevice for Ip32Bus {
         if self.in_crime(addr) {
             return self.crime.read32(addr);
         }
+        if self.in_ust(addr) {
+            return self.ust.read32(addr);
+        }
+        if self.in_macepci(addr) {
+            return self.macepci.read32(addr);
+        }
+        if self.in_pci_view(addr) {
+            return self.pci_view.read32(addr);
+        }
         if self.in_mace(addr) {
             return self.mace.read32(addr);
         }
@@ -361,6 +595,15 @@ impl BusDevice for Ip32Bus {
     fn read64(&self, addr: u32) -> BusRead64 {
         if self.in_crime(addr) {
             return self.crime.read64(addr);
+        }
+        if self.in_ust(addr) {
+            return self.ust.read64(addr);
+        }
+        if self.in_macepci(addr) {
+            return self.macepci.read64(addr);
+        }
+        if self.in_pci_view(addr) {
+            return self.pci_view.read64(addr);
         }
         if self.in_mace(addr) {
             return self.mace.read64(addr);
@@ -372,6 +615,12 @@ impl BusDevice for Ip32Bus {
         if self.in_crime(addr) {
             return self.crime.write32(addr & !3, val as u32);
         }
+        if self.in_macepci(addr) {
+            return self.macepci.write32(addr & !3, val as u32);
+        }
+        if self.in_pci_view(addr) {
+            return self.pci_view.write8(addr, val);
+        }
         if self.in_mace(addr) {
             return self.mace.write8(addr, val);
         }
@@ -381,6 +630,12 @@ impl BusDevice for Ip32Bus {
     fn write16(&self, addr: u32, val: u16) -> u32 {
         if self.in_crime(addr) {
             return self.crime.write32(addr & !3, val as u32);
+        }
+        if self.in_macepci(addr) {
+            return self.macepci.write32(addr & !3, val as u32);
+        }
+        if self.in_pci_view(addr) {
+            return self.pci_view.write16(addr, val);
         }
         if self.in_mace(addr) {
             return self.mace.write16(addr, val);
@@ -392,6 +647,15 @@ impl BusDevice for Ip32Bus {
         if self.in_crime(addr) {
             return self.crime.write32(addr, val);
         }
+        if self.in_ust(addr) {
+            return self.ust.write32(addr, val);
+        }
+        if self.in_macepci(addr) {
+            return self.macepci.write32(addr, val);
+        }
+        if self.in_pci_view(addr) {
+            return self.pci_view.write32(addr, val);
+        }
         if self.in_mace(addr) {
             return self.mace.write32(addr, val);
         }
@@ -401,6 +665,15 @@ impl BusDevice for Ip32Bus {
     fn write64(&self, addr: u32, val: u64) -> u32 {
         if self.in_crime(addr) {
             return self.crime.write64(addr, val);
+        }
+        if self.in_ust(addr) {
+            return self.ust.write64(addr, val);
+        }
+        if self.in_macepci(addr) {
+            return self.macepci.write64(addr, val);
+        }
+        if self.in_pci_view(addr) {
+            return self.pci_view.write64(addr, val);
         }
         if self.in_mace(addr) {
             return self.mace.write64(addr, val);
@@ -585,13 +858,17 @@ mod bringup {
 
         let mut reached_post1 = false;
         let mut steps = 0u64;
-        const LIMIT: u64 = 2_000_000;
+        let mut max_prom_pc = 0u32;
+        const LIMIT: u64 = 50_000_000;
 
         while steps < LIMIT {
             let pc = exec.core.pc as u32;
             if pc == POST1_ENTRY {
                 reached_post1 = true;
                 break;
+            }
+            if (0xbfc0_0000..0xbfc8_0000).contains(&pc) && pc > max_prom_pc {
+                max_prom_pc = pc;
             }
             exec.step_int();
             steps += 1;
@@ -600,6 +877,7 @@ mod bringup {
         let pc = exec.core.pc as u32;
         eprintln!("ip32: stopped after {steps} steps at PC 0x{pc:08x}{}",
                   if reached_post1 { "  <-- post1 entry" } else { "" });
+        eprintln!("ip32: furthest PC seen inside the PROM: 0x{max_prom_pc:08x}");
 
         let touched = bus.crime.touched();
         eprintln!("ip32: CRIME registers touched ({}):", touched.len());
@@ -609,6 +887,21 @@ mod bringup {
 
         let (mr, mw) = bus.mace.counts();
         eprintln!("ip32: MACE accesses: {mr} reads, {mw} writes");
+
+        eprintln!("ip32: busiest MACE offsets:");
+        for (off, r, w) in bus.mace.hottest().into_iter().take(8) {
+            eprintln!("   +0x{:06x}  {:>8} R  {:>4} W", off, r, w);
+        }
+
+        let probed = bus.macepci.probed();
+        eprintln!("ip32: PCI config addresses selected ({}):", probed.len());
+        for a in probed.iter().take(16) {
+            // MACE tags are bus/dev/func/reg packed the usual way.
+            eprintln!("   0x{:08x}  bus {} dev {:2} fn {} reg 0x{:02x}",
+                      a, (a >> 16) & 0xff, (a >> 11) & 0x1f, (a >> 8) & 7, a & 0xfc);
+        }
+        let (pr, pw) = bus.pci_view.counts();
+        eprintln!("ip32: PCI native-view accesses: {pr} reads, {pw} writes");
 
         let un = bus.unmapped();
         eprintln!("ip32: unmapped accesses ({}):", un.len());
