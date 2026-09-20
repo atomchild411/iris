@@ -701,6 +701,98 @@ bit-banged it off the 1-Wire line one pulse width at a time. The bring-up test
 asserts it, along with the menu, the monitor, and the inventory, so any one of
 those devices regressing fails the test with the console attached.
 
+## The PCI bus, and where block storage stops being cheap
+
+2026-09-19, started. Three things are done and one decision is open.
+
+### What the PROM looks for
+
+Choosing `1) Start System` makes the PROM probe **bus 0, devices 1, 2 and 3,
+function 0, register 0** — a vendor-ID scan and nothing more. An empty bus
+answers `0xffffffff` three times and it gives up with `Autoboot failed`.
+
+Putting the controller a real O2 has there — an Adaptec AIC-7880, vendor
+`0x9004` device `0x8078` — makes it go much further. It reads the class code,
+sizes **all six BARs**, sets the cache line size, enables memory decoding, and
+goes straight to the device.
+
+So the config space had to become real: a slot table, and BARs that answer a
+size probe. A BAR that stores whatever it is given claims four gigabytes, and
+firmware lays the bus out accordingly.
+
+### The window is not where the BAR says
+
+The first attempt mapped PCI memory one-to-one, because the PROM had
+programmed BAR1 to `0x80001000`. It bus-errored anyway, and the PROM's own
+register dump said why:
+
+```text
+Instruction Bus error
+  tmp: 81070000 0 81073548 81055888 ba001084 810735d0 ffff 4
+```
+
+`0xba001084` is physical `0x1a001084`. `0x80001000` is a **PCI** address; the
+CPU reaches it through a window at `0x1a000000`. The translation is
+`pci = 0x80000000 + (phys - 0x1a000000)`, and with that the device is where
+the firmware looks.
+
+A panic register dump is a gift. It named the address nothing had decoded.
+
+### Byte lanes, and a list of registers that suddenly made sense
+
+With the window mapped, the chip conversation was writes to offsets `0x84`,
+`0x91`, `0x93` and `0xbc`. Those are nothing in particular on an AIC-7880.
+
+PCI is little-endian and this CPU is not, so the bridge swaps byte lanes: an
+8-bit access at `A` reaches device byte `A ^ 3`. Applying that:
+
+| CPU | Device | Register | What it does |
+|---|---|---|---|
+| `0x84` | `0x87` | `HCNTRL` | write 1 (chip reset), then 4 (pause), read back |
+| `0x91` | `0x92` | `CLRINT` | `0x1f`, clear every interrupt |
+| `0x93` | `0x90` | `SCBPTR` | `0,1,2,...,15` |
+| `0xbc` | `0xbf` | last SCB byte | `0xff` for each, clearing them |
+
+That is textbook aic7xxx bring-up, and it is the confirmation that both the
+window and the swizzle are right. Guessing either one wrong produces a
+plausible-looking register list that is entirely fictional.
+
+### Where it stops
+
+The whole conversation, by register:
+
+```text
+3a..5d : one write each   sequencer scratch RAM, the driver's configuration
+60     : 3 writes         SEQCTL
+61     : 1696 writes      SEQRAM
+62,63  : 2 writes each    SEQADDR0/1
+87     : 2w 1r            HCNTRL
+90     : 16 writes        SCBPTR
+92     : 1 write          CLRINT
+bf     : 16 writes        SCB control
+```
+
+**1696 bytes written to `SEQRAM`.** The AIC-7880 has no fixed behaviour to
+emulate: the driver downloads a sequencer program into the chip and starts it,
+and everything the controller does afterwards is that program running. Two
+ways forward, and they are very different pieces of work:
+
+1. **Run the sequencer.** Implement its instruction set and execute the 1696
+   bytes the PROM supplies. Faithful, and it would work for any driver — the
+   PROM, IRIX and NetBSD all download their own program. It is also an
+   instruction set to write and debug.
+2. **Emulate above it.** Ignore the downloaded program and implement what the
+   driver observes: SCBs, the queue in and out FIFOs, and interrupts, doing
+   the SCSI work ourselves. Much less code, and IRIS already has a SCSI target
+   model to reuse. But it is a behavioural contract with each driver rather
+   than with the hardware, so a driver that uses the chip differently — or a
+   different sequencer program — can break it.
+
+Worth noting before choosing: the licence constraints still apply. MAME and
+recent QEMU forks are GPL and may not be copied from; NetBSD's `ahc` driver is
+BSD and is a legitimate reference for what the *host side* expects to see,
+which is exactly the contract option 2 needs.
+
 ### Diagnostics need a disk
 
 `3) Run Diagnostics` answers `No SystemPartition set`. The IDE suite is a

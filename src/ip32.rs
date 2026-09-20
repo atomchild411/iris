@@ -317,11 +317,156 @@ impl BusDevice for Crime {
 /// absent device must return **all ones**, not zero. Zero reads back as vendor
 /// ID 0x0000, which firmware takes for a device that is present but broken;
 /// 0xffffffff is the architectural "nobody home".
+/// One PCI function's configuration space.
+///
+/// Enough of it to be discovered and configured: identity, class, command and
+/// status, and base address registers that answer a size probe. Writing all
+/// ones to a BAR and reading it back is how firmware learns how much space a
+/// device wants, so a BAR that stores whatever it is given reports a size of
+/// four gigabytes and the bus layout falls apart.
+pub struct PciFunction {
+    pub name: &'static str,
+    config: Mutex<[u32; 64]>,
+    /// Size of each BAR in bytes; zero means the BAR is not implemented.
+    bar_size: [u32; 6],
+    /// Every config register touched, in first-touch order, with direction.
+    touched: Mutex<Vec<(u8, bool)>>,
+    /// The device's own registers, behind its memory BAR, and a log of what
+    /// the guest did to them. At this stage the log is the point: it says
+    /// which parts of the chip the firmware insists on.
+    mem: Mutex<std::collections::BTreeMap<u32, u32>>,
+    mem_log: Mutex<Vec<(u32, bool, u32, u32)>>,
+}
+
+impl PciFunction {
+    /// `class` is the 24-bit class/subclass/interface, as it sits in the top
+    /// three bytes of register 0x08.
+    pub fn new(
+        name: &'static str,
+        vendor: u16,
+        device: u16,
+        class: u32,
+        revision: u8,
+        bar_size: [u32; 6],
+    ) -> Self {
+        let mut c = [0u32; 64];
+        c[0] = ((device as u32) << 16) | vendor as u32;
+        c[2] = (class << 8) | revision as u32;
+        // Single-function, ordinary device header.
+        c[3] = 0;
+        // Interrupt pin A; the line is left for firmware to assign.
+        c[15] = 0x0000_0100;
+        Self {
+            name,
+            config: Mutex::new(c),
+            bar_size,
+            touched: Mutex::new(Vec::new()),
+            mem: Mutex::new(std::collections::BTreeMap::new()),
+            mem_log: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn note(&self, reg: u8, write: bool) {
+        let mut t = self.touched.lock().unwrap();
+        if !t.iter().any(|&(r, w)| r == reg && w == write) {
+            t.push((reg, write));
+        }
+    }
+
+    /// Config registers touched so far: `(byte offset, was_write)`.
+    pub fn touched(&self) -> Vec<(u8, bool)> {
+        self.touched.lock().unwrap().clone()
+    }
+
+    /// The base address firmware programmed into a BAR, with the type bits
+    /// masked off.
+    pub fn bar(&self, i: usize) -> u32 {
+        let v = self.config.lock().unwrap()[4 + i];
+        if v & 1 != 0 { v & !3 } else { v & !15 }
+    }
+
+    /// Accesses to the device's memory BAR: `(offset, was_write, value, pc)`.
+    pub fn mem_log(&self) -> Vec<(u32, bool, u32, u32)> {
+        self.mem_log.lock().unwrap().clone()
+    }
+
+    fn log_mem(&self, off: u32, write: bool, val: u32, pc: u32) {
+        let mut l = self.mem_log.lock().unwrap();
+        if l.len() < 20000 {
+            l.push((off, write, val, pc));
+        }
+    }
+
+    pub fn mem_read(&self, off: u32, width: usize, pc: u32) -> u32 {
+        let m = self.mem.lock().unwrap();
+        let mut v = 0u32;
+        for i in 0..width as u32 {
+            v = (v << 8) | m.get(&(off + i)).copied().unwrap_or(0);
+        }
+        drop(m);
+        self.log_mem(off, false, v, pc);
+        v
+    }
+
+    pub fn mem_write(&self, off: u32, val: u32, width: usize, pc: u32) {
+        self.log_mem(off, true, val, pc);
+        let mut m = self.mem.lock().unwrap();
+        for i in 0..width as u32 {
+            m.insert(off + i, (val >> (8 * (width as u32 - 1 - i))) as u8 as u32);
+        }
+    }
+
+    /// True when the device has been told it may decode memory accesses.
+    pub fn memory_enabled(&self) -> bool {
+        self.config.lock().unwrap()[1] & 0x2 != 0
+    }
+
+    pub fn read(&self, reg: usize) -> u32 {
+        self.note((reg * 4) as u8, false);
+        match reg {
+            // Status: report that we are a fast device with no errors.
+            1 => (self.config.lock().unwrap()[1] & 0xffff) | 0x0200_0000,
+            _ => self.config.lock().unwrap()[reg],
+        }
+    }
+
+    pub fn write(&self, reg: usize, val: u32) {
+        self.note((reg * 4) as u8, true);
+        let mut c = self.config.lock().unwrap();
+        match reg {
+            // Identity, class and header type are read-only.
+            0 | 2 | 3 => {}
+            // Command register; status bits are write-one-to-clear and we
+            // never set any.
+            1 => c[1] = val & 0xffff,
+            4..=9 => {
+                let i = reg - 4;
+                let size = self.bar_size[i];
+                if size == 0 {
+                    c[reg] = 0;
+                } else {
+                    // Bit 0 selects I/O space. Keep the type bits we
+                    // advertise and let the address bits above the size be
+                    // written; everything below reads back as zero, which is
+                    // what tells firmware the size.
+                    let io = i == 0;
+                    let mask = !(size - 1);
+                    let type_bits = if io { 1 } else { 0 };
+                    c[reg] = (val & mask) | type_bits;
+                }
+            }
+            _ => c[reg] = val,
+        }
+    }
+}
+
 pub struct MacePci {
     config_addr: Mutex<u32>,
     regs: Mutex<[u32; (MACEPCI_SIZE / 4) as usize]>,
     /// Distinct config addresses the guest selected, in order.
     probed: Mutex<Vec<u32>>,
+    /// Devices by slot number on bus 0.
+    slots: Mutex<std::collections::BTreeMap<u8, std::sync::Arc<PciFunction>>>,
 }
 
 pub mod macepci_reg {
@@ -337,6 +482,26 @@ pub mod macepci_reg {
 /// conclude the bridge is missing.
 pub const MACEPCI_REVISION_VALUE: u32 = 1;
 
+/// The SCSI controller an O2 has on its PCI bus: an Adaptec AIC-7880.
+pub const PCI_VENDOR_ADAPTEC: u16 = 0x9004;
+pub const PCI_DEVICE_AIC7880: u16 = 0x8078;
+/// Mass storage controller, SCSI, no specific programming interface.
+pub const PCI_CLASS_SCSI: u32 = 0x0100_00;
+/// The slot the PROM looks in first.
+pub const IP32_SCSI_SLOT: u8 = 1;
+
+/// The CPU-side window onto PCI memory, and the PCI address it starts at.
+///
+/// These are not the same number, which is the whole point. The PROM programs
+/// a BAR with a *PCI* address — 0x80001000 — and then reaches it through a
+/// window low in the CPU's physical map. The bus-error register dump named
+/// `0xba001084`, physical 0x1a001084, which is this window plus 0x1084, which
+/// is that BAR plus 0x84. Mapping the window one-to-one instead would put the
+/// device nowhere the firmware ever looks.
+pub const PCI_MEM_BASE: u32 = 0x1a00_0000;
+pub const PCI_MEM_SIZE: u32 = 0x0200_0000;
+pub const PCI_MEM_PCI_BASE: u32 = 0x8000_0000;
+
 impl Default for MacePci {
     fn default() -> Self { Self::new() }
 }
@@ -347,7 +512,55 @@ impl MacePci {
             config_addr: Mutex::new(0),
             regs: Mutex::new([0u32; (MACEPCI_SIZE / 4) as usize]),
             probed: Mutex::new(Vec::new()),
+            slots: Mutex::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    /// Put a device in a slot on bus 0.
+    pub fn attach(&self, slot: u8, f: std::sync::Arc<PciFunction>) {
+        self.slots.lock().unwrap().insert(slot, f);
+    }
+
+    pub fn slot(&self, slot: u8) -> Option<std::sync::Arc<PciFunction>> {
+        self.slots.lock().unwrap().get(&slot).cloned()
+    }
+
+    /// The device decoding a PCI memory address, and the offset within its
+    /// BAR, if any device claims it.
+    pub fn mem_target(&self, pci_addr: u32) -> Option<(std::sync::Arc<PciFunction>, u32)> {
+        for f in self.slots.lock().unwrap().values() {
+            if !f.memory_enabled() {
+                continue;
+            }
+            for i in 0..6 {
+                let size = f.bar_size[i];
+                let base = f.bar(i);
+                if size != 0 && base != 0 && pci_addr >= base && pci_addr < base + size {
+                    return Some((f.clone(), pci_addr - base));
+                }
+            }
+        }
+        None
+    }
+
+    /// Split a CONFIG_ADDR value into the function it selects and the
+    /// register within it. Only bus 0 exists here.
+    fn selected(&self) -> Option<(std::sync::Arc<PciFunction>, usize)> {
+        let a = *self.config_addr.lock().unwrap();
+        // Bit 31 enables the cycle.
+        if a & 0x8000_0000 == 0 {
+            return None;
+        }
+        if (a >> 16) & 0xff != 0 {
+            return None;
+        }
+        let dev = ((a >> 11) & 0x1f) as u8;
+        let func = (a >> 8) & 7;
+        if func != 0 {
+            return None;
+        }
+        let f = self.slots.lock().unwrap().get(&dev).cloned()?;
+        Some((f, ((a >> 2) & 0x3f) as usize))
     }
 
     /// Config addresses selected so far, in first-touch order.
@@ -360,10 +573,11 @@ impl BusDevice for MacePci {
     fn read32(&self, addr: u32) -> BusRead32 {
         let off = addr & (MACEPCI_SIZE - 1) & !3;
         match off {
-            macepci_reg::CONFIG_DATA => {
-                // Empty bus: every device is absent.
-                BusRead32::ok(0xffff_ffff)
-            }
+            macepci_reg::CONFIG_DATA => BusRead32::ok(match self.selected() {
+                Some((f, reg)) => f.read(reg),
+                // An absent device: the bus floats high.
+                None => 0xffff_ffff,
+            }),
             macepci_reg::CONFIG_ADDR => BusRead32::ok(*self.config_addr.lock().unwrap()),
             macepci_reg::REVISION => BusRead32::ok(MACEPCI_REVISION_VALUE),
             _ => BusRead32::ok(self.regs.lock().unwrap()[(off / 4) as usize]),
@@ -380,7 +594,11 @@ impl BusDevice for MacePci {
                     p.push(val);
                 }
             }
-            macepci_reg::CONFIG_DATA => { /* writes to an absent device evaporate */ }
+            macepci_reg::CONFIG_DATA => {
+                if let Some((f, reg)) = self.selected() {
+                    f.write(reg, val);
+                }
+            }
             _ => self.regs.lock().unwrap()[(off / 4) as usize] = val,
         }
         BUS_OK
@@ -1309,6 +1527,24 @@ impl Ip32Bus {
             }),
             watch_log: Mutex::new(Vec::new()),
         };
+        // An experiment for now: the PROM probes slots 1..3 for a vendor ID
+        // and finds nothing, so it has no disk and cannot boot. Putting the
+        // controller a real O2 has there is how we learn how much of it the
+        // PROM insists on.
+        if std::env::var("IRIS_IP32_SCSI").is_ok() {
+            bus.macepci.attach(
+                IP32_SCSI_SLOT,
+                std::sync::Arc::new(PciFunction::new(
+                    "aic7880",
+                    PCI_VENDOR_ADAPTEC,
+                    PCI_DEVICE_AIC7880,
+                    PCI_CLASS_SCSI,
+                    0x01,
+                    // 256 bytes of I/O, 4 KiB of memory: what the part has.
+                    [0x100, 0x1000, 0, 0, 0, 0],
+                )),
+            );
+        }
         // So a hot offset can name the code polling it.
         bus.mace.watch_pc(pc.clone());
         bus.crime_re.watch_pc(pc.clone());
@@ -1401,6 +1637,54 @@ impl Ip32Bus {
 
     fn in_prom(&self, addr: u32) -> bool {
         addr >= PROM_BASE && addr < PROM_BASE + PROM_SIZE
+    }
+
+    /// Reads of PCI memory: the device that claims the address, or all ones
+    /// from the floating bus.
+    /// PCI is little-endian and this CPU is not, so the bridge swaps byte
+    /// lanes: an 8-bit access at CPU offset `A` reaches device byte `A ^ 3`,
+    /// and a 16-bit one `A ^ 2`.
+    ///
+    /// This is not cosmetic. Without it the AIC-7880's initialisation reads
+    /// as writes to registers 0x84, 0x91, 0x93 and 0xbc, which are nothing in
+    /// particular. With it they are HCNTRL (chip reset, then pause), CLRINT
+    /// (clear every interrupt), SCBPTR walking 0,1,2,... and the last byte of
+    /// each SCB being cleared — which is exactly how that chip is brought up.
+    fn lane_swizzle(off: u32, width: usize) -> u32 {
+        match width {
+            1 => off ^ 3,
+            2 => off ^ 2,
+            _ => off,
+        }
+    }
+
+    fn pci_addr_of(addr: u32) -> u32 {
+        PCI_MEM_PCI_BASE.wrapping_add(addr.wrapping_sub(PCI_MEM_BASE))
+    }
+
+    fn pci_mem_read_w(&self, addr: u32, width: usize) -> u32 {
+        match self.macepci.mem_target(Self::pci_addr_of(addr)) {
+            Some((f, off)) => f.mem_read(Self::lane_swizzle(off, width), width, self.pc.get()),
+            None => 0xffff_ffff,
+        }
+    }
+
+    fn pci_mem_read(&self, addr: u32) -> u32 {
+        self.pci_mem_read_w(addr, 4)
+    }
+
+    fn pci_mem_write_w(&self, addr: u32, val: u32, width: usize) {
+        if let Some((f, off)) = self.macepci.mem_target(Self::pci_addr_of(addr)) {
+            f.mem_write(Self::lane_swizzle(off, width), val, width, self.pc.get());
+        }
+    }
+
+    fn pci_mem_write(&self, addr: u32, val: u32) {
+        self.pci_mem_write_w(addr, val, 4)
+    }
+
+    fn in_pci_mem(&self, addr: u32) -> bool {
+        addr >= PCI_MEM_BASE && addr < PCI_MEM_BASE.wrapping_add(PCI_MEM_SIZE)
     }
 
     fn in_ps2(&self, addr: u32) -> bool {
@@ -1590,6 +1874,9 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read8(addr);
         }
+        if self.in_pci_mem(addr) {
+            return BusRead8::ok(self.pci_mem_read_w(addr, 1) as u8);
+        }
         if self.in_ps2(addr) {
             return BusRead8::ok(self.ps2.read(addr) as u8);
         }
@@ -1620,6 +1907,9 @@ impl BusDevice for Ip32Bus {
         }
         if let Some(c) = self.com_for(addr) {
             return c.read16(addr);
+        }
+        if self.in_pci_mem(addr) {
+            return BusRead16::ok(self.pci_mem_read_w(addr, 2) as u16);
         }
         if self.in_ps2(addr) {
             return BusRead16::ok(self.ps2.read(addr) as u16);
@@ -1660,6 +1950,9 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read32(addr);
         }
+        if self.in_pci_mem(addr) {
+            return BusRead32::ok(self.pci_mem_read(addr) as u32);
+        }
         if self.in_ps2(addr) {
             return BusRead32::ok(self.ps2.read(addr) as u32);
         }
@@ -1699,6 +1992,12 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read64(addr);
         }
+        if self.in_pci_mem(addr) {
+            // A 64-bit access to a 32-bit bus is two cycles.
+            let hi = self.pci_mem_read(addr) as u64;
+            let lo = self.pci_mem_read(addr.wrapping_add(4)) as u64;
+            return BusRead64::ok((hi << 32) | lo);
+        }
         if self.in_ps2(addr) {
             return BusRead64::ok(self.ps2.read(addr));
         }
@@ -1737,6 +2036,10 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.write8(addr, val);
         }
+        if self.in_pci_mem(addr) {
+            self.pci_mem_write_w(addr, val as u32, 1);
+            return BUS_OK;
+        }
         if self.in_ps2(addr) {
             self.ps2.write(addr, val as u64);
             return BUS_OK;
@@ -1768,6 +2071,10 @@ impl BusDevice for Ip32Bus {
         }
         if let Some(c) = self.com_for(addr) {
             return c.write16(addr, val);
+        }
+        if self.in_pci_mem(addr) {
+            self.pci_mem_write_w(addr, val as u32, 2);
+            return BUS_OK;
         }
         if self.in_ps2(addr) {
             self.ps2.write(addr, val as u64);
@@ -1809,6 +2116,10 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.write32(addr, val);
         }
+        if self.in_pci_mem(addr) {
+            self.pci_mem_write_w(addr, val as u32, 4);
+            return BUS_OK;
+        }
         if self.in_ps2(addr) {
             self.ps2.write(addr, val as u64);
             return BUS_OK;
@@ -1848,6 +2159,10 @@ impl BusDevice for Ip32Bus {
         }
         if let Some(c) = self.com_for(addr) {
             return c.write64(addr, val);
+        }
+        if self.in_pci_mem(addr) {
+            self.pci_mem_write_w(addr, val as u32, 4);
+            return BUS_OK;
         }
         if self.in_ps2(addr) {
             self.ps2.write(addr, val as u64);
@@ -2391,6 +2706,60 @@ mod tests {
         assert_eq!(r.peek(0x3f), 0xa5);
         // The valid-RAM-and-time flag must not read as a dead battery.
         assert_ne!(r.peek(0x0d) & 0x80, 0);
+    }
+
+    /// Firmware learns how much space a device wants by writing all ones to
+    /// a BAR and reading back which address bits stuck. A BAR that stores
+    /// whatever it is given claims four gigabytes and the bus layout
+    /// collapses.
+    #[test]
+    fn a_bar_reports_its_size_to_a_probe() {
+        let f = PciFunction::new("t", 0x9004, 0x8078, PCI_CLASS_SCSI, 1, [0x100, 0x1000, 0, 0, 0, 0]);
+        assert_eq!(f.read(0), 0x8078_9004, "device and vendor id");
+
+        f.write(4, 0xffff_ffff);
+        assert_eq!(f.read(4), 0xffff_ff01, "256 bytes of I/O space");
+        f.write(5, 0xffff_ffff);
+        assert_eq!(f.read(5), 0xffff_f000, "4 KiB of memory space");
+        // An unimplemented BAR reads back as zero however hard it is probed.
+        f.write(6, 0xffff_ffff);
+        assert_eq!(f.read(6), 0);
+
+        f.write(5, 0x8000_1000);
+        assert_eq!(f.bar(1), 0x8000_1000, "and then holds the address assigned to it");
+    }
+
+    /// PCI is little-endian and this CPU is not. Without the bridge's byte
+    /// lane swap the AIC-7880's bring-up reads as traffic to registers 0x84,
+    /// 0x91, 0x93 and 0xbc, which are nothing; with it they are HCNTRL,
+    /// CLRINT, SCBPTR and the SCB array, which is exactly right.
+    #[test]
+    fn the_bridge_swaps_byte_lanes_for_a_little_endian_device() {
+        assert_eq!(Ip32Bus::lane_swizzle(0x84, 1), 0x87, "HCNTRL");
+        assert_eq!(Ip32Bus::lane_swizzle(0x91, 1), 0x92, "CLRINT");
+        assert_eq!(Ip32Bus::lane_swizzle(0x93, 1), 0x90, "SCBPTR");
+        assert_eq!(Ip32Bus::lane_swizzle(0xbc, 1), 0xbf, "last byte of the SCB");
+        assert_eq!(Ip32Bus::lane_swizzle(0x84, 2), 0x86, "16-bit lanes swap in pairs");
+        assert_eq!(Ip32Bus::lane_swizzle(0x84, 4), 0x84, "a whole word needs no swap");
+    }
+
+    /// A device only decodes memory once it has been told it may, and only
+    /// within the BAR it was assigned.
+    #[test]
+    fn a_device_claims_only_its_own_window_and_only_when_enabled() {
+        let pci = MacePci::new();
+        let f = std::sync::Arc::new(PciFunction::new(
+            "t", 0x9004, 0x8078, PCI_CLASS_SCSI, 1, [0x100, 0x1000, 0, 0, 0, 0]));
+        pci.attach(IP32_SCSI_SLOT, f.clone());
+        f.write(5, 0x8000_1000);
+
+        assert!(pci.mem_target(0x8000_1000).is_none(),
+                "memory decoding is off until the command register says otherwise");
+        f.write(1, 0x2);
+        let (got, off) = pci.mem_target(0x8000_1084).expect("in range");
+        assert_eq!(got.name, "t");
+        assert_eq!(off, 0x84);
+        assert!(pci.mem_target(0x8000_2000).is_none(), "past the end of the BAR");
     }
 
     #[test]
@@ -2959,6 +3328,53 @@ mod bringup {
                       off, r, w, who.join(" "));
         }
 
+        for slot in 0..8u8 {
+            if let Some(f) = bus.macepci.slot(slot) {
+                let t: Vec<String> = f.touched().iter()
+                    .map(|(r, w)| format!("{:02x}{}", r, if *w { "W" } else { "R" }))
+                    .collect();
+                eprintln!("ip32: PCI slot {slot} ({}) config touched: {}", f.name, t.join(" "));
+                for i in 0..6 {
+                    let b = f.bar(i);
+                    if b != 0 {
+                        eprintln!("   BAR{i} programmed to 0x{b:08x}");
+                    }
+                }
+                eprintln!("   memory decoding {}",
+                          if f.memory_enabled() { "enabled" } else { "disabled" });
+                let ml = f.mem_log();
+                eprintln!("   {} accesses to its registers:", ml.len());
+                // Collapse repeats: a poll says one thing however often it
+                // happens, and the distinct offsets are the shopping list.
+                let mut runs: Vec<(u32, bool, u32, u32, u32)> = Vec::new();
+                for (off, w, v, pc) in ml.iter().copied() {
+                    match runs.last_mut() {
+                        Some(r) if r.0 == off && r.1 == w && r.2 == v => r.4 += 1,
+                        _ => runs.push((off, w, v, pc, 1)),
+                    }
+                }
+                {
+                    // What the whole conversation touched, as a shopping
+                    // list: this is the part of the chip that has to exist.
+                    let mut by_off: std::collections::BTreeMap<u32, (u32, u32)> =
+                        Default::default();
+                    for (off, w, _, _) in ml.iter() {
+                        let e = by_off.entry(*off).or_insert((0, 0));
+                        if *w { e.1 += 1 } else { e.0 += 1 }
+                    }
+                    let line: Vec<String> = by_off.iter()
+                        .map(|(o, (r, w))| format!("{o:02x}:{r}r/{w}w"))
+                        .collect();
+                    eprintln!("      registers touched ({}): {}",
+                              by_off.len(), line.join(" "));
+                }
+                for (off, w, v, pc, n) in runs.iter().take(6) {
+                    let times = if *n > 1 { format!(" x{n}") } else { String::new() };
+                    eprintln!("      +0x{off:03x} {} 0x{v:08x}  from PC 0x{pc:08x}{times}",
+                              if *w { "W" } else { "R" });
+                }
+            }
+        }
         let probed = bus.macepci.probed();
         eprintln!("ip32: PCI config addresses selected ({}):", probed.len());
         for a in probed.iter().take(16) {
