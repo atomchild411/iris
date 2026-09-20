@@ -793,6 +793,67 @@ recent QEMU forks are GPL and may not be copied from; NetBSD's `ahc` driver is
 BSD and is a legitimate reference for what the *host side* expects to see,
 which is exactly the contract option 2 needs.
 
+## Emulating above the sequencer
+
+2026-09-20. `src/aic7880.rs`. The decision was to implement what the driver
+*observes* rather than the sequencer's instruction set, and the first half of
+that works.
+
+### What is standing up
+
+The driver's bring-up now completes:
+
+```text
+chip reset
+sequencer paused
+sequencer RAM selected
+sequencer RAM deselected, 1696 bytes held
+sequencer RAM selected
+sequencer RAM deselected, 1696 bytes held
+sequencer running
+queued SCB 1
+```
+
+Two things in there cost a bug each.
+
+**`LOADRAM` does not erase the program.** It only points `SEQRAM` accesses at
+the program store. The driver sets it a second time to read the download back
+and check it, and clearing on the rising edge handed it zeros — the download
+"succeeded" and then silently verified as empty. The give-away was a second
+"download started" with a final length of zero.
+
+**The SCB window follows `SCBPTR`, and the driver probes its depth.** It walks
+`SCBPTR` from 0 to `0x7f` writing `0xff` to SCB offset `0x1f` — `SCB_NEXT`,
+set to the end-of-list marker. A part with sixteen SCBs wraps, which is what
+tells the driver how many it really has.
+
+### Where it stops
+
+After configuring the chip the driver queues SCB 1, then reads `INTSTAT`
+**2318 times**, gets nothing, and resets the chip to try again. We post no
+completion, so that part is expected.
+
+What is *not* yet understood is how the command gets to us. The SCB the driver
+queued is empty apart from the `0xff` the probe left in it, and nothing sets
+up `HADDR`/`HCNT` for a DMA of one. Immediately before the `QINFIFO` write it
+writes scratch registers `0x32` and `0x33` to zero, which in this sequencer are
+plausibly queue positions — which would mean the real queue lives in host
+memory and `QINFIFO` is not the submission path at all.
+
+That is a guess, and guesses are what this project keeps getting caught by.
+The next step is the one that worked for the identity chip: **read the
+driver's own code**. It is at PC `0x81025870` in the loaded firmware, and
+`IRIS_IP32_DIS` will disassemble it.
+
+### The honest state of the trade
+
+Option 2 was chosen knowing it is a contract with what a driver observes
+rather than with silicon. This is what that costs: the submission path has to
+be read out of each driver instead of looked up. The upside is unchanged —
+there is no sequencer instruction set to write — and the parts that are
+generic to the chip rather than to the program, which is most of what is above,
+did not need the driver at all.
+
 ### Diagnostics need a disk
 
 `3) Run Diagnostics` answers `No SystemPartition set`. The IDE suite is a

@@ -187,6 +187,7 @@ pub mod hpc3;
 pub mod ioc;
 /// IP32 (SGI O2) bring-up scaffold — see `docs/ip32-o2-bringup.md`. Not wired
 /// into `Physical`; it drives the CPU against its own bus.
+pub mod aic7880;
 pub mod ip32;
 pub mod physical;
 pub mod ds1x86;
