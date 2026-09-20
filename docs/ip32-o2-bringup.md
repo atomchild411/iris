@@ -1122,7 +1122,66 @@ Two fixes it needed:
   settle" with its clock stopped at 1.0000030. The harness now polls
   Count against Compare every [`TIMER_POLL_STEPS`] and raises IP7.
 
-### NetBSD's driver: still undecoded, and one wrong guess recorded
+### NetBSD's driver, decoded from its source, and root mounted
+
+`sys/dev/ic/aic7xxx_inline.h` settles it in one function. `ahc_queue_scb` does
+**not** write a tag to `QINFIFO`:
+
+```c
+ahc->qinfifo[ahc->qinfifonext++] = scb->hscb->tag;
+...
+ahc_outb(ahc, KERNEL_QINPOS, ahc->qinfifonext);
+```
+
+The tag goes into a 256-entry ring in host memory and the host writes only the
+new **producer index** to a scratch register. The sequencer consumes from the
+ring and fetches the SCB from a flat array indexed by tag. Completion comes
+back through a second ring beside the first. The addresses live in scratch:
+
+| scratch | meaning |
+|---|---|
+| `0x44` | `HSCB_ADDR` — base of the SCB array, stride 64 |
+| `0x48` | `SHARED_DATA_ADDR` — `qoutfifo`, with `qinfifo` at +256 |
+| `0x4c` | `KERNEL_QINPOS` — the producer index, and the trigger |
+
+and the SCB itself is CDB inline at 0, status at 8, `dataptr` 12, `datacnt`
+16, `sgptr` 20, `control` 24, `scsiid` 25, `lun` 26, `cdb_len` 28. The first
+scatter-gather segment is carried in the SCB; `sgptr` points at the rest.
+
+Three things then had to be right, and each was wrong first:
+
+- **Interrupts.** NetBSD attaches CRIME as `platform.intr0`, so a device
+  interrupt arrives as IP2, and the controller sits on CRIME input 8 — the
+  kernel works that out and prints it. Without the path the driver only
+  noticed a finished command when its watchdog fired, and said so:
+  "Interrupts may not be functioning."
+- **Endianness.** The chip is little-endian and NetBSD's driver writes its SCB
+  fields with `ahc_htole32`, while the PROM's loader handed its own program
+  big-endian words. Reading NetBSD's pointers the wrong way round turns
+  `0x0005fe58` into `0x58fe0500` — an address outside memory, which lands
+  nowhere and reports success. The symptom was an INQUIRY that returned 36
+  bytes of nothing, and a driver attaching a disk whose vendor string was
+  binary rubbish.
+- **The target nibble.** `SCSIID` is target in the high nibble and our own id
+  in the low, which the driver's own card dump states plainly:
+  `SCB_SCSIID[0x17]` is target 1 on an adapter at id 7. Reading the wrong
+  nibble made one disk answer for all sixty-four addresses, and then, once
+  filtered, for none.
+
+With those:
+
+```text
+sd0 at scsibus0 target 1 lun 0: <SGI, IRIS EMULATED, 1.0> disk fixed
+sd0: 4096 MB, 4096 cyl, 64 head, 32 sec, 512 bytes/sect x 8388608 sectors
+boot device: sd0
+root on sd0a dumps on sd0b
+root file system type: ffs
+Enter pathname of shell or RETURN for /bin/sh:
+```
+
+NetBSD 11 mounts its root off the emulated controller and starts init.
+
+### The earlier account, kept because the wrong guess is instructive
 
 With the scatter-gather fix in, NetBSD gets further but its `ahc` still times
 out. Two things are now known and one guess was wrong.
