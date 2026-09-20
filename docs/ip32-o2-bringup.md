@@ -105,6 +105,18 @@ written independently, and commits that were informed by the annotations should
 say so plainly. The PROM binaries themselves are SGI's; they stay out of the
 repo exactly like `ip24prom.070-9101-011.bin` does.
 
+## Milestone reached (and the check was wrong)
+
+The success message POST prints on the good path is
+
+    <post1> <SizeMEM> bank%d = 0x%0lx (128M)
+
+The `<post1>` tag settles it: **we are executing post1.** The check below —
+"trace the PC reaching 0xa0004000" — never fires because post1 runs *in place*
+from the PROM window at 0xbfc04408+, not from the address its section header
+names. The SHDR load address is where sloader would copy it, not where it first
+executes. Worth remembering for any future section.
+
 ## Suggested first milestone
 
 Not "boot NetBSD" — too far. Instead: **get `sloader` to hand off to `post1`.**
@@ -248,8 +260,38 @@ What CRIME is told beforehand is the clue:
 Eight banks, all programmed identically, then probed. Our RAM is flat at
 physical 0 and ignores the bank registers entirely, so every bank aliases onto
 the same store — which is exactly what a sizing algorithm is designed to detect
-and report as "nothing there". That is the likely cause and the next thing to
-test: **make CRIME's bank controls actually place memory.**
+and report as "nothing there". ### What SizeMEM actually does
+
+It compares against a table of `(!a << 32) | a` constants at 0xbfc06f70..fa0 —
+the classic address/complement signature — for probe addresses 0x00000000,
+0x01fffff8 (32M-8), 0x02000000 (32M) and 0x07fffff8 (128M-8). It is a cascade:
+test for 128M, fall through to 32M, fall through to "no SIMM".
+
+Tracing every 64-bit access carrying that signature gives the surprise:
+
+    0x1fc06f48 R 0xffffffff00000000  (prom table)
+    0x1fc06f50 R 0xfe00000701fffff8  (prom table)
+    ...
+
+**Every one is the PROM reading its own constants. None is a write to RAM.**
+So POST never stores the probe patterns at all in our run — it reads its
+expected values, compares against something it obtained earlier, and fails at
+`bne v1,t2` (0xbfc05dc0) *before* reaching the three pattern comparisons.
+
+So the open question is narrower than "memory sizing is broken": where do the
+operands of that first comparison come from? Candidates, in order of cheapness
+to test:
+
+1. An earlier phase wrote them and we lost the writes — which would point at
+   the cache model in the harness rather than the bus.
+2. They come from a CRIME register we answer with a stored value where hardware
+   would compute one (the bank controls are the obvious suspects: we hand back
+   the 0x100 we were given).
+3. They are derived from something not yet emulated at all.
+
+The bank-control theory remains the strongest, but it is now a hypothesis with
+a specific test rather than a conclusion: trace backwards from 0xbfc05dc0 to
+where `v1` is set.
 
 Note also that nothing went unmapped during the run, so this is not a missing
 device. It is a device that answers, but lies.
