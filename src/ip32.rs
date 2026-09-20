@@ -66,6 +66,24 @@ pub const MACE_COM_SIZE: u32 = 0x0000_0800;
 
 /// MACE's free-running timer (`MACE_UST_MSC`, i.e. `MACE_PERIF + 0x40000`).
 /// The PROM busy-waits on this; a constant hangs it forever.
+/// The two PS/2 ports, keyboard at +0x00 and mouse at +0x20, each
+/// `tx / rx / control / status` at eight-byte spacing.
+pub const MACE_PS2: u32 = MACE_BASE + 0x0032_0000;
+pub const MACE_PS2_SIZE: u32 = 0x40;
+
+pub mod ps2_bit {
+    pub const CLOCK_SIGNAL: u64 = 1 << 0;
+    pub const CLOCK_INHIBIT: u64 = 1 << 1;
+    pub const TX_INPROGRESS: u64 = 1 << 2;
+    /// The transmit holding register has drained. The PROM spins on this for
+    /// up to 20834 tries after every byte it sends, so a port that never sets
+    /// it is not merely idle — it is expensive.
+    pub const TX_EMPTY: u64 = 1 << 3;
+    /// A byte has arrived. Never set here: nothing is plugged in.
+    pub const RX_FULL: u64 = 1 << 4;
+    pub const RX_INPROGRESS: u64 = 1 << 5;
+}
+
 pub const MACE_UST_MSC: u32 = MACE_BASE + 0x0034_0000;
 pub const MACE_UST_MSC_SIZE: u32 = 0x0001_0000;
 
@@ -175,26 +193,37 @@ pub struct Crime {
     /// is only meaningful if you can see what it was told.
     writes: Mutex<Vec<(u32, u64)>>,
     revision: u64,
+    /// The clock CRIME's free-running counter is derived from, so the PROM's
+    /// delays take the time they ask for rather than a number of reads.
+    ust: std::sync::Arc<MaceUst>,
+    /// Subtracted from the counter, so a write sets what the next read sees.
+    time_base: Mutex<u64>,
 }
 
-impl Default for Crime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// CRIME's counter runs at 66.67 MHz. The PROM's own delay routine computes
+/// `66 * microseconds` before waiting on it, which is where this number comes
+/// from — it is the firmware's arithmetic, not a datasheet's.
+pub const CRIME_TICKS_PER_US: u64 = 66;
 
 impl Crime {
-    pub fn new() -> Self {
+    pub fn new(ust: std::sync::Arc<MaceUst>) -> Self {
         Self {
             regs: Mutex::new(vec![0u64; (CRIME_SIZE / 8) as usize]),
             trace: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             revision: CRIME_REV_DEFAULT,
+            ust,
+            time_base: Mutex::new(0),
         }
     }
 
-    pub fn with_revision(revision: u64) -> Self {
-        Self { revision, ..Self::new() }
+    pub fn with_revision(ust: std::sync::Arc<MaceUst>, revision: u64) -> Self {
+        Self { revision, ..Self::new(ust) }
+    }
+
+    /// The raw counter, before the offset a write installs.
+    fn raw_time(&self) -> u64 {
+        self.ust.now().wrapping_mul(CRIME_TICKS_PER_US)
     }
 
     fn note(&self, off: u32, write: bool) {
@@ -217,16 +246,19 @@ impl Crime {
             // A free-running microsecond-ish counter. POST loops on this to time
             // out, so a constant would hang it forever.
             crime_reg::TIME => {
-                let mut r = self.regs.lock().unwrap();
-                let i = (crime_reg::TIME / 8) as usize;
-                r[i] = r[i].wrapping_add(1);
-                r[i] & 0x0000_ffff_ffff_ffff
+                let base = *self.time_base.lock().unwrap();
+                self.raw_time().wrapping_sub(base) & 0x0000_ffff_ffff_ffff
             }
             _ => self.regs.lock().unwrap()[(off / 8) as usize],
         }
     }
 
     fn store(&self, off: u32, val: u64) {
+        if off == crime_reg::TIME {
+            // The PROM zeroes the counter and then waits for it to reach a
+            // deadline, so a write has to set where it counts from.
+            *self.time_base.lock().unwrap() = self.raw_time().wrapping_sub(val);
+        }
         self.regs.lock().unwrap()[(off / 8) as usize] = val;
         let mut w = self.writes.lock().unwrap();
         if w.len() < 256 {
@@ -571,6 +603,76 @@ impl BusDevice for Com16550 {
     fn write64(&self, addr: u32, val: u64) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
 }
 
+/// The pair of PS/2 ports, with nothing plugged into either.
+///
+/// We drive this machine on the serial console, so an empty port is the
+/// honest model — but "empty" is not the same as "dead". A real controller
+/// still drains its transmit register whether or not a keyboard is listening,
+/// and the PROM waits for exactly that. Reporting zero makes every probe take
+/// its full 20834-iteration timeout instead of returning at once.
+pub struct MacePs2 {
+    ports: [Mutex<Ps2Port>; 2],
+}
+
+#[derive(Default)]
+struct Ps2Port {
+    control: u64,
+    /// Bytes the PROM has sent into the void, kept so a test can see that the
+    /// transmit path was actually exercised.
+    sent: Vec<u8>,
+}
+
+impl MacePs2 {
+    pub fn new() -> Self {
+        Self { ports: [Mutex::new(Ps2Port::default()), Mutex::new(Ps2Port::default())] }
+    }
+
+    /// `(port, register)` for an address in the block, if it names one.
+    fn decode(addr: u32) -> (usize, u32) {
+        let off = addr - MACE_PS2;
+        (((off >> 5) & 1) as usize, (off >> 3) & 3)
+    }
+
+    pub fn sent(&self, port: usize) -> Vec<u8> {
+        self.ports[port].lock().unwrap().sent.clone()
+    }
+
+    pub fn read(&self, addr: u32) -> u64 {
+        let (p, reg) = Self::decode(addr);
+        let port = self.ports[p].lock().unwrap();
+        match reg {
+            2 => port.control,
+            3 => {
+                // Idle and drained, with nothing ever arriving. The clock line
+                // is pulled up when no device is holding it down.
+                ps2_bit::TX_EMPTY | ps2_bit::CLOCK_SIGNAL
+            }
+            // The receive register of a port with nothing on it.
+            _ => 0,
+        }
+    }
+
+    pub fn write(&self, addr: u32, val: u64) {
+        let (p, reg) = Self::decode(addr);
+        let mut port = self.ports[p].lock().unwrap();
+        match reg {
+            0 => {
+                if port.sent.len() < 64 {
+                    port.sent.push(val as u8);
+                }
+            }
+            2 => port.control = val,
+            _ => {}
+        }
+    }
+}
+
+impl Default for MacePs2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A Dallas-style RTC with battery-backed NVRAM.
 ///
 /// Registers are reached with MACE's ISA spacing, `(reg << 8) + 7`. The low
@@ -722,23 +824,22 @@ pub const OW_FAMILY_DS2502: u8 = 0x09;
 pub const OW_PRESENCE_DELAY_US: u64 = 20;
 pub const OW_PRESENCE_LEN_US: u64 = 150;
 
-/// Thresholds, set from the widths this PROM actually produces rather than
-/// from the datasheet. Measured on the firmware's own ROM read:
+/// Thresholds, and a lesson about calibration.
 ///
-/// ```text
-/// 31x4 32x20 | 329x1 356x4 357x4 | 1980x2 | 7220 15954 21570
-///  write-1        write-0           reset     idle low
-/// ```
+/// These were first set from the widths the PROM produced, which were
+/// `32 / 357 / 1980` microseconds — four to six times the 1-Wire spec's
+/// `6 / 60 / 480`. That looked like the PROM simply bit-banging slowly, and
+/// the thresholds were moved out to match. They were in fact compensating for
+/// CRIME's counter, which advanced once per *read* instead of with time, so
+/// every delay the firmware asked for came out stretched.
 ///
-/// Three populations with a 10x and a 5.5x gap between them, so the
-/// thresholds sit in the middle of each gap with better than 3x margin on
-/// both sides. The absolute numbers run long against the 1-Wire spec (which
-/// wants ~6/60/480 us) because the PROM bit-bangs with instruction-count
-/// delays, and our instructions-per-microsecond is a free parameter —
-/// [`UST_TICKS_DEN`]. What matters is that the populations stay separated,
-/// and they are separated by an order of magnitude.
-pub const OW_RESET_US: u64 = 800;
-pub const OW_WRITE0_US: u64 = 120;
+/// With [`CRIME_TICKS_PER_US`] driving that counter from the same clock as
+/// the UST, the measured widths are `8 / 90 / 500` and the datasheet numbers
+/// work unmodified. A device model that needs constants tuned away from the
+/// specification is usually telling you something about the clock, not about
+/// the device.
+pub const OW_RESET_US: u64 = 300;
+pub const OW_WRITE0_US: u64 = 30;
 
 impl OneWireId {
     /// Build a ROM from a MAC address: the family code, the six address bytes
@@ -1056,6 +1157,11 @@ pub struct Stub {
     hot: Mutex<std::collections::BTreeMap<u32, (u64, u64)>>,
     /// Per-offset stored value.
     cells: Mutex<std::collections::BTreeMap<u32, u64>>,
+    /// Which code touches each offset. "Polled 80,000 times" is a symptom;
+    /// the PC is what lets you go and read the loop.
+    who: Mutex<std::collections::BTreeMap<u32, Vec<(u32, u32)>>>,
+    /// Set by the owner so the PC can be attributed.
+    pc: Mutex<Option<std::sync::Arc<PcTap>>>,
 }
 
 impl Stub {
@@ -1066,6 +1172,8 @@ impl Stub {
             writes: Mutex::new(0),
             hot: Mutex::new(std::collections::BTreeMap::new()),
             cells: Mutex::new(std::collections::BTreeMap::new()),
+            who: Mutex::new(std::collections::BTreeMap::new()),
+            pc: Mutex::new(None),
         }
     }
     pub fn counts(&self) -> (u64, u64) {
@@ -1091,9 +1199,29 @@ impl Stub {
         self.cells.lock().unwrap().insert(addr & 0x007f_ffff & !7, val);
     }
     fn hit(&self, addr: u32, write: bool) {
+        let off = addr & 0x007f_ffff & !3;
         let mut h = self.hot.lock().unwrap();
-        let e = h.entry(addr & 0x007f_ffff & !3).or_insert((0, 0));
+        let e = h.entry(off).or_insert((0, 0));
         if write { e.1 += 1 } else { e.0 += 1 }
+        drop(h);
+        if let Some(tap) = self.pc.lock().unwrap().as_ref() {
+            let who = (tap.get(), tap.get_ra());
+            let mut w = self.who.lock().unwrap();
+            let v = w.entry(off).or_default();
+            if v.len() < 4 && !v.contains(&who) {
+                v.push(who);
+            }
+        }
+    }
+
+    /// Attribute this stub's accesses to the PC making them.
+    pub fn watch_pc(&self, tap: std::sync::Arc<PcTap>) {
+        *self.pc.lock().unwrap() = Some(tap);
+    }
+
+    /// The PCs seen touching an offset.
+    pub fn who_touched(&self, off: u32) -> Vec<(u32, u32)> {
+        self.who.lock().unwrap().get(&off).cloned().unwrap_or_default()
     }
 }
 
@@ -1121,9 +1249,10 @@ pub struct Ip32Bus {
     pub crime_re: Stub,
     pub gbe: Stub,
     pub macepci: MacePci,
-    pub ust: MaceUst,
+    pub ust: std::sync::Arc<MaceUst>,
     pub nic_trace: NicTrace,
     pub rtc: MaceRtc,
+    pub ps2: MacePs2,
     pub onewire: OneWireId,
     pub com0: Com16550,
     pub com1: Com16550,
@@ -1131,7 +1260,7 @@ pub struct Ip32Bus {
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write, pc)`.
     unmapped: Mutex<Vec<(u32, bool, u32)>>,
     /// The PC of the instruction currently executing.
-    pub pc: PcTap,
+    pub pc: std::sync::Arc<PcTap>,
     /// Count of writes into the firmware load region.
     fw_writes: Mutex<u64>,
     /// 64-bit RAM accesses at the addresses POST's memory sizing uses, as
@@ -1150,24 +1279,27 @@ impl Ip32Bus {
     /// `ram_bytes` is rounded down to a multiple of 8. `prom` must be the raw
     /// 512 KiB IP32 PROM image.
     pub fn new(ram_bytes: usize, prom: Vec<u8>) -> Self {
-        Self {
+        let pc = std::sync::Arc::new(PcTap::default());
+        let ust = std::sync::Arc::new(MaceUst::new());
+        let bus = Self {
             ram: Mutex::new(vec![0u8; ram_bytes & !7]),
             prom,
-            crime: Crime::new(),
+            crime: Crime::new(ust.clone()),
             mace: Stub::new("mace"),
             crime_re: Stub::new("crime-re"),
             gbe: Stub::new("gbe"),
             macepci: MacePci::new(),
-            ust: MaceUst::new(),
+            ust: ust.clone(),
             nic_trace: NicTrace::new(),
             rtc: MaceRtc::new(),
+            ps2: MacePs2::new(),
             // A locally-administered address; nothing depends on the value yet.
             onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
             com0: Com16550::new(),
             com1: Com16550::new(),
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
-            pc: PcTap::default(),
+            pc: pc.clone(),
             fw_writes: Mutex::new(0),
             sizemem: Mutex::new(Vec::new()),
             watch: std::env::var("IRIS_IP32_WATCHMEM").ok().and_then(|v| {
@@ -1176,7 +1308,12 @@ impl Ip32Bus {
                 Some((p(a)?, p(b)? + 8))
             }),
             watch_log: Mutex::new(Vec::new()),
-        }
+        };
+        // So a hot offset can name the code polling it.
+        bus.mace.watch_pc(pc.clone());
+        bus.crime_re.watch_pc(pc.clone());
+        bus.gbe.watch_pc(pc);
+        bus
     }
 
     /// The addresses POST's sizing test probes.
@@ -1264,6 +1401,10 @@ impl Ip32Bus {
 
     fn in_prom(&self, addr: u32) -> bool {
         addr >= PROM_BASE && addr < PROM_BASE + PROM_SIZE
+    }
+
+    fn in_ps2(&self, addr: u32) -> bool {
+        addr >= MACE_PS2 && addr < MACE_PS2 + MACE_PS2_SIZE
     }
 
     fn in_gbe(&self, addr: u32) -> bool {
@@ -1449,6 +1590,9 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read8(addr);
         }
+        if self.in_ps2(addr) {
+            return BusRead8::ok(self.ps2.read(addr) as u8);
+        }
         if self.in_rtc(addr) {
             return self.rtc.read8(addr);
         }
@@ -1476,6 +1620,9 @@ impl BusDevice for Ip32Bus {
         }
         if let Some(c) = self.com_for(addr) {
             return c.read16(addr);
+        }
+        if self.in_ps2(addr) {
+            return BusRead16::ok(self.ps2.read(addr) as u16);
         }
         if self.in_rtc(addr) {
             return self.rtc.read16(addr);
@@ -1513,6 +1660,9 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read32(addr);
         }
+        if self.in_ps2(addr) {
+            return BusRead32::ok(self.ps2.read(addr) as u32);
+        }
         if self.in_rtc(addr) {
             return self.rtc.read32(addr);
         }
@@ -1549,6 +1699,9 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read64(addr);
         }
+        if self.in_ps2(addr) {
+            return BusRead64::ok(self.ps2.read(addr));
+        }
         if self.in_rtc(addr) {
             return self.rtc.read64(addr);
         }
@@ -1584,6 +1737,10 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.write8(addr, val);
         }
+        if self.in_ps2(addr) {
+            self.ps2.write(addr, val as u64);
+            return BUS_OK;
+        }
         if self.in_rtc(addr) {
             return self.rtc.write8(addr, val);
         }
@@ -1611,6 +1768,10 @@ impl BusDevice for Ip32Bus {
         }
         if let Some(c) = self.com_for(addr) {
             return c.write16(addr, val);
+        }
+        if self.in_ps2(addr) {
+            self.ps2.write(addr, val as u64);
+            return BUS_OK;
         }
         if self.in_rtc(addr) {
             return self.rtc.write16(addr, val);
@@ -1648,6 +1809,10 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.write32(addr, val);
         }
+        if self.in_ps2(addr) {
+            self.ps2.write(addr, val as u64);
+            return BUS_OK;
+        }
         if self.in_rtc(addr) {
             return self.rtc.write32(addr, val);
         }
@@ -1683,6 +1848,10 @@ impl BusDevice for Ip32Bus {
         }
         if let Some(c) = self.com_for(addr) {
             return c.write64(addr, val);
+        }
+        if self.in_ps2(addr) {
+            self.ps2.write(addr, val as u64);
+            return BUS_OK;
         }
         if self.in_rtc(addr) {
             return self.rtc.write64(addr, val);
@@ -1720,14 +1889,27 @@ impl BusDevice for Ip32Bus {
 /// and correlating a store with its code site is worth an atomic store per
 /// instruction.
 #[derive(Default)]
-pub struct PcTap(AtomicU32);
+pub struct PcTap {
+    pc: AtomicU32,
+    /// `ra` as well, because the PROM reaches most registers through one-line
+    /// `ld`/`sd` accessors. Attributing a hot register to the accessor names
+    /// the same three addresses every time and says nothing; the return
+    /// address names the code that actually wanted it.
+    ra: AtomicU32,
+}
 
 impl PcTap {
     pub fn set(&self, pc: u32) {
-        self.0.store(pc, Ordering::Relaxed);
+        self.pc.store(pc, Ordering::Relaxed);
+    }
+    pub fn set_ra(&self, ra: u32) {
+        self.ra.store(ra, Ordering::Relaxed);
     }
     pub fn get(&self) -> u32 {
-        self.0.load(Ordering::Relaxed)
+        self.pc.load(Ordering::Relaxed)
+    }
+    pub fn get_ra(&self) -> u32 {
+        self.ra.load(Ordering::Relaxed)
     }
 }
 
@@ -1898,7 +2080,7 @@ mod tests {
 
     #[test]
     fn crime_is_a_64_bit_register_file() {
-        let c = Crime::new();
+        let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
         c.write64(CRIME_BASE + crime_reg::MEM_BANK_CTRL0, 0x0123_4567_89ab_cdef);
         assert_eq!(
             c.read64(CRIME_BASE + crime_reg::MEM_BANK_CTRL0).data,
@@ -1911,22 +2093,38 @@ mod tests {
     /// anything else, so zero is the one answer guaranteed to be wrong.
     #[test]
     fn revision_does_not_read_as_zero() {
-        let c = Crime::new();
+        let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
         assert_ne!(c.read64(CRIME_BASE + crime_reg::REVISION).data, 0);
     }
 
     /// POST times its waits against this counter. A constant would spin forever.
+    /// The PROM zeroes this counter and waits for it to reach `66 * n`, so it
+    /// has to advance with *time* and not with reads: a per-read counter makes
+    /// every delay cost a fixed number of polls no matter how long the wait
+    /// was supposed to be, and makes the two clocks disagree.
     #[test]
-    fn the_time_counter_advances() {
-        let c = Crime::new();
+    fn the_time_counter_tracks_the_clock_and_can_be_reset() {
+        let ust = std::sync::Arc::new(MaceUst::new());
+        let c = Crime::new(ust.clone());
+
+        ust.advance_to(1_000 * UST_TICKS_DEN as u64);
         let a = c.read64(CRIME_BASE + crime_reg::TIME).data;
-        let b = c.read64(CRIME_BASE + crime_reg::TIME).data;
-        assert!(b > a, "CRIME_TIME must advance between reads, got {a} then {b}");
+        assert!(a >= 1_000 * CRIME_TICKS_PER_US, "counter must follow the clock, got {a}");
+        assert_eq!(c.read64(CRIME_BASE + crime_reg::TIME).data, a,
+                   "and must not advance merely because it was read");
+
+        // Zero it, wait 100us, and it must read about 100us worth of ticks.
+        c.write64(CRIME_BASE + crime_reg::TIME, 0);
+        assert_eq!(c.read64(CRIME_BASE + crime_reg::TIME).data, 0, "a write sets the counter");
+        ust.advance_to(1_100 * UST_TICKS_DEN as u64);
+        let d = c.read64(CRIME_BASE + crime_reg::TIME).data;
+        assert_eq!(d, 100 * CRIME_TICKS_PER_US,
+                   "100us must be 100 * {CRIME_TICKS_PER_US} ticks, got {d}");
     }
 
     #[test]
     fn every_touched_register_is_recorded_once_per_direction() {
-        let c = Crime::new();
+        let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
         c.write64(CRIME_BASE + crime_reg::MEM_CONTROL, 1);
         c.write64(CRIME_BASE + crime_reg::MEM_CONTROL, 2);
         let _ = c.read64(CRIME_BASE + crime_reg::MEM_CONTROL);
@@ -2371,6 +2569,7 @@ mod bringup {
             // Publish the PC so devices can attribute the accesses this
             // instruction is about to make.
             bus.pc.set(pc);
+            bus.pc.set_ra(exec.core.gpr[31] as u32);
             bus.ust.advance_to(steps);
 
             ring[ring_at % RING] = pc;
@@ -2741,7 +2940,10 @@ mod bringup {
         }
         eprintln!("ip32: busiest MACE offsets:");
         for (off, r, w) in bus.mace.hottest().into_iter().take(8) {
-            eprintln!("   +0x{:06x}  {:>8} R  {:>4} W", off, r, w);
+            let who: Vec<String> = bus.mace.who_touched(off).iter()
+                .map(|(p, ra)| format!("{p:08x}<-{ra:08x}")).collect();
+            eprintln!("   +0x{:06x}  {:>8} R  {:>4} W   from {}",
+                      off, r, w, who.join(" "));
         }
 
         let probed = bus.macepci.probed();

@@ -583,6 +583,101 @@ shortfall stated out loud.
 With all five fixed the console goes quiet, the master takes `1040 of 1040
 bits`, and the firmware moves on.
 
+## The PROM boots to its menu
+
+2026-09-19. Two more gates after the identity chip, and the second one changed
+the shape of everything before it.
+
+### PS/2: empty is not the same as dead
+
+`MACE + 0x320000` is the pair of PS/2 ports — keyboard at `+0x00`, mouse at
+`+0x20`, each `tx / rx / control / status` at eight-byte spacing. The firmware
+was reading `+0x320018` **84,619 times**.
+
+Attributing that to code needed one extra piece of instrumentation. The first
+attempt named `0x81004d70` every time, which turns out to be a one-line
+accessor — `ld a0, 0(a0)`, return the halves. The PROM reaches almost every
+register through those, so the PC says nothing; the *return address* is what
+names the caller. `PcTap` now carries both, and the answer came straight out:
+`0x8101f9e8`, `0x8101fbf8`, `0x8101fd8c`.
+
+There the loop is explicit — spin up to `20834` times waiting for
+`status & 0x08`, `TX_EMPTY`. We drive this machine on serial and nothing is
+plugged into either port, so a stub returning zero looked harmless. It is not:
+a real controller drains its transmit register whether or not a keyboard is
+listening, and reporting zero makes every single byte the PROM sends take the
+full timeout. Reporting `TX_EMPTY | CLOCK_SIGNAL`, with `RX_FULL` never set,
+is what "port present, nothing attached" actually looks like.
+
+### CRIME's counter had to be a clock
+
+With PS/2 quiet, a third of the run was still going into a delay loop at
+`0x81006ff0`:
+
+```asm
+addiu a2, zero, 66
+mult  a0, a2          ; 66 * microseconds
+lui   a1, 0xb400
+ori   a1, a1, 0x38    ; CRIME + 0x38
+sd    zero, 0(a1)     ; zero the counter
+ld    a2, 0(a1)       ; ...and wait for it to reach the deadline
+```
+
+`66 * microseconds` is the firmware telling us the rate: CRIME's counter runs
+at 66.67 MHz. Ours advanced **once per read**, so a delay cost a fixed number
+of polls regardless of how long it was supposed to be. Deriving it from the
+same clock as the UST — [`CRIME_TICKS_PER_US`], with a write setting where it
+counts from, because the PROM zeroes it before each wait — dropped time in
+spin loops from 34% of the run to 1%.
+
+And then this happened:
+
+```text
+Cannot connect to keyboard -- check the cable.
+Warning: time invalid, resetting clock to epoch.
+Initialized tod clock.
+
+                         Running power-on diagnostics...
+
+System Maintenance Menu
+
+1) Start System
+2) Install System Software
+3) Run Diagnostics
+4) Recover System
+5) Enter Command Monitor
+
+Option?
+```
+
+### The calibration lesson
+
+Fixing the clock broke the 1-Wire, and that is the most useful thing in this
+section.
+
+The thresholds had been set from measured pulse widths of `32 / 357 / 1980`
+microseconds — four to six times the 1-Wire specification's `6 / 60 / 480`.
+That was rationalised as the PROM bit-banging slowly against a free parameter,
+and the thresholds were moved out to match. They were really compensating for
+CRIME's broken counter stretching every delay the firmware asked for.
+
+With the counter fixed the widths are `8 / 90 / 500`, and the **datasheet
+numbers work unmodified**. The tuned constants then put `OW_WRITE0_US` above
+the write-0 population, so every command decoded as `0xff` and the identity
+chip broke again.
+
+A device model that needs its constants tuned away from the specification is
+usually telling you something about the clock, not about the device. It said
+so for three sessions and was not listened to.
+
+### Still cosmetic
+
+- `Cannot connect to keyboard` — correct; nothing is attached, and the menu
+  comes out on serial regardless. Pointing the PROM's console at serial in
+  NVRAM would silence it.
+- `time invalid, resetting clock to epoch` — the RTC answers, but not with
+  anything the firmware accepts as a valid time.
+
 ## Instrumentation worth keeping
 
 All of this came out of the harness, and none of it out of reading the PROM
