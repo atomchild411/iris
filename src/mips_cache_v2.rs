@@ -63,6 +63,16 @@ pub use crate::mips_isa::{
     C_HINV, C_HWBINV, C_FILL, C_HWB, C_HSV,
 };
 
+// R10000 reassigns cache operations 5, 6 and 7. Where an R4000 has
+// Hit_Invalidate, Hit_Writeback_Invalidate and Hit_Writeback, an R10000 has a
+// cache barrier and index-addressed load/store of the cache *data* array.
+// Confirmed against NetBSD's mips/include/cache_r10k.h, and against the IP28
+// PROM, whose secondary-cache SRAM test issues C_R10K_ISD(SD) — which this
+// emulator was executing as a hit-writeback, so nothing was ever stored.
+pub const C_R10K_CBARRIER: u32 = 5 << 2;
+pub const C_R10K_ILD: u32 = 6 << 2;
+pub const C_R10K_ISD: u32 = 7 << 2;
+
 /// Decode a raw cache_op field (5-bit: op[4:2] | target[1:0]) to a human-readable name.
 /// Matches the disassembler mnemonic convention used by gas/objdump.
 pub fn cache_op_name(op: u32) -> &'static str {
@@ -424,6 +434,11 @@ pub trait CpuModel: MipsCache {
     const TLB_ENTRIES: usize;
     /// Name as the guest and the benchmark report see it.
     const NAME: &'static str;
+    /// Cache ops 5/6/7 carry their R10000 meanings rather than their R4000 ones.
+    /// The executor needs this: `Index_Store_Data` takes its value from TagLo
+    /// and `Index_Load_Data` returns into it, neither of which is true of the
+    /// R4000 hit operations that share those encodings.
+    const R10K_CACHE_OPS: bool = false;
 }
 
 pub trait MipsCache: Send + Sync {
@@ -1175,6 +1190,32 @@ pub type R5000Cache = CpuCache<32768, 32, 2, 1024,
                                32768, 32, 2, 1024, 4096,
                                128, 128, 1, 16, 0, false,
                                true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }>;
+/// SGI Indigo2 IMPACT R10000 (IP28), modelled for speed rather than fidelity.
+///
+/// The real part has two-way 32 KB L1s and a two-way secondary cache. This
+/// models all three **direct-mapped**, keeping the real total sizes and line
+/// sizes (64-byte L1I lines, 32-byte L1D, 128-byte L2).
+///
+/// That is deliberate. Associativity reaches software only through the
+/// way-select bits of `CACHE Index_*`, and the only thing an operating system
+/// does by index is flush the whole cache — which comes out the same for any
+/// geometry holding the same lines. Emulating ways costs a victim-selection
+/// and LRU update on every access and buys nothing IRIX can observe.
+///
+/// It also buys correctness here, not just speed. A two-way L1 *with* an L2 is
+/// a combination this file has never had: `fetch()` selects the two-way tag
+/// probe and the L1I-resident decode slots under one condition, and such a
+/// part needs the first with the second's alternative. Direct-mapped plus L2
+/// is exactly the R4400's shape, so every associativity and decode-slot branch
+/// already does the right thing for this model, unchanged.
+///
+/// What is *not* faked is anything software reads back: the PRId, the TLB
+/// size, MIPS IV decoding, and the cache tag layout the PROM's diagnostics
+/// inspect directly.
+pub type R10000Cache = CpuCache<32768, 64, 1, 512,
+                                32768, 32, 1, 1024, 4096,
+                                1048576, 128, 8192, 131072, 262144, true,
+                                true, 0x0000_0900, 0x0000_0900, 64, { model::R10000 }>;
 
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
@@ -2826,6 +2867,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
+    const R10K_CACHE_OPS: bool = MODEL == model::R10000;
     const NAME: &'static str = match MODEL {
         model::R5000 => "R5000",
         model::R10000 => "R10000",
@@ -3335,6 +3377,50 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u32 {
+        if Self::R10K_CACHE_OPS && std::env::var_os("IRIS_IP28_CACHEOPS").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEEN: AtomicU32 = AtomicU32::new(0);
+            let bit = 1u32 << (cache_op & 0x1F);
+            if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                eprintln!("ip28: first {} raw={:#04x} va={:#018x} arg={:#018x}",
+                          cache_op_name(cache_op), cache_op, virt_addr, phys_addr);
+            }
+        }
+        // R10000 ops 5/6/7 are not the R4000 hit operations that share these
+        // encodings — see C_R10K_ISD. Handled before the shared decode below.
+        if Self::R10K_CACHE_OPS {
+            // The R10000 meanings are scoped to particular cache selects;
+            // outside those the R4000 operation on the same encoding still
+            // applies. cache_r10k.h annotates each one, and the IP28 PROM uses
+            // both readings of op 5: `Cache_Barrier` against the instruction
+            // cache, and R4000 `Hit_Invalidate` against the secondary.
+            let sel = cache_op & 3;
+            match cache_op & 0x1C {
+                // An ordering barrier. Nothing to do in a model with no
+                // speculative memory pipeline to hold back.
+                C_R10K_CBARRIER if sel == CACH_PI => return 0,
+                C_R10K_ILD if matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
+                    let is_l2 = sel == CACH_SD;
+                    // The index is a byte offset into the data array. Bit 0
+                    // selects the way on real silicon; this model is
+                    // direct-mapped, and bit 0 falls below the u64 slot index,
+                    // so it drops out without any special case.
+                    let slot = (virt_addr as usize) >> 3;
+                    if is_l2 && HAS_L2 {
+                        return self.l2.data()[slot & (L2_DATA - 1)] as u32;
+                    }
+                    return self.dc.data()[slot & (DC_DATA - 1)] as u32;
+                }
+                C_R10K_ISD if matches!(sel, CACH_SI | CACH_SD) => {
+                    let slot = (virt_addr as usize) >> 3;
+                    if HAS_L2 {
+                        self.l2.data_mut()[slot & (L2_DATA - 1)] = phys_addr;
+                    }
+                    return 0;
+                }
+                _ => {}
+            }
+        }
         // Decode cache operation
         let cache_target = cache_op & 0x3;   // bits [17:16]
         let operation = cache_op & 0x1C;     // bits [20:18] (shifted by 2)
@@ -3424,6 +3510,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     // L2 TagLo format:
                     //   [31:13] physical tag   [12:10] state   [9:7] PIdx
                     let tag: L2Tag = self.l2.get_tag(idx);
+                    if MODEL == model::R10000 {
+                        eprintln!("ip28: C_ILT(SD) idx={idx:#x} ptag={:#x} cs={:#x} pidx={:#x}",
+                                  tag.ptag(), tag.cs(), tag.pidx());
+                    }
                     let state = match tag.cs() {
                         L2_CS_INVALID => 0,
                         L2_CS_CLEAN_EXCLUSIVE => 4,
@@ -3480,6 +3570,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 let tag_lo = phys_addr as u32;
 
                 if is_l2 {
+                    if MODEL == model::R10000 {
+                        eprintln!("ip28: C_IST(SD) idx={idx:#x} taglo={tag_lo:#010x} phys={phys_addr:#018x}");
+                    }
                     // L2 TagLo format:  [31:13] ptag   [12:10] state   [9:7] PIdx
                     let ptag = (tag_lo >> 13) & L2_PTAG_MASK;
                     let state = (tag_lo >> 10) & 0x7;

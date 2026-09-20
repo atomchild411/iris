@@ -6644,7 +6644,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let op = cache_op & 0x1C;
 
         // Determine if this is a Hit operation that needs address translation
-        let needs_translation = matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV);
+        // On an R10000 the encodings for 5/6/7 are index operations, not the
+        // R4000 hit operations — translating them would fault on an index that
+        // is not a valid virtual address. See C_R10K_ISD in mips_cache_v2.
+        let sel = cache_op & 3;
+        let r10k_index_op = C::R10K_CACHE_OPS
+            && match op {
+                C_R10K_CBARRIER => sel == CACH_PI,
+                C_R10K_ILD => matches!(sel, CACH_PI | CACH_PD | CACH_SD),
+                C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
+                _ => false,
+            };
+        let needs_translation =
+            !r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV);
 
         let phys_addr = if needs_translation {
             // Hit operations need address translation
@@ -6658,7 +6670,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         // For Index_Store_Tag, pass TagLo via phys_addr
         let op = cache_op & 0x1C;
-        let phys_addr_or_taglo = if op == C_IST {
+        let stores_taglo = op == C_IST || (r10k_index_op && op == C_R10K_ISD);
+        let phys_addr_or_taglo = if stores_taglo {
             self.core.cp0_taglo as u64
         } else {
             phys_addr
@@ -6668,7 +6681,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let result = self.cache.cache_op(cache_op, virt_addr, phys_addr_or_taglo);
 
         // For Index_Load_Tag, update CP0 TagLo from result
-        if op == C_ILT {
+        if op == C_ILT || (r10k_index_op && op == C_R10K_ILD) {
             self.core.cp0_taglo = result;
             self.core.cp0_taghi = 0;
         }

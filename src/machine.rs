@@ -26,7 +26,7 @@ use crate::mc::MemoryController;
 use crate::mips_tlb::MipsTlb;
 use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
-use crate::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
+use crate::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache, R10000Cache};
 use crate::hpc3::Hpc3;
 use crate::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -281,6 +281,7 @@ impl Machine {
         let model_has_l2 = match cfg_cpu_model {
             crate::config::CpuModel::R4400 => <R4400Cache as MipsCache>::L2_SIZE > 0,
             crate::config::CpuModel::R5000 => <R5000Cache as MipsCache>::L2_SIZE > 0,
+            crate::config::CpuModel::R10000 => <R10000Cache as MipsCache>::L2_SIZE > 0,
         };
         if !model_has_l2 {
             eeprom_mc.lock().set_cachsz(0);
@@ -767,6 +768,7 @@ impl Machine {
         let cpu: Arc<dyn crate::mips_exec::CpuDevice> = match cfg_cpu_model {
             crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
             crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
+            crate::config::CpuModel::R10000 => build_cpu!(R10000Cache),
         };
 
         // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.

@@ -521,12 +521,19 @@ pub enum CpuModel {
     R4400,
     /// MIPS R5000, 2-way 32K L1s, no secondary cache, MIPS IV.
     R5000,
+    /// MIPS R10000, 2-way 32K L1s, 1 MB secondary cache, MIPS IV. The CPU in
+    /// the Indigo2 IMPACT (IP28). Bring-up only — see docs/ip28-bringup.md.
+    R10000,
 }
 
 impl CpuModel {
-    pub const ALL: [Self; 2] = [Self::R4400, Self::R5000];
+    pub const ALL: [Self; 3] = [Self::R4400, Self::R5000, Self::R10000];
     pub fn label(self) -> &'static str {
-        match self { Self::R4400 => "MIPS R4400", Self::R5000 => "MIPS R5000" }
+        match self {
+            Self::R4400 => "MIPS R4400",
+            Self::R5000 => "MIPS R5000",
+            Self::R10000 => "MIPS R10000",
+        }
     }
 }
 
