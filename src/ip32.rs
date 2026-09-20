@@ -336,6 +336,14 @@ pub struct PciFunction {
     /// which parts of the chip the firmware insists on.
     mem: Mutex<std::collections::BTreeMap<u32, u32>>,
     mem_log: Mutex<Vec<(u32, bool, u32, u32)>>,
+    /// The device's behaviour, if it has any beyond storing what it is told.
+    ops: Option<std::sync::Arc<dyn PciDeviceOps>>,
+}
+
+/// What a PCI device does when the guest touches its memory BAR.
+pub trait PciDeviceOps: Send + Sync {
+    fn read(&self, off: u32, width: usize) -> u32;
+    fn write(&self, off: u32, val: u32, width: usize);
 }
 
 impl PciFunction {
@@ -363,6 +371,7 @@ impl PciFunction {
             touched: Mutex::new(Vec::new()),
             mem: Mutex::new(std::collections::BTreeMap::new()),
             mem_log: Mutex::new(Vec::new()),
+            ops: None,
         }
     }
 
@@ -397,7 +406,18 @@ impl PciFunction {
         }
     }
 
+    /// Give the function real behaviour instead of a register file.
+    pub fn with_ops(mut self, ops: std::sync::Arc<dyn PciDeviceOps>) -> Self {
+        self.ops = Some(ops);
+        self
+    }
+
     pub fn mem_read(&self, off: u32, width: usize, pc: u32) -> u32 {
+        if let Some(ops) = &self.ops {
+            let v = ops.read(off, width);
+            self.log_mem(off, false, v, pc);
+            return v;
+        }
         let m = self.mem.lock().unwrap();
         let mut v = 0u32;
         for i in 0..width as u32 {
@@ -410,6 +430,10 @@ impl PciFunction {
 
     pub fn mem_write(&self, off: u32, val: u32, width: usize, pc: u32) {
         self.log_mem(off, true, val, pc);
+        if let Some(ops) = &self.ops {
+            ops.write(off, val, width);
+            return;
+        }
         let mut m = self.mem.lock().unwrap();
         for i in 0..width as u32 {
             m.insert(off + i, (val >> (8 * (width as u32 - 1 - i))) as u8 as u32);
@@ -1491,6 +1515,9 @@ pub struct Ip32Bus {
     /// Cheap to leave in: one range compare on the RAM path.
     watch: Option<(u32, u32)>,
     watch_log: Mutex<Vec<(u32, bool, u64, u32, u64)>>,
+    /// The SCSI controller, when one is attached, so the trace can report
+    /// what the driver asked it for.
+    pub scsi: Mutex<Option<std::sync::Arc<crate::aic7880::Aic7880>>>,
 }
 
 impl Ip32Bus {
@@ -1526,24 +1553,30 @@ impl Ip32Bus {
                 Some((p(a)?, p(b)? + 8))
             }),
             watch_log: Mutex::new(Vec::new()),
+            scsi: Mutex::new(None),
         };
         // An experiment for now: the PROM probes slots 1..3 for a vendor ID
         // and finds nothing, so it has no disk and cannot boot. Putting the
         // controller a real O2 has there is how we learn how much of it the
         // PROM insists on.
         if std::env::var("IRIS_IP32_SCSI").is_ok() {
+            let scsi = std::sync::Arc::new(crate::aic7880::Aic7880::new());
             bus.macepci.attach(
                 IP32_SCSI_SLOT,
-                std::sync::Arc::new(PciFunction::new(
-                    "aic7880",
-                    PCI_VENDOR_ADAPTEC,
-                    PCI_DEVICE_AIC7880,
-                    PCI_CLASS_SCSI,
-                    0x01,
-                    // 256 bytes of I/O, 4 KiB of memory: what the part has.
-                    [0x100, 0x1000, 0, 0, 0, 0],
-                )),
+                std::sync::Arc::new(
+                    PciFunction::new(
+                        "aic7880",
+                        PCI_VENDOR_ADAPTEC,
+                        PCI_DEVICE_AIC7880,
+                        PCI_CLASS_SCSI,
+                        0x01,
+                        // 256 bytes of I/O, 4 KiB of memory: what the part has.
+                        [0x100, 0x1000, 0, 0, 0, 0],
+                    )
+                    .with_ops(scsi.clone()),
+                ),
             );
+            *bus.scsi.lock().unwrap() = Some(scsi);
         }
         // So a hot offset can name the code polling it.
         bus.mace.watch_pc(pc.clone());
@@ -3368,11 +3401,32 @@ mod bringup {
                     eprintln!("      registers touched ({}): {}",
                               by_off.len(), line.join(" "));
                 }
+                // The tail, with the poll registers dropped: HCNTRL and
+                // INTSTAT are read thousands of times and say nothing.
+                let quiet: Vec<&(u32, bool, u32, u32)> = ml.iter()
+                    .filter(|(o, _, _, _)| !matches!(*o, 0x87 | 0x91 | 0x61))
+                    .collect();
+                eprintln!("      last {} non-polling accesses:", quiet.len().min(30));
+                for (off, w, v, pc) in quiet.iter().rev().take(30).rev() {
+                    eprintln!("      +0x{off:03x} {} 0x{v:02x}  from PC 0x{pc:08x}",
+                              if *w { "W" } else { "R" });
+                }
                 for (off, w, v, pc, n) in runs.iter().take(6) {
                     let times = if *n > 1 { format!(" x{n}") } else { String::new() };
                     eprintln!("      +0x{off:03x} {} 0x{v:08x}  from PC 0x{pc:08x}{times}",
                               if *w { "W" } else { "R" });
                 }
+            }
+        }
+        if let Some(scsi) = bus.scsi.lock().unwrap().as_ref() {
+            eprintln!("ip32: SCSI controller: {} bytes of sequencer program downloaded",
+                      scsi.seqram_len());
+            for n in scsi.notes().iter().take(24) {
+                eprintln!("   {n}");
+            }
+            for (i, scb) in scsi.queued().iter().take(8) {
+                let b: Vec<String> = scb.iter().map(|x| format!("{x:02x}")).collect();
+                eprintln!("   SCB {i}: {}", b.join(" "));
             }
         }
         let probed = bus.macepci.probed();
