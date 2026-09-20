@@ -187,6 +187,8 @@ struct State {
     qoutpos: u32,
     /// How many times the sequencer was paused or restarted.
     pauses: u64,
+    /// Per SCB: filled in through the register window since last queued.
+    scb_onchip: [bool; SCB_COUNT],
     notes: Vec<String>,
 }
 
@@ -204,6 +206,7 @@ impl Default for State {
             executed: Vec::new(),
             qoutpos: 0,
             pauses: 0,
+            scb_onchip: [false; SCB_COUNT],
             notes: Vec::new(),
         }
     }
@@ -474,6 +477,18 @@ impl Aic7880 {
 
     /// Fetch a queued command and run it.
     fn submit(&self, st: &mut State, tag: u8) {
+        let i = (tag as usize) % SCB_COUNT;
+        if st.scb_onchip[i] {
+            // Written through the register window: the SCB is already here.
+            // The layout is not the PROM's, and is not yet decoded -- record
+            // it so the next reader has the evidence rather than a guess.
+            let scb = st.scb[i];
+            let hex: Vec<String> = scb.iter().map(|b| format!("{b:02x}")).collect();
+            Self::note(st, format!("tag {tag}: on-chip SCB {}", hex.join(" ")));
+            st.scb_onchip[i] = false;
+            self.complete(st, tag);
+            return;
+        }
         let array = Self::scratch_le32(st, sram::SCB_ARRAY);
         if array == 0 {
             Self::note(st, format!("tag {tag} queued with no SCB array configured"));
@@ -643,6 +658,13 @@ impl Aic7880 {
             reg::SCBARRAY_FIRST..=reg::SCBARRAY_LAST => {
                 let i = Self::scb_index(&st);
                 st.scb[i][(off - reg::SCBARRAY_FIRST) as usize] = val;
+                // Remember that this SCB was filled in on the chip. Two
+                // drivers use two different submission paths: the PROM's
+                // sequencer program fetches SCBs from host memory and is
+                // handed only a tag, while NetBSD's writes the whole SCB
+                // through this window first. Which one is in use is decided
+                // by what the driver actually did, not by guessing.
+                st.scb_onchip[i] = true;
             }
             _ => st.regs[off as usize] = val,
         }
