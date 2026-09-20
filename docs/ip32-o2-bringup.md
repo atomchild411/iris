@@ -1013,6 +1013,70 @@ disk — and that refusal is a test.
 The CDB length now comes from the SCB rather than from the opcode group, with
 the opcode as a fallback if the SCB says something impossible.
 
+## NetBSD's bootstrap runs on the emulated O2
+
+2026-09-20.
+
+### The volume header is partition 8, not 0
+
+`boot -f dksc(0,1,0)sash` was answering `media not loaded` because partition 0
+is the *filesystem*, and the standalone directory an SGI PROM loads from lives
+in **partition 8**. With the path corrected:
+
+```text
+> ls dksc(0,1,8)
+dksc(0,1,8):
+sash
+> hinv
+                 SCSI Disk: scsi(0)disk(1)
+                 SCSI Disk: scsi(0)disk(2)
+```
+
+The PROM reads our volume header, lists its directory, and reports the disk in
+its inventory. (It lists several because one image still answers for every
+target — see above.)
+
+### And it runs a NetBSD bootloader
+
+`ip3xboot` out of NetBSD 11's `base.tgz` is the sgimips bootloader for this
+machine. Put in the volume header with `mkvh` and loaded from partition 8:
+
+```text
+> boot -f dksc(0,1,8)boot
+54688+1408 entry: 0x80002000
+
+NetBSD/sgimips 11.0 Bootstrap, Revision 1.5 (Thu Jul 30 15:23:12 UTC 2026)
+
+devopen: pci(0)scsi(0)disk(1)rdisk(0)partition(0) type scsi file boot
+open pci(0)scsi(0)disk(1)rdisk(0)partition(0)boot: Input/output error
+```
+
+Third-party code, loaded off an emulated SCSI disk through an emulated PCI
+controller, running on the emulated CPU and printing to the emulated UART. It
+then asks the PROM to open `partition(0)` — the root filesystem, which the
+image does not have yet.
+
+### The 8 MB kernel does not load, and the size is the clue
+
+Loading the IP3x kernel directly rather than through the bootloader gets as
+far as an entry point and no further:
+
+```text
+> boot -f dksc(0,1,8)netbsd
+8056208+128448 entry: 0x80069000
+```
+
+Those numbers are right — they are the ELF's `filesz` and its bss. But only
+**five** SCSI reads happen in the whole session, all of a single block, and
+memory at the entry point is zero afterwards: the kernel runs NOPs from
+`0x80069000` upwards until it falls out of RAM. The loader reads the first
+block of the file and one near the end, prints the summary, and jumps.
+
+A 54 KB bootloader through the same path loads perfectly, so the loader works.
+The PROM also says `not enough space` further down its own output. The
+likeliest explanation is a limit on where or how much it will load, and the
+next step is to find it rather than assume it.
+
 ### What is left
 
 - The PROM reads the volume header but has not yet been given a bootable one.
