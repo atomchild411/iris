@@ -260,62 +260,68 @@ What CRIME is told beforehand is the clue:
 Eight banks, all programmed identically, then probed. Our RAM is flat at
 physical 0 and ignores the bank registers entirely, so every bank aliases onto
 the same store — which is exactly what a sizing algorithm is designed to detect
-and report as "nothing there". ### What SizeMEM actually does
+and report as "nothing there". ### SizeMEM passes: RAM is at 0x40000000
 
-It compares against a table of `(!a << 32) | a` constants at 0xbfc06f70..fa0 —
-the classic address/complement signature — for probe addresses 0x00000000,
-0x01fffff8 (32M-8), 0x02000000 (32M) and 0x07fffff8 (128M-8). It is a cascade:
-test for 128M, fall through to 32M, fall through to "no SIMM".
+Tracing back from the failing `bne` gives the whole routine (0xbfc05c80):
 
-Tracing every 64-bit access carrying that signature gives the surprise:
+    sd t6, 0(s3)          # base + 0
+    sd t9, 0(a0)          # base + 0x01fffff8
+    sd t1, 0(a1)          # base + 0x02000000
+    sd t3, 0(a2)          # base + 0x07fffff8
+    ld v1, 0(s3)          # read base + 0 back
+    bne v1, t0, fail
 
-    0x1fc06f48 R 0xffffffff00000000  (prom table)
-    0x1fc06f50 R 0xfe00000701fffff8  (prom table)
-    ...
+It *does* write its patterns. The reason none appeared in RAM is that the
+physical address they land on is **0x40000000** — visible all along as the
+target of the bus-erroring `sd` at 0xbfc05c9c, which I had read as a PCI probe.
 
-**Every one is the PROM reading its own constants. None is a write to RAM.**
-So POST never stores the probe patterns at all in our run — it reads its
-expected values, compares against something it obtained earlier, and fails at
-`bne v1,t2` (0xbfc05dc0) *before* reaching the three pattern comparisons.
+**O2 main memory is based at 0x40000000, not at 0.** This is the "RAM at a
+non-zero base address" GXemul's documentation mentions as an O2 trait. It
+collides with what `macereg.h` calls `MACE_PCI_NATIVE_VIEW`; memory has the
+stronger claim on that address, so the PCI window is unmapped for now.
 
-So the open question is narrower than "memory sizing is broken": where do the
-operands of that first comparison come from? Candidates, in order of cheapness
-to test:
+Moving RAM there, SizeMEM passes outright:
 
-1. An earlier phase wrote them and we lost the writes — which would point at
-   the cache model in the harness rather than the bus.
-2. They come from a CRIME register we answer with a stored value where hardware
-   would compute one (the bank controls are the obvious suspects: we hand back
-   the 0x100 we were given).
-3. They are derived from something not yet emulated at all.
+    0x40000000 W ffffffff00000000     0x40000000 R ffffffff00000000
+    0x41fffff8 W fe00000701fffff8     0x41fffff8 R fe00000701fffff8
+    0x42000000 W fdffffff02000000     0x42000000 R fdffffff02000000
+    0x47fffff8 W f800000707fffff8     0x47fffff8 R f800000707fffff8
+    0x48000000 W ...                  <- bank 1, at base + 128 MB
 
-The bank-control theory remains the strongest, but it is now a hypothesis with
-a specific test rather than a conclusion: trace backwards from 0xbfc05dc0 to
-where `v1` is set.
+Every pattern reads back. MACE traffic drops from 20,334 accesses to **5** —
+the panic blinker is gone — and CRIME's bank registers go from `0x100` to
+`0x104` for the banks behind bank 0, so bit 2 is something POST sets once a
+bank has been sized.
 
-Note also that nothing went unmapped during the run, so this is not a missing
-device. It is a device that answers, but lies.
+The one remaining unmapped access is `0x48000000 W`: bank 1, past our 128 MB.
+That is correct behaviour rather than a bug — the PROM installs a bus-error
+handler (`jr s8` at 0xbfc00388, with a CP0 dump behind it) specifically so it
+can probe banks that are not populated.
 
-## Gates found so far, in the order the PROM hits them
+### The lesson from this one
 
-| # | gate | verdict |
-|---|---|---|
-| 1 | CRIME | nearly free — `CONTROL` plus eight bank-control qwords |
-| 2 | MACE PCI | an **empty** bus is accepted, provided config reads are all-ones |
-| 3 | `MACE_UST_MSC` timer | required, trivial — must advance |
-| 4 | memory sizing | **current gate** — `Error, no SIMM in bank0` |
+The bus error at 0x40000000 was visible in the *first* run of the evening. I
+read it as "the PROM is enumerating PCI" because `macereg.h` has a constant at
+that address, and then built a PCI window to satisfy it — which duly absorbed
+the writes and made main memory invisible. The address was right there; the
+wrong name was attached to it.
 
-Everything up to here took one evening, which is the useful signal: the early
-PROM is far less demanding than the device list suggests.
+Twice in one session the same mistake: `MACE_ISA_FLASH_NIC_REG` read as 1-Wire
+when the bits said LED, and 0x40000000 read as PCI when the access pattern said
+memory. **Trust the access pattern over the header name.**
 
 ## Open questions
 
 - ~~How much does `post1` insist on?~~ Answered: CRIME is cheap, MACE PCI is
   the gate. See above.
 - ~~What does the PROM expect to find on PCI?~~ Answered: an empty bus is fine.
-- What do CRIME's bank-control bits mean? `0x100` is written to all eight. The
-  sizing test's three patterns and their expected values are in the PROM at
-  0xbfc06f90..fa0, so the test can be read directly rather than guessed at.
+- What do CRIME's bank-control bits mean? POST writes `0x100` to all eight,
+  then `0x104` to the ones behind bank 0. Bit 2 is set once a bank is sized.
+- Where does the PCI native view really live, given memory owns 0x40000000?
+- **Next, and cheapest by far: implement `com0` at MACE + 0x390000.** The PROM
+  calls a print routine at 0xbfc04d74 throughout POST, and its messages are
+  tagged (`<post1> <SizeMEM> ...`). A 16550 that just collects bytes would turn
+  every further gate from a disassembly exercise into reading the console.
 - 1-Wire is still there and still unimplemented; the PROM simply has not
   reached it yet.
 - `UST_STRIDE` is a bring-up shortcut: the counter advances per read rather
