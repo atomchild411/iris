@@ -535,16 +535,18 @@ impl Aic7880 {
     /// Fetch a queued command and run it.
     fn submit(&self, st: &mut State, tag: u8) {
         let i = (tag as usize) % SCB_COUNT;
+        // The register window is used by both drivers, but only to *clear*
+        // SCBs during initialisation -- a window write is not evidence that
+        // the command lives on the chip. Report a window-filled SCB that
+        // carries anything, so the day one does it is not a silent surprise,
+        // and otherwise take the host-memory path both drivers actually use.
         if st.scb_onchip[i] {
-            // Written through the register window: the SCB is already here.
-            // The layout is not the PROM's, and is not yet decoded -- record
-            // it so the next reader has the evidence rather than a guess.
-            let scb = st.scb[i];
-            let hex: Vec<String> = scb.iter().map(|b| format!("{b:02x}")).collect();
-            Self::note(st, format!("tag {tag}: on-chip SCB {}", hex.join(" ")));
             st.scb_onchip[i] = false;
-            self.complete(st, tag);
-            return;
+            let scb = st.scb[i];
+            if scb.iter().take(SCB_SIZE - 1).any(|b| *b != 0) {
+                let hex: Vec<String> = scb.iter().map(|b| format!("{b:02x}")).collect();
+                Self::note(st, format!("tag {tag}: on-chip SCB carries {}", hex.join(" ")));
+            }
         }
         let array = Self::scratch_le32(st, sram::SCB_ARRAY);
         if array == 0 {

@@ -1122,6 +1122,30 @@ Two fixes it needed:
   settle" with its clock stopped at 1.0000030. The harness now polls
   Count against Compare every [`TIMER_POLL_STEPS`] and raises IP7.
 
+### NetBSD's driver: still undecoded, and one wrong guess recorded
+
+With the scatter-gather fix in, NetBSD gets further but its `ahc` still times
+out. Two things are now known and one guess was wrong.
+
+A first attempt read the register-window writes (`0xa0`..`0xbf`, sixteen each)
+as "this driver puts SCBs on the chip". It does not: those writes are the
+driver **clearing** all sixteen SCBs during initialisation, and the SCBs are
+empty when a tag is queued. Treating a window write as evidence made the
+device complete commands from blank SCBs, which is worse than failing. The
+discriminator now only reports a window-filled SCB that actually carries
+something, and otherwise uses the host-memory path both drivers share.
+
+What is actually wrong is narrower: NetBSD sets the scratch SCB-array pointer,
+and we read an SCB from it, but always the *same* stale address
+(`0x4107681c`, left over from the PROM) with `control 0x05`. So either the
+pointer it writes is not the one at `sram::SCB_ARRAY`, or the indexing differs.
+The driver then reports `Infinite interrupt loop, INTSTAT = 0`, which is its
+watchdog rather than a clue about the chip.
+
+577 commands and 9.1 MB moved in a session, so the path works for the PROM and
+the bootloader; this is specifically NetBSD's convention, and it needs the
+same treatment the PROM's got — read it out of the driver.
+
 ### Two drivers, two submission paths
 
 With time running, NetBSD probes the bus and times out, and the register
