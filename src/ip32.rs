@@ -335,7 +335,7 @@ pub struct PciFunction {
     /// the guest did to them. At this stage the log is the point: it says
     /// which parts of the chip the firmware insists on.
     mem: Mutex<std::collections::BTreeMap<u32, u32>>,
-    mem_log: Mutex<Vec<(u32, bool, u32, u32)>>,
+    mem_log: Mutex<Vec<(u32, bool, u32, u32, u32)>>,
     /// The device's behaviour, if it has any beyond storing what it is told.
     ops: Option<std::sync::Arc<dyn PciDeviceOps>>,
 }
@@ -395,14 +395,14 @@ impl PciFunction {
     }
 
     /// Accesses to the device's memory BAR: `(offset, was_write, value, pc)`.
-    pub fn mem_log(&self) -> Vec<(u32, bool, u32, u32)> {
+    pub fn mem_log(&self) -> Vec<(u32, bool, u32, u32, u32)> {
         self.mem_log.lock().unwrap().clone()
     }
 
-    fn log_mem(&self, off: u32, write: bool, val: u32, pc: u32) {
+    fn log_mem(&self, off: u32, write: bool, val: u32, pc: (u32, u32)) {
         let mut l = self.mem_log.lock().unwrap();
         if l.len() < 20000 {
-            l.push((off, write, val, pc));
+            l.push((off, write, val, pc.0, pc.1));
         }
     }
 
@@ -412,7 +412,7 @@ impl PciFunction {
         self
     }
 
-    pub fn mem_read(&self, off: u32, width: usize, pc: u32) -> u32 {
+    pub fn mem_read(&self, off: u32, width: usize, pc: (u32, u32)) -> u32 {
         if let Some(ops) = &self.ops {
             let v = ops.read(off, width);
             self.log_mem(off, false, v, pc);
@@ -428,7 +428,7 @@ impl PciFunction {
         v
     }
 
-    pub fn mem_write(&self, off: u32, val: u32, width: usize, pc: u32) {
+    pub fn mem_write(&self, off: u32, val: u32, width: usize, pc: (u32, u32)) {
         self.log_mem(off, true, val, pc);
         if let Some(ops) = &self.ops {
             ops.write(off, val, width);
@@ -1697,7 +1697,8 @@ impl Ip32Bus {
 
     fn pci_mem_read_w(&self, addr: u32, width: usize) -> u32 {
         match self.macepci.mem_target(Self::pci_addr_of(addr)) {
-            Some((f, off)) => f.mem_read(Self::lane_swizzle(off, width), width, self.pc.get()),
+            Some((f, off)) => f.mem_read(Self::lane_swizzle(off, width), width,
+                                         (self.pc.get(), self.pc.get_ra())),
             None => 0xffff_ffff,
         }
     }
@@ -1708,7 +1709,8 @@ impl Ip32Bus {
 
     fn pci_mem_write_w(&self, addr: u32, val: u32, width: usize) {
         if let Some((f, off)) = self.macepci.mem_target(Self::pci_addr_of(addr)) {
-            f.mem_write(Self::lane_swizzle(off, width), val, width, self.pc.get());
+            f.mem_write(Self::lane_swizzle(off, width), val, width,
+                        (self.pc.get(), self.pc.get_ra()));
         }
     }
 
@@ -3201,6 +3203,24 @@ mod bringup {
                 }
             }
         }
+        // IRIS_IP32_DUMP=addr:len hex-dumps physical memory after the run.
+        if let Ok(spec) = std::env::var("IRIS_IP32_DUMP") {
+            for part in spec.split(',') {
+                if let Some((a, n)) = part.split_once(':') {
+                    let a = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+                    let n = n.trim().parse::<u32>().unwrap_or(64);
+                    eprintln!("ip32: memory at 0x{a:08x}:");
+                    for row in 0..n.div_ceil(16) {
+                        let base = a + row * 16;
+                        let mut line = format!("   0x{base:08x} ");
+                        for i in 0..4 {
+                            line += &format!(" {:08x}", bus.read32(base + i * 4).data);
+                        }
+                        eprintln!("{line}");
+                    }
+                }
+            }
+        }
         // IRIS_IP32_DIS=start:end disassembles a range once the run is over,
         // reading through the bus so RAM-resident code (post1) is visible.
         if let Ok(spec) = std::env::var("IRIS_IP32_DIS") {
@@ -3380,7 +3400,7 @@ mod bringup {
                 // Collapse repeats: a poll says one thing however often it
                 // happens, and the distinct offsets are the shopping list.
                 let mut runs: Vec<(u32, bool, u32, u32, u32)> = Vec::new();
-                for (off, w, v, pc) in ml.iter().copied() {
+                for (off, w, v, pc, _) in ml.iter().copied() {
                     match runs.last_mut() {
                         Some(r) if r.0 == off && r.1 == w && r.2 == v => r.4 += 1,
                         _ => runs.push((off, w, v, pc, 1)),
@@ -3391,7 +3411,7 @@ mod bringup {
                     // list: this is the part of the chip that has to exist.
                     let mut by_off: std::collections::BTreeMap<u32, (u32, u32)> =
                         Default::default();
-                    for (off, w, _, _) in ml.iter() {
+                    for (off, w, _, _, _) in ml.iter() {
                         let e = by_off.entry(*off).or_insert((0, 0));
                         if *w { e.1 += 1 } else { e.0 += 1 }
                     }
@@ -3403,12 +3423,31 @@ mod bringup {
                 }
                 // The tail, with the poll registers dropped: HCNTRL and
                 // INTSTAT are read thousands of times and say nothing.
-                let quiet: Vec<&(u32, bool, u32, u32)> = ml.iter()
-                    .filter(|(o, _, _, _)| !matches!(*o, 0x87 | 0x91 | 0x61))
+                let quiet: Vec<&(u32, bool, u32, u32, u32)> = ml.iter()
+                    .filter(|(o, _, _, _, _)| !matches!(*o, 0x87 | 0x91 | 0x61))
                     .collect();
-                eprintln!("      last {} non-polling accesses:", quiet.len().min(30));
-                for (off, w, v, pc) in quiet.iter().rev().take(30).rev() {
-                    eprintln!("      +0x{off:03x} {} 0x{v:02x}  from PC 0x{pc:08x}",
+                {
+                    // The sequencer's scratch RAM, as the driver left it. A
+                    // four-byte run that looks like a DMA address is what we
+                    // are after: the host-memory array of SCB addresses.
+                    let mut sram = [0u8; 0x40];
+                    for (o, w, v, _, _) in ml.iter() {
+                        if *w && (0x20..0x60).contains(o) {
+                            sram[(*o - 0x20) as usize] = *v as u8;
+                        }
+                    }
+                    eprint!("      sequencer scratch RAM 0x20..0x5f:");
+                    for (i, b) in sram.iter().enumerate() {
+                        if i % 16 == 0 {
+                            eprint!("\n        {:02x}:", 0x20 + i);
+                        }
+                        eprint!(" {b:02x}");
+                    }
+                    eprintln!();
+                }
+                eprintln!("      last {} non-polling accesses:", quiet.len().min(24));
+                for (off, w, v, pc, ra) in quiet.iter().rev().take(24).rev() {
+                    eprintln!("      +0x{off:03x} {} 0x{v:02x}  from PC 0x{pc:08x}<-0x{ra:08x}",
                               if *w { "W" } else { "R" });
                 }
                 for (off, w, v, pc, n) in runs.iter().take(6) {
