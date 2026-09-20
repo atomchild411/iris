@@ -570,11 +570,12 @@ impl MacePci {
     /// Split a CONFIG_ADDR value into the function it selects and the
     /// register within it. Only bus 0 exists here.
     fn selected(&self) -> Option<(std::sync::Arc<PciFunction>, usize)> {
-        let a = *self.config_addr.lock().unwrap();
-        // Bit 31 enables the cycle.
-        if a & 0x8000_0000 == 0 {
-            return None;
-        }
+        // Bit 31 is the enable bit of the standard PCI mechanism, and MACE's
+        // bridge does not insist on it: the PROM sets it (0x80000800) and
+        // NetBSD's driver does not (0x00000800). Requiring it makes the whole
+        // bus invisible to one of them, which is exactly how the kernel came
+        // to probe and find nothing.
+        let a = *self.config_addr.lock().unwrap() & 0x7fff_ffff;
         if (a >> 16) & 0xff != 0 {
             return None;
         }
@@ -3551,7 +3552,7 @@ mod bringup {
             eprintln!("ip32: SCSI controller: {} bytes of sequencer program downloaded",
                       scsi.seqram_len());
             eprintln!("   sequencer paused/restarted {} times", scsi.pauses());
-            for n in scsi.notes().iter() {
+            for n in scsi.notes().iter().rev().take(40).rev() {
                 eprintln!("   {n}");
             }
             let ex = scsi.executed();
