@@ -3455,6 +3455,16 @@ mod bringup {
                     }
                     eprintln!();
                 }
+                {
+                    // The SCSI block, 0x00..0x1f: selection, transfer control
+                    // and IDs. If the target a command is for is not in the
+                    // SCB, it is set here.
+                    let sel: Vec<String> = ml.iter()
+                        .filter(|(o, w, _, _, _)| *w && *o < 0x20)
+                        .map(|(o, _, v, _, _)| format!("{o:02x}={v:02x}"))
+                        .collect();
+                    eprintln!("      SCSI block writes ({}): {}", sel.len(), sel.join(" "));
+                }
                 eprintln!("      last {} non-polling accesses:", quiet.len().min(24));
                 for (off, w, v, pc, ra) in quiet.iter().rev().take(24).rev() {
                     eprintln!("      +0x{off:03x} {} 0x{v:02x}  from PC 0x{pc:08x}<-0x{ra:08x}",
@@ -3471,7 +3481,7 @@ mod bringup {
             eprintln!("ip32: SCSI controller: {} bytes of sequencer program downloaded",
                       scsi.seqram_len());
             eprintln!("   sequencer paused/restarted {} times", scsi.pauses());
-            for n in scsi.notes().iter().rev().take(10).rev() {
+            for n in scsi.notes().iter().rev().take(200).rev() {
                 eprintln!("   {n}");
             }
             let ex = scsi.executed();
