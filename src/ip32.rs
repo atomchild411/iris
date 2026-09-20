@@ -164,6 +164,11 @@ pub mod crime_reg {
     pub const INT_SOFT: u32 = 0x0020;
     pub const WATCHDOG: u32 = 0x0030;
     pub const TIME: u32 = 0x0038;
+    /// Pending interrupts, and which of them are allowed through. NetBSD
+    /// attaches CRIME as `platform.intr0`, so anything getting past the mask
+    /// arrives at the CPU as IP2.
+    pub const INTSTAT: u32 = 0x0010;
+    pub const INTMASK: u32 = 0x0018;
     pub const CPU_ERROR_ADDR: u32 = 0x0040;
     pub const CPU_ERROR_STAT: u32 = 0x0048;
     pub const CPU_ERROR_ENA: u32 = 0x0050;
@@ -224,6 +229,25 @@ impl Crime {
 
     pub fn with_revision(ust: std::sync::Arc<MaceUst>, revision: u64) -> Self {
         Self { revision, ..Self::new(ust) }
+    }
+
+    /// Raise or lower one of CRIME's interrupt inputs.
+    pub fn set_int(&self, bit: u32, on: bool) {
+        let mut r = self.regs.lock().unwrap();
+        let i = (crime_reg::INTSTAT / 8) as usize;
+        if on {
+            r[i] |= 1u64 << bit;
+        } else {
+            r[i] &= !(1u64 << bit);
+        }
+    }
+
+    /// True when something is pending that the mask lets through.
+    pub fn interrupting(&self) -> bool {
+        let r = self.regs.lock().unwrap();
+        let stat = r[(crime_reg::INTSTAT / 8) as usize];
+        let mask = r[(crime_reg::INTMASK / 8) as usize];
+        stat & mask != 0
     }
 
     /// The raw counter, before the offset a write installs.
@@ -518,6 +542,10 @@ pub const PCI_DEVICE_AIC7880: u16 = 0x8078;
 pub const PCI_CLASS_SCSI: u32 = 0x0100_00;
 /// The slot the PROM looks in first.
 pub const IP32_SCSI_SLOT: u8 = 1;
+/// Which of CRIME's interrupt inputs the controller in that slot drives.
+/// NetBSD works this out for itself and prints it: "interrupting at crime
+/// interrupt 8".
+pub const IP32_SCSI_CRIME_INT: u32 = 8;
 
 /// The CPU-side window onto PCI memory, and the PCI address it starts at.
 ///
@@ -3190,6 +3218,22 @@ mod bringup {
             // all inside a guest kernel, and NetBSD sits forever "waiting 2
             // seconds for devices to settle" with its clock stopped.
             if steps % TIMER_POLL_STEPS == 0 {
+                // Device interrupts reach the CPU through CRIME, which
+                // NetBSD attaches as interrupt 0 -- IP2. Without this the
+                // driver only discovers a finished command when its own
+                // watchdog fires, which it reports as "Interrupts may not be
+                // functioning", and it is right.
+                if let Some(scsi) = bus.scsi.lock().unwrap().as_ref() {
+                    bus.crime.set_int(IP32_SCSI_CRIME_INT, scsi.interrupting());
+                }
+                let bits = &exec.core.hot.interrupts;
+                let cur = bits.load(std::sync::atomic::Ordering::Relaxed);
+                let ip2 = crate::mips_core::CAUSE_IP2 as u64;
+                let want = if bus.crime.interrupting() { cur | ip2 } else { cur & !ip2 };
+                if want != cur {
+                    bits.store(want, std::sync::atomic::Ordering::Relaxed);
+                }
+
                 let compare = exec.core.cp0_compare as u32;
                 let count = exec.core.count_now();
                 // Count wraps; treat it as fired when it is within a window

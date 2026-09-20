@@ -152,6 +152,45 @@ impl ScsiDisk {
     }
 }
 
+/// NetBSD's sequencer program uses a different arrangement from the PROM's,
+/// and these names come from its own headers rather than from guessing.
+///
+/// Its host does not write a tag to `QINFIFO` at all. It puts the tag into a
+/// 256-entry ring in host memory and then writes the *producer index* to a
+/// scratch register; the sequencer consumes from the ring and fetches the SCB
+/// from a flat array indexed by tag. Completion goes back through a second
+/// ring beside the first.
+pub mod nb {
+    /// Scratch registers holding the two base addresses and the index.
+    pub const HSCB_ADDR: u32 = 0x44;
+    pub const SHARED_DATA_ADDR: u32 = 0x48;
+    pub const KERNEL_QINPOS: u32 = 0x4c;
+
+    /// `qoutfifo` sits at the shared-data base and `qinfifo` right after it,
+    /// 256 bytes each.
+    pub const FIFO_LEN: u32 = 256;
+    /// Stride of the host's SCB array. The chip only looks at the first 32
+    /// bytes; the rest is room for a long CDB.
+    pub const HSCB_STRIDE: u32 = 64;
+
+    /// Offsets inside one SCB.
+    pub const CDB: u32 = 0;
+    /// Status is returned in the same union the CDB arrived in, after two
+    /// residual words.
+    pub const STATUS: u32 = 8;
+    pub const DATAPTR: u32 = 12;
+    pub const DATACNT: u32 = 16;
+    pub const SGPTR: u32 = 20;
+    pub const CONTROL: u32 = 24;
+    pub const SCSIID: u32 = 25;
+    pub const LUN: u32 = 26;
+    pub const CDB_LEN: u32 = 28;
+
+    /// A scatter-gather entry's length carries flags in its top byte.
+    pub const LAST_SEG: u32 = 0x8000_0000;
+    pub const SG_PTR_MASK: u32 = 0xffff_fff8;
+}
+
 /// The host queue-out FIFO is 256 entries, filled with this until used.
 pub const QOUTFIFO_LEN: u32 = 256;
 pub const QOUTFIFO_EMPTY: u8 = 0xff;
@@ -197,6 +236,8 @@ struct State {
     executed: Vec<(u8, u32, Vec<u8>)>,
     /// Where the next completion goes in the host queue-out FIFO.
     qoutpos: u32,
+    /// How far we have consumed NetBSD's queue-in ring.
+    qinpos: u8,
     /// How many times the sequencer was paused or restarted.
     pauses: u64,
     /// Per SCB: filled in through the register window since last queued.
@@ -223,6 +264,7 @@ impl Default for State {
             queued: Vec::new(),
             executed: Vec::new(),
             qoutpos: 0,
+            qinpos: 0,
             pauses: 0,
             scb_onchip: [false; SCB_COUNT],
             total_cmds: 0,
@@ -240,6 +282,8 @@ pub struct Aic7880 {
     /// being handed it a register at a time, so without this it can see the
     /// tag of a command and nothing else about it.
     ram: std::sync::Arc<Mutex<Vec<u8>>>,
+    /// The SCSI id the one disk answers at.
+    target: u8,
     /// An address range to report DMA writes for, from IRIS_IP32_DMAWATCH.
     /// "Did the loader ever write the entry point" is not answerable from the
     /// command log, because the log says where a transfer was aimed and not
@@ -260,6 +304,9 @@ impl Aic7880 {
                 Some((p(a)?, p(b)?))
             }),
             dma_hits: Mutex::new(Vec::new()),
+            target: std::env::var("IRIS_IP32_SCSI_ID").ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
         }
     }
 
@@ -324,6 +371,21 @@ impl Aic7880 {
         v
     }
 
+    /// A 32-bit word the little-endian way.
+    ///
+    /// The chip is little-endian and NetBSD's driver writes its SCB fields
+    /// accordingly (`ahc_htole32`), while the PROM's sequencer program was
+    /// handed big-endian words by its own loader. Reading NetBSD's pointers
+    /// the wrong way round turns 0x0005fe58 into 0x58fe0500 -- an address
+    /// far outside memory, which lands nowhere and reports success.
+    fn dma_read32_le(&self, addr: u32) -> u32 {
+        let mut v = 0u32;
+        for i in (0..4).rev() {
+            v = (v << 8) | self.dma_read8(addr + i) as u32;
+        }
+        v
+    }
+
     fn dma_read_bytes(&self, addr: u32, n: usize) -> Vec<u8> {
         (0..n as u32).map(|i| self.dma_read8(addr + i)).collect()
     }
@@ -343,6 +405,11 @@ impl Aic7880 {
     pub fn totals(&self) -> (u64, u64, u64) {
         let st = self.st.lock().unwrap();
         (st.total_cmds, st.total_in, st.total_out)
+    }
+
+    /// True while the chip is asserting its interrupt line.
+    pub fn interrupting(&self) -> bool {
+        self.st.lock().unwrap().intstat != 0
     }
 
     /// How many times the driver paused or restarted the sequencer.
@@ -392,6 +459,39 @@ impl Aic7880 {
         let blocks = d.blocks;
         *self.disk.lock().unwrap() = Some(d);
         Ok(blocks)
+    }
+
+    /// Whether this address is the one disk we have.
+    ///
+    /// A controller that answers for every target and LUN makes a driver
+    /// attach sixty-four copies of the same disk, which is slow, confusing,
+    /// and nothing like the machine. Where the target is known we answer only
+    /// at our own address; where it is not — the PROM's SCBs do not carry it —
+    /// we answer, because refusing would be a guess.
+    fn addressed(&self, who: Option<(u8, u8)>) -> bool {
+        match who {
+            Some((t, l)) => t == self.target && l == 0,
+            None => true,
+        }
+    }
+
+    /// Run a CDB against the attached disk. Returns the data to send back and
+    /// a SCSI status byte.
+    fn execute_for(&self, cdb: &[u8], who: Option<(u8, u8)>) -> (Vec<u8>, u8) {
+        if !self.addressed(who) {
+            // The way SCSI says "nothing here": an INQUIRY answered with
+            // peripheral qualifier 011b and type 1Fh. Anything else is a
+            // check condition.
+            if cdb[0] == 0x12 {
+                let mut d = vec![0u8; 36];
+                d[0] = 0x7f;
+                d[4] = 31;
+                d.truncate((cdb[4] as usize).min(36));
+                return (d, 0x00);
+            }
+            return (Vec::new(), 0x02);
+        }
+        self.execute(cdb)
     }
 
     /// Run a CDB against the attached disk. Returns the data to send back and
@@ -459,6 +559,35 @@ impl Aic7880 {
 
     /// Collect `want` bytes out of the buffers the driver listed, for a
     /// command that sends data to the device.
+    /// Collect bytes out of an explicit list of buffers.
+    fn gather_segs(&self, segs: &[(u32, u32)], want: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(want);
+        for (a, l) in segs {
+            if out.len() >= want {
+                break;
+            }
+            let n = (*l as usize).min(want - out.len());
+            out.extend(self.dma_read_bytes(*a, n));
+        }
+        out
+    }
+
+    /// Place bytes into an explicit list of buffers; returns how many landed.
+    fn scatter_segs(&self, segs: &[(u32, u32)], data: &[u8]) -> usize {
+        let mut done = 0usize;
+        for (a, l) in segs {
+            if done >= data.len() {
+                break;
+            }
+            let n = (*l as usize).min(data.len() - done);
+            for k in 0..n {
+                self.dma_write8(a + k as u32, data[done + k]);
+            }
+            done += n;
+        }
+        done
+    }
+
     fn gather(&self, sg_ptr: u32, want: usize) -> (Vec<u8>, Vec<(u32, u32)>) {
         let mut entries = Vec::new();
         let mut out = Vec::with_capacity(want);
@@ -530,6 +659,109 @@ impl Aic7880 {
             }
         };
         if disk.write_blocks(lba, data) { GOOD } else { CHECK_CONDITION }
+    }
+
+    /// Consume everything the host has added to its queue-in ring.
+    fn drain_netbsd(&self, st: &mut State, want: u8) {
+        let shared = Self::scratch_le32(st, nb::SHARED_DATA_ADDR);
+        let hscb_base = Self::scratch_le32(st, nb::HSCB_ADDR);
+        if shared == 0 || hscb_base == 0 {
+            return;
+        }
+        // The ring is 256 entries, so it cannot legitimately need more than
+        // that many steps to catch up.
+        for _ in 0..nb::FIFO_LEN {
+            if st.qinpos == want {
+                break;
+            }
+            let tag = self.dma_read8(shared + nb::FIFO_LEN + st.qinpos as u32);
+            st.qinpos = st.qinpos.wrapping_add(1);
+            self.submit_netbsd(st, tag, hscb_base, shared);
+        }
+    }
+
+    /// The buffers one command transfers through: the SCB carries the first
+    /// segment directly and points at the rest.
+    fn netbsd_segments(&self, hscb: u32) -> Vec<(u32, u32)> {
+        let mut segs = Vec::new();
+        let first_len = self.dma_read32_le(hscb + nb::DATACNT) & SG_LEN_MASK;
+        if first_len != 0 {
+            segs.push((self.dma_read32_le(hscb + nb::DATAPTR), first_len));
+        }
+        let mut sg = self.dma_read32_le(hscb + nb::SGPTR) & nb::SG_PTR_MASK;
+        for _ in 0..SG_MAX {
+            if sg == 0 {
+                break;
+            }
+            let a = self.dma_read32_le(sg);
+            let raw = self.dma_read32_le(sg + 4);
+            let l = raw & SG_LEN_MASK;
+            if a == 0 && l == 0 {
+                break;
+            }
+            segs.push((a, l));
+            if raw & nb::LAST_SEG != 0 {
+                break;
+            }
+            sg += 8;
+        }
+        segs
+    }
+
+    /// Run one command the NetBSD way.
+    fn submit_netbsd(&self, st: &mut State, tag: u8, hscb_base: u32, shared: u32) {
+        let hscb = hscb_base + tag as u32 * nb::HSCB_STRIDE;
+        let len = self.dma_read8(hscb + nb::CDB_LEN) as usize;
+        // A CDB longer than the twelve bytes that fit inline is kept
+        // elsewhere and pointed at from the same field.
+        let cdb = if len <= 12 {
+            self.dma_read_bytes(hscb + nb::CDB, len.clamp(6, 12))
+        } else {
+            self.dma_read_bytes(self.dma_read32_le(hscb + nb::CDB), len.min(32))
+        };
+        let segs = self.netbsd_segments(hscb);
+        // SCSIID holds the target in the high nibble and our own id in the
+        // low one -- the driver's own card dump prints SCB_SCSIID[0x17] for
+        // target 1 on an adapter at id 7.
+        let scsiid = self.dma_read8(hscb + nb::SCSIID);
+        let lun = self.dma_read8(hscb + nb::LUN) & 0x07;
+
+        let (status, moved) = match Self::data_out_len(&cdb) {
+            Some(want) => {
+                let data = self.gather_segs(&segs, want);
+                let n = data.len();
+                (self.execute_write(&cdb, &data), n)
+            }
+            None => {
+                let (data, status) = self.execute_for(&cdb, Some((scsiid >> 4, lun)));
+                (status, self.scatter_segs(&segs, &data))
+            }
+        };
+
+        let hex: Vec<String> = cdb.iter().map(|b| format!("{b:02x}")).collect();
+        let segtxt: Vec<String> = segs.iter()
+            .map(|(a, l)| format!("0x{a:08x}+{l}")).collect();
+        Self::note(st, format!(
+            "nb tag {tag} id 0x{scsiid:02x} lun {lun}: CDB {} -> status {status}, {moved} bytes into [{}]",
+            hex.join(" "), segtxt.join(" ")));
+
+        // Status goes back in the SCB, and the residual words beside it are
+        // cleared so the driver does not go looking for one.
+        for i in 0..8 {
+            self.dma_write8(hscb + i, 0);
+        }
+        self.dma_write8(hscb + nb::STATUS, status);
+        for i in 0..4 {
+            self.dma_write8(hscb + nb::SGPTR + i, 0);
+        }
+
+        st.total_cmds += 1;
+        st.total_in += moved as u64;
+
+        // And the tag goes back through the other ring.
+        self.dma_write8(shared + st.qoutpos, tag);
+        st.qoutpos = (st.qoutpos + 1) % nb::FIFO_LEN;
+        st.intstat |= intstat::CMDCMPLT;
     }
 
     /// Fetch a queued command and run it.
@@ -710,6 +942,10 @@ impl Aic7880 {
                 }
                 st.seqram[a] = val;
                 st.seqaddr = st.seqaddr.wrapping_add(1);
+            }
+            nb::KERNEL_QINPOS => {
+                st.regs[off as usize] = val;
+                self.drain_netbsd(&mut st, val);
             }
             reg::ERROR_CLRINT => {
                 // Write-one-to-clear, sharing an address with the sequencer
