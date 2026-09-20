@@ -423,7 +423,134 @@ MACE + 0x3a0000, and the 1-Wire ID chip at `MACE_ISA_FLASH_NIC_REG`. Both are
 small, and both are the IP32 counterparts of things IRIS already models for the
 Indy (`eeprom_93c56`, `ds1x86`).
 
-## The console will not help during post1## Open questions
+## The PROM boots: three gates, and an emulator bug
+
+Resolved 2026-09-19, in one chain. Each gate was found by instrumentation, not
+by guessing, and the instrumentation is all still in `bringup`.
+
+### 1. The UART self-test, and why the console printed garbage
+
+post1 was blinking the front-panel LED forever: `s0 = 0xbf310008`, writing
+`0x20` (green) and `0x30` (amber) a second apart, with `a0 = 0xf4240` =
+1,000,000 µs delays between them. That is a POST failure code, not a hang.
+
+Either side of the blink it calls `0xa0004494` with `a0` = 1 and 2, and that
+routine sets `s2` to `0xbf390000` or `0xbf398000` — com0 and com1. It is the
+**serial self-test**, and it was failing on both ports.
+
+Decoded with MACE's `(reg << 8) + 7` spacing, it sets `MCR = 0x13`. Bit 4 is
+**LOOP**: the test runs the UART in internal loopback, writes 0..254, and
+requires that it reads the same sequence back, comparing byte by byte and
+returning `index | 0x100` on the first mismatch.
+
+`Com16550` had no loopback, so those 255 bytes went out of the transmitter
+instead — which is exactly the mysterious `0x00`..`0xFF` dump that had been
+appearing on the console and that `grep` kept skipping as binary. One symptom,
+one cause. Implementing `MCR_LOOP` (route THR into the receive queue, and the
+modem control outputs to the status inputs) makes the test pass and the garbage
+disappear.
+
+### 2. `Index_Store_Tag` was writing cache lines back
+
+With the UART fixed, post1 completed and returned to the PROM — which promptly
+fell into its serial loader (`SL-9600-8E>`) and blocked in a `getchar` polling
+LSR forever.
+
+The loader is reached from `0xbfc00b34`, which is a `jal` plus `b .` — a
+terminal state. The real boot is a `jalr v1` at `0xbfc00b00` that should never
+return. It returned.
+
+Inside it, four gates guard the handoff, and the PC trace showed the **first**
+one failing at `0xbfc044f4`:
+
+```asm
+0xbfc0449c  sd   sp, 4104(t0)     ; save sp at 0xa0001008, before...
+0xbfc044ac  or   sp, sp, t1       ; ...switching to the uncached stack
+...                               ; (post1 runs here)
+0xbfc044e8  ld   t0, 8(t0)        ; the saved sp
+0xbfc044f0  xor  t1, 0x20000000, sp   ; flip cached/uncached
+0xbfc044f4  bne  t0, t1 -> bail
+```
+
+A stack-integrity cookie. It should match trivially. A memory watch on the
+cookie showed `0xbfc0449c` executing **twice**, the second time with `sp`
+already uncached — so the function had re-entered itself, and the cookie no
+longer described the current stack.
+
+Watching the physical address of the saved return address explains why:
+
+```
+@787us  0x40000fa4 W 0xbfc044b0   sw ra, 44(sp) — correct
+@917us  0x40000fa4 W 0xbfc04498   clobbered, from PC 0xbfc06938
+@928us  0x40000fa4 R 0xbfc04498   lw ra, 44(sp) — reads the clobbered value
+```
+
+`0xbfc06938` is `cache Index_Store_Tag(PD), 0(t2)`, inside a loop walking every
+D-cache index storing an invalid tag — ordinary cache initialisation. Our
+`C_IST` wrote the line back first. `Index_Store_Tag` must not: it exists to
+install tags over power-up garbage, and writing back sends the line's data to
+an address derived from the tag being discarded. Here that address was the
+PROM's own stack.
+
+This was an **IRIS bug, not an IP32 one** — shared CPU code that every guest
+runs through. The fix and its regression testing are in
+[`../pr-drafts/pr-cache-index-store-tag.md`](../pr-drafts/pr-cache-index-store-tag.md).
+The L2 path in the same `match` arm already got it right.
+
+### 3. GBE has to answer
+
+With the cookie check passing, the PROM copies the `firmware` section in and
+enters it — `98336 write(s) to its load region, PC entered it: true`, after
+weeks of `0` and `false`. The firmware then probed `0x16000000`, the graphics
+back end, which nothing claimed. A storing stub is enough; we drive the machine
+on serial and never read a pixel back.
+
+### Where it stands
+
+The firmware runs and prints. Its current complaint is
+`ds2502_init: presence pulse not detected` — the 1-Wire identity chip, which is
+modelled but whose line-level handshake the firmware does not accept yet. That
+is the next gate, and unlike every gate before it, it is one we already have
+the parts for.
+
+## Instrumentation worth keeping
+
+All of this came out of the harness, and none of it out of reading the PROM
+top to bottom. In rough order of how much time each saved:
+
+- **A call tracer.** A call is recognised exactly — an instruction that leaves
+  `ra` equal to its own address + 8, which `jal`/`jalr`/`bal` do and an
+  `lw ra, n(sp)` epilogue restore does not. Returns pop the matching frame and
+  record `v0`. Run-length encoded, and filtered to shallow or slow calls, it
+  prints the entire shape of the boot in forty lines, with return values.
+- **A memory watchpoint** (`IRIS_IP32_WATCHMEM=lo[:hi]`), logging address,
+  direction, value, PC and UST time. It is what turned "the cookie is wrong"
+  into "this exact instruction clobbered it". Note the watch sits *after*
+  address resolution, so low-memory addresses must be watched at their
+  `RAM_BASE` equivalents.
+- **Disassembly of spin-loop bodies**, with the registers the loop names. A
+  five-instruction loop plus `v0=0xbf340000 v1=0x2c8d` says "waiting for the
+  UST to reach 11405" immediately.
+- **Loop entry counts.** Time in a loop says it is hot; the number of *entries*
+  says whether it is progress or a wedge. Entered 5 times, 99% of the run:
+  those are real delays. Entered once: that is the hang.
+- **`IRIS_IP32_DIS=start:end`**, reading through the bus so RAM-resident code
+  is visible.
+- **Report everything, then assert.** The asserts now run at the very end of
+  the test. A panic in the middle used to throw away the evidence for itself.
+
+## Two lessons, both already on the list
+
+- **Trust observed access patterns over header names.** `MACE_ISA_FLASH_NIC_REG`
+  is named for the 1-Wire chip, and it *is* that — but the writes that had been
+  puzzling us were `0x20`/`0x30` a second apart, which is the LED. Same
+  register, different bits. The third time this exact mistake has cost time.
+- **A wrong emulator can look like a missing device.** Three sessions of this
+  were spent looking for IP32 hardware we had not implemented. One of the three
+  gates was hardware; one was a UART feature; one was a CPU bug that had been
+  in the tree the whole time, affecting every guest.
+
+## Open questions
 
 - ~~How much does `post1` insist on?~~ Answered: CRIME is cheap, MACE PCI is
   the gate. See above.
@@ -433,11 +560,14 @@ Indy (`eeprom_93c56`, `ds1x86`).
 - Where does the PCI native view really live, given memory owns 0x40000000?
 - ~~Implement `com0` to read POST's messages.~~ **Done, and it does not help
   yet — see below.**
-- 1-Wire is still there and still unimplemented; the PROM simply has not
-  reached it yet.
-- `UST_STRIDE` is a bring-up shortcut: the counter advances per read rather
-  than with time. If the PROM ever derives a clock rate from it, that has to
-  become time-based.
+- ~~1-Wire is still unimplemented.~~ Modelled now, and the firmware has
+  reached it: `ds2502_init: presence pulse not detected`. The reset/presence
+  handshake is the open part.
+- ~~`UST_STRIDE` is a bring-up shortcut.~~ Retired: the UST is now a real
+  clock, advanced from the instruction count at `UST_TICKS_NUM/UST_TICKS_DEN`
+  (one tick ≈ 1 µs at ~100 instructions/µs). It had to become time-based —
+  post1 polls it for deadlines, one of them a full second, and 1-Wire is
+  decoded by pulse width.
 - Does the PROM require a framebuffer to be present even with `console=d`? The
   Indy PROM does not; the O2's `crt_option=1` in the default env suggests it at
   least looks.

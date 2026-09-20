@@ -36,6 +36,12 @@ pub const CRIME_BASE: u32 = 0x1400_0000;
 pub const CRIME_SIZE: u32 = 0x0000_1000;
 /// MACE: the I/O ASIC. Only present here so probes read as empty rather than
 /// taking a bus error — none of it is implemented yet.
+/// GBE, the graphics back end. We drive the machine on serial and have no
+/// interest in its output, but the firmware probes it during startup, so it
+/// has to answer. A storing register file is enough for that.
+pub const GBE_BASE: u32 = 0x1600_0000;
+pub const GBE_SIZE: u32 = 0x0010_0000;
+
 pub const MACE_BASE: u32 = 0x1f00_0000;
 pub const MACE_SIZE: u32 = 0x0080_0000;
 /// MACE's ISA-block register holding the flash write-enable and the Dallas
@@ -110,6 +116,11 @@ pub const PROM_SIZE: u32 = 0x0008_0000; // 512 KiB
 pub const FIRMWARE_LOAD_VA: u32 = 0x8100_0000;
 pub const FIRMWARE_LOAD_PA: u32 = 0x0100_0000;
 pub const FIRMWARE_SPAN: u32 = 0x0006_0000;
+
+/// The RTC and its battery-backed NVRAM, at MACE + 0x3a0000. Registers use
+/// MACE's ISA spacing, `(reg << 8) + 7`, exactly like the UART.
+pub const MACE_RTC: u32 = MACE_BASE + 0x003a_0000;
+pub const MACE_RTC_SIZE: u32 = 0x0001_0000;
 
 /// sloader's serial prompt: "SL", 9600 baud, 8 data bits, even parity. Seeing
 /// this means POST has completed and the PROM is waiting on console input.
@@ -422,6 +433,21 @@ pub mod com_reg {
     pub const LSR_THRE: u8 = 0x20;
     /// LSR: transmitter completely empty.
     pub const LSR_TEMT: u8 = 0x40;
+
+    /// MCR bit 4: loopback. The transmitter is wired back to the receiver and
+    /// the modem control outputs to the modem status inputs. post1's serial
+    /// self-test runs entirely in this mode, so a UART without it fails POST.
+    pub const MCR_LOOP: u8 = 0x10;
+    /// MCR outputs that loop back to MSR while `MCR_LOOP` is set.
+    pub const MCR_DTR: u8 = 0x01;
+    pub const MCR_RTS: u8 = 0x02;
+    pub const MCR_OUT1: u8 = 0x04;
+    pub const MCR_OUT2: u8 = 0x08;
+    /// MSR inputs, in the order the loopback wires them.
+    pub const MSR_CTS: u8 = 0x10;
+    pub const MSR_DSR: u8 = 0x20;
+    pub const MSR_RI: u8 = 0x40;
+    pub const MSR_DCD: u8 = 0x80;
 }
 
 impl Default for Com16550 {
@@ -470,6 +496,11 @@ impl Com16550 {
         self.regs.lock().unwrap()[com_reg::LCR as usize] & com_reg::LCR_DLAB != 0
     }
 
+    /// True while MCR selects internal loopback.
+    fn looped(&self) -> bool {
+        self.regs.lock().unwrap()[com_reg::MCR as usize] & com_reg::MCR_LOOP != 0
+    }
+
     pub fn read_reg(&self, addr: u32) -> u8 {
         let Some(n) = Self::reg_of(addr) else { return 0 };
         match n {
@@ -487,6 +518,24 @@ impl Com16550 {
             com_reg::THR if !self.dlab() => {
                 self.input.lock().unwrap().pop_front().unwrap_or(0)
             }
+            // In loopback the modem control outputs appear as the status
+            // inputs. Nothing in POST depends on this, but a half-wired
+            // loopback is the kind of thing that misleads the next reader.
+            com_reg::MSR if self.looped() => {
+                let mcr = self.regs.lock().unwrap()[com_reg::MCR as usize];
+                let mut v = 0;
+                for (out, inp) in [
+                    (com_reg::MCR_RTS, com_reg::MSR_CTS),
+                    (com_reg::MCR_DTR, com_reg::MSR_DSR),
+                    (com_reg::MCR_OUT1, com_reg::MSR_RI),
+                    (com_reg::MCR_OUT2, com_reg::MSR_DCD),
+                ] {
+                    if mcr & out != 0 {
+                        v |= inp;
+                    }
+                }
+                v
+            }
             _ => self.regs.lock().unwrap()[n as usize],
         }
     }
@@ -494,7 +543,14 @@ impl Com16550 {
     pub fn write_reg(&self, addr: u32, val: u8) {
         let Some(n) = Self::reg_of(addr) else { return };
         if n == com_reg::THR && !self.dlab() {
-            self.out.lock().unwrap().push(val);
+            // Loopback: the byte never leaves the chip, it arrives back in
+            // the receive register. post1 writes 0..254 this way and insists
+            // on reading the same sequence back.
+            if self.looped() {
+                self.input.lock().unwrap().push_back(val);
+            } else {
+                self.out.lock().unwrap().push(val);
+            }
             return;
         }
         self.regs.lock().unwrap()[n as usize] = val;
@@ -513,6 +569,201 @@ impl BusDevice for Com16550 {
     fn write32(&self, addr: u32, val: u32) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
     fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.read_reg(addr | 7) as u64) }
     fn write64(&self, addr: u32, val: u64) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
+}
+
+/// A Dallas-style RTC with battery-backed NVRAM.
+///
+/// Registers are reached with MACE's ISA spacing, `(reg << 8) + 7`. The low
+/// registers are the clock; everything from [`NVRAM_FIRST`] up is storage that
+/// survives power loss on a real machine — which is precisely why firmware
+/// trusts it, and why handing back zeros is not neutral.
+pub struct MaceRtc {
+    cells: Mutex<Vec<u8>>,
+}
+
+impl MaceRtc {
+    /// First register that is general-purpose NVRAM rather than clock state.
+    pub const NVRAM_FIRST: usize = 0x0e;
+    pub const REGS: usize = 0x100;
+
+    pub fn new() -> Self {
+        let mut c = vec![0u8; Self::REGS];
+        // A plausible stopped-but-valid clock. Register D bit 7 is the
+        // valid-RAM-and-time flag: firmware that sees it clear concludes the
+        // battery died, which is its own diagnostic path.
+        c[0x0d] = 0x80;
+        Self { cells: Mutex::new(c) }
+    }
+
+    fn reg_of(addr: u32) -> Option<usize> {
+        if addr & 7 != 7 {
+            return None;
+        }
+        Some(((addr >> 8) & 0xff) as usize)
+    }
+
+    pub fn peek(&self, reg: usize) -> u8 {
+        self.cells.lock().unwrap()[reg & 0xff]
+    }
+    pub fn poke(&self, reg: usize, val: u8) {
+        self.cells.lock().unwrap()[reg & 0xff] = val;
+    }
+}
+
+impl Default for MaceRtc {
+    fn default() -> Self { Self::new() }
+}
+
+impl BusDevice for MaceRtc {
+    fn read8(&self, addr: u32) -> BusRead8 {
+        BusRead8::ok(Self::reg_of(addr).map(|r| self.peek(r)).unwrap_or(0))
+    }
+    fn write8(&self, addr: u32, val: u8) -> u32 {
+        if let Some(r) = Self::reg_of(addr) {
+            self.poke(r, val);
+        }
+        BUS_OK
+    }
+    fn read16(&self, a: u32) -> BusRead16 { BusRead16::ok(self.read8(a | 7).data as u16) }
+    fn read32(&self, a: u32) -> BusRead32 { BusRead32::ok(self.read8(a | 7).data as u32) }
+    fn read64(&self, a: u32) -> BusRead64 { BusRead64::ok(self.read8(a | 7).data as u64) }
+    fn write16(&self, a: u32, v: u16) -> u32 { self.write8(a | 7, v as u8) }
+    fn write32(&self, a: u32, v: u32) -> u32 { self.write8(a | 7, v as u8) }
+    fn write64(&self, a: u32, v: u64) -> u32 { self.write8(a | 7, v as u8) }
+}
+
+/// The Dallas 1-Wire identity chip: 64 bits of ROM holding a family code, a
+/// 48-bit serial number and a CRC. SGI machines keep the Ethernet address here.
+///
+/// The bus is one wire, so everything is encoded in how long the master holds
+/// it low. Durations are read from the UST clock, which is why that had to
+/// become time-based first.
+pub struct OneWireId {
+    rom: [u8; 8],
+    st: Mutex<OneWireState>,
+}
+
+#[derive(Default)]
+struct OneWireState {
+    /// Time the master last pulled the line low.
+    low_since: Option<u64>,
+    /// Bits received from the master in the current command byte.
+    in_bits: u8,
+    in_count: u8,
+    /// Command being executed, once a whole byte has arrived.
+    command: Option<u8>,
+    /// Bit position of the reply stream.
+    out_pos: usize,
+    /// What the device is driving onto the line right now.
+    driving_low: bool,
+    /// Set from a reset pulse until the master's next read.
+    presence: bool,
+}
+
+pub mod onewire_cmd {
+    pub const READ_ROM: u8 = 0x33;
+    pub const SKIP_ROM: u8 = 0xcc;
+}
+
+/// Microsecond thresholds. A reset is held for at least 480 µs; within a time
+/// slot, a short low is a 1 and a long low is a 0.
+pub const OW_RESET_US: u64 = 400;
+pub const OW_WRITE0_US: u64 = 30;
+
+impl OneWireId {
+    /// Build a ROM from a MAC address: family code 0x01, the six address bytes
+    /// as the serial number, and a CRC-8 over the first seven.
+    pub fn from_mac(mac: [u8; 6]) -> Self {
+        let mut rom = [0u8; 8];
+        rom[0] = 0x01;
+        rom[1..7].copy_from_slice(&mac);
+        rom[7] = crc8_dallas(&rom[..7]);
+        Self { rom, st: Mutex::new(Default::default()) }
+    }
+
+    pub fn rom(&self) -> [u8; 8] {
+        self.rom
+    }
+
+    /// The bit the device is currently presenting, LSB-first out of the ROM.
+    fn reply_bit(&self, st: &OneWireState) -> bool {
+        match st.command {
+            Some(onewire_cmd::READ_ROM) => {
+                let i = st.out_pos;
+                if i >= 64 {
+                    return true;
+                }
+                (self.rom[i / 8] >> (i % 8)) & 1 != 0
+            }
+            _ => true,
+        }
+    }
+
+    /// The master changed the line. `low` is true when it is pulling low.
+    pub fn master_drive(&self, now: u64, low: bool) {
+        let mut st = self.st.lock().unwrap();
+        if low {
+            st.low_since = Some(now);
+            return;
+        }
+        // Rising edge: classify by how long it was held.
+        let Some(since) = st.low_since.take() else { return };
+        let held = now.saturating_sub(since);
+        if held >= OW_RESET_US {
+            *st = OneWireState { presence: true, ..Default::default() };
+            return;
+        }
+        if st.command.is_none() {
+            // Still collecting a command byte, LSB first.
+            let bit = held < OW_WRITE0_US;
+            st.in_bits |= (bit as u8) << st.in_count;
+            st.in_count += 1;
+            if st.in_count == 8 {
+                st.command = Some(st.in_bits);
+                st.in_bits = 0;
+                st.in_count = 0;
+                st.out_pos = 0;
+            }
+        } else {
+            // A read slot: the master pulsed briefly and now samples.
+            st.out_pos += 1;
+        }
+    }
+
+    /// What the master sees on the line.
+    pub fn line_level(&self) -> bool {
+        let st = self.st.lock().unwrap();
+        if st.presence {
+            // Hold the presence pulse until the master looks once.
+            return false;
+        }
+        if st.command.is_some() {
+            return self.reply_bit(&st);
+        }
+        true
+    }
+
+    /// Clear the presence pulse once observed.
+    pub fn sample_done(&self) {
+        self.st.lock().unwrap().presence = false;
+    }
+}
+
+/// Dallas/Maxim CRC-8, polynomial x^8 + x^5 + x^4 + 1 reflected (0x8c).
+pub fn crc8_dallas(data: &[u8]) -> u8 {
+    let mut crc = 0u8;
+    for &b in data {
+        let mut byte = b;
+        for _ in 0..8 {
+            let mix = (crc ^ byte) & 1;
+            crc >>= 1;
+            if mix != 0 {
+                crc ^= 0x8c;
+            }
+            byte >>= 1;
+        }
+    }
+    crc
 }
 
 /// Records what the PROM does to the 1-Wire register and when, so the protocol
@@ -540,20 +791,25 @@ impl NicTrace {
 
 /// MACE's UST/MSC counter: unadjusted system time, free-running.
 ///
-/// Every read advances it by [`UST_STRIDE`]. Real hardware ticks off a clock
-/// independently of who is looking; the PROM's delay loops
-/// (`while (ust() < start + n)`) therefore spin at whatever rate we choose.
-/// Advancing one per read makes an `n`-tick delay cost `n` loop iterations,
-/// which for a millisecond-scale delay is millions of instructions. A coarse
-/// stride keeps those loops honest — they still terminate in order — without
-/// making bring-up runs take minutes.
+/// Driven by executed instructions, not by reads.
+///
+/// Advancing on read was enough to stop delay loops hanging, but it makes
+/// duration meaningless: a loop that reads twice as often "takes" twice as
+/// long. Anything that decodes a *pulse width* — 1-Wire above all — needs
+/// elapsed time to mean something, so the harness advances this from its step
+/// count and the rate below fixes the relationship.
 pub struct MaceUst {
     ticks: Mutex<u64>,
 }
 
-/// Ticks added per read. Nothing derives a wall-clock figure from this yet; if
-/// something ever does, this has to become time-based instead.
-pub const UST_STRIDE: u64 = 1024;
+/// UST ticks per emulated instruction, as a fraction: `TICKS_NUM / TICKS_DEN`.
+///
+/// The PROM's delay loops are written in microseconds, and its 1-Wire slots
+/// are tens of microseconds, so a tick is taken to be 1 µs. At roughly 100
+/// emulated instructions per microsecond a bring-up run stays fast while pulse
+/// widths keep their proportions.
+pub const UST_TICKS_NUM: u64 = 1;
+pub const UST_TICKS_DEN: u64 = 100;
 
 impl Default for MaceUst {
     fn default() -> Self { Self::new() }
@@ -561,11 +817,13 @@ impl Default for MaceUst {
 
 impl MaceUst {
     pub fn new() -> Self { Self { ticks: Mutex::new(0) } }
-    fn tick(&self) -> u64 {
-        let mut t = self.ticks.lock().unwrap();
-        *t = t.wrapping_add(UST_STRIDE);
-        *t
+
+    /// Advance the clock to match `instructions` executed so far.
+    pub fn advance_to(&self, instructions: u64) {
+        *self.ticks.lock().unwrap() = instructions * UST_TICKS_NUM / UST_TICKS_DEN;
     }
+
+    fn tick(&self) -> u64 { *self.ticks.lock().unwrap() }
     pub fn now(&self) -> u64 { *self.ticks.lock().unwrap() }
 }
 
@@ -659,9 +917,12 @@ pub struct Ip32Bus {
     pub crime: Crime,
     pub mace: Stub,
     pub crime_re: Stub,
+    pub gbe: Stub,
     pub macepci: MacePci,
     pub ust: MaceUst,
     pub nic_trace: NicTrace,
+    pub rtc: MaceRtc,
+    pub onewire: OneWireId,
     pub com0: Com16550,
     pub com1: Com16550,
     pub pci_view: PciNativeView,
@@ -676,6 +937,11 @@ pub struct Ip32Bus {
     /// reads it back, so seeing both halves is what tells us whether the store
     /// or the load is the one going wrong.
     sizemem: Mutex<Vec<(u32, bool, u64, u32)>>,
+    /// A physical-address watch range, from `IRIS_IP32_WATCHMEM=lo[:hi]`.
+    /// Every access within it is logged as `(addr, is_write, value, pc)`.
+    /// Cheap to leave in: one range compare on the RAM path.
+    watch: Option<(u32, u32)>,
+    watch_log: Mutex<Vec<(u32, bool, u64, u32, u64)>>,
 }
 
 impl Ip32Bus {
@@ -688,9 +954,13 @@ impl Ip32Bus {
             crime: Crime::new(),
             mace: Stub::new("mace"),
             crime_re: Stub::new("crime-re"),
+            gbe: Stub::new("gbe"),
             macepci: MacePci::new(),
             ust: MaceUst::new(),
             nic_trace: NicTrace::new(),
+            rtc: MaceRtc::new(),
+            // A locally-administered address; nothing depends on the value yet.
+            onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
             com0: Com16550::new(),
             com1: Com16550::new(),
             pci_view: PciNativeView::new(),
@@ -698,6 +968,12 @@ impl Ip32Bus {
             pc: PcTap::default(),
             fw_writes: Mutex::new(0),
             sizemem: Mutex::new(Vec::new()),
+            watch: std::env::var("IRIS_IP32_WATCHMEM").ok().and_then(|v| {
+                let (a, b) = v.split_once(':').unwrap_or((&v, &v));
+                let p = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+                Some((p(a)?, p(b)? + 8))
+            }),
+            watch_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -746,6 +1022,23 @@ impl Ip32Bus {
         self.ram.lock().unwrap().len() as u32
     }
 
+    /// Record an access if it falls in the watch range.
+    fn watch_hit(&self, addr: u32, write: bool, val: u64) {
+        if let Some((lo, hi)) = self.watch {
+            if addr >= lo && addr < hi {
+                let mut w = self.watch_log.lock().unwrap();
+                if w.len() < 256 {
+                    w.push((addr, write, val, self.pc.get(), self.ust.now()));
+                }
+            }
+        }
+    }
+
+    /// The watch log, in order.
+    pub fn watched(&self) -> Vec<(u32, bool, u64, u32, u64)> {
+        self.watch_log.lock().unwrap().clone()
+    }
+
     fn in_ram(&self, addr: u32) -> bool {
         addr >= RAM_BASE && addr < RAM_BASE.wrapping_add(self.ram_len())
     }
@@ -769,6 +1062,10 @@ impl Ip32Bus {
 
     fn in_prom(&self, addr: u32) -> bool {
         addr >= PROM_BASE && addr < PROM_BASE + PROM_SIZE
+    }
+
+    fn in_gbe(&self, addr: u32) -> bool {
+        addr >= GBE_BASE && addr < GBE_BASE + GBE_SIZE
     }
 
     fn in_crime_re(&self, addr: u32) -> bool {
@@ -795,6 +1092,29 @@ impl Ip32Bus {
 
     fn is_nic_reg(&self, addr: u32) -> bool {
         (addr & !3) == MACE_ISA_FLASH_NIC_REG
+    }
+
+    fn in_rtc(&self, addr: u32) -> bool {
+        addr >= MACE_RTC && addr < MACE_RTC + MACE_RTC_SIZE
+    }
+
+    /// Feed a write of the NIC register through to the 1-Wire device, and
+    /// report what the master should read back on the data line.
+    fn nic_write(&self, val: u8) {
+        // DEASSERT releases the line; otherwise DATA drives it.
+        let low = val & nic_bit::DEASSERT == 0 && val & nic_bit::DATA == 0;
+        self.onewire.master_drive(self.ust.now(), low);
+    }
+
+    fn nic_read(&self) -> u8 {
+        let mut v = self.mace.cell(MACE_ISA_FLASH_NIC_REG) as u8;
+        if self.onewire.line_level() {
+            v |= nic_bit::DATA;
+        } else {
+            v &= !nic_bit::DATA;
+        }
+        self.onewire.sample_done();
+        v
     }
 
     fn in_ust(&self, addr: u32) -> bool {
@@ -840,6 +1160,7 @@ impl Ip32Bus {
             for k in 0..n {
                 v = (v << 8) | r[i + k] as u64;
             }
+            self.watch_hit(addr, false, v);
             return Some(v);
         }
         if self.in_prom(addr) {
@@ -861,6 +1182,7 @@ impl Ip32Bus {
             *self.fw_writes.lock().unwrap() += 1;
         }
         let addr = self.resolve(addr);
+        self.watch_hit(addr, true, val);
         // Writes into an empty bank are swallowed by the memory controller.
         if self.in_unpopulated_ram(addr) {
             return true;
@@ -899,6 +1221,9 @@ macro_rules! bus_read {
 
 impl BusDevice for Ip32Bus {
     fn read8(&self, addr: u32) -> BusRead8 {
+        if self.in_gbe(addr) {
+            return BusRead8::ok(self.gbe.read32(addr & !3).data as u8);
+        }
         if self.in_crime_re(addr) {
             return BusRead8::ok(self.crime_re.read32(addr & !3).data as u8);
         }
@@ -912,12 +1237,15 @@ impl BusDevice for Ip32Bus {
             return self.pci_view.read8(addr);
         }
         if self.is_nic_reg(addr) {
-            let v = self.mace.read8(addr).data;
+            let v = self.nic_read();
             self.nic_trace.record(self.ust.now(), false, v);
             return BusRead8::ok(v);
         }
         if let Some(c) = self.com_for(addr) {
             return c.read8(addr);
+        }
+        if self.in_rtc(addr) {
+            return self.rtc.read8(addr);
         }
         if self.in_mace(addr) {
             return self.mace.read8(addr);
@@ -926,6 +1254,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn read16(&self, addr: u32) -> BusRead16 {
+        if self.in_gbe(addr) {
+            return BusRead16::ok(self.gbe.read32(addr & !3).data as u16);
+        }
         if self.in_crime_re(addr) {
             return BusRead16::ok(self.crime_re.read32(addr & !3).data as u16);
         }
@@ -941,6 +1272,9 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read16(addr);
         }
+        if self.in_rtc(addr) {
+            return self.rtc.read16(addr);
+        }
         if self.in_mace(addr) {
             return self.mace.read16(addr);
         }
@@ -948,6 +1282,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn read32(&self, addr: u32) -> BusRead32 {
+        if self.in_gbe(addr) {
+            return self.gbe.read32(addr);
+        }
         if self.in_crime_re(addr) {
             return self.crime_re.read32(addr);
         }
@@ -964,12 +1301,15 @@ impl BusDevice for Ip32Bus {
             return self.pci_view.read32(addr);
         }
         if self.is_nic_reg(addr) {
-            let v = self.mace.read32(addr).data;
-            self.nic_trace.record(self.ust.now(), false, v as u8);
-            return BusRead32::ok(v);
+            let v = self.nic_read();
+            self.nic_trace.record(self.ust.now(), false, v);
+            return BusRead32::ok(v as u32);
         }
         if let Some(c) = self.com_for(addr) {
             return c.read32(addr);
+        }
+        if self.in_rtc(addr) {
+            return self.rtc.read32(addr);
         }
         if self.in_mace(addr) {
             return self.mace.read32(addr);
@@ -978,6 +1318,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn read64(&self, addr: u32) -> BusRead64 {
+        if self.in_gbe(addr) {
+            return self.gbe.read64(addr);
+        }
         if self.in_crime_re(addr) {
             return self.crime_re.read64(addr);
         }
@@ -994,12 +1337,15 @@ impl BusDevice for Ip32Bus {
             return self.pci_view.read64(addr);
         }
         if self.is_nic_reg(addr) {
-            let v = self.mace.read64(addr).data;
-            self.nic_trace.record(self.ust.now(), false, v as u8);
-            return BusRead64::ok(v);
+            let v = self.nic_read();
+            self.nic_trace.record(self.ust.now(), false, v);
+            return BusRead64::ok(v as u64);
         }
         if let Some(c) = self.com_for(addr) {
             return c.read64(addr);
+        }
+        if self.in_rtc(addr) {
+            return self.rtc.read64(addr);
         }
         if self.in_mace(addr) {
             return self.mace.read64(addr);
@@ -1010,6 +1356,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write8(&self, addr: u32, val: u8) -> u32 {
+        if self.in_gbe(addr) {
+            return self.gbe.write32(addr & !3, val as u32);
+        }
         if self.in_crime_re(addr) {
             return self.crime_re.write32(addr & !3, val as u32);
         }
@@ -1024,10 +1373,14 @@ impl BusDevice for Ip32Bus {
         }
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), true, val);
+            self.nic_write(val);
             return self.mace.write8(addr, val);
         }
         if let Some(c) = self.com_for(addr) {
             return c.write8(addr, val);
+        }
+        if self.in_rtc(addr) {
+            return self.rtc.write8(addr, val);
         }
         if self.in_mace(addr) {
             return self.mace.write8(addr, val);
@@ -1036,6 +1389,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write16(&self, addr: u32, val: u16) -> u32 {
+        if self.in_gbe(addr) {
+            return self.gbe.write32(addr & !3, val as u32);
+        }
         if self.in_crime_re(addr) {
             return self.crime_re.write32(addr & !3, val as u32);
         }
@@ -1051,6 +1407,9 @@ impl BusDevice for Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.write16(addr, val);
         }
+        if self.in_rtc(addr) {
+            return self.rtc.write16(addr, val);
+        }
         if self.in_mace(addr) {
             return self.mace.write16(addr, val);
         }
@@ -1058,6 +1417,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write32(&self, addr: u32, val: u32) -> u32 {
+        if self.in_gbe(addr) {
+            return self.gbe.write32(addr, val);
+        }
         if self.in_crime_re(addr) {
             return self.crime_re.write32(addr, val);
         }
@@ -1075,10 +1437,14 @@ impl BusDevice for Ip32Bus {
         }
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), true, val as u8);
+            self.nic_write(val as u8);
             return self.mace.write32(addr, val);
         }
         if let Some(c) = self.com_for(addr) {
             return c.write32(addr, val);
+        }
+        if self.in_rtc(addr) {
+            return self.rtc.write32(addr, val);
         }
         if self.in_mace(addr) {
             return self.mace.write32(addr, val);
@@ -1087,6 +1453,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write64(&self, addr: u32, val: u64) -> u32 {
+        if self.in_gbe(addr) {
+            return self.gbe.write64(addr, val);
+        }
         if self.in_crime_re(addr) {
             return self.crime_re.write64(addr, val);
         }
@@ -1104,10 +1473,14 @@ impl BusDevice for Ip32Bus {
         }
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), true, val as u8);
+            self.nic_write(val as u8);
             return self.mace.write64(addr, val);
         }
         if let Some(c) = self.com_for(addr) {
             return c.write64(addr, val);
+        }
+        if self.in_rtc(addr) {
+            return self.rtc.write64(addr, val);
         }
         if self.in_mace(addr) {
             return self.mace.write64(addr, val);
@@ -1421,6 +1794,80 @@ mod tests {
         assert_eq!(c.read8(lsr).data & com_reg::LSR_DR, 0, "queue drained");
     }
 
+    /// The CRC is how firmware decides the chip is real. Maxim's published
+    /// example ROM is the standard check.
+    #[test]
+    fn the_dallas_crc_matches_the_published_example() {
+        assert_eq!(crc8_dallas(&[0x02, 0x1c, 0xb8, 0x01, 0x00, 0x00, 0x00]), 0xa2);
+    }
+
+    #[test]
+    fn a_rom_built_from_a_mac_is_self_consistent() {
+        let ow = OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
+        let rom = ow.rom();
+        assert_eq!(rom[0], 0x01, "family code");
+        assert_eq!(&rom[1..7], &[0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
+        assert_eq!(rom[7], crc8_dallas(&rom[..7]), "CRC must cover the first seven bytes");
+    }
+
+    /// A reset long enough to qualify must be answered with a presence pulse —
+    /// the line pulled low — or the master concludes nothing is attached.
+    #[test]
+    fn a_reset_is_answered_with_presence() {
+        let ow = OneWireId::from_mac([1, 2, 3, 4, 5, 6]);
+        ow.master_drive(0, true);
+        ow.master_drive(OW_RESET_US + 100, false);
+        assert!(!ow.line_level(), "presence pulse must pull the line low");
+        ow.sample_done();
+        assert!(ow.line_level(), "and release it once seen");
+    }
+
+    /// READ ROM, clocked in a bit at a time, must stream the ROM back LSB
+    /// first — that is what carries the MAC address to the firmware.
+    #[test]
+    fn read_rom_streams_the_identity_back() {
+        let mac = [0x08u8, 0x00, 0x69, 0x12, 0x34, 0x56];
+        let ow = OneWireId::from_mac(mac);
+        let mut t = 0u64;
+        // Reset.
+        ow.master_drive(t, true);
+        t += OW_RESET_US + 100;
+        ow.master_drive(t, false);
+        ow.sample_done();
+        // Clock in READ ROM, LSB first: a short low is a 1, a long low a 0.
+        for i in 0..8 {
+            let bit = (onewire_cmd::READ_ROM >> i) & 1 != 0;
+            ow.master_drive(t, true);
+            t += if bit { 5 } else { OW_WRITE0_US + 20 };
+            ow.master_drive(t, false);
+            t += 10;
+        }
+        // Read 64 bits back.
+        let mut got = [0u8; 8];
+        for i in 0..64 {
+            if ow.line_level() {
+                got[i / 8] |= 1 << (i % 8);
+            }
+            ow.master_drive(t, true);
+            t += 5;
+            ow.master_drive(t, false);
+            t += 10;
+        }
+        assert_eq!(got, ow.rom(), "the master must read back exactly the ROM");
+        assert_eq!(&got[1..7], &mac, "and the MAC must survive the round trip");
+    }
+
+    #[test]
+    fn nvram_survives_and_decodes_maces_spacing() {
+        let r = MaceRtc::new();
+        // Register 0x3f, byte lane +7.
+        r.write8(MACE_RTC + (0x3f << 8) + 7, 0xa5);
+        assert_eq!(r.read8(MACE_RTC + (0x3f << 8) + 7).data, 0xa5);
+        assert_eq!(r.peek(0x3f), 0xa5);
+        // The valid-RAM-and-time flag must not read as a dead battery.
+        assert_ne!(r.peek(0x0d) & 0x80, 0);
+    }
+
     #[test]
     fn section_headers_parse() {
         // Two records: a name, a version, a length.
@@ -1446,6 +1893,21 @@ mod tests {
 #[cfg(test)]
 mod bringup {
     use super::*;
+
+    /// The distinct PCs in a ring, oldest first, most recent last. Repeats
+    /// inside a loop collapse, so a long spin does not push the interesting
+    /// prologue out of view.
+    fn ring_path(ring: &[u32], at: usize) -> Vec<u32> {
+        let n = ring.len();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut v: Vec<u32> = (0..n.min(at))
+            .map(|i| ring[(at - 1 - i) % n])
+            .filter(|p| seen.insert(*p))
+            .collect();
+        v.reverse();
+        v
+    }
+
     use crate::mips_cache_v2::R5000Cache;
     use crate::mips_exec::{MipsCpuConfig, MipsExecutor};
     use crate::mips_tlb::MipsTlb;
@@ -1513,21 +1975,56 @@ mod bringup {
         // A short ring of recent PCs, snapshotted the moment the PROM first
         // writes to the console. Whatever branch chose serial-loader mode is
         // in here.
-        let mut ring: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        // A fixed ring, maintained for the whole run: two stores per
+        // instruction, and it means any interesting moment can be explained
+        // after the fact rather than only the first one we thought to catch.
+        const RING: usize = 512;
+        let mut ring = [0u32; RING];
+        let mut ring_at = 0usize;
+
+        // A call tracer. A call is recognised exactly: an instruction that
+        // leaves ra == its own address + 8, which is what jal/jalr/bal do and
+        // what an `lw ra, n(sp)` epilogue restore does not. Returns are the
+        // matching pc. This is what turns "it ends up in the serial loader"
+        // into "this function was called, and returned this".
+        let mut call_stack: Vec<(u32, u32, u64)> = Vec::new();
+        // (target, last return value, total steps, depth, times in a row)
+        let mut calls_done: std::collections::VecDeque<(u32, u64, u64, usize, u64)> =
+            std::collections::VecDeque::new();
+        let mut arm_call: Option<(u32, u64, u8)> = None;
+        let mut call_snapshot: std::collections::HashMap<u32, Vec<String>> =
+            std::collections::HashMap::new();
         let mut path_to_console: Vec<u32> = Vec::new();
         let mut fed = false;
         let mut fed_at = 0u64;
         let feed_bytes: Option<Vec<u8>> = std::env::var("IRIS_IP32_INPUT")
             .ok()
             .map(|v| v.replace("\\r", "\r").into_bytes());
-        const LIMIT: u64 = 50_000_000;
+        // post1 contains real timed delays — one of them waits a full second
+        // of UST, which at UST_TICKS_DEN instructions per tick is 100M steps
+        // on its own. The default budget clears that with room to spare;
+        // IRIS_IP32_STEPS raises it for longer explorations.
+        let limit: u64 = std::env::var("IRIS_IP32_STEPS").ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300_000_000);
+        #[allow(non_snake_case)]
+        let LIMIT = limit;
 
         let printf = PrintfTap::new(PrintfTap::POST1_PRINTF);
         let mut stall = StallDetector::new(200_000, 24);
         // A stall inside the exception vectors is an unhandled trap, and the
         // only useful question then is which one. Capture CP0 at the moment it
         // is recognised rather than making someone reproduce it by hand.
-        let mut stalls: Vec<(u64, Vec<u32>, u32, u64, u64)> = Vec::new();
+        let mut stalls: Vec<(u64, Vec<u32>, u32, u64, u64, [u64; 32])> = Vec::new();
+        // PC -> the loop it belongs to, and total steps burned per loop.
+        let mut loop_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut loop_cost: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        // loop -> (entries, first step, first GPRs, last step, last GPRs)
+        #[allow(clippy::type_complexity)]
+        let mut loop_entry: std::collections::HashMap<
+            u32, (u64, u64, [u64; 32], u64, [u64; 32], Vec<u32>, Vec<u32>)>
+            = std::collections::HashMap::new();
+        let mut in_loop = false;
         let prom_for_strings = bus_prom.clone();
 
         while steps < LIMIT {
@@ -1547,20 +2044,62 @@ mod bringup {
             // Publish the PC so devices can attribute the accesses this
             // instruction is about to make.
             bus.pc.set(pc);
+            bus.ust.advance_to(steps);
 
-            if path_to_console.is_empty() {
-                ring.push_back(pc);
-                if ring.len() > 400 {
-                    ring.pop_front();
+            ring[ring_at % RING] = pc;
+            ring_at += 1;
+
+            // Two instructions after the call instruction, pc is the target.
+            // The instruction after the call is its delay slot; the one
+            // after that is the target. Wait for it, so the trace names the
+            // function called rather than the branch delay slot.
+            match arm_call {
+                Some((ret, at, 0)) => {
+                    call_stack.push((pc, ret, at));
+                    arm_call = None;
                 }
-                if bus.com0.bytes_out() > 0 {
-                    // Keep only the distinct PCs, in order of last visit.
-                    let mut seen = std::collections::BTreeSet::new();
-                    let mut v: Vec<u32> = ring.iter().rev().copied()
-                        .filter(|p| seen.insert(*p)).collect();
-                    v.reverse();
-                    path_to_console = v;
+                Some((ret, at, n)) => arm_call = Some((ret, at, n - 1)),
+                None => {}
+            }
+            // A return: pc is the address some frame is waiting to come back
+            // to. Unwind through at most a few frames so a tail call or a
+            // restore does not desynchronise the whole trace.
+            if let Some(d) = call_stack.iter().rev().take(8)
+                .position(|f| f.1 == pc)
+            {
+                for _ in 0..d {
+                    call_stack.pop();
                 }
+                if let Some((target, _, at)) = call_stack.pop() {
+                    // Leaf helpers called thousands of times would otherwise
+                    // flush everything structural out of the ring. Keep the
+                    // shallow calls, which carry the shape of the boot, and
+                    // any call that took real time, which is where it went.
+                    let took = steps - at;
+                    let depth = call_stack.len();
+                    if depth <= 5 || took >= 10_000 {
+                        // Run-length encode: a helper called ten thousand
+                        // times is one line, and the structure above it
+                        // survives in the ring.
+                        match calls_done.back_mut() {
+                            Some(b) if b.0 == target && b.3 == depth => {
+                                b.1 = exec.core.gpr[2];
+                                b.2 += took;
+                                b.4 += 1;
+                            }
+                            _ => {
+                                if calls_done.len() == 64 {
+                                    calls_done.pop_front();
+                                }
+                                calls_done.push_back(
+                                    (target, exec.core.gpr[2], took, depth, 1));
+                            }
+                        }
+                    }
+                }
+            }
+            if path_to_console.is_empty() && bus.com0.bytes_out() > 0 {
+                path_to_console = ring_path(&ring, ring_at);
             }
 
             if pc == printf.entry {
@@ -1568,10 +2107,56 @@ mod bringup {
                 printf.on_call(&prom_for_strings, [a[4], a[5], a[6], a[7]]);
             }
 
+            // Once a spin loop has been recognised, keep counting the time
+            // spent in it. A loop that costs half the run is the thing to
+            // fix, whether or not it ever exits.
+            if let Some(&key) = loop_of.get(&pc) {
+                *loop_cost.entry(key).or_insert(0u64) += 1;
+                // Count entries, not just time: a delay loop re-entered a
+                // thousand times is progress, the same loop entered once is
+                // a wedge. Keep the register state of the first and latest
+                // entry so the difference between them is visible.
+                if !in_loop {
+                    let path = ring_path(&ring, ring_at);
+                    let e = loop_entry.entry(key).or_insert_with(
+                        || (0u64, steps, exec.core.gpr, steps, exec.core.gpr,
+                            Vec::new(), Vec::new()));
+                    e.0 += 1;
+                    e.3 = steps;
+                    e.4 = exec.core.gpr;
+                    e.6 = path.clone();
+                    if e.0 == 1 {
+                        e.1 = steps;
+                        e.2 = exec.core.gpr;
+                        e.5 = path;
+                        {
+                            let snap = call_snapshot.entry(key).or_default();
+                            for (t, v0, took, depth, n) in calls_done.iter() {
+                                let times = if *n > 1 { format!(" x{n}") } else { String::new() };
+                                snap.push(format!(
+                                    "{:indent$}0x{t:08x} -> 0x{v0:x}  ({took} steps){times}",
+                                    "", indent = (*depth).min(12) * 2));
+                            }
+                            for (t, r, at) in call_stack.iter() {
+                                snap.push(format!(
+                                    "   in flight: 0x{t:08x} (returns to 0x{r:08x}, entered @{at})"));
+                            }
+                        }
+                    }
+                }
+                in_loop = true;
+            } else {
+                in_loop = false;
+            }
             if let Some(body) = stall.step(pc) {
+                for &p in &body {
+                    loop_of.entry(p).or_insert(body[0]);
+                }
                 if stalls.len() < 8 {
                     let cause = exec.core.cp0_cause as u32;
-                    stalls.push((steps, body, cause, exec.core.cp0_epc, exec.core.cp0_badvaddr));
+                    let g = exec.core.gpr;
+                    stalls.push((steps, body, cause, exec.core.cp0_epc, exec.core.cp0_badvaddr,
+                                 g));
                 }
             }
 
@@ -1591,14 +2176,36 @@ mod bringup {
             }
             exec.step_int();
             steps += 1;
+            if arm_call.is_none() && exec.core.gpr[31] as u32 == pc.wrapping_add(8) {
+                arm_call = Some((pc.wrapping_add(8), steps, 1));
+            }
         }
 
         let pc = exec.core.pc as u32;
         eprintln!("ip32: stopped after {steps} steps at PC 0x{pc:08x}{}",
                   if reached_post1 { "  <-- post1 entry" } else { "" });
         eprintln!("ip32: furthest PC seen inside the PROM: 0x{max_prom_pc:08x}");
+        {
+            let tail = ring_path(&ring, ring_at);
+            eprintln!("ip32: last {} distinct PCs before stopping (most recent last):",
+                      tail.len());
+            for chunk in tail.chunks(8) {
+                let line: Vec<String> = chunk.iter().map(|p| format!("{p:08x}")).collect();
+                eprintln!("   {}", line.join(" "));
+            }
+        }
+
         if reached_post1 {
             eprintln!("ip32: entered post1 after {post1_at} steps; furthest PC in post1: 0x{max_post1_pc:08x}");
+        }
+
+        let watched = bus.watched();
+        if !watched.is_empty() {
+            eprintln!("ip32: watched memory accesses ({}):", watched.len());
+            for (a, w, v, p, t) in watched.iter().take(40) {
+                eprintln!("   @{t:<9} 0x{a:08x} {} 0x{v:016x}  from PC 0x{p:08x}",
+                          if *w { "W" } else { "R" });
+            }
         }
 
         let msgs = printf.lines();
@@ -1609,22 +2216,98 @@ mod bringup {
         }
         eprintln!("ip32: ===== end POST messages =====");
 
-        assert!(
-            reached_post1,
-            "sloader did not reach post1 at 0x{POST1_ENTRY:08x}; it stopped at \
-             0x{:08x} after {steps} steps. The trace above says what it wanted.",
-            exec.core.pc as u32,
-        );
-        assert!(bus.unmapped().is_empty(), "unmapped accesses: {:x?}", bus.unmapped());
-
+        {
+            let mut by_cost: Vec<(u32, u64)> = loop_cost.iter().map(|(&k, &v)| (k, v)).collect();
+            by_cost.sort_by_key(|&(_, v)| std::cmp::Reverse(v));
+            let spun: u64 = by_cost.iter().map(|&(_, v)| v).sum();
+            eprintln!("ip32: {spun} of {steps} steps ({}%) spent in {} recognised spin loops:",
+                      spun * 100 / steps.max(1), by_cost.len());
+            for (pc, cost) in by_cost.iter().take(6) {
+                eprintln!("   0x{pc:08x}  {cost} steps ({}%)", cost * 100 / steps.max(1));
+                if let Some((n, fs, fg, ls, lg, fp, lp)) = loop_entry.get(pc) {
+                    eprintln!("      entered {n} time(s)");
+                    let body: Vec<u32> = loop_of.iter()
+                        .filter(|(_, &v)| v == *pc).map(|(&k, _)| k).collect();
+                    let mut named: Vec<usize> = Vec::new();
+                    for &p in &body {
+                        let w = bus.read32(p & 0x1fff_ffff).data;
+                        for r in [(w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31] {
+                            if r != 0 && !named.contains(&(r as usize)) { named.push(r as usize); }
+                        }
+                    }
+                    named.push(31);
+                    named.sort_unstable();
+                    named.dedup();
+                    if let Some(snap) = call_snapshot.get(pc) {
+                        eprintln!("      calls before it (indent = depth, -> = return value):");
+                        for l in snap {
+                            eprintln!("        {l}");
+                        }
+                    }
+                    for (label, at, g, path) in
+                        [("first", fs, fg, fp), ("last", ls, lg, lp)]
+                    {
+                        let line: Vec<String> = named.iter()
+                            .map(|&r| format!("{}=0x{:x}", crate::mips_dis::reg_name(r as u32), g[r]))
+                            .collect();
+                        eprintln!("      {label} entry @{at}: {}", line.join("  "));
+                        eprint!("      {label} path:");
+                        for p in path.iter().rev().take(28).collect::<Vec<_>>().iter().rev() {
+                            eprint!(" {p:08x}");
+                        }
+                        eprintln!();
+                    }
+                }
+            }
+        }
+        // IRIS_IP32_DIS=start:end disassembles a range once the run is over,
+        // reading through the bus so RAM-resident code (post1) is visible.
+        if let Ok(spec) = std::env::var("IRIS_IP32_DIS") {
+            if let Some((a, b)) = spec.split_once(':') {
+                let a = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0);
+                let b = u32::from_str_radix(b.trim_start_matches("0x"), 16).unwrap_or(0);
+                eprintln!("ip32: disassembly 0x{a:08x}..0x{b:08x}");
+                let mut p = a;
+                while p < b {
+                    let w = bus.read32(p & 0x1fff_ffff).data;
+                    eprintln!("   0x{p:08x}  {w:08x}  {}",
+                              crate::mips_dis::disassemble(w, p as u64, None));
+                    p += 4;
+                }
+            }
+        }
         eprintln!("ip32: stalls detected: {}", stalls.len());
-        for (at, body, cause, epc, bad) in stalls.iter().take(3) {
+        for (at, body, cause, epc, bad, gpr) in stalls.iter() {
             let lo = body.first().copied().unwrap_or(0);
             let hi = body.last().copied().unwrap_or(0);
             let exc = (cause >> 2) & 0x1f;
             eprintln!("   after {at} steps: {} distinct PCs in 0x{lo:08x}..0x{hi:08x}", body.len());
             eprintln!("      CP0 Cause=0x{cause:08x} ExcCode={exc} ({}) EPC=0x{epc:08x} BadVAddr=0x{bad:08x}",
                       exc_name(exc));
+            // A short loop body is worth reading. Anything longer is a
+            // legitimate busy routine, not something to disassemble here.
+            if body.len() <= 24 {
+                for &p in body {
+                    let w = bus.read32(p & 0x1fff_ffff).data;
+                    eprintln!("      0x{p:08x}  {:08x}  {}", w,
+                              crate::mips_dis::disassemble(w, p as u64, None));
+                }
+                // The registers are what say *which* counter a poll is
+                // waiting on, and for what value. Only the ones the loop
+                // body actually names, so the output stays readable.
+                let mut named: Vec<usize> = Vec::new();
+                for &p in body {
+                    let w = bus.read32(p & 0x1fff_ffff).data;
+                    for r in [(w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31] {
+                        if r != 0 && !named.contains(&(r as usize)) { named.push(r as usize); }
+                    }
+                }
+                named.sort_unstable();
+                let line: Vec<String> = named.iter()
+                    .map(|&r| format!("{}=0x{:016x}", crate::mips_dis::reg_name(r as u32), gpr[r]))
+                    .collect();
+                eprintln!("      {}", line.join("  "));
+            }
         }
 
         let console = bus.com0.output();
@@ -1675,18 +2358,34 @@ mod bringup {
         eprintln!("ip32: MACE accesses: {mr} reads, {mw} writes");
 
         let ev = bus.nic_trace.events();
-        eprintln!("ip32: 1-Wire register activity, first 40 of {} events:", ev.len());
-        let mut prev = 0u64;
-        for (t, w, v) in ev.iter().take(40) {
-            let dt = t.saturating_sub(prev);
-            prev = *t;
-            eprintln!("   +{:>8}  {}  0x{:02x}  [we={} deassert={} data={}]",
-                      dt, if *w { "W" } else { "R" }, v,
-                      v & nic_bit::FLASH_WE != 0,
-                      v & nic_bit::DEASSERT != 0,
-                      v & nic_bit::DATA != 0);
+        // Writes are what drive the bus; a run of reads is the master
+        // sampling and says nothing new. Show every write, and collapse the
+        // polling between them into a count.
+        eprintln!("ip32: 1-Wire bus, {} events (reads between writes collapsed):", ev.len());
+        {
+            let mut prev = 0u64;
+            let mut reads = 0u32;
+            let mut read_lo = 0u32;
+            for (t, w, v) in ev.iter() {
+                if !*w {
+                    reads += 1;
+                    if v & nic_bit::DATA == 0 { read_lo += 1; }
+                    continue;
+                }
+                if reads > 0 {
+                    eprintln!("      ({reads} reads, {read_lo} of them saw the line low)");
+                    reads = 0;
+                    read_lo = 0;
+                }
+                let dt = t.saturating_sub(prev);
+                prev = *t;
+                eprintln!("   +{dt:>8}us  W 0x{v:02x}  [deassert={} data={}]",
+                          v & nic_bit::DEASSERT != 0, v & nic_bit::DATA != 0);
+            }
+            if reads > 0 {
+                eprintln!("      ({reads} reads, {read_lo} of them saw the line low)");
+            }
         }
-
         eprintln!("ip32: busiest MACE offsets:");
         for (off, r, w) in bus.mace.hottest().into_iter().take(8) {
             eprintln!("   +0x{:06x}  {:>8} R  {:>4} W", off, r, w);
@@ -1707,5 +2406,15 @@ mod bringup {
         for (a, w, pc) in un.iter().take(24) {
             eprintln!("   0x{:08x} {}  from PC 0x{:08x}", a, if *w { "W" } else { "R" }, pc);
         }
+
+        // Checks last. Everything above is the evidence for whatever fails
+        // here, and a panic partway through would throw it away.
+        assert!(
+            reached_post1,
+            "sloader did not reach post1 at 0x{POST1_ENTRY:08x}; it stopped at \
+             0x{:08x} after {steps} steps. The trace above says what it wanted.",
+            exec.core.pc as u32,
+        );
+        assert!(un.is_empty(), "unmapped accesses: {un:x?}");
     }
 }
