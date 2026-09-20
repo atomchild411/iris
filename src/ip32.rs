@@ -640,7 +640,27 @@ impl BusDevice for MaceRtc {
 /// become time-based first.
 pub struct OneWireId {
     rom: [u8; 8],
+    /// The EPROM data area. Erased cells read as 0xff on a real part, so an
+    /// unprogrammed chip is all-ones rather than all-zeros — a distinction
+    /// firmware notices.
+    data: Vec<u8>,
+    /// The status/redirection bytes, likewise erased.
+    status: Vec<u8>,
     st: Mutex<OneWireState>,
+}
+
+/// What the device is doing between slots. It decides how the next slot is
+/// read: while the master still has things to say a slot is a write and is
+/// classified by width, and once the device is answering every slot is a read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum OwPhase {
+    /// Waiting for a command byte.
+    #[default]
+    Idle,
+    /// Collecting the address bytes a memory command needs.
+    WantAddr,
+    /// Streaming a reply.
+    Sending,
 }
 
 #[derive(Default)]
@@ -652,100 +672,282 @@ struct OneWireState {
     in_count: u8,
     /// Command being executed, once a whole byte has arrived.
     command: Option<u8>,
-    /// Bit position of the reply stream.
+    /// Bit position within [`OneWireState::out`].
     out_pos: usize,
-    /// What the device is driving onto the line right now.
-    driving_low: bool,
-    /// Set from a reset pulse until the master's next read.
-    presence: bool,
+    phase: OwPhase,
+    /// The memory command waiting for its address bytes.
+    pending: u8,
+    addr: [u8; 2],
+    addr_count: usize,
+    /// The bytes the device is sending, LSB first within each.
+    out: Vec<u8>,
+    /// True when the reply has a definite end after which the device listens
+    /// for another command — READ ROM does, a memory read does not.
+    out_then_idle: bool,
+    /// Decoded protocol events, for the bring-up trace.
+    log: Vec<String>,
+    /// True once the master has opened a read slot, so a bit is on the line.
+    presenting: bool,
+    /// The presence pulse, as a window in UST time. Equal bounds mean none.
+    presence_from: u64,
+    presence_to: u64,
 }
 
 pub mod onewire_cmd {
     pub const READ_ROM: u8 = 0x33;
     pub const SKIP_ROM: u8 = 0xcc;
+    /// DS2502 memory read: two address bytes follow, then the device sends a
+    /// CRC of what it was told and streams data from that address.
+    pub const READ_MEMORY: u8 = 0xf0;
+    /// As above, but the device also emits a CRC after each page.
+    pub const READ_DATA_CRC: u8 = 0xc3;
+    /// DS2502 status (the redirection/write-protect bytes), same shape.
+    pub const READ_STATUS: u8 = 0xaa;
 }
 
 /// Microsecond thresholds. A reset is held for at least 480 µs; within a time
 /// slot, a short low is a 1 and a long low is a 0.
-pub const OW_RESET_US: u64 = 400;
-pub const OW_WRITE0_US: u64 = 30;
+/// After the master releases a reset, the device waits this long and then
+/// pulls the line low for [`OW_PRESENCE_LEN_US`]. The master samples somewhere
+/// in that window; holding the pulse for a fixed time rather than "until
+/// somebody looks" is what makes it independent of how often it polls.
+/// The part SGI fits, and the one the firmware insists on: a DS2502, family
+/// code 0x09. Getting this wrong is not subtle but it is quiet — the firmware
+/// reads the first eight bits of the ROM, sees a family it does not recognise,
+/// abandons the read and reports `ds2502_read_rom failed`, with the other
+/// fifty-six bits never requested. A DS1990A's 0x01 is the obvious wrong
+/// answer because it is the one every 1-Wire example uses.
+pub const OW_FAMILY_DS2502: u8 = 0x09;
+
+pub const OW_PRESENCE_DELAY_US: u64 = 20;
+pub const OW_PRESENCE_LEN_US: u64 = 150;
+
+/// Thresholds, set from the widths this PROM actually produces rather than
+/// from the datasheet. Measured on the firmware's own ROM read:
+///
+/// ```text
+/// 31x4 32x20 | 329x1 356x4 357x4 | 1980x2 | 7220 15954 21570
+///  write-1        write-0           reset     idle low
+/// ```
+///
+/// Three populations with a 10x and a 5.5x gap between them, so the
+/// thresholds sit in the middle of each gap with better than 3x margin on
+/// both sides. The absolute numbers run long against the 1-Wire spec (which
+/// wants ~6/60/480 us) because the PROM bit-bangs with instruction-count
+/// delays, and our instructions-per-microsecond is a free parameter —
+/// [`UST_TICKS_DEN`]. What matters is that the populations stay separated,
+/// and they are separated by an order of magnitude.
+pub const OW_RESET_US: u64 = 800;
+pub const OW_WRITE0_US: u64 = 120;
 
 impl OneWireId {
-    /// Build a ROM from a MAC address: family code 0x01, the six address bytes
+    /// Build a ROM from a MAC address: the family code, the six address bytes
     /// as the serial number, and a CRC-8 over the first seven.
     pub fn from_mac(mac: [u8; 6]) -> Self {
         let mut rom = [0u8; 8];
-        rom[0] = 0x01;
+        rom[0] = OW_FAMILY_DS2502;
         rom[1..7].copy_from_slice(&mac);
         rom[7] = crc8_dallas(&rom[..7]);
-        Self { rom, st: Mutex::new(Default::default()) }
+        // The firmware reads six bytes from offset 0 and reverses them to
+        // form the address, so store it backwards.
+        let mut data = vec![0xff; Self::DATA_LEN];
+        for (i, b) in mac.iter().rev().enumerate() {
+            data[i] = *b;
+        }
+        Self {
+            rom,
+            data,
+            status: vec![0xff; Self::STATUS_LEN],
+            st: Mutex::new(Default::default()),
+        }
     }
+
+    /// 1 kbit of EPROM, in four 32-byte pages.
+    pub const DATA_LEN: usize = 128;
+    pub const STATUS_LEN: usize = 8;
 
     pub fn rom(&self) -> [u8; 8] {
         self.rom
     }
 
-    /// The bit the device is currently presenting, LSB-first out of the ROM.
-    fn reply_bit(&self, st: &OneWireState) -> bool {
-        match st.command {
-            Some(onewire_cmd::READ_ROM) => {
-                let i = st.out_pos;
-                if i >= 64 {
-                    return true;
-                }
-                (self.rom[i / 8] >> (i % 8)) & 1 != 0
+    /// Program the EPROM data area.
+    pub fn set_data(&mut self, at: usize, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            if at + i < self.data.len() {
+                self.data[at + i] = *b;
             }
-            _ => true,
         }
     }
 
+    /// The bit the device is currently presenting, LSB first within each byte.
+    /// Past the end of the reply the line simply floats high, which is what a
+    /// real part does.
+    fn reply_bit(&self, st: &OneWireState) -> bool {
+        let i = st.out_pos;
+        match st.out.get(i / 8) {
+            Some(b) => (b >> (i % 8)) & 1 != 0,
+            None => true,
+        }
+    }
+
+    /// A whole byte arrived from the master.
+    fn take_byte(&self, st: &mut OneWireState, b: u8) {
+        match st.phase {
+            OwPhase::Idle => {
+                st.command = Some(b);
+                self.note(st, format!("cmd 0x{b:02x}"));
+                match b {
+                    onewire_cmd::READ_ROM => {
+                        st.out = self.rom.to_vec();
+                        st.out_pos = 0;
+                        // Exactly 64 bits, and then the master may issue a
+                        // memory command without an intervening reset.
+                        st.out_then_idle = true;
+                        st.phase = OwPhase::Sending;
+                    }
+                    onewire_cmd::READ_MEMORY
+                    | onewire_cmd::READ_DATA_CRC
+                    | onewire_cmd::READ_STATUS => {
+                        st.pending = b;
+                        st.addr_count = 0;
+                        st.phase = OwPhase::WantAddr;
+                    }
+                    // SKIP_ROM and anything else: nothing to say.
+                    _ => st.phase = OwPhase::Idle,
+                }
+            }
+            OwPhase::WantAddr => {
+                if st.addr_count < 2 {
+                    st.addr[st.addr_count] = b;
+                    st.addr_count += 1;
+                }
+                if st.addr_count == 2 {
+                    let a = u16::from_le_bytes(st.addr) as usize;
+                    // The device answers with a CRC over everything it was
+                    // told, then streams memory from that address.
+                    // The firmware reads exactly 1 + (len - addr) + 1 bytes:
+                    // a CRC over what it just sent, the rest of the memory
+                    // from that address, and a CRC over that data. Omitting
+                    // the trailing CRC costs nothing visible — the master
+                    // simply reads one byte past the end, gets the floating
+                    // 0xff, and rejects the whole transfer.
+                    let mut out = vec![crc8_dallas(&[st.pending, st.addr[0], st.addr[1]])];
+                    let src: &[u8] = if st.pending == onewire_cmd::READ_STATUS {
+                        &self.status
+                    } else {
+                        &self.data
+                    };
+                    let body: Vec<u8> = src.iter().skip(a).copied().collect();
+                    let body_crc = crc8_dallas(&body);
+                    out.extend(body);
+                    out.push(body_crc);
+                    self.note(st, format!("{} from 0x{a:04x}",
+                        if st.pending == onewire_cmd::READ_STATUS { "status" } else { "memory" }));
+                    st.out = out;
+                    st.out_pos = 0;
+                    // A memory read streams until the master resets.
+                    st.out_then_idle = false;
+                    st.phase = OwPhase::Sending;
+                }
+            }
+            // Once the device is talking, the master listens.
+            OwPhase::Sending => {}
+        }
+    }
+
+    fn note(&self, st: &mut OneWireState, what: String) {
+        if st.log.len() < 64 {
+            st.log.push(what);
+        }
+    }
+
+    /// The protocol the device saw, decoded — resets, commands, addresses.
+    pub fn protocol_log(&self) -> Vec<String> {
+        self.st.lock().unwrap().log.clone()
+    }
+
     /// The master changed the line. `low` is true when it is pulling low.
+    ///
+    /// Everything is decided by how long the master held the line down, which
+    /// is why the UST has to be a real clock: a reset, a write-0, a write-1 and
+    /// a read slot differ only in duration.
     pub fn master_drive(&self, now: u64, low: bool) {
         let mut st = self.st.lock().unwrap();
         if low {
-            st.low_since = Some(now);
+            if st.low_since.is_none() {
+                // Falling edge. It opens the next slot, so the bit the last
+                // slot presented is finished with now — advance past it here
+                // rather than on release, where the master has not yet had a
+                // chance to sample it.
+                if st.phase == OwPhase::Sending && st.presenting {
+                    st.out_pos += 1;
+                    st.presenting = false;
+                    // A finite reply ends, and the device goes back to
+                    // listening. Without this the master's next command is
+                    // read as more read slots and silently lost.
+                    if st.out_then_idle && st.out_pos >= st.out.len() * 8 {
+                        st.phase = OwPhase::Idle;
+                        st.in_bits = 0;
+                        st.in_count = 0;
+                    }
+                }
+                st.low_since = Some(now);
+            }
             return;
         }
         // Rising edge: classify by how long it was held.
         let Some(since) = st.low_since.take() else { return };
         let held = now.saturating_sub(since);
         if held >= OW_RESET_US {
-            *st = OneWireState { presence: true, ..Default::default() };
+            // How much of the reply the master actually took before giving up
+            // is the difference between "it hated the CRC" and "it hated the
+            // contents".
+            if st.phase == OwPhase::Sending {
+                let (got, total) = (st.out_pos, st.out.len() * 8);
+                self.note(&mut st, format!("master took {got} of {total} bits"));
+            }
+            let log = std::mem::take(&mut st.log);
+            *st = OneWireState {
+                presence_from: now + OW_PRESENCE_DELAY_US,
+                presence_to: now + OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US,
+                log,
+                ..Default::default()
+            };
+            self.note(&mut st, "reset".into());
             return;
         }
-        if st.command.is_none() {
-            // Still collecting a command byte, LSB first.
-            let bit = held < OW_WRITE0_US;
-            st.in_bits |= (bit as u8) << st.in_count;
-            st.in_count += 1;
-            if st.in_count == 8 {
-                st.command = Some(st.in_bits);
-                st.in_bits = 0;
-                st.in_count = 0;
-                st.out_pos = 0;
-            }
-        } else {
-            // A read slot: the master pulsed briefly and now samples.
-            st.out_pos += 1;
+        if st.phase == OwPhase::Sending {
+            // A read slot: the master pulsed briefly, and for the rest of the
+            // slot the device owns the line.
+            st.presenting = true;
+            return;
+        }
+        // A write slot, LSB first.
+        let bit = held < OW_WRITE0_US;
+        st.in_bits |= (bit as u8) << st.in_count;
+        st.in_count += 1;
+        if st.in_count == 8 {
+            let b = st.in_bits;
+            st.in_bits = 0;
+            st.in_count = 0;
+            self.take_byte(&mut st, b);
         }
     }
 
-    /// What the master sees on the line.
-    pub fn line_level(&self) -> bool {
+    /// What the master sees on the line: true is high (idle), false is low.
+    pub fn line_level(&self, now: u64) -> bool {
         let st = self.st.lock().unwrap();
-        if st.presence {
-            // Hold the presence pulse until the master looks once.
+        if now >= st.presence_from && now < st.presence_to {
             return false;
         }
-        if st.command.is_some() {
+        if st.low_since.is_some() {
+            // The master is holding it down itself.
+            return false;
+        }
+        if st.phase == OwPhase::Sending && st.presenting {
             return self.reply_bit(&st);
         }
         true
-    }
-
-    /// Clear the presence pulse once observed.
-    pub fn sample_done(&self) {
-        self.st.lock().unwrap().presence = false;
     }
 }
 
@@ -1101,19 +1303,22 @@ impl Ip32Bus {
     /// Feed a write of the NIC register through to the 1-Wire device, and
     /// report what the master should read back on the data line.
     fn nic_write(&self, val: u8) {
-        // DEASSERT releases the line; otherwise DATA drives it.
-        let low = val & nic_bit::DEASSERT == 0 && val & nic_bit::DATA == 0;
+        // DEASSERT alone decides it: clear means the master is pulling the
+        // line down, set means it has let go. The firmware writes DATA=1 in
+        // both cases, so DATA is an input here, not a level to drive — which
+        // is exactly what the bus trace shows (only 0x08 and 0x0c are ever
+        // written).
+        let low = val & nic_bit::DEASSERT == 0;
         self.onewire.master_drive(self.ust.now(), low);
     }
 
     fn nic_read(&self) -> u8 {
         let mut v = self.mace.cell(MACE_ISA_FLASH_NIC_REG) as u8;
-        if self.onewire.line_level() {
+        if self.onewire.line_level(self.ust.now()) {
             v |= nic_bit::DATA;
         } else {
             v &= !nic_bit::DATA;
         }
-        self.onewire.sample_done();
         v
     }
 
@@ -1805,35 +2010,155 @@ mod tests {
     fn a_rom_built_from_a_mac_is_self_consistent() {
         let ow = OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
         let rom = ow.rom();
-        assert_eq!(rom[0], 0x01, "family code");
+        assert_eq!(rom[0], OW_FAMILY_DS2502, "family code must be the DS2502's");
         assert_eq!(&rom[1..7], &[0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
         assert_eq!(rom[7], crc8_dallas(&rom[..7]), "CRC must cover the first seven bytes");
     }
 
     /// A reset long enough to qualify must be answered with a presence pulse —
     /// the line pulled low — or the master concludes nothing is attached.
+    /// The pulse is a window in time, not a one-shot cleared by the first
+    /// read: the firmware polls it around 150 times, and a pulse that
+    /// vanished after the first look would be missed by every later one.
     #[test]
-    fn a_reset_is_answered_with_presence() {
+    fn a_reset_is_answered_with_a_presence_pulse_of_real_duration() {
         let ow = OneWireId::from_mac([1, 2, 3, 4, 5, 6]);
         ow.master_drive(0, true);
-        ow.master_drive(OW_RESET_US + 100, false);
-        assert!(!ow.line_level(), "presence pulse must pull the line low");
-        ow.sample_done();
-        assert!(ow.line_level(), "and release it once seen");
+        let released = OW_RESET_US + 100;
+        ow.master_drive(released, false);
+
+        assert!(ow.line_level(released + 1),
+                "the device must not answer instantly; the master is still letting go");
+        let inside = released + OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US / 2;
+        assert!(!ow.line_level(inside), "presence pulse must pull the line low");
+        // Every sample inside the window sees it, however many there are.
+        for k in 0..20 {
+            let t = released + OW_PRESENCE_DELAY_US + k * (OW_PRESENCE_LEN_US / 25);
+            assert!(!ow.line_level(t), "presence pulse vanished at +{k}");
+        }
+        let after = released + OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US + 1;
+        assert!(ow.line_level(after), "and the device must let go afterwards");
+    }
+
+    /// A low too short to be a reset is a write slot, and must not be
+    /// mistaken for one — otherwise every command byte restarts the device.
+    #[test]
+    fn a_short_low_is_not_a_reset() {
+        let ow = OneWireId::from_mac([1, 2, 3, 4, 5, 6]);
+        ow.master_drive(0, true);
+        let released = OW_RESET_US - 1;
+        ow.master_drive(released, false);
+        assert!(ow.line_level(released + OW_PRESENCE_DELAY_US + 1),
+                "a sub-reset low must not produce a presence pulse");
     }
 
     /// READ ROM, clocked in a bit at a time, must stream the ROM back LSB
     /// first — that is what carries the MAC address to the firmware.
+    /// A tiny 1-Wire master, so the protocol tests read like the transaction
+    /// they are rather than a list of pulse widths.
+    struct OwMaster<'a> {
+        ow: &'a OneWireId,
+        t: u64,
+    }
+
+    impl<'a> OwMaster<'a> {
+        fn new(ow: &'a OneWireId) -> Self {
+            Self { ow, t: 0 }
+        }
+
+        fn reset(&mut self) {
+            self.ow.master_drive(self.t, true);
+            self.t += OW_RESET_US + 100;
+            self.ow.master_drive(self.t, false);
+            let pulse = self.t + OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US / 2;
+            assert!(!self.ow.line_level(pulse), "no presence pulse after a reset");
+            self.t += OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US + 10;
+        }
+
+        fn write_bit(&mut self, bit: bool) {
+            self.ow.master_drive(self.t, true);
+            self.t += if bit { 20 } else { OW_WRITE0_US + 200 };
+            self.ow.master_drive(self.t, false);
+            self.t += 50;
+        }
+
+        fn write_byte(&mut self, b: u8) {
+            for i in 0..8 {
+                self.write_bit((b >> i) & 1 != 0);
+            }
+        }
+
+        fn read_bit(&mut self) -> bool {
+            self.ow.master_drive(self.t, true);
+            self.t += 20;
+            self.ow.master_drive(self.t, false);
+            self.t += 20;
+            let v = self.ow.line_level(self.t);
+            self.t += 50;
+            v
+        }
+
+        fn read_byte(&mut self) -> u8 {
+            let mut b = 0u8;
+            for i in 0..8 {
+                if self.read_bit() {
+                    b |= 1 << i;
+                }
+            }
+            b
+        }
+    }
+
+    /// The whole transaction the firmware performs: identify the part, then
+    /// read its memory. Every byte of it is checked, because each one was a
+    /// separate gate — the family code, the address CRC, the data, and the
+    /// trailing CRC that nothing in the datasheet summary mentions.
+    #[test]
+    fn the_firmwares_whole_ds2502_transaction_is_answered() {
+        let mac = [0x08u8, 0x00, 0x69, 0x12, 0x34, 0x56];
+        let ow = OneWireId::from_mac(mac);
+        let mut m = OwMaster::new(&ow);
+
+        m.reset();
+        m.write_byte(onewire_cmd::READ_ROM);
+        let mut rom = [0u8; 8];
+        for b in rom.iter_mut() {
+            *b = m.read_byte();
+        }
+        assert_eq!(rom, ow.rom(), "READ ROM must stream the identity back");
+
+        // No reset in between: the firmware goes straight on to the memory
+        // read, and a device still stuck in "sending" would swallow it.
+        m.write_byte(onewire_cmd::READ_MEMORY);
+        m.write_byte(0);
+        m.write_byte(0);
+        assert_eq!(
+            m.read_byte(),
+            crc8_dallas(&[onewire_cmd::READ_MEMORY, 0, 0]),
+            "the device must answer with a CRC over the command and address"
+        );
+
+        let data: Vec<u8> = (0..OneWireId::DATA_LEN).map(|_| m.read_byte()).collect();
+        assert_eq!(
+            m.read_byte(),
+            crc8_dallas(&data),
+            "and a CRC over the data it just sent"
+        );
+
+        let eaddr: Vec<u8> = data[..6].iter().rev().copied().collect();
+        assert_eq!(eaddr, mac, "the firmware reverses the first six bytes to get the MAC");
+    }
+
     #[test]
     fn read_rom_streams_the_identity_back() {
         let mac = [0x08u8, 0x00, 0x69, 0x12, 0x34, 0x56];
         let ow = OneWireId::from_mac(mac);
         let mut t = 0u64;
-        // Reset.
+        // Reset, then wait out the presence pulse.
         ow.master_drive(t, true);
         t += OW_RESET_US + 100;
         ow.master_drive(t, false);
-        ow.sample_done();
+        t += OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US + 10;
         // Clock in READ ROM, LSB first: a short low is a 1, a long low a 0.
         for i in 0..8 {
             let bit = (onewire_cmd::READ_ROM >> i) & 1 != 0;
@@ -1842,15 +2167,17 @@ mod tests {
             ow.master_drive(t, false);
             t += 10;
         }
-        // Read 64 bits back.
+        // Read 64 bits back. Each slot is the master pulsing the line low and
+        // then sampling what the device leaves on it.
         let mut got = [0u8; 8];
         for i in 0..64 {
-            if ow.line_level() {
-                got[i / 8] |= 1 << (i % 8);
-            }
             ow.master_drive(t, true);
             t += 5;
             ow.master_drive(t, false);
+            t += 5;
+            if ow.line_level(t) {
+                got[i / 8] |= 1 << (i % 8);
+            }
             t += 10;
         }
         assert_eq!(got, ow.rom(), "the master must read back exactly the ROM");
@@ -2366,6 +2693,8 @@ mod bringup {
             let mut prev = 0u64;
             let mut reads = 0u32;
             let mut read_lo = 0u32;
+            let mut last_level_low = false;
+            let mut lows: Vec<u64> = Vec::new();
             for (t, w, v) in ev.iter() {
                 if !*w {
                     reads += 1;
@@ -2379,12 +2708,36 @@ mod bringup {
                 }
                 let dt = t.saturating_sub(prev);
                 prev = *t;
-                eprintln!("   +{dt:>8}us  W 0x{v:02x}  [deassert={} data={}]",
-                          v & nic_bit::DEASSERT != 0, v & nic_bit::DATA != 0);
+                // What matters is how long the *previous* level lasted: on
+                // this bus every distinction — reset, write-0, write-1, read
+                // slot — is a pulse width.
+                let was_low = last_level_low;
+                last_level_low = v & nic_bit::DEASSERT == 0;
+                eprintln!("   W 0x{v:02x} -> {:5}   (was {} for {dt}us)",
+                          if last_level_low { "LOW" } else { "high" },
+                          if was_low { "LOW " } else { "high" });
+                if was_low {
+                    lows.push(dt);
+                }
             }
             if reads > 0 {
                 eprintln!("      ({reads} reads, {read_lo} of them saw the line low)");
             }
+            // The populations are the whole argument for where the thresholds
+            // go. If they are not well separated, the thresholds are guesses.
+            lows.sort_unstable();
+            let mut runs: Vec<(u64, u32)> = Vec::new();
+            for d in &lows {
+                match runs.last_mut() {
+                    Some(r) if r.0 == *d => r.1 += 1,
+                    _ => runs.push((*d, 1)),
+                }
+            }
+            let plog = bus.onewire.protocol_log();
+            eprintln!("   decoded protocol ({} events): {}", plog.len(), plog.join(" | "));
+            eprintln!("   master low-pulse widths (us x count): {}",
+                      runs.iter().map(|(d, n)| format!("{d}x{n}"))
+                          .collect::<Vec<_>>().join(" "));
         }
         eprintln!("ip32: busiest MACE offsets:");
         for (off, r, w) in bus.mace.hottest().into_iter().take(8) {

@@ -513,6 +513,76 @@ modelled but whose line-level handshake the firmware does not accept yet. That
 is the next gate, and unlike every gate before it, it is one we already have
 the parts for.
 
+## The 1-Wire identity chip, gate by gate
+
+Resolved 2026-09-19. Five separate things were wrong, and each one hid the
+next. Worth listing because every one of them was found by making the device
+report what it saw, not by reading the datasheet harder.
+
+1. **`DEASSERT` alone drives the line.** `nic_write` required `DATA == 0` as
+   well, and the firmware writes `DATA = 1` throughout — so the master never
+   appeared to pull the line low and no reset was ever recognised. The bus
+   trace settles it: only `0x08` and `0x0c` are ever written, so `DATA` is an
+   input here, not a level to drive.
+
+2. **The presence pulse is a window in time, not a one-shot.** It had been
+   cleared by the first read. The firmware polls around 150 times, so a pulse
+   that vanished after the first look was missed by every later one. It is now
+   held from `OW_PRESENCE_DELAY_US` to `+ OW_PRESENCE_LEN_US` and any sample
+   inside sees it.
+
+3. **The pulse-width thresholds were inside a population.** Printing the
+   histogram of master low-pulse widths made this obvious in one line:
+
+   ```text
+   31x4 32x20 | 329x1 356x4 357x4 | 1980x2 | 7220 15954 21570
+    write-1        write-0          reset      idle low
+   ```
+
+   Three populations, 10x and 5.5x apart. `OW_WRITE0_US` was 30 and
+   `OW_RESET_US` 400 — the first sat *below* the write-1 cluster, so every
+   write-1 read as a write-0 and the command byte came out as zero. Moved to
+   120 and 800, in the middle of each gap. The absolute values run long
+   against the 1-Wire spec because the PROM bit-bangs with instruction-count
+   delays and our instructions-per-microsecond is a free parameter; what
+   matters is that the populations stay separated.
+
+4. **The family code.** With the command decoding, the master read exactly
+   eight bits — `1,0,0,0,0,0,0,0`, our `0x01` — and immediately reset. It is a
+   **DS2502**, family `0x09`. `0x01` is the DS1990A, and it is the wrong
+   answer every 1-Wire example hands you.
+
+5. **`READ ROM` has an end; a memory read does not.** After streaming the ROM
+   the device stayed in "sending" forever, so the master's next command was
+   read as more read slots and silently lost. The decoded log showed it
+   plainly — `reset | cmd 0x33 | reset | cmd 0x33`, with no memory command
+   ever arriving, while 49 long pulses went by where two `0x33`s account for
+   only 8.
+
+Then the memory read itself. Rather than guess the layout, read the parser:
+the error strings live at PROM offsets `0x530f8`/`0x53124`/`0x53150`, and
+since the `firmware` section is loaded verbatim at `0x81000000` from PROM
+offset `0x9208`, each maps to exactly one `addiu` site. `ds2502_get_eaddr` is
+at `0x81005674` and `ds2502_read_ram` at `0x810053d4`, and between them they
+say:
+
+- send `0xf0`, `TA1`, `TA2`, accumulating a CRC over those three bytes;
+- read one byte and compare it with that CRC — mismatch returns failure
+  immediately;
+- read `128 - addr` data bytes;
+- read **one more byte** and check it as a CRC over the data;
+- take the first six bytes, **reversed**, as the Ethernet address.
+
+That trailing data CRC is the part no summary of the datasheet mentions, and
+its absence is invisible: the master simply reads one byte past the end of the
+reply, gets the floating `0xff`, and rejects the whole transfer. The
+instrumentation that caught it was logging how much of the reply the master
+consumed before giving up — `master took 1040 of 1032 bits` is an eight-bit
+shortfall stated out loud.
+
+With all five fixed the console goes quiet, the master takes `1040 of 1040
+bits`, and the firmware moves on.
+
 ## Instrumentation worth keeping
 
 All of this came out of the harness, and none of it out of reading the PROM
