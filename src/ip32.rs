@@ -540,8 +540,12 @@ pub const PCI_VENDOR_ADAPTEC: u16 = 0x9004;
 pub const PCI_DEVICE_AIC7880: u16 = 0x8078;
 /// Mass storage controller, SCSI, no specific programming interface.
 pub const PCI_CLASS_SCSI: u32 = 0x0100_00;
-/// The slot the PROM looks in first.
+/// The two SCSI controllers an O2 has on its motherboard. CRIME carries a
+/// separate interrupt line for each -- `CRIME_INT_PCI_SCSI0` and
+/// `CRIME_INT_PCI_SCSI1` -- which is the clearest evidence that both are
+/// expected to be there.
 pub const IP32_SCSI_SLOT: u8 = 1;
+pub const IP32_SCSI_SLOT_B: u8 = 2;
 /// MACE's own interrupt status, which CRIME input 4 cascades from. NetBSD's
 /// handler reads this register and matches each device's mask against it, so
 /// raising CRIME alone is not enough -- the demultiplexer has to find
@@ -557,6 +561,7 @@ pub const MACE_ISA_SERIAL0_MASK: u64 = 0x03f0_0000;
 /// NetBSD works this out for itself and prints it: "interrupting at crime
 /// interrupt 8".
 pub const IP32_SCSI_CRIME_INT: u32 = 8;
+pub const IP32_SCSI_CRIME_INT_B: u32 = 9;
 
 /// The CPU-side window onto PCI memory, and the PCI address it starts at.
 ///
@@ -1599,6 +1604,10 @@ pub struct Ip32Bus {
     /// Writes into the flash, so a command protocol would be visible rather
     /// than silently corrupting the image.
     prom_writes: Mutex<Vec<(u32, u8)>>,
+    /// Where to keep the flash between runs, if anywhere. Never the image the
+    /// caller supplied: settings written by a guest belong in the user's
+    /// working directory, not in their copy of the PROM.
+    flash_file: Option<std::path::PathBuf>,
     pub crime: Crime,
     pub mace: Stub,
     pub crime_re: Stub,
@@ -1630,7 +1639,7 @@ pub struct Ip32Bus {
     watch_log: Mutex<Vec<(u32, bool, u64, u32, u64)>>,
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
-    pub scsi: Mutex<Option<std::sync::Arc<crate::aic7880::Aic7880>>>,
+    pub scsi: Mutex<Vec<(std::sync::Arc<crate::aic7880::Aic7880>, u32)>>,
 }
 
 impl Ip32Bus {
@@ -1644,6 +1653,7 @@ impl Ip32Bus {
             ram: ram.clone(),
             prom: Mutex::new(prom),
             prom_writes: Mutex::new(Vec::new()),
+            flash_file: std::env::var_os("IRIS_IP32_FLASH").map(Into::into),
             crime: Crime::new(ust.clone()),
             mace: Stub::new("mace"),
             crime_re: Stub::new("crime-re"),
@@ -1668,7 +1678,7 @@ impl Ip32Bus {
                 Some((p(a)?, p(b)? + 8))
             }),
             watch_log: Mutex::new(Vec::new()),
-            scsi: Mutex::new(None),
+            scsi: Mutex::new(Vec::new()),
         };
         // An experiment for now: the PROM probes slots 1..3 for a vendor ID
         // and finds nothing, so it has no disk and cannot boot. Putting the
@@ -1679,6 +1689,24 @@ impl Ip32Bus {
             // needs to reach RAM directly rather than through the bus that
             // owns it.
             let scsi = std::sync::Arc::new(crate::aic7880::Aic7880::new(ram.clone()));
+            // The second controller. Real hardware has it whether or not
+            // anything is plugged into it, and a kernel that expects two
+            // waits on the one that is missing.
+            let scsi_b = std::sync::Arc::new(crate::aic7880::Aic7880::new(ram.clone()));
+            bus.macepci.attach(
+                IP32_SCSI_SLOT_B,
+                std::sync::Arc::new(
+                    PciFunction::new(
+                        "aic7880-b",
+                        PCI_VENDOR_ADAPTEC,
+                        PCI_DEVICE_AIC7880,
+                        PCI_CLASS_SCSI,
+                        0x01,
+                        [0x100, 0x1000, 0, 0, 0, 0],
+                    )
+                    .with_ops(scsi_b.clone()),
+                ),
+            );
             bus.macepci.attach(
                 IP32_SCSI_SLOT,
                 std::sync::Arc::new(
@@ -1719,7 +1747,22 @@ impl Ip32Bus {
                     }
                 }
             }
-            *bus.scsi.lock().unwrap() = Some(scsi);
+            let mut list = bus.scsi.lock().unwrap();
+            list.push((scsi, IP32_SCSI_CRIME_INT));
+            list.push((scsi_b, IP32_SCSI_CRIME_INT_B));
+        }
+        // A saved flash carries the guest's environment -- boot paths, console
+        // choice, everything the PROM's `setenv` writes -- from one run to
+        // the next, which is what makes an install worth doing once.
+        if let Some(path) = bus.flash_file.clone() {
+            match std::fs::read(&path) {
+                Ok(saved) if saved.len() == PROM_SIZE as usize => {
+                    *bus.prom.lock().unwrap() = saved;
+                    eprintln!("ip32: flash restored from {}", path.display());
+                }
+                Ok(_) => eprintln!("ip32: flash {} is the wrong size; ignoring", path.display()),
+                Err(_) => {}
+            }
         }
         // So a hot offset can name the code polling it.
         bus.mace.watch_pc(pc.clone());
@@ -1786,6 +1829,16 @@ impl Ip32Bus {
     }
 
     /// The watch log, in order.
+    /// Write the flash out, if a file was named for it.
+    pub fn save_flash(&self) {
+        let Some(path) = &self.flash_file else { return };
+        let p = self.prom.lock().unwrap();
+        match std::fs::write(path, &p[..]) {
+            Ok(()) => eprintln!("ip32: flash saved to {}", path.display()),
+            Err(e) => eprintln!("ip32: flash {}: {e}", path.display()),
+        }
+    }
+
     /// Everything written into the flash, in order.
     pub fn prom_writes(&self) -> Vec<(u32, u8)> {
         self.prom_writes.lock().unwrap().clone()
@@ -3411,8 +3464,8 @@ mod bringup {
                 // driver only discovers a finished command when its own
                 // watchdog fires, which it reports as "Interrupts may not be
                 // functioning", and it is right.
-                if let Some(scsi) = bus.scsi.lock().unwrap().as_ref() {
-                    bus.crime.set_int(IP32_SCSI_CRIME_INT, scsi.interrupting());
+                for (scsi, line) in bus.scsi.lock().unwrap().iter() {
+                    bus.crime.set_int(*line, scsi.interrupting());
                 }
                 // The console's receive interrupt. The PROM polls the UART
                 // and never needed this; a kernel does not poll, so without
@@ -3816,7 +3869,7 @@ mod bringup {
                 }
             }
         }
-        if let Some(scsi) = bus.scsi.lock().unwrap().as_ref() {
+        for (scsi, _) in bus.scsi.lock().unwrap().iter() {
             eprintln!("ip32: SCSI controller: {} bytes of sequencer program downloaded",
                       scsi.seqram_len());
             let (c, bi, bo) = scsi.totals();
@@ -3854,6 +3907,7 @@ mod bringup {
                 }
             }
         }
+        bus.save_flash();
         let un = bus.unmapped();
         eprintln!("ip32: unmapped accesses ({}):", un.len());
         for (a, w, pc) in un.iter().take(24) {
