@@ -100,7 +100,19 @@ pub const BLOCK_SIZE: usize = 512;
 /// length carries flags we do not need, so it is masked off.
 pub const SG_LEN_MASK: u32 = 0x00ff_ffff;
 /// How many entries to follow before deciding the list is not a list.
-pub const SG_MAX: usize = 32;
+///
+/// This was 32, which is a plausible-looking number and was wrong. A single
+/// 264-block read scatters into 33 pages, so the walk stopped one entry short
+/// and dropped the tail — silently, because the command still reported
+/// success. The symptom was a 5456-byte hole in a loaded image, which
+/// happened to contain the entry point: the PROM loaded `sashARCS`, printed
+/// the right sizes and the right entry, jumped, and executed whatever had
+/// been in that memory before.
+///
+/// The bound only exists so a corrupt list cannot spin forever. A transfer
+/// ends when the data runs out or an entry is null, both of which come first
+/// in any healthy list.
+pub const SG_MAX: usize = 4096;
 
 /// A disk behind the controller.
 pub struct ScsiDisk {
@@ -189,6 +201,12 @@ struct State {
     pauses: u64,
     /// Per SCB: filled in through the register window since last queued.
     scb_onchip: [bool; SCB_COUNT],
+    /// Totals that survive a chip reset, because the drivers reset often and
+    /// per-reset counts answer the wrong question. "Was the whole file
+    /// transferred" needs a number for the whole session.
+    total_cmds: u64,
+    total_in: u64,
+    total_out: u64,
     notes: Vec<String>,
 }
 
@@ -207,6 +225,9 @@ impl Default for State {
             qoutpos: 0,
             pauses: 0,
             scb_onchip: [false; SCB_COUNT],
+            total_cmds: 0,
+            total_in: 0,
+            total_out: 0,
             notes: Vec::new(),
         }
     }
@@ -219,11 +240,27 @@ pub struct Aic7880 {
     /// being handed it a register at a time, so without this it can see the
     /// tag of a command and nothing else about it.
     ram: std::sync::Arc<Mutex<Vec<u8>>>,
+    /// An address range to report DMA writes for, from IRIS_IP32_DMAWATCH.
+    /// "Did the loader ever write the entry point" is not answerable from the
+    /// command log, because the log says where a transfer was aimed and not
+    /// which bytes moved.
+    dma_watch: Option<(u32, u32)>,
+    dma_hits: Mutex<Vec<(u32, u8)>>,
 }
 
 impl Aic7880 {
     pub fn new(ram: std::sync::Arc<Mutex<Vec<u8>>>) -> Self {
-        Self { st: Mutex::new(State::default()), disk: Mutex::new(None), ram }
+        Self {
+            st: Mutex::new(State::default()),
+            disk: Mutex::new(None),
+            ram,
+            dma_watch: std::env::var("IRIS_IP32_DMAWATCH").ok().and_then(|v| {
+                let (a, b) = v.split_once(':')?;
+                let p = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+                Some((p(a)?, p(b)?))
+            }),
+            dma_hits: Mutex::new(Vec::new()),
+        }
     }
 
     /// Offset into RAM for an address the device sees.
@@ -252,10 +289,24 @@ impl Aic7880 {
     }
 
     fn dma_write8(&self, addr: u32, val: u8) {
+        if let Some((lo, hi)) = self.dma_watch {
+            let a = addr & 0x1fff_ffff;
+            if a >= lo && a < hi {
+                let mut w = self.dma_hits.lock().unwrap();
+                if w.len() < 64 {
+                    w.push((addr, val));
+                }
+            }
+        }
         let mut r = self.ram.lock().unwrap();
         if let Some(i) = self.ram_offset(addr, r.len()) {
             r[i] = val;
         }
+    }
+
+    /// DMA writes seen inside the watch range, as `(address, byte)`.
+    pub fn dma_hits(&self) -> Vec<(u32, u8)> {
+        self.dma_hits.lock().unwrap().clone()
     }
 
     /// A 32-bit word, in the order the host wrote it.
@@ -286,6 +337,12 @@ impl Aic7880 {
     /// A running commentary on what the driver asked for.
     pub fn notes(&self) -> Vec<String> {
         self.st.lock().unwrap().notes.clone()
+    }
+
+    /// Commands, bytes read and bytes written for the whole session.
+    pub fn totals(&self) -> (u64, u64, u64) {
+        let st = self.st.lock().unwrap();
+        (st.total_cmds, st.total_in, st.total_out)
     }
 
     /// How many times the driver paused or restarted the sequencer.
@@ -544,6 +601,8 @@ impl Aic7880 {
             .map(|(a, l)| format!("0x{a:08x}+{l}")).collect();
         // Hand the status back where the driver left room for it.
         self.dma_write8(scb_addr + scb::TARGET_STATUS as u32, status);
+        st.total_cmds += 1;
+        if dir == "into" { st.total_in += moved as u64 } else { st.total_out += moved as u64 }
         Self::note(st, format!(
             "   -> status {status}, {moved} bytes {dir} [{}]", sgtxt.join(" ")));
         st.executed.push((tag, scb_addr, cdb));
@@ -596,7 +655,14 @@ impl Aic7880 {
                     // A chip reset clears everything except the program we
                     // were given, which the driver reloads anyway.
                     let notes = std::mem::take(&mut st.notes);
-                    *st = State { notes, ..Default::default() };
+                    let (c, i, o) = (st.total_cmds, st.total_in, st.total_out);
+                    *st = State {
+                        notes,
+                        total_cmds: c,
+                        total_in: i,
+                        total_out: o,
+                        ..Default::default()
+                    };
                     Self::note(&mut st, "chip reset".into());
                     // The reset bit reads back as an acknowledgement.
                     st.regs[reg::HCNTRL as usize] = hcntrl::CHIPRST;
@@ -863,6 +929,56 @@ mod tests {
         assert!(on_disk[4 * BLOCK_SIZE..5 * BLOCK_SIZE].iter().all(|b| *b == 0),
                 "and must not disturb its neighbour");
         assert_eq!(on_disk.len(), 64 * BLOCK_SIZE, "the image must not grow");
+    }
+
+    /// A transfer larger than any plausible fixed bound must still complete.
+    /// A 32-entry cap looked reasonable and silently truncated a 33-page
+    /// read, reporting success and leaving a hole in the middle of a loaded
+    /// program.
+    #[test]
+    fn a_long_scatter_gather_list_is_followed_to_the_end() {
+        let ram = std::sync::Arc::new(std::sync::Mutex::new(vec![0u8; 4 << 20]));
+        let c = Aic7880::new(ram.clone());
+        let img = std::env::temp_dir().join("iris-aic7880-sg.img");
+        let pattern: Vec<u8> = (0..264 * BLOCK_SIZE).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&img, &pattern).expect("test image");
+        c.attach_disk(&img).expect("attach");
+
+        let base = crate::ip32::RAM_BASE;
+        let (array, scb, cdb, sg, buf, qout) =
+            (0x1000u32, 0x2000u32, 0x2100u32, 0x4000u32, 0x100000u32, 0x3000u32);
+        // 264 blocks into 4 KiB pages: 33 entries, one past the old bound.
+        let pages = 264 * BLOCK_SIZE / 4096;
+        assert!(pages > 32, "the test must cross the bound it is checking");
+        {
+            let mut m = ram.lock().unwrap();
+            let put32 = |m: &mut Vec<u8>, at: u32, v: u32| {
+                m[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
+            };
+            put32(&mut m, array + 4, base + scb);
+            put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
+            put32(&mut m, scb + scb::CMD_PTR as u32, base + cdb);
+            m[(scb + scb::CDB_LEN as u32) as usize] = 10;
+            // READ(10), 264 blocks from LBA 0.
+            m[cdb as usize] = 0x28;
+            m[cdb as usize + 7] = (264 >> 8) as u8;
+            m[cdb as usize + 8] = (264 & 0xff) as u8;
+            for i in 0..pages as u32 {
+                put32(&mut m, sg + i * 8, base + buf + i * 4096);
+                put32(&mut m, sg + i * 8 + 4, 4096);
+            }
+        }
+        for (i, b) in (base + array).to_le_bytes().iter().enumerate() {
+            c.write(sram::SCB_ARRAY + i as u32, *b as u32, 1);
+        }
+        for (i, b) in (base + qout).to_le_bytes().iter().enumerate() {
+            c.write(sram::QOUTFIFO + i as u32, *b as u32, 1);
+        }
+        c.write(reg::QINFIFO, 1, 1);
+
+        let m = ram.lock().unwrap();
+        let got = &m[buf as usize..buf as usize + pattern.len()];
+        assert_eq!(got, &pattern[..], "every page of the transfer must arrive");
     }
 
     /// Writing past the end is an error, not a bigger disk.
