@@ -310,34 +310,56 @@ Twice in one session the same mistake: `MACE_ISA_FLASH_NIC_REG` read as 1-Wire
 when the bits said LED, and 0x40000000 read as PCI when the access pattern said
 memory. **Trust the access pattern over the header name.**
 
-## The console will not help during post1
+## Instrumentation, and then the milestone
 
-`com0` is implemented (`Com16550`), at MACE + 0x390000 with MACE's ISA register
-spacing: register `n` is at `base + (n << 8) + 7`, per `sgimips/bus.c`'s
-`h + (o << 8) + 7`. Decode that wrong and the UART is silently inert, which is
-why there are tests for it.
+Three instruments, each chosen because its absence had already cost a wrong
+turn:
 
-It captures nothing, and the reason is not the UART. The routine post1 calls to
-print — 0xbfc04d74, the one reached from every `<post1> <SizeMEM>` message — is
-a **stub**:
+1. **PC attribution on every recorded access.** The bus publishes the current
+   PC (`PcTap`) and the miss log records it. `0x00000018 W from PC 0xbfc051b4`
+   is a one-line diagnosis; `0x00000018 W` alone is a puzzle.
+2. **A printf tap.** post1's print routine at 0xbfc04d74 is a stub that emits
+   nothing, but the format strings are in the image and the arguments are in
+   `a0`-`a3` at the call. Reading them there recovers POST's narrative that the
+   hardware never prints.
+3. **Stall detection with CP0.** When the PC stops spreading, report the loop
+   body *and* Cause/ExcCode/EPC. "Spinning at 0xbfc003a0" says nothing;
+   "ExcCode=7 (DBE) EPC=0xbfc051b4" names the faulting instruction.
 
-    bfc04d74:  addiu sp,sp,-8
-    bfc04d78:  sw a0,8(sp)        # save the format string
-    bfc04d7c:  sw a1,12(sp)       # and the arguments
-    bfc04d88:  jr ra              # ...and return
-    bfc04d8c:  addiu sp,sp,8
+They paid for themselves immediately. The printf tap gave:
 
-It saves its arguments and returns. post1 has no console at all; the messages
-exist in the image and are never emitted. The PROM's built-in default env also
-says `console=g`, so even a working console would be the framebuffer rather
-than the UART unless NVRAM says otherwise.
+    <post1> <SizeMEM> Entering routine
+    <post1> <SizeMEM> ECC off
+    <post1> <SizeMEM> Initilaize BANK0
+    <post1> <SizeMEM> bank0 = 0x... (128M)
+    <post1> <SizeMEM> bank1 = 0x..., no simm installed
+    ...
+    <post1> <SizeMEM> MEM Size = 0x8000000 bytes
 
-So the strings remain useful — reading them out of the image is how
-`Error, no SIMM in bank0` was found — but they are documentation, not output.
-The UART will matter once the `firmware` section (4.18, at 0x81000000) runs and
-brings up a real console. Until then, tracing is the instrument.
+and the stall reporter turned two further hangs into single-line answers:
 
-## Open questions
+- `ExcCode=7 (DBE)` at 0xbfc051b4 → miss log → `0x00000018 W`. POST writes a
+  walking pattern to **low physical memory** long after sizing RAM at
+  0x40000000. Low memory aliases the base of RAM, as it does on the Indy.
+- The same again at 0xbfc05088 → `0x00001000 R`, i.e. the alias was too small.
+
+Two more gates, both found and fixed in minutes rather than by disassembly.
+
+### The milestone, literally
+
+    stopped after 112536 steps at PC 0xa0004000  <-- post1 entry
+    stalls detected: 0
+    unmapped accesses (0):
+
+sloader sizes memory, copies post1 into RAM and jumps to it. No stalls, no
+unmapped accesses, and the test now asserts it rather than merely printing it.
+
+What it took, in total: CRIME's control and bank registers, a UST timer that
+advances, a PCI bridge answering all-ones, a memory window that absorbs
+accesses to unpopulated banks instead of bus-erroring, and a low-memory alias.
+No PCI enumeration, no `ahc`, no graphics, no 1-Wire, no console.
+
+## The console will not help during post1## Open questions
 
 - ~~How much does `post1` insist on?~~ Answered: CRIME is cheap, MACE PCI is
   the gate. See above.

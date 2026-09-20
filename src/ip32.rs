@@ -16,6 +16,7 @@
 //!
 //! See `docs/ip32-o2-bringup.md`.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR};
@@ -69,6 +70,34 @@ pub const MACEPCI_SIZE: u32 = 0x0001_0000;
 /// PROM walks this while looking for the Adaptec SCSI controller.
 pub const PCI_NATIVE_VIEW_BASE: u32 = 0x4000_0000;
 pub const PCI_NATIVE_VIEW_SIZE: u32 = 0x0800_0000;
+
+/// CRIME's rendering-engine block. NetBSD's `crmfb` maps exactly
+/// `0x15000000, 0x6000` for this. Graphics are out of scope, but POST touches
+/// it regardless, so it is present and inert rather than absent.
+pub const CRIME_RE_BASE: u32 = 0x1500_0000;
+pub const CRIME_RE_SIZE: u32 = 0x0000_6000;
+
+/// Low memory aliases the base of RAM.
+///
+/// POST writes a walking pattern to physical 0x00..0x20 from 0xbfc051b4, long
+/// after it has sized memory at [`RAM_BASE`]. Without an alias those are
+/// unmapped, the store takes a data bus error, and the PROM spins in its
+/// exception vector. The Indy models the same idea (`ALIAS_BASE` in
+/// `physical.rs`), so the shape is familiar even though the base differs.
+///
+/// The alias covers as much as there is RAM. POST walks well past the first
+/// page, and since the lowest device sits at 0x14000000 an alias of up to
+/// 128 MB cannot shadow anything.
+
+/// The memory window CRIME decodes: eight banks of 128 MB from [`RAM_BASE`].
+///
+/// Whether a bank is *populated* is a separate question from whether it is
+/// decoded. POST probes every bank in turn; an absent one must read back
+/// something that fails its pattern check, **not** raise a bus error. Erroring
+/// sends the PROM into its bus-error handler, which on an unpopulated machine
+/// immediately faults again — a two-address exception loop between `jr s8` and
+/// whatever `s8` happens to hold.
+pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 
 /// Boot PROM. Same address as the Indy's, which is the one thing that carries
 /// over: the MIPS reset vector is 0xbfc00000 on both.
@@ -430,7 +459,12 @@ impl Com16550 {
 }
 
 impl BusDevice for Com16550 {
+    // Every width must be answered. An unimplemented one falls through to the
+    // trait default, which reports a bus error — and a DBE inside POST looks
+    // like a missing device rather than a missing method.
     fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.read_reg(addr)) }
+    fn read16(&self, addr: u32) -> BusRead16 { BusRead16::ok(self.read_reg(addr | 7) as u16) }
+    fn write16(&self, addr: u32, val: u16) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
     fn write8(&self, addr: u32, val: u8) -> u32 { self.write_reg(addr, val); BUS_OK }
     fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.read_reg(addr | 7) as u32) }
     fn write32(&self, addr: u32, val: u32) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
@@ -581,19 +615,22 @@ pub struct Ip32Bus {
     prom: Vec<u8>,
     pub crime: Crime,
     pub mace: Stub,
+    pub crime_re: Stub,
     pub macepci: MacePci,
     pub ust: MaceUst,
     pub nic_trace: NicTrace,
     pub com0: Com16550,
     pub com1: Com16550,
     pub pci_view: PciNativeView,
-    /// Accesses that hit nothing, first 64 kept, as `(addr, is_write)`.
-    unmapped: Mutex<Vec<(u32, bool)>>,
+    /// Accesses that hit nothing, first 64 kept, as `(addr, is_write, pc)`.
+    unmapped: Mutex<Vec<(u32, bool, u32)>>,
+    /// The PC of the instruction currently executing.
+    pub pc: PcTap,
     /// 64-bit RAM accesses at the addresses POST's memory sizing uses, as
-    /// `(addr, is_write, value)`. The test writes `(!a << 32) | a` to each and
+    /// `(addr, is_write, value, pc)`. The test writes `(!a << 32) | a` to each and
     /// reads it back, so seeing both halves is what tells us whether the store
     /// or the load is the one going wrong.
-    sizemem: Mutex<Vec<(u32, bool, u64)>>,
+    sizemem: Mutex<Vec<(u32, bool, u64, u32)>>,
 }
 
 impl Ip32Bus {
@@ -605,6 +642,7 @@ impl Ip32Bus {
             prom,
             crime: Crime::new(),
             mace: Stub::new("mace"),
+            crime_re: Stub::new("crime-re"),
             macepci: MacePci::new(),
             ust: MaceUst::new(),
             nic_trace: NicTrace::new(),
@@ -612,6 +650,7 @@ impl Ip32Bus {
             com1: Com16550::new(),
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
+            pc: PcTap::default(),
             sizemem: Mutex::new(Vec::new()),
         }
     }
@@ -624,7 +663,7 @@ impl Ip32Bus {
         RAM_BASE + 0x07ff_fff8,
     ];
 
-    pub fn sizemem_trace(&self) -> Vec<(u32, bool, u64)> {
+    pub fn sizemem_trace(&self) -> Vec<(u32, bool, u64, u32)> {
         self.sizemem.lock().unwrap().clone()
     }
 
@@ -637,21 +676,23 @@ impl Ip32Bus {
 
     fn note_sizemem(&self, addr: u32, write: bool, val: u64) {
         if Self::SIZEMEM_PROBES.contains(&addr) || Self::is_probe_pattern(val) {
+            let pc = self.pc.get();
             let mut t = self.sizemem.lock().unwrap();
             if t.len() < 64 {
-                t.push((addr, write, val));
+                t.push((addr, write, val, pc));
             }
         }
     }
 
-    pub fn unmapped(&self) -> Vec<(u32, bool)> {
+    pub fn unmapped(&self) -> Vec<(u32, bool, u32)> {
         self.unmapped.lock().unwrap().clone()
     }
 
     fn miss(&self, addr: u32, write: bool) {
+        let pc = self.pc.get();
         let mut u = self.unmapped.lock().unwrap();
-        if u.len() < 64 && !u.iter().any(|&(a, w)| a == addr && w == write) {
-            u.push((addr, write));
+        if u.len() < 64 && !u.iter().any(|&(a, w, _)| a == addr && w == write) {
+            u.push((addr, write, pc));
         }
     }
 
@@ -663,6 +704,13 @@ impl Ip32Bus {
         addr >= RAM_BASE && addr < RAM_BASE.wrapping_add(self.ram_len())
     }
 
+    /// Inside CRIME's memory window but behind a bank with no SIMM in it.
+    fn in_unpopulated_ram(&self, addr: u32) -> bool {
+        !self.in_ram(addr)
+            && addr >= RAM_BASE
+            && addr < RAM_BASE.wrapping_add(RAM_WINDOW_SIZE)
+    }
+
     /// Offset of `addr` within RAM, if it is in RAM.
     pub fn ram_offset(&self, addr: u32) -> Option<u32> {
         self.in_ram(addr).then(|| addr - RAM_BASE)
@@ -670,6 +718,10 @@ impl Ip32Bus {
 
     fn in_prom(&self, addr: u32) -> bool {
         addr >= PROM_BASE && addr < PROM_BASE + PROM_SIZE
+    }
+
+    fn in_crime_re(&self, addr: u32) -> bool {
+        addr >= CRIME_RE_BASE && addr < CRIME_RE_BASE + CRIME_RE_SIZE
     }
 
     fn in_crime(&self, addr: u32) -> bool {
@@ -711,7 +763,22 @@ impl Ip32Bus {
         false
     }
 
+    /// Map an address through the low-memory alias, if it falls in it.
+    fn resolve(&self, addr: u32) -> u32 {
+        if addr < self.ram_len() {
+            RAM_BASE.wrapping_add(addr)
+        } else {
+            addr
+        }
+    }
+
     fn read_bytes(&self, addr: u32, n: usize) -> Option<u64> {
+        let addr = self.resolve(addr);
+        // Decoded but not populated: give back a value that cannot pass POST's
+        // address/complement check, so sizing concludes "no SIMM" and moves on.
+        if self.in_unpopulated_ram(addr) {
+            return Some(0);
+        }
         if self.in_ram(addr) {
             let r = self.ram.lock().unwrap();
             let i = (addr - RAM_BASE) as usize;
@@ -739,6 +806,11 @@ impl Ip32Bus {
     }
 
     fn write_bytes(&self, addr: u32, n: usize, val: u64) -> bool {
+        let addr = self.resolve(addr);
+        // Writes into an empty bank are swallowed by the memory controller.
+        if self.in_unpopulated_ram(addr) {
+            return true;
+        }
         if self.in_ram(addr) {
             let mut r = self.ram.lock().unwrap();
             let i = (addr - RAM_BASE) as usize;
@@ -773,6 +845,9 @@ macro_rules! bus_read {
 
 impl BusDevice for Ip32Bus {
     fn read8(&self, addr: u32) -> BusRead8 {
+        if self.in_crime_re(addr) {
+            return BusRead8::ok(self.crime_re.read32(addr & !3).data as u8);
+        }
         if self.in_crime(addr) {
             return BusRead8::ok(self.crime.read32(addr & !3).data as u8);
         }
@@ -797,6 +872,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn read16(&self, addr: u32) -> BusRead16 {
+        if self.in_crime_re(addr) {
+            return BusRead16::ok(self.crime_re.read32(addr & !3).data as u16);
+        }
         if self.in_crime(addr) {
             return BusRead16::ok(self.crime.read32(addr & !3).data as u16);
         }
@@ -816,6 +894,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn read32(&self, addr: u32) -> BusRead32 {
+        if self.in_crime_re(addr) {
+            return self.crime_re.read32(addr);
+        }
         if self.in_crime(addr) {
             return self.crime.read32(addr);
         }
@@ -843,6 +924,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn read64(&self, addr: u32) -> BusRead64 {
+        if self.in_crime_re(addr) {
+            return self.crime_re.read64(addr);
+        }
         if self.in_crime(addr) {
             return self.crime.read64(addr);
         }
@@ -872,6 +956,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write8(&self, addr: u32, val: u8) -> u32 {
+        if self.in_crime_re(addr) {
+            return self.crime_re.write32(addr & !3, val as u32);
+        }
         if self.in_crime(addr) {
             return self.crime.write32(addr & !3, val as u32);
         }
@@ -895,6 +982,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write16(&self, addr: u32, val: u16) -> u32 {
+        if self.in_crime_re(addr) {
+            return self.crime_re.write32(addr & !3, val as u32);
+        }
         if self.in_crime(addr) {
             return self.crime.write32(addr & !3, val as u32);
         }
@@ -914,6 +1004,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write32(&self, addr: u32, val: u32) -> u32 {
+        if self.in_crime_re(addr) {
+            return self.crime_re.write32(addr, val);
+        }
         if self.in_crime(addr) {
             return self.crime.write32(addr, val);
         }
@@ -940,6 +1033,9 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write64(&self, addr: u32, val: u64) -> u32 {
+        if self.in_crime_re(addr) {
+            return self.crime_re.write64(addr, val);
+        }
         if self.in_crime(addr) {
             return self.crime.write64(addr, val);
         }
@@ -964,6 +1060,168 @@ impl BusDevice for Ip32Bus {
         }
         self.note_sizemem(addr, true, val);
         if self.write_bytes(addr, 8, val) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
+    }
+}
+
+// ── Instrumentation ─────────────────────────────────────────────────────────
+//
+// Three things, each chosen because its absence cost real time during
+// bring-up:
+//
+// 1. **Every recorded access carries the PC that issued it.** The very first
+//    run bus-errored on a store to 0x40000000, and it was read as "the PROM is
+//    enumerating PCI" because a header names a PCI constant there. Had the log
+//    said the store came from inside the memory-sizing routine, the real answer
+//    — that RAM is based at 0x40000000 — would have been immediate.
+//
+// 2. **A printf tap.** post1's print routine is a stub that emits nothing, so
+//    a console cannot show POST's narrative. But the format strings are in the
+//    image and the arguments are in registers at the call. Reading them at the
+//    call site recovers the narrative the hardware never prints.
+//
+// 3. **Stall detection that says what the loop touched.** "Stopped at PC X" is
+//    nearly useless; "spun 390k times between PC A and B, reading only
+//    MACE+0x340000" names the missing device immediately.
+
+/// The PC of the instruction currently executing, published by the harness so
+/// devices can attribute accesses. A plain atomic: this is a bring-up harness,
+/// and correlating a store with its code site is worth an atomic store per
+/// instruction.
+#[derive(Default)]
+pub struct PcTap(AtomicU32);
+
+impl PcTap {
+    pub fn set(&self, pc: u32) {
+        self.0.store(pc, Ordering::Relaxed);
+    }
+    pub fn get(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Watches the PC for a loop that is going nowhere.
+///
+/// Keeps the distinct PCs seen in the current window. When the window fills
+/// without the set growing beyond `spread`, the guest is spinning, and the set
+/// is the loop body.
+pub struct StallDetector {
+    window: usize,
+    spread: usize,
+    seen: std::collections::BTreeSet<u32>,
+    count: usize,
+}
+
+impl StallDetector {
+    pub fn new(window: usize, spread: usize) -> Self {
+        Self { window, spread, seen: Default::default(), count: 0 }
+    }
+
+    /// Feed one PC. Returns the loop body once a stall is recognised.
+    pub fn step(&mut self, pc: u32) -> Option<Vec<u32>> {
+        self.seen.insert(pc);
+        self.count += 1;
+        if self.count < self.window {
+            return None;
+        }
+        let stalled = self.seen.len() <= self.spread;
+        let body: Vec<u32> = self.seen.iter().copied().collect();
+        self.seen.clear();
+        self.count = 0;
+        stalled.then_some(body)
+    }
+}
+
+/// Recovers POST's intended messages by reading them at the call site.
+///
+/// The PROM's print routine takes a format string in `a0` and up to three
+/// arguments in `a1`-`a3`, and — in post1 — throws them away. Catching the call
+/// and resolving `a0` against the PROM image gives the message anyway.
+pub struct PrintfTap {
+    /// Address of the routine to watch.
+    pub entry: u32,
+    lines: Mutex<Vec<String>>,
+}
+
+impl PrintfTap {
+    /// post1's print routine: saves its arguments and returns.
+    pub const POST1_PRINTF: u32 = 0xbfc0_4d74;
+
+    pub fn new(entry: u32) -> Self {
+        Self { entry, lines: Mutex::new(Vec::new()) }
+    }
+
+    /// Call when the PC reaches `entry`. `args` are a0..a3.
+    pub fn on_call(&self, prom: &[u8], args: [u64; 4]) {
+        let fmt = read_prom_cstr(prom, args[0] as u32);
+        let Some(fmt) = fmt else { return };
+        self.lines.lock().unwrap().push(format_prom(&fmt, &args[1..]));
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        self.lines.lock().unwrap().clone()
+    }
+}
+
+/// Read a NUL-terminated string out of the PROM image, given a guest address
+/// anywhere in the PROM window. Returns `None` for addresses outside it.
+pub fn read_prom_cstr(prom: &[u8], addr: u32) -> Option<String> {
+    // Accept KSEG0/KSEG1 aliases as well as the bare physical address.
+    let phys = addr & 0x1fff_ffff;
+    if !(PROM_BASE & 0x1fff_ffff..(PROM_BASE & 0x1fff_ffff) + PROM_SIZE).contains(&phys) {
+        return None;
+    }
+    let off = (phys - (PROM_BASE & 0x1fff_ffff)) as usize;
+    let end = prom[off..].iter().position(|&b| b == 0)? + off;
+    if end == off {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&prom[off..end]).to_string())
+}
+
+/// Substitute `%d`/`%x`/`%lx`/`%s` style conversions with the supplied
+/// arguments. Deliberately approximate: the point is to read the message, not
+/// to reimplement printf.
+pub fn format_prom(fmt: &str, args: &[u64]) -> String {
+    let mut out = String::new();
+    let mut it = fmt.chars().peekable();
+    let mut argi = 0usize;
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        // Skip flags, width and length modifiers.
+        let mut spec = String::new();
+        while let Some(&n) = it.peek() {
+            it.next();
+            if n.is_ascii_alphabetic() {
+                spec.push(n);
+                break;
+            }
+        }
+        let a = args.get(argi).copied().unwrap_or(0);
+        match spec.chars().last() {
+            Some('d') | Some('i') => { out.push_str(&format!("{}", a as i64)); argi += 1 }
+            Some('u') => { out.push_str(&format!("{a}")); argi += 1 }
+            Some('x') | Some('X') | Some('p') => { out.push_str(&format!("{a:x}")); argi += 1 }
+            Some('c') => { out.push(a as u8 as char); argi += 1 }
+            Some('s') => { out.push_str("<str>"); argi += 1 }
+            Some('%') => out.push('%'),
+            _ => out.push_str(&format!("%{spec}")),
+        }
+    }
+    out
+}
+
+/// MIPS CP0 Cause.ExcCode, named. An unhandled trap is usually diagnosed
+/// entirely from this plus BadVAddr.
+pub fn exc_name(code: u32) -> &'static str {
+    match code {
+        0 => "Int", 1 => "TLBMod", 2 => "TLBL", 3 => "TLBS", 4 => "AdEL",
+        5 => "AdES", 6 => "IBE", 7 => "DBE", 8 => "Sys", 9 => "Bp",
+        10 => "RI", 11 => "CpU", 12 => "Ov", 13 => "Tr", 15 => "FPE",
+        23 => "WATCH", 31 => "VCED",
+        _ => "?",
     }
 }
 
@@ -1060,7 +1318,7 @@ mod tests {
         let bus = Ip32Bus::new(1 << 20, image);
         assert_eq!(bus.read32(PROM_BASE).data, 0x1000_0011, "reset vector must read back");
         assert_eq!(bus.write32(PROM_BASE, 0), BUS_ERR, "the PROM must reject writes");
-        assert_eq!(bus.unmapped(), vec![(PROM_BASE, true)], "and record the attempt");
+        assert_eq!(bus.unmapped(), vec![(PROM_BASE, true, 0)], "and record the attempt");
     }
 
     /// MACE spaces ISA registers 256 bytes apart with the byte in the last lane
@@ -1148,11 +1406,15 @@ mod bringup {
         None
     }
 
-    /// Run the PROM from reset and report where it goes.
+    /// Run the PROM from reset and require that it reaches post1.
     ///
-    /// Not an assertion about reaching POST — we do not yet know that it can.
-    /// The output *is* the deliverable: which CRIME registers POST depends on,
-    /// and what it reaches for that we have not built.
+    /// sloader sizes memory, copies post1 into RAM and jumps to it. Reaching
+    /// [`POST1_ENTRY`] means every gate before that is satisfied: CRIME's bank
+    /// controls, the UST timer, the low-memory alias, and a memory window that
+    /// absorbs accesses to unpopulated banks instead of bus-erroring.
+    ///
+    /// The printed trace is still the point of the test — it is what makes the
+    /// next gate findable — but the milestone itself is now checked.
     #[test]
     fn trace_the_prom_from_reset() {
         let Some(prom) = prom_image() else { return };
@@ -1165,6 +1427,7 @@ mod bringup {
 
         // 128 MB: a common O2 configuration, and enough that a memory sizing
         // loop has something to find.
+        let bus_prom = prom.clone();
         let bus = Arc::new(Ip32Bus::new(128 << 20, prom));
         let sysad: Arc<dyn crate::traits::BusDevice> = bus.clone();
         let cfg = MipsCpuConfig::indy();
@@ -1176,12 +1439,36 @@ mod bringup {
         let mut max_prom_pc = 0u32;
         const LIMIT: u64 = 50_000_000;
 
+        let printf = PrintfTap::new(PrintfTap::POST1_PRINTF);
+        let mut stall = StallDetector::new(200_000, 24);
+        // A stall inside the exception vectors is an unhandled trap, and the
+        // only useful question then is which one. Capture CP0 at the moment it
+        // is recognised rather than making someone reproduce it by hand.
+        let mut stalls: Vec<(u64, Vec<u32>, u32, u64, u64)> = Vec::new();
+        let prom_for_strings = bus_prom.clone();
+
         while steps < LIMIT {
             let pc = exec.core.pc as u32;
             if pc == POST1_ENTRY {
                 reached_post1 = true;
                 break;
             }
+            // Publish the PC so devices can attribute the accesses this
+            // instruction is about to make.
+            bus.pc.set(pc);
+
+            if pc == printf.entry {
+                let a = &exec.core.gpr;
+                printf.on_call(&prom_for_strings, [a[4], a[5], a[6], a[7]]);
+            }
+
+            if let Some(body) = stall.step(pc) {
+                if stalls.len() < 8 {
+                    let cause = exec.core.cp0_cause as u32;
+                    stalls.push((steps, body, cause, exec.core.cp0_epc, exec.core.cp0_badvaddr));
+                }
+            }
+
             if (0xbfc0_0000..0xbfc8_0000).contains(&pc) && pc > max_prom_pc {
                 max_prom_pc = pc;
             }
@@ -1193,6 +1480,32 @@ mod bringup {
         eprintln!("ip32: stopped after {steps} steps at PC 0x{pc:08x}{}",
                   if reached_post1 { "  <-- post1 entry" } else { "" });
         eprintln!("ip32: furthest PC seen inside the PROM: 0x{max_prom_pc:08x}");
+
+        let msgs = printf.lines();
+        eprintln!("ip32: ===== POST messages, recovered at the call site ({}) =====", msgs.len());
+        for m in msgs.iter().take(40) {
+            eprint!("   | {m}");
+            if !m.ends_with('\n') { eprintln!(); }
+        }
+        eprintln!("ip32: ===== end POST messages =====");
+
+        assert!(
+            reached_post1,
+            "sloader did not reach post1 at 0x{POST1_ENTRY:08x}; it stopped at \
+             0x{:08x} after {steps} steps. The trace above says what it wanted.",
+            exec.core.pc as u32,
+        );
+        assert!(bus.unmapped().is_empty(), "unmapped accesses: {:x?}", bus.unmapped());
+
+        eprintln!("ip32: stalls detected: {}", stalls.len());
+        for (at, body, cause, epc, bad) in stalls.iter().take(3) {
+            let lo = body.first().copied().unwrap_or(0);
+            let hi = body.last().copied().unwrap_or(0);
+            let exc = (cause >> 2) & 0x1f;
+            eprintln!("   after {at} steps: {} distinct PCs in 0x{lo:08x}..0x{hi:08x}", body.len());
+            eprintln!("      CP0 Cause=0x{cause:08x} ExcCode={exc} ({}) EPC=0x{epc:08x} BadVAddr=0x{bad:08x}",
+                      exc_name(exc));
+        }
 
         let console = bus.com0.output();
         eprintln!("ip32: ===== PROM console output ({} bytes) =====", console.len());
@@ -1209,7 +1522,7 @@ mod bringup {
 
         let sm = bus.sizemem_trace();
         eprintln!("ip32: SizeMEM probe traffic ({} events):", sm.len());
-        for (a, w, v) in sm.iter().take(24) {
+        for (a, w, v, pc) in sm.iter().take(24) {
             // An access inside the PROM window is the firmware reading its own
             // expected-value table, not a probe of RAM. Only RAM traffic here
             // is evidence about memory.
@@ -1218,7 +1531,8 @@ mod bringup {
             } else {
                 "RAM"
             };
-            eprintln!("   0x{:08x} {} 0x{:016x}  ({})", a, if *w { "W" } else { "R" }, v, where_);
+            eprintln!("   0x{:08x} {} 0x{:016x}  ({})  from PC 0x{:08x}",
+                      a, if *w { "W" } else { "R" }, v, where_, pc);
         }
 
         eprintln!("ip32: CRIME writes in order:");
@@ -1259,8 +1573,8 @@ mod bringup {
 
         let un = bus.unmapped();
         eprintln!("ip32: unmapped accesses ({}):", un.len());
-        for (a, w) in un.iter().take(24) {
-            eprintln!("   0x{:08x} {}", a, if *w { "W" } else { "R" });
+        for (a, w, pc) in un.iter().take(24) {
+            eprintln!("   0x{:08x} {}  from PC 0x{:08x}", a, if *w { "W" } else { "R" }, pc);
         }
     }
 }
