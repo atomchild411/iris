@@ -115,6 +115,18 @@ impl ScsiDisk {
         Ok(Self { file: Mutex::new(file), blocks })
     }
 
+    fn write_blocks(&self, lba: u64, data: &[u8]) -> bool {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = self.file.lock().unwrap();
+        // Refuse to write past the end rather than growing the image: a
+        // disk that silently gets bigger is not a disk.
+        let end = lba + (data.len() / BLOCK_SIZE) as u64;
+        if end > self.blocks {
+            return false;
+        }
+        f.seek(SeekFrom::Start(lba * BLOCK_SIZE as u64)).is_ok() && f.write_all(data).is_ok()
+    }
+
     fn read_blocks(&self, lba: u64, count: usize) -> Vec<u8> {
         use std::io::{Read, Seek, SeekFrom};
         let mut buf = vec![0u8; count * BLOCK_SIZE];
@@ -135,7 +147,14 @@ pub const QOUTFIFO_EMPTY: u8 = 0xff;
 /// Offsets within the 32-byte SCB that are known. The rest are still unread.
 pub mod scb {
     pub const CONTROL: usize = 0;
-    pub const TCL: usize = 1;
+    /// The length of the CDB, in bytes.
+    ///
+    /// This was first read as a target/lun byte, on the strength of the
+    /// aic7xxx register named `SCB_TCL` sitting at the same offset. It is
+    /// not: it holds `0x06` for INQUIRY, TEST UNIT READY, MODE SENSE and
+    /// START STOP UNIT — every six-byte command — and `0x0a` for READ(10).
+    /// Header names again, observed behaviour again, and the behaviour wins.
+    pub const CDB_LEN: usize = 1;
     /// Bus address of the scatter-gather list.
     pub const SG_PTR: usize = 4;
     /// Bus address of the CDB.
@@ -378,6 +397,27 @@ impl Aic7880 {
         }
     }
 
+    /// Collect `want` bytes out of the buffers the driver listed, for a
+    /// command that sends data to the device.
+    fn gather(&self, sg_ptr: u32, want: usize) -> (Vec<u8>, Vec<(u32, u32)>) {
+        let mut entries = Vec::new();
+        let mut out = Vec::with_capacity(want);
+        for i in 0..SG_MAX {
+            if out.len() >= want {
+                break;
+            }
+            let a = self.dma_read32(sg_ptr + i as u32 * 8);
+            let l = self.dma_read32(sg_ptr + i as u32 * 8 + 4) & SG_LEN_MASK;
+            if a == 0 || l == 0 {
+                break;
+            }
+            entries.push((a, l));
+            let n = (l as usize).min(want - out.len());
+            out.extend(self.dma_read_bytes(a, n));
+        }
+        (out, entries)
+    }
+
     /// Copy data back into the buffers the driver listed. Returns how much
     /// was placed, and the list as read, for the trace.
     fn scatter(&self, sg_ptr: u32, data: &[u8]) -> (usize, Vec<(u32, u32)>) {
@@ -402,6 +442,36 @@ impl Aic7880 {
         (done, entries)
     }
 
+    /// How many bytes a command sends *to* the device, if it is one that
+    /// does. Everything else either receives data or carries none.
+    fn data_out_len(cdb: &[u8]) -> Option<usize> {
+        match cdb[0] {
+            // WRITE(6): a zero count means 256 blocks, as with READ(6).
+            0x0a => Some(if cdb[4] == 0 { 256 } else { cdb[4] as usize } * BLOCK_SIZE),
+            // WRITE(10).
+            0x2a => Some((((cdb[7] as usize) << 8) | cdb[8] as usize) * BLOCK_SIZE),
+            _ => None,
+        }
+    }
+
+    /// Run a command that carries data to the disk.
+    fn execute_write(&self, cdb: &[u8], data: &[u8]) -> u8 {
+        const GOOD: u8 = 0x00;
+        const CHECK_CONDITION: u8 = 0x02;
+        let disk = self.disk.lock().unwrap();
+        let Some(disk) = disk.as_ref() else {
+            return CHECK_CONDITION;
+        };
+        let lba = match cdb[0] {
+            0x0a => (((cdb[1] & 0x1f) as u64) << 16) | ((cdb[2] as u64) << 8) | cdb[3] as u64,
+            _ => {
+                ((cdb[2] as u64) << 24) | ((cdb[3] as u64) << 16)
+                    | ((cdb[4] as u64) << 8) | cdb[5] as u64
+            }
+        };
+        if disk.write_blocks(lba, data) { GOOD } else { CHECK_CONDITION }
+    }
+
     /// Fetch a queued command and run it.
     fn submit(&self, st: &mut State, tag: u8) {
         let array = Self::scratch_le32(st, sram::SCB_ARRAY);
@@ -419,30 +489,48 @@ impl Aic7880 {
             scb[scb::CMD_PTR], scb[scb::CMD_PTR + 1],
             scb[scb::CMD_PTR + 2], scb[scb::CMD_PTR + 3],
         ]);
-        let op = self.dma_read8(cmd_ptr);
-        let cdb = self.dma_read_bytes(cmd_ptr, Self::cdb_len(op));
+        // The SCB says how long the CDB is; fall back on the opcode group if
+        // it says something impossible.
+        let len = scb[scb::CDB_LEN] as usize;
+        let len = if (6..=16).contains(&len) {
+            len
+        } else {
+            Self::cdb_len(self.dma_read8(cmd_ptr))
+        };
+        let cdb = self.dma_read_bytes(cmd_ptr, len);
 
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
         Self::note(st, format!(
-            "tag {tag}: SCB at 0x{scb_addr:08x} control 0x{:02x} tcl 0x{:02x}",
-            scb[scb::CONTROL], scb[scb::TCL]));
+            "tag {tag}: SCB at 0x{scb_addr:08x} control 0x{:02x} cdblen {}",
+            scb[scb::CONTROL], len));
         Self::note(st, format!("   CDB {}", hex(&cdb)));
+        Self::note(st, format!("   SCB {}", hex(&scb)));
         let sg_ptr = u32::from_be_bytes([
             scb[scb::SG_PTR], scb[scb::SG_PTR + 1],
             scb[scb::SG_PTR + 2], scb[scb::SG_PTR + 3],
         ]);
-        let (data, status) = self.execute(&cdb);
-        let (sent, sg) = if data.is_empty() {
-            (0, Vec::new())
-        } else {
-            self.scatter(sg_ptr, &data)
+        let (status, moved, sg, dir) = match Self::data_out_len(&cdb) {
+            Some(want) => {
+                let (data, sg) = self.gather(sg_ptr, want);
+                let n = data.len();
+                (self.execute_write(&cdb, &data), n, sg, "out of")
+            }
+            None => {
+                let (data, status) = self.execute(&cdb);
+                let (sent, sg) = if data.is_empty() {
+                    (0, Vec::new())
+                } else {
+                    self.scatter(sg_ptr, &data)
+                };
+                (status, sent, sg, "into")
+            }
         };
         let sgtxt: Vec<String> = sg.iter()
             .map(|(a, l)| format!("0x{a:08x}+{l}")).collect();
         // Hand the status back where the driver left room for it.
         self.dma_write8(scb_addr + scb::TARGET_STATUS as u32, status);
         Self::note(st, format!(
-            "   -> status {status}, {} bytes into [{}]", sent, sgtxt.join(" ")));
+            "   -> status {status}, {moved} bytes {dir} [{}]", sgtxt.join(" ")));
         st.executed.push((tag, scb_addr, cdb));
 
         self.complete(st, tag);
@@ -704,6 +792,65 @@ mod tests {
         drop(m);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8 & intstat::CMDCMPLT, intstat::CMDCMPLT,
                    "and the driver is told to look");
+    }
+
+    /// A write goes the other way through the same scatter-gather list, and
+    /// must reach the image rather than growing it.
+    #[test]
+    fn a_write_reaches_the_disk_and_reads_back() {
+        let ram = std::sync::Arc::new(std::sync::Mutex::new(vec![0u8; 1 << 20]));
+        let c = Aic7880::new(ram.clone());
+        let img = std::env::temp_dir().join("iris-aic7880-write.img");
+        std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
+        c.attach_disk(&img).expect("attach");
+
+        let base = crate::ip32::RAM_BASE;
+        let (array, scb, cdb, sg, buf, qout) =
+            (0x1000u32, 0x2000u32, 0x2100u32, 0x2200u32, 0x3000u32, 0x4000u32);
+        let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
+        {
+            let mut m = ram.lock().unwrap();
+            let put32 = |m: &mut Vec<u8>, at: u32, v: u32| {
+                m[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
+            };
+            put32(&mut m, array + 4, base + scb);
+            put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
+            put32(&mut m, scb + scb::CMD_PTR as u32, base + cdb);
+            m[(scb + scb::CDB_LEN as u32) as usize] = 10;
+            // WRITE(10), one block at LBA 5.
+            m[cdb as usize] = 0x2a;
+            m[cdb as usize + 5] = 5;
+            m[cdb as usize + 8] = 1;
+            put32(&mut m, sg, base + buf);
+            put32(&mut m, sg + 4, BLOCK_SIZE as u32);
+            m[buf as usize..buf as usize + BLOCK_SIZE].copy_from_slice(&pattern);
+        }
+        for (i, b) in (base + array).to_le_bytes().iter().enumerate() {
+            c.write(sram::SCB_ARRAY + i as u32, *b as u32, 1);
+        }
+        for (i, b) in (base + qout).to_le_bytes().iter().enumerate() {
+            c.write(sram::QOUTFIFO + i as u32, *b as u32, 1);
+        }
+        c.write(reg::QINFIFO, 1, 1);
+
+        assert_eq!(ram.lock().unwrap()[(scb + scb::TARGET_STATUS as u32) as usize], 0,
+                   "the write must report success");
+        let on_disk = std::fs::read(&img).expect("read back");
+        assert_eq!(&on_disk[5 * BLOCK_SIZE..6 * BLOCK_SIZE], &pattern[..],
+                   "the block must land at the address the CDB named");
+        assert!(on_disk[4 * BLOCK_SIZE..5 * BLOCK_SIZE].iter().all(|b| *b == 0),
+                "and must not disturb its neighbour");
+        assert_eq!(on_disk.len(), 64 * BLOCK_SIZE, "the image must not grow");
+    }
+
+    /// Writing past the end is an error, not a bigger disk.
+    #[test]
+    fn a_write_past_the_end_fails_rather_than_growing_the_image() {
+        let img = std::env::temp_dir().join("iris-aic7880-grow.img");
+        std::fs::write(&img, vec![0u8; 8 * BLOCK_SIZE]).expect("test image");
+        let d = ScsiDisk::open(&img).expect("open");
+        assert!(!d.write_blocks(7, &vec![0xab; 4 * BLOCK_SIZE]), "refused");
+        assert_eq!(std::fs::metadata(&img).unwrap().len(), (8 * BLOCK_SIZE) as u64);
     }
 
     /// Memory answers both at its own base and in a low alias, and the driver

@@ -967,6 +967,52 @@ Scatter-gather entries are `(bus address, length)` pairs, the length masked to
 24 bits. CDB length is taken from the opcode group rather than from a field,
 which is how SCSI defines it and one less piece of layout to guess at.
 
+### The target byte: it was not a target byte
+
+Reported earlier as "byte 1 is target/lun, it varies per command". Both halves
+of that were wrong, and two controlled experiments say so.
+
+**It is the CDB length.** Correlating it against the opcode:
+
+```text
+byte1 0x06  ->  0x00 TEST UNIT READY, 0x12 INQUIRY,
+                0x1a MODE SENSE, 0x1b START STOP UNIT     all six-byte CDBs
+byte1 0x0a  ->  0x28 READ(10)                             a ten-byte CDB
+```
+
+Six and ten. The reason it was read as a target is that the aic7xxx register
+named `SCB_TCL` sits at that offset — trusting a header name over observed
+behaviour, for the fourth time in this project.
+
+**And the target is not in the SCB at all.** Booting the same disk as
+`dksc(0,1,0)` and as `dksc(0,3,0)` produces byte-identical SCBs, and identical
+writes to the chip's whole SCSI block (`0x00..0x1f`):
+
+```text
+target 1:  05=00 10=00 11=00 00=01 00=00 0c=20 ... 01=12 02=27 11=a4 01=80
+target 3:  05=00 10=00 11=00 00=01 00=00 0c=20 ... 01=12 02=27 11=a4 01=80
+```
+
+So where the target is conveyed is **still unknown**, and these runs cannot
+answer it: the boot fails before any target-specific I/O happens, so every
+command seen is from one bus scan that does not depend on the argument. The
+experiment to run is one that gets far enough to address a specific disk —
+which needs a volume header the PROM will accept.
+
+Until then one disk answers for every address, which is why the PROM believes
+it has found several.
+
+### The write path
+
+`WRITE(6)` and `WRITE(10)` go the other way through the same scatter-gather
+list: `gather` collects the bytes out of the buffers the driver listed and
+`execute_write` puts them on the image. A write past the end of the image is
+refused rather than growing it — a disk that silently gets bigger is not a
+disk — and that refusal is a test.
+
+The CDB length now comes from the SCB rather than from the opcode group, with
+the opcode as a fallback if the SCB says something impossible.
+
 ### What is left
 
 - The PROM reads the volume header but has not yet been given a bootable one.
