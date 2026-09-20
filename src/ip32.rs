@@ -2936,6 +2936,17 @@ mod bringup {
         let mut path_to_console: Vec<u32> = Vec::new();
         let mut fed = false;
         let mut fed_at = 0u64;
+        // (step, vector, ExcCode, EPC, BadVAddr)
+        let mut exceptions: Vec<(u64, u32, u32, u64, u64)> = Vec::new();
+        let mut last_exc_pc = 0u32;
+        // A loaded kernel lives in kseg0 well above the PROM's own use of it.
+        // Track when we get there and what the last thing before leaving was.
+        let mut kernel_entered = 0u64;
+        let mut kernel_max = 0u32;
+        let mut kernel_exit: Vec<u32> = Vec::new();
+        let mut kernel_exit_at = 0u64;
+        let mut kernel_first = 0u32;
+        let mut kernel_trace: Vec<u32> = Vec::new();
         // By default, drive the machine the way a person would: take the
         // menu into the command monitor and ask it what it thinks it is.
         // That turns the trace into an end-to-end check -- the answer comes
@@ -2992,6 +3003,43 @@ mod bringup {
             }
             if reached_post1 && (POST1_ENTRY..POST1_ENTRY + 0x8000).contains(&pc) && pc > max_post1_pc {
                 max_post1_pc = pc;
+            }
+            if (0x8006_0000..0x8100_0000).contains(&pc) {
+                if kernel_entered == 0 {
+                    kernel_entered = steps;
+                    kernel_first = pc;
+                }
+                // The opening moves, which is where a kernel that runs away
+                // decides to.
+                if kernel_trace.len() < 96 && kernel_trace.last() != Some(&pc) {
+                    kernel_trace.push(pc);
+                }
+                if pc > kernel_max {
+                    kernel_max = pc;
+                }
+            } else if kernel_entered != 0 && kernel_exit.is_empty() {
+                // Left the kernel for PROM or reset space: this is where it
+                // stopped being a kernel, and the ring says how it got there.
+                kernel_exit = ring_path(&ring, ring_at);
+                kernel_exit_at = steps;
+            }
+            // Exception vectors. Landing on one is the single most
+            // informative event in a kernel bring-up, and without this the
+            // only symptom is "it restarted".
+            if matches!(pc, 0x8000_0000 | 0x8000_0080 | 0x8000_0100 | 0x8000_0180
+                            | 0xa000_0000 | 0xa000_0080 | 0xa000_0100 | 0xa000_0180
+                            | 0xbfc0_0200 | 0xbfc0_0280 | 0xbfc0_0300 | 0xbfc0_0380
+                            | 0xbfc0_0400 | 0xbfc0_0480)
+                && last_exc_pc != pc
+            {
+                let cause = exec.core.cp0_cause as u32;
+                let exc = (cause >> 2) & 0x1f;
+                if exceptions.len() < 24 {
+                    exceptions.push((steps, pc, exc, exec.core.cp0_epc, exec.core.cp0_badvaddr));
+                }
+                last_exc_pc = pc;
+            } else if pc != last_exc_pc {
+                last_exc_pc = 0;
             }
             // Publish the PC so devices can attribute the accesses this
             // instruction is about to make.
@@ -3247,6 +3295,28 @@ mod bringup {
                 }
             }
         }
+        if kernel_entered != 0 {
+            eprintln!("ip32: kernel entered at step {kernel_entered} at 0x{kernel_first:08x}, furthest PC 0x{kernel_max:08x}");
+            eprintln!("   its first {} PCs:", kernel_trace.len());
+            for chunk in kernel_trace.chunks(8) {
+                let line: Vec<String> = chunk.iter().map(|p| format!("{p:08x}")).collect();
+                eprintln!("     {}", line.join(" "));
+            }
+            if !kernel_exit.is_empty() {
+                eprintln!("   left it at step {kernel_exit_at}; last distinct PCs:");
+                for chunk in kernel_exit.iter().rev().take(32).rev().collect::<Vec<_>>().chunks(8) {
+                    let line: Vec<String> = chunk.iter().map(|p| format!("{p:08x}")).collect();
+                    eprintln!("     {}", line.join(" "));
+                }
+            } else {
+                eprintln!("   and never left it");
+            }
+        }
+        eprintln!("ip32: exceptions taken: {}", exceptions.len());
+        for (at, vec, exc, epc, bad) in exceptions.iter().take(12) {
+            eprintln!("   @{at} vector 0x{vec:08x} {} EPC 0x{epc:08x} BadVAddr 0x{bad:08x}",
+                      exc_name(*exc));
+        }
         eprintln!("ip32: stalls detected: {}", stalls.len());
         for (at, body, cause, epc, bad, gpr) in stalls.iter() {
             let lo = body.first().copied().unwrap_or(0);
@@ -3481,7 +3551,7 @@ mod bringup {
             eprintln!("ip32: SCSI controller: {} bytes of sequencer program downloaded",
                       scsi.seqram_len());
             eprintln!("   sequencer paused/restarted {} times", scsi.pauses());
-            for n in scsi.notes().iter().rev().take(200).rev() {
+            for n in scsi.notes().iter() {
                 eprintln!("   {n}");
             }
             let ex = scsi.executed();
