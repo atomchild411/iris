@@ -142,6 +142,11 @@ pub const MACE_RTC_SIZE: u32 = 0x0001_0000;
 
 /// sloader's serial prompt: "SL", 9600 baud, 8 data bits, even parity. Seeing
 /// this means POST has completed and the PROM is waiting on console input.
+/// How often the harness looks at the CP0 timer. Every instruction would be
+/// honest and far too slow; this is fine enough that a kernel's clock ticks
+/// smoothly and coarse enough to cost nothing.
+pub const TIMER_POLL_STEPS: u64 = 256;
+
 pub const SLOADER_PROMPT: &str = "SL-9600-8E>";
 
 /// Where `post1` is loaded and entered. Reaching this PC is the milestone.
@@ -3178,6 +3183,29 @@ mod bringup {
             }
             exec.step_int();
             steps += 1;
+
+            // Deliver the CP0 timer interrupt. IRIS normally arms this as an
+            // hptimer one-shot when the guest writes Compare, on a thread
+            // this harness does not run -- so without this no time passes at
+            // all inside a guest kernel, and NetBSD sits forever "waiting 2
+            // seconds for devices to settle" with its clock stopped.
+            if steps % TIMER_POLL_STEPS == 0 {
+                let compare = exec.core.cp0_compare as u32;
+                let count = exec.core.count_now();
+                // Count wraps; treat it as fired when it is within a window
+                // past Compare, which is what a real edge would look like.
+                let fired = count.wrapping_sub(compare) < 0x4000_0000;
+                let bits = &exec.core.hot.interrupts;
+                let cur = bits.load(std::sync::atomic::Ordering::Relaxed);
+                let want = if compare != 0 && fired {
+                    cur | crate::mips_core::CAUSE_IP7 as u64
+                } else {
+                    cur & !(crate::mips_core::CAUSE_IP7 as u64)
+                };
+                if want != cur {
+                    bits.store(want, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             if arm_call.is_none() && exec.core.gpr[31] as u32 == pc.wrapping_add(8) {
                 arm_call = Some((pc.wrapping_add(8), steps, 1));
             }

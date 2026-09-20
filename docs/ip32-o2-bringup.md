@@ -1077,6 +1077,87 @@ The PROM also says `not enough space` further down its own output. The
 likeliest explanation is a limit on where or how much it will load, and the
 next step is to find it rather than assume it.
 
+## NetBSD 11 boots; the remaining gate is one loader bug
+
+2026-09-20.
+
+### The disk, built with the guest that already had the tools
+
+`sgivol -i` on a 4 GB image lays down an SGI volume header with partition 0 as
+BSD and partition 8 as the header itself; `sgivol -w boot /usr/mdec/ip3xboot`
+installs NetBSD's own sgimips bootloader. `newfs`, then base/etc and the IP3x
+kernel out of `nbsd11-sets.iso`. All of it done inside the working NetBSD 11
+Indy guest, which already has `sgivol`, `newfs` and the sets — far less
+error-prone than reimplementing FFS on the host.
+
+### It boots
+
+```text
+NetBSD/sgimips 11.0 Bootstrap, Revision 1.5
+NetBSD 11.0 (GENERIC32_IP3x) #0
+total memory = 127 MB
+mainbus0 (root): SGI-IP32 [SGI, 6], 1 processor
+cpu0: MIPS R5000 CPU (0x2321) Rev. 2.1 with built-in FPU
+com0: console
+macekbc0 at mace0 offset 0x320000: PS2 controller
+mcclock0 at mace0 offset 0x3a0000
+mec0: Ethernet address 08:00:69:12:34:56
+ahc0 at pci0 dev 1 function 0: Adaptec aic7880 Ultra SCSI adapter
+ahc0: aic7880: Ultra Single Channel A, SCSI Id=7, 16/253 SCBs
+scsibus0 at ahc0: 8 targets, 8 luns per target
+```
+
+The Ethernet address is the one in the DS2502, read this time by the kernel's
+own driver rather than the PROM's.
+
+Two fixes it needed:
+
+- **The PCI enable bit.** MACE's config mechanism does not insist on it: the
+  PROM sets it (`0x80000800`), NetBSD's driver does not (`0x00000800`).
+  Requiring it made the whole bus invisible to the kernel, which attached
+  `pci0` with nothing on it.
+- **A timer interrupt.** IRIS normally arms Count==Compare as an hptimer
+  one-shot on a thread this harness does not run, so no time passed inside the
+  guest at all — NetBSD sat forever at "waiting 2 seconds for devices to
+  settle" with its clock stopped at 1.0000030. The harness now polls
+  Count against Compare every [`TIMER_POLL_STEPS`] and raises IP7.
+
+### Two drivers, two submission paths
+
+With time running, NetBSD probes the bus and times out, and the register
+histogram says why: it writes each SCB **through the register window**
+(`0xa0`..`0xbf`, sixteen times each) and then hands over a tag. The PROM's
+sequencer program fetches SCBs from host memory instead and is handed only a
+tag. Same chip, same registers, different contract — because the contract
+belongs to the downloaded program, which is exactly the trade option 2 was
+chosen with.
+
+The device now records which path a driver used rather than assuming, and the
+on-chip layout is captured for decoding.
+
+### The loader bug that gates everything else
+
+A 54 KB bootloader loads perfectly. A 340 KB `sashARCS` and an 8 MB kernel do
+not: the PROM prints correct sizes and an entry point, jumps, and executes
+whatever was already in memory. For `sashARCS` the entry at `0x87fa5fa0`
+holds a sparse repeating structure, not code.
+
+The reads themselves look healthy — multi-block, with proper scatter-gather:
+
+```text
+CDB 28 00 00 00 92 15 00 00 5f 00     95 blocks
+  -> status 0, 48640 bytes into [0x01076970+1680 0x01077000+4096 ... 0x01082000+1904]
+```
+
+but only ten of them for a file of 665 blocks, and none covering the entry
+point's neighbourhood. So the data that *is* transferred lands correctly and
+most of the file is never asked for. That is the next thing to find, and it
+gates IRIX as well as booting a kernel without the bootloader.
+
+Worth noting: NetBSD's bootloader loads the 8 MB kernel through the same PROM
+without trouble, so the fault is in the PROM's own loader path rather than in
+the disk, the controller or the scatter-gather.
+
 ### What is left
 
 - The PROM reads the volume header but has not yet been given a bootable one.
