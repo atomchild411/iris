@@ -1592,7 +1592,13 @@ impl BusDevice for Stub {
 /// worth more than the lookup.
 pub struct Ip32Bus {
     ram: std::sync::Arc<Mutex<Vec<u8>>>,
-    prom: Vec<u8>,
+    /// The flash. Writable, because an O2 keeps its environment variables in
+    /// it -- there is no separate NVRAM chip -- and the installer saves
+    /// settings there. The user's PROM file is never touched: this is a copy.
+    prom: Mutex<Vec<u8>>,
+    /// Writes into the flash, so a command protocol would be visible rather
+    /// than silently corrupting the image.
+    prom_writes: Mutex<Vec<(u32, u8)>>,
     pub crime: Crime,
     pub mace: Stub,
     pub crime_re: Stub,
@@ -1636,7 +1642,8 @@ impl Ip32Bus {
         let ust = std::sync::Arc::new(MaceUst::new());
         let bus = Self {
             ram: ram.clone(),
-            prom,
+            prom: Mutex::new(prom),
+            prom_writes: Mutex::new(Vec::new()),
             crime: Crime::new(ust.clone()),
             mace: Stub::new("mace"),
             crime_re: Stub::new("crime-re"),
@@ -1691,6 +1698,25 @@ impl Ip32Bus {
                 match scsi.attach_disk(std::path::Path::new(&path)) {
                     Ok(blocks) => eprintln!("ip32: SCSI disk {path}: {blocks} blocks"),
                     Err(e) => eprintln!("ip32: SCSI disk {path}: {e}"),
+                }
+            }
+            // IRIS_IP32_DISKS=id=path,id=path for more than one. An install
+            // needs the media on one id and the disk being installed to on
+            // another, so a single-disk machine cannot do it at all.
+            if let Ok(spec) = std::env::var("IRIS_IP32_DISKS") {
+                for entry in spec.split(',') {
+                    let Some((id, path)) = entry.split_once('=') else { continue };
+                    let Ok(id) = id.trim().parse::<u8>() else { continue };
+                    // A trailing ":cd" says the medium is a CD-ROM, which
+                    // the PROM's install menu insists on seeing.
+                    let (path, cdrom) = match path.trim().strip_suffix(":cd") {
+                        Some(p) => (p, true),
+                        None => (path.trim(), false),
+                    };
+                    match scsi.attach_at(id, std::path::Path::new(path), cdrom) {
+                        Ok(b) => eprintln!("ip32: SCSI id {id}: {path} ({b} blocks)"),
+                        Err(e) => eprintln!("ip32: SCSI id {id}: {path}: {e}"),
+                    }
                 }
             }
             *bus.scsi.lock().unwrap() = Some(scsi);
@@ -1760,6 +1786,11 @@ impl Ip32Bus {
     }
 
     /// The watch log, in order.
+    /// Everything written into the flash, in order.
+    pub fn prom_writes(&self) -> Vec<(u32, u8)> {
+        self.prom_writes.lock().unwrap().clone()
+    }
+
     pub fn watched(&self) -> Vec<(u32, bool, u64, u32, u64)> {
         self.watch_log.lock().unwrap().clone()
     }
@@ -1946,13 +1977,14 @@ impl Ip32Bus {
             return Some(v);
         }
         if self.in_prom(addr) {
+            let p = self.prom.lock().unwrap();
             let i = (addr - PROM_BASE) as usize;
-            if i + n > self.prom.len() {
+            if i + n > p.len() {
                 return None;
             }
             let mut v = 0u64;
             for k in 0..n {
-                v = (v << 8) | self.prom[i + k] as u64;
+                v = (v << 8) | p[i + k] as u64;
             }
             return Some(v);
         }
@@ -1980,7 +2012,25 @@ impl Ip32Bus {
             }
             return true;
         }
-        // The PROM is read-only; a write to it is a real finding, not a no-op.
+        if self.in_prom(addr) {
+            let mut p = self.prom.lock().unwrap();
+            let i = (addr - PROM_BASE) as usize;
+            if i + n > p.len() {
+                return false;
+            }
+            {
+                let mut log = self.prom_writes.lock().unwrap();
+                for k in 0..n {
+                    if log.len() < 512 {
+                        log.push((addr + k as u32, (val >> (8 * (n - 1 - k))) as u8));
+                    }
+                }
+            }
+            for k in 0..n {
+                p[i + k] = (val >> (8 * (n - 1 - k))) as u8;
+            }
+            return true;
+        }
         false
     }
 }
@@ -2609,13 +2659,25 @@ mod tests {
     }
 
     #[test]
-    fn the_prom_is_readable_and_not_writable() {
+    /// The flash is readable and, deliberately, writable.
+    ///
+    /// This asserted the opposite until an install failed on it: an O2 has no
+    /// separate NVRAM chip and keeps its environment variables in the flash,
+    /// so `2) Install System Software` bus-errors saving its settings if the
+    /// region rejects writes. The copy in memory is what changes; the image
+    /// the caller handed us is theirs.
+    fn the_flash_is_readable_and_writable() {
         let mut image = vec![0u8; PROM_SIZE as usize];
         image[..4].copy_from_slice(&0x1000_0011u32.to_be_bytes());
         let bus = Ip32Bus::new(1 << 20, image);
         assert_eq!(bus.read32(PROM_BASE).data, 0x1000_0011, "reset vector must read back");
-        assert_eq!(bus.write32(PROM_BASE, 0), BUS_ERR, "the PROM must reject writes");
-        assert_eq!(bus.unmapped(), vec![(PROM_BASE, true, 0)], "and record the attempt");
+
+        // The environment section, which is what firmware actually writes.
+        let env = PROM_BASE + 0x4000;
+        assert_eq!(bus.write32(env, 0xcafe_f00d), BUS_OK, "the flash must accept writes");
+        assert_eq!(bus.read32(env).data, 0xcafe_f00d, "and read back what was written");
+        assert!(bus.unmapped().is_empty(), "a flash write is not an unmapped access");
+        assert_eq!(bus.prom_writes().len(), 4, "and is recorded, byte by byte");
     }
 
     /// MACE spaces ISA registers 256 bytes apart with the byte in the last lane
@@ -3783,6 +3845,15 @@ mod bringup {
         let (pr, pw) = bus.pci_view.counts();
         eprintln!("ip32: PCI native-view accesses: {pr} reads, {pw} writes");
 
+        {
+            let pw = bus.prom_writes();
+            if !pw.is_empty() {
+                eprintln!("ip32: {} write(s) into the flash, first few:", pw.len());
+                for (a, v) in pw.iter().take(12) {
+                    eprintln!("   0x{a:08x} <- 0x{v:02x}");
+                }
+            }
+        }
         let un = bus.unmapped();
         eprintln!("ip32: unmapped accesses ({}):", un.len());
         for (a, w, pc) in un.iter().take(24) {
