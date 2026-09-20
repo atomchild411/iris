@@ -103,9 +103,34 @@ Open, and the next thing to work on. What is known:
   Whatever the real semantics are, they cannot be "scribble on the data array
   and leave the tags alone".
 
-So the next step is to establish what state `Index_Store_Data` leaves a line
-in, and that wants observation — a watch on the L2 line the test uses, across
-the store and the read-back — rather than another guess at semantics.
+The apparent *regression* from implementing `Index_Store_Data` was a
+misreading. The PROM does not hang: it reaches a deliberate dead stop.
+
+```
+bfc012cc: beq fp, zero, 5   -> bfc012e4    ; no continuation registered?
+bfc012e4: beq zero, zero,-1 -> bfc012e4    ; then spin here forever
+```
+
+`fp` is zero, so it takes the second branch. This is the PROM's panic path —
+jump to a registered continuation, or halt. The truncated failure message is
+just output unflushed when the run is killed; the message repeats five times
+across retries before the PROM gives up.
+
+A physical-address watch on `0x20000000` (`IRIS_IP28_WATCH`) records **no
+accesses at all**, so the address in the failure text is a label for the region
+under test, not something the test reached. It fails before touching memory.
+
+CP0 `Config` was then found to be presented in R4000 format, which an R10000
+PROM reads as "primary caches minimal, secondary cache size zero" — see below.
+Fixing the layout did not clear the gate either; sweeping the 3-bit `SS` field
+across 0..3 fails at every value. (An apparent pass at `SS=3` was a timing
+artefact of too short a run. It is recorded here because it was briefly
+believed.)
+
+**Next step**: stop inferring and use the debugger. Put a breakpoint on
+`0xbfc012cc` — the give-up decision — and read the stack there. The diagnostic's
+own return addresses should be on it, which names the test routine directly
+instead of guessing at its mechanism from op traces.
 
 ## The CPU model
 
@@ -132,6 +157,11 @@ from shape. It used to be inferred from `IC_WAYS == 2`, which held only while
 ## Open questions
 
 - `Index_Store_Data` semantics (above) — the live blocker.
+- The CP0 `Config` `SS` (secondary size) encoding. The layout is from NetBSD's
+  `MIPS4_CONFIG_*`; the other fields are `4096 << field`, but `SS` is not
+  decoded anywhere to hand, so its base is unknown. `IRIS_IP28_SS` overrides it
+  for sweeping. Pin the value and delete the override once something depends
+  on it being right.
 - The R10000 secondary cache TagLo layout. The current code uses the R4400
   format (`[31:13] ptag, [12:10] state, [9:7] PIdx`) and discards bits `[6:0]`
   and unrecognised state codes, so arbitrary bit patterns do not round-trip.

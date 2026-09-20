@@ -2632,6 +2632,36 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             config |= ss << CONFIG_TR_SS;
         }
 
+        // R10000 lays Config out completely differently from an R4000, and the
+        // PROM sizes its cache diagnostics from it. Fields, per NetBSD's
+        // mips/include/cpuregs.h (MIPS4_CONFIG_*):
+        //   [31:29] IC  primary I-cache size, as 4096 << field
+        //   [28:26] DC  primary D-cache size, likewise
+        //   [18:16] SS  secondary cache size
+        //   [15]    BE  big endian
+        //   [13]    SB  secondary block size, 0 = 64B, 1 = 128B
+        //   [2:0]   K0  kseg0 cacheability, which the PROM sets for itself
+        // Presenting an R4000 Config here told an R10000 PROM that its
+        // secondary cache size field was zero.
+        if C::R10K_CACHE_OPS {
+            let log2 = |n: usize| (n / 4096).trailing_zeros();
+            let mut c = 0u32;
+            c |= log2(32768) << 29;          // 32 KB L1I
+            c |= log2(32768) << 26;          // 32 KB L1D
+            c |= 1 << 15;                    // big endian
+            if C::L2_LINE == 128 { c |= 1 << 13; }
+            // The SS encoding is not documented in anything to hand, and it is
+            // three bits. Sweepable rather than guessed: let the PROM say which
+            // value it believes, then pin it and delete this.
+            let ss: u32 = std::env::var("IRIS_IP28_SS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            c |= (ss & 0x7) << 16;
+            c |= 2;                          // K0 = uncached at reset
+            config = c;
+        }
+
         core.cp0_config = config;
         core.tlb_entries = C::TLB_ENTRIES as u32;
         // MipsCore::new already ran reset_registers, so set both the reset value
