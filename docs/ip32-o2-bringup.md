@@ -310,6 +310,33 @@ Twice in one session the same mistake: `MACE_ISA_FLASH_NIC_REG` read as 1-Wire
 when the bits said LED, and 0x40000000 read as PCI when the access pattern said
 memory. **Trust the access pattern over the header name.**
 
+## The console will not help during post1
+
+`com0` is implemented (`Com16550`), at MACE + 0x390000 with MACE's ISA register
+spacing: register `n` is at `base + (n << 8) + 7`, per `sgimips/bus.c`'s
+`h + (o << 8) + 7`. Decode that wrong and the UART is silently inert, which is
+why there are tests for it.
+
+It captures nothing, and the reason is not the UART. The routine post1 calls to
+print — 0xbfc04d74, the one reached from every `<post1> <SizeMEM>` message — is
+a **stub**:
+
+    bfc04d74:  addiu sp,sp,-8
+    bfc04d78:  sw a0,8(sp)        # save the format string
+    bfc04d7c:  sw a1,12(sp)       # and the arguments
+    bfc04d88:  jr ra              # ...and return
+    bfc04d8c:  addiu sp,sp,8
+
+It saves its arguments and returns. post1 has no console at all; the messages
+exist in the image and are never emitted. The PROM's built-in default env also
+says `console=g`, so even a working console would be the framebuffer rather
+than the UART unless NVRAM says otherwise.
+
+So the strings remain useful — reading them out of the image is how
+`Error, no SIMM in bank0` was found — but they are documentation, not output.
+The UART will matter once the `firmware` section (4.18, at 0x81000000) runs and
+brings up a real console. Until then, tracing is the instrument.
+
 ## Open questions
 
 - ~~How much does `post1` insist on?~~ Answered: CRIME is cheap, MACE PCI is
@@ -318,10 +345,8 @@ memory. **Trust the access pattern over the header name.**
 - What do CRIME's bank-control bits mean? POST writes `0x100` to all eight,
   then `0x104` to the ones behind bank 0. Bit 2 is set once a bank is sized.
 - Where does the PCI native view really live, given memory owns 0x40000000?
-- **Next, and cheapest by far: implement `com0` at MACE + 0x390000.** The PROM
-  calls a print routine at 0xbfc04d74 throughout POST, and its messages are
-  tagged (`<post1> <SizeMEM> ...`). A 16550 that just collects bytes would turn
-  every further gate from a disassembly exercise into reading the console.
+- ~~Implement `com0` to read POST's messages.~~ **Done, and it does not help
+  yet — see below.**
 - 1-Wire is still there and still unimplemented; the PROM simply has not
   reached it yet.
 - `UST_STRIDE` is a bring-up shortcut: the counter advances per read rather

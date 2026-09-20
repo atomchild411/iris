@@ -51,6 +51,12 @@ pub mod nic_bit {
     pub const DATA: u8 = 0x08;
 }
 
+/// `com0`, the PROM's console UART. NetBSD attaches it at `mace0 offset
+/// 0x390000`; `com1` follows at 0x398000.
+pub const MACE_COM0: u32 = MACE_BASE + 0x0039_0000;
+pub const MACE_COM1: u32 = MACE_BASE + 0x0039_8000;
+pub const MACE_COM_SIZE: u32 = 0x0000_0800;
+
 /// MACE's free-running timer (`MACE_UST_MSC`, i.e. `MACE_PERIF + 0x40000`).
 /// The PROM busy-waits on this; a constant hangs it forever.
 pub const MACE_UST_MSC: u32 = MACE_BASE + 0x0034_0000;
@@ -338,6 +344,100 @@ impl BusDevice for PciNativeView {
     fn write64(&self, _a: u32, _v: u64) -> u32 { *self.writes.lock().unwrap() += 1; BUS_OK }
 }
 
+/// A 16550 with just enough behaviour to be written to.
+///
+/// Register `n` lives at `base + (n << 8) + 7`: MACE spaces its ISA registers
+/// 256 bytes apart and puts the byte in the last lane of the 64-bit slot
+/// (`sgimips/bus.c`: `h + (o << 8) + 7`). Getting this wrong is silent — every
+/// register reads back zero and the firmware simply never transmits.
+///
+/// Transmit only. The line status register always reports the holding register
+/// empty, so the PROM never waits on us, and bytes are appended to a buffer
+/// rather than going anywhere.
+pub struct Com16550 {
+    out: Mutex<Vec<u8>>,
+    regs: Mutex<[u8; 8]>,
+}
+
+pub mod com_reg {
+    /// Transmit holding / receive buffer (and divisor low when DLAB is set).
+    pub const THR: u32 = 0;
+    pub const IER: u32 = 1;
+    pub const IIR_FCR: u32 = 2;
+    pub const LCR: u32 = 3;
+    pub const MCR: u32 = 4;
+    pub const LSR: u32 = 5;
+    pub const MSR: u32 = 6;
+    pub const SCR: u32 = 7;
+
+    /// LCR bit 7: the next accesses to 0 and 1 are the baud divisor.
+    pub const LCR_DLAB: u8 = 0x80;
+    /// LSR: transmit holding register empty.
+    pub const LSR_THRE: u8 = 0x20;
+    /// LSR: transmitter completely empty.
+    pub const LSR_TEMT: u8 = 0x40;
+}
+
+impl Default for Com16550 {
+    fn default() -> Self { Self::new() }
+}
+
+impl Com16550 {
+    pub fn new() -> Self {
+        Self { out: Mutex::new(Vec::new()), regs: Mutex::new([0u8; 8]) }
+    }
+
+    /// Everything written to the transmit register so far.
+    pub fn output(&self) -> String {
+        String::from_utf8_lossy(&self.out.lock().unwrap()).to_string()
+    }
+
+    pub fn bytes_out(&self) -> usize {
+        self.out.lock().unwrap().len()
+    }
+
+    /// Decode a MACE ISA address into a 16550 register number, if it names one.
+    fn reg_of(addr: u32) -> Option<u32> {
+        // Only the +7 lane carries the byte.
+        if addr & 7 != 7 {
+            return None;
+        }
+        let n = (addr >> 8) & 7;
+        Some(n)
+    }
+
+    fn dlab(&self) -> bool {
+        self.regs.lock().unwrap()[com_reg::LCR as usize] & com_reg::LCR_DLAB != 0
+    }
+
+    pub fn read_reg(&self, addr: u32) -> u8 {
+        let Some(n) = Self::reg_of(addr) else { return 0 };
+        match n {
+            // Always ready to take another byte.
+            com_reg::LSR => com_reg::LSR_THRE | com_reg::LSR_TEMT,
+            _ => self.regs.lock().unwrap()[n as usize],
+        }
+    }
+
+    pub fn write_reg(&self, addr: u32, val: u8) {
+        let Some(n) = Self::reg_of(addr) else { return };
+        if n == com_reg::THR && !self.dlab() {
+            self.out.lock().unwrap().push(val);
+            return;
+        }
+        self.regs.lock().unwrap()[n as usize] = val;
+    }
+}
+
+impl BusDevice for Com16550 {
+    fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.read_reg(addr)) }
+    fn write8(&self, addr: u32, val: u8) -> u32 { self.write_reg(addr, val); BUS_OK }
+    fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.read_reg(addr | 7) as u32) }
+    fn write32(&self, addr: u32, val: u32) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
+    fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.read_reg(addr | 7) as u64) }
+    fn write64(&self, addr: u32, val: u64) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
+}
+
 /// Records what the PROM does to the 1-Wire register and when, so the protocol
 /// can be reconstructed from its own behaviour rather than guessed at.
 pub struct NicTrace {
@@ -484,6 +584,8 @@ pub struct Ip32Bus {
     pub macepci: MacePci,
     pub ust: MaceUst,
     pub nic_trace: NicTrace,
+    pub com0: Com16550,
+    pub com1: Com16550,
     pub pci_view: PciNativeView,
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write)`.
     unmapped: Mutex<Vec<(u32, bool)>>,
@@ -506,6 +608,8 @@ impl Ip32Bus {
             macepci: MacePci::new(),
             ust: MaceUst::new(),
             nic_trace: NicTrace::new(),
+            com0: Com16550::new(),
+            com1: Com16550::new(),
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
             sizemem: Mutex::new(Vec::new()),
@@ -574,6 +678,16 @@ impl Ip32Bus {
 
     fn in_mace(&self, addr: u32) -> bool {
         addr >= MACE_BASE && addr < MACE_BASE + MACE_SIZE
+    }
+
+    fn com_for(&self, addr: u32) -> Option<&Com16550> {
+        if (MACE_COM0..MACE_COM0 + MACE_COM_SIZE).contains(&addr) {
+            Some(&self.com0)
+        } else if (MACE_COM1..MACE_COM1 + MACE_COM_SIZE).contains(&addr) {
+            Some(&self.com1)
+        } else {
+            None
+        }
     }
 
     fn is_nic_reg(&self, addr: u32) -> bool {
@@ -673,6 +787,9 @@ impl BusDevice for Ip32Bus {
             self.nic_trace.record(self.ust.now(), false, v);
             return BusRead8::ok(v);
         }
+        if let Some(c) = self.com_for(addr) {
+            return c.read8(addr);
+        }
         if self.in_mace(addr) {
             return self.mace.read8(addr);
         }
@@ -688,6 +805,9 @@ impl BusDevice for Ip32Bus {
         }
         if self.in_pci_view(addr) {
             return self.pci_view.read16(addr);
+        }
+        if let Some(c) = self.com_for(addr) {
+            return c.read16(addr);
         }
         if self.in_mace(addr) {
             return self.mace.read16(addr);
@@ -713,6 +833,9 @@ impl BusDevice for Ip32Bus {
             self.nic_trace.record(self.ust.now(), false, v as u8);
             return BusRead32::ok(v);
         }
+        if let Some(c) = self.com_for(addr) {
+            return c.read32(addr);
+        }
         if self.in_mace(addr) {
             return self.mace.read32(addr);
         }
@@ -737,6 +860,9 @@ impl BusDevice for Ip32Bus {
             self.nic_trace.record(self.ust.now(), false, v as u8);
             return BusRead64::ok(v);
         }
+        if let Some(c) = self.com_for(addr) {
+            return c.read64(addr);
+        }
         if self.in_mace(addr) {
             return self.mace.read64(addr);
         }
@@ -759,6 +885,9 @@ impl BusDevice for Ip32Bus {
             self.nic_trace.record(self.ust.now(), true, val);
             return self.mace.write8(addr, val);
         }
+        if let Some(c) = self.com_for(addr) {
+            return c.write8(addr, val);
+        }
         if self.in_mace(addr) {
             return self.mace.write8(addr, val);
         }
@@ -774,6 +903,9 @@ impl BusDevice for Ip32Bus {
         }
         if self.in_pci_view(addr) {
             return self.pci_view.write16(addr, val);
+        }
+        if let Some(c) = self.com_for(addr) {
+            return c.write16(addr, val);
         }
         if self.in_mace(addr) {
             return self.mace.write16(addr, val);
@@ -798,6 +930,9 @@ impl BusDevice for Ip32Bus {
             self.nic_trace.record(self.ust.now(), true, val as u8);
             return self.mace.write32(addr, val);
         }
+        if let Some(c) = self.com_for(addr) {
+            return c.write32(addr, val);
+        }
         if self.in_mace(addr) {
             return self.mace.write32(addr, val);
         }
@@ -820,6 +955,9 @@ impl BusDevice for Ip32Bus {
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), true, val as u8);
             return self.mace.write64(addr, val);
+        }
+        if let Some(c) = self.com_for(addr) {
+            return c.write64(addr, val);
         }
         if self.in_mace(addr) {
             return self.mace.write64(addr, val);
@@ -925,6 +1063,36 @@ mod tests {
         assert_eq!(bus.unmapped(), vec![(PROM_BASE, true)], "and record the attempt");
     }
 
+    /// MACE spaces ISA registers 256 bytes apart with the byte in the last lane
+    /// (`sgimips/bus.c`: `h + (o << 8) + 7`). Decode this wrong and the UART is
+    /// silently inert — every register reads zero and nothing is ever sent.
+    #[test]
+    fn the_uart_decodes_maces_register_spacing() {
+        let c = Com16550::new();
+        // Transmit register is offset 0, so byte lane +7 of the first slot.
+        c.write8(MACE_COM0 + 7, b'A');
+        assert_eq!(c.output(), "A");
+        // Anything not in the +7 lane is not a register.
+        c.write8(MACE_COM0 + 3, b'X');
+        assert_eq!(c.output(), "A", "only the +7 lane carries the byte");
+        // Line status lives at register 5, i.e. +0x507.
+        let lsr = c.read8(MACE_COM0 + 0x507).data;
+        assert_eq!(lsr, com_reg::LSR_THRE | com_reg::LSR_TEMT,
+                   "the holding register must always read empty or the PROM waits forever");
+    }
+
+    /// With DLAB set, writes to register 0 are the baud divisor, not characters.
+    #[test]
+    fn the_baud_divisor_is_not_mistaken_for_output() {
+        let c = Com16550::new();
+        c.write8(MACE_COM0 + 0x307, com_reg::LCR_DLAB);
+        c.write8(MACE_COM0 + 7, 0x0c);
+        assert_eq!(c.output(), "", "divisor writes are not characters");
+        c.write8(MACE_COM0 + 0x307, 0x03);
+        c.write8(MACE_COM0 + 7, b'B');
+        assert_eq!(c.output(), "B");
+    }
+
     #[test]
     fn section_headers_parse() {
         // Two records: a name, a version, a length.
@@ -1025,6 +1193,13 @@ mod bringup {
         eprintln!("ip32: stopped after {steps} steps at PC 0x{pc:08x}{}",
                   if reached_post1 { "  <-- post1 entry" } else { "" });
         eprintln!("ip32: furthest PC seen inside the PROM: 0x{max_prom_pc:08x}");
+
+        let console = bus.com0.output();
+        eprintln!("ip32: ===== PROM console output ({} bytes) =====", console.len());
+        for line in console.lines() {
+            eprintln!("   | {line}");
+        }
+        eprintln!("ip32: ===== end console =====");
 
         let touched = bus.crime.touched();
         eprintln!("ip32: CRIME registers touched ({}):", touched.len());
