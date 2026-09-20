@@ -118,17 +118,38 @@ pub const SG_MAX: usize = 4096;
 pub struct ScsiDisk {
     file: Mutex<std::fs::File>,
     pub blocks: u64,
+    /// Presented as a CD-ROM rather than a fixed disk.
+    ///
+    /// SGI's PROM greys out "Local CD-ROM" on its install menu unless
+    /// something on the bus says it is one, and the install media is the only
+    /// way in without a network. SGI formatted its CD-ROMs with 512-byte
+    /// logical blocks, which is why the volume header on one reads correctly
+    /// with ordinary disk arithmetic.
+    pub cdrom: bool,
 }
 
 impl ScsiDisk {
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        Self::open_as(path, false)
+    }
+
+    pub fn open_as(path: &std::path::Path, cdrom: bool) -> std::io::Result<Self> {
+        // Read-only media must be opened read-only: a write that silently
+        // succeeded on an install CD would be worse than one that failed.
+        let file = if cdrom {
+            std::fs::OpenOptions::new().read(true).open(path)?
+        } else {
+            std::fs::OpenOptions::new().read(true).write(true).open(path)?
+        };
         let blocks = file.metadata()?.len() / BLOCK_SIZE as u64;
-        Ok(Self { file: Mutex::new(file), blocks })
+        Ok(Self { file: Mutex::new(file), blocks, cdrom })
     }
 
     fn write_blocks(&self, lba: u64, data: &[u8]) -> bool {
         use std::io::{Seek, SeekFrom, Write};
+        if self.cdrom {
+            return false;
+        }
         let mut f = self.file.lock().unwrap();
         // Refuse to write past the end rather than growing the image: a
         // disk that silently gets bigger is not a disk.
@@ -210,6 +231,14 @@ pub mod scb {
     pub const SG_PTR: usize = 4;
     /// Bus address of the CDB.
     pub const CMD_PTR: usize = 8;
+    /// Target in the high nibble, LUN in the low -- the same shape as
+    /// aic7xxx's `SCB_TCL`.
+    ///
+    /// Read as `tag << 4` at first, which fitted perfectly while the PROM was
+    /// scanning targets 1, 2 and 3 with tags 1, 2 and 3. Two disks at
+    /// different ids in one session separate them: asking for `dksc(0,1,8)`
+    /// and then `dksc(0,4,8)` produces `0x10` and `0x40` with the same tag.
+    pub const TCL: usize = 3;
     /// Where the SCSI status is handed back. The driver pre-fills this with
     /// 0x40, which is not a valid status, so it is reading it expecting
     /// somebody to overwrite it.
@@ -277,7 +306,9 @@ impl Default for State {
 
 pub struct Aic7880 {
     st: Mutex<State>,
-    disk: Mutex<Option<ScsiDisk>>,
+    /// Disks by SCSI id. An install needs at least two -- the media to read
+    /// and the disk to write -- so one is not enough.
+    disks: Mutex<std::collections::BTreeMap<u8, ScsiDisk>>,
     /// Host memory. The controller fetches its work from there rather than
     /// being handed it a register at a time, so without this it can see the
     /// tag of a command and nothing else about it.
@@ -296,7 +327,7 @@ impl Aic7880 {
     pub fn new(ram: std::sync::Arc<Mutex<Vec<u8>>>) -> Self {
         Self {
             st: Mutex::new(State::default()),
-            disk: Mutex::new(None),
+            disks: Mutex::new(std::collections::BTreeMap::new()),
             ram,
             dma_watch: std::env::var("IRIS_IP32_DMAWATCH").ok().and_then(|v| {
                 let (a, b) = v.split_once(':')?;
@@ -453,12 +484,29 @@ impl Aic7880 {
         }
     }
 
-    /// Attach a disk image.
-    pub fn attach_disk(&self, path: &std::path::Path) -> std::io::Result<u64> {
-        let d = ScsiDisk::open(path)?;
+    /// Attach a disk image at a SCSI id.
+    pub fn attach_disk_at(&self, target: u8, path: &std::path::Path) -> std::io::Result<u64> {
+        self.attach_at(target, path, false)
+    }
+
+    pub fn attach_at(&self, target: u8, path: &std::path::Path, cdrom: bool)
+        -> std::io::Result<u64>
+    {
+        let d = ScsiDisk::open_as(path, cdrom)?;
         let blocks = d.blocks;
-        *self.disk.lock().unwrap() = Some(d);
+        self.disks.lock().unwrap().insert(target, d);
         Ok(blocks)
+    }
+
+
+    /// Attach at the default id, which is what a single-disk run wants.
+    pub fn attach_disk(&self, path: &std::path::Path) -> std::io::Result<u64> {
+        self.attach_disk_at(self.target, path)
+    }
+
+    /// The ids that have something on them.
+    pub fn attached(&self) -> Vec<u8> {
+        self.disks.lock().unwrap().keys().copied().collect()
     }
 
     /// Whether this address is the one disk we have.
@@ -468,17 +516,25 @@ impl Aic7880 {
     /// and nothing like the machine. Where the target is known we answer only
     /// at our own address; where it is not — the PROM's SCBs do not carry it —
     /// we answer, because refusing would be a guess.
-    fn addressed(&self, who: Option<(u8, u8)>) -> bool {
+    /// Which disk a command is for, if any. A command whose target we cannot
+    /// see -- the PROM's SCBs do not carry one -- goes to the default id,
+    /// because refusing would be a guess.
+    fn target_of(&self, who: Option<(u8, u8)>) -> Option<u8> {
         match who {
-            Some((t, l)) => t == self.target && l == 0,
-            None => true,
+            Some((_, l)) if l != 0 => None,
+            Some((t, _)) => Some(t),
+            None => Some(self.target),
         }
     }
 
     /// Run a CDB against the attached disk. Returns the data to send back and
     /// a SCSI status byte.
     fn execute_for(&self, cdb: &[u8], who: Option<(u8, u8)>) -> (Vec<u8>, u8) {
-        if !self.addressed(who) {
+        let present = self
+            .target_of(who)
+            .map(|t| self.disks.lock().unwrap().contains_key(&t))
+            .unwrap_or(false);
+        if !present {
             // The way SCSI says "nothing here": an INQUIRY answered with
             // peripheral qualifier 011b and type 1Fh. Anything else is a
             // check condition.
@@ -491,16 +547,20 @@ impl Aic7880 {
             }
             return (Vec::new(), 0x02);
         }
-        self.execute(cdb)
+        self.execute_on(cdb, self.target_of(who).unwrap())
     }
 
     /// Run a CDB against the attached disk. Returns the data to send back and
     /// a SCSI status byte.
     fn execute(&self, cdb: &[u8]) -> (Vec<u8>, u8) {
+        self.execute_on(cdb, self.target)
+    }
+
+    fn execute_on(&self, cdb: &[u8], target: u8) -> (Vec<u8>, u8) {
         const GOOD: u8 = 0x00;
         const CHECK_CONDITION: u8 = 0x02;
-        let disk = self.disk.lock().unwrap();
-        let Some(disk) = disk.as_ref() else {
+        let disks = self.disks.lock().unwrap();
+        let Some(disk) = disks.get(&target) else {
             return (Vec::new(), CHECK_CONDITION);
         };
         let be16 = |i: usize| ((cdb[i] as usize) << 8) | cdb[i + 1] as usize;
@@ -515,8 +575,8 @@ impl Aic7880 {
             // INQUIRY.
             0x12 => {
                 let mut d = vec![0u8; 36];
-                d[0] = 0x00; // direct access device
-                d[1] = 0x00; // not removable
+                d[0] = if disk.cdrom { 0x05 } else { 0x00 };
+                d[1] = if disk.cdrom { 0x80 } else { 0x00 }; // removable
                 d[2] = 0x02; // SCSI-2
                 d[3] = 0x02; // response format
                 d[4] = 31; // additional length
@@ -645,10 +705,14 @@ impl Aic7880 {
 
     /// Run a command that carries data to the disk.
     fn execute_write(&self, cdb: &[u8], data: &[u8]) -> u8 {
+        self.execute_write_on(cdb, data, self.target)
+    }
+
+    fn execute_write_on(&self, cdb: &[u8], data: &[u8], target: u8) -> u8 {
         const GOOD: u8 = 0x00;
         const CHECK_CONDITION: u8 = 0x02;
-        let disk = self.disk.lock().unwrap();
-        let Some(disk) = disk.as_ref() else {
+        let disks = self.disks.lock().unwrap();
+        let Some(disk) = disks.get(&target) else {
             return CHECK_CONDITION;
         };
         let lba = match cdb[0] {
@@ -730,7 +794,8 @@ impl Aic7880 {
             Some(want) => {
                 let data = self.gather_segs(&segs, want);
                 let n = data.len();
-                (self.execute_write(&cdb, &data), n)
+                let t = self.target_of(Some((scsiid >> 4, lun))).unwrap_or(self.target);
+                (self.execute_write_on(&cdb, &data, t), n)
             }
             None => {
                 let (data, status) = self.execute_for(&cdb, Some((scsiid >> 4, lun)));
@@ -807,22 +872,25 @@ impl Aic7880 {
 
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
         Self::note(st, format!(
-            "tag {tag}: SCB at 0x{scb_addr:08x} control 0x{:02x} cdblen {}",
-            scb[scb::CONTROL], len));
+            "tag {tag}: SCB at 0x{scb_addr:08x} control 0x{:02x} target {} lun {} cdblen {}",
+            scb[scb::CONTROL], scb[scb::TCL] >> 4, scb[scb::TCL] & 0x0f, len));
         Self::note(st, format!("   CDB {}", hex(&cdb)));
         Self::note(st, format!("   SCB {}", hex(&scb)));
         let sg_ptr = u32::from_be_bytes([
             scb[scb::SG_PTR], scb[scb::SG_PTR + 1],
             scb[scb::SG_PTR + 2], scb[scb::SG_PTR + 3],
         ]);
+        let tcl = scb[scb::TCL];
+        let who = Some((tcl >> 4, tcl & 0x0f));
         let (status, moved, sg, dir) = match Self::data_out_len(&cdb) {
             Some(want) => {
                 let (data, sg) = self.gather(sg_ptr, want);
                 let n = data.len();
-                (self.execute_write(&cdb, &data), n, sg, "out of")
+                let t = self.target_of(who).unwrap_or(self.target);
+                (self.execute_write_on(&cdb, &data, t), n, sg, "out of")
             }
             None => {
-                let (data, status) = self.execute(&cdb);
+                let (data, status) = self.execute_for(&cdb, who);
                 let (sent, sg) = if data.is_empty() {
                     (0, Vec::new())
                 } else {
@@ -1090,6 +1158,8 @@ mod tests {
             put32(&mut m, scb_addr + scb::CMD_PTR as u32, base + cdb_addr);
             // The driver leaves this filled with a value that is not a status.
             m[(scb_addr + scb::TARGET_STATUS as u32) as usize] = 0x40;
+            // Address the id the disk was attached at.
+            m[(scb_addr + scb::TCL as u32) as usize] = 1 << 4;
             // INQUIRY, 64 bytes
             m[cdb_addr as usize] = 0x12;
             m[cdb_addr as usize + 4] = 0x40;
@@ -1143,6 +1213,7 @@ mod tests {
             put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
             put32(&mut m, scb + scb::CMD_PTR as u32, base + cdb);
             m[(scb + scb::CDB_LEN as u32) as usize] = 10;
+            m[(scb + scb::TCL as u32) as usize] = 1 << 4;
             // WRITE(10), one block at LBA 5.
             m[cdb as usize] = 0x2a;
             m[cdb as usize + 5] = 5;
@@ -1197,6 +1268,7 @@ mod tests {
             put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
             put32(&mut m, scb + scb::CMD_PTR as u32, base + cdb);
             m[(scb + scb::CDB_LEN as u32) as usize] = 10;
+            m[(scb + scb::TCL as u32) as usize] = 1 << 4;
             // READ(10), 264 blocks from LBA 0.
             m[cdb as usize] = 0x28;
             m[cdb as usize + 7] = (264 >> 8) as u8;
