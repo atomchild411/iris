@@ -104,6 +104,10 @@ pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 pub const PROM_BASE: u32 = 0x1fc0_0000;
 pub const PROM_SIZE: u32 = 0x0008_0000; // 512 KiB
 
+/// sloader's serial prompt: "SL", 9600 baud, 8 data bits, even parity. Seeing
+/// this means POST has completed and the PROM is waiting on console input.
+pub const SLOADER_PROMPT: &str = "SL-9600-8E>";
+
 /// Where `post1` is loaded and entered. Reaching this PC is the milestone.
 pub const POST1_ENTRY: u32 = 0xa000_4000;
 
@@ -385,6 +389,10 @@ impl BusDevice for PciNativeView {
 /// rather than going anywhere.
 pub struct Com16550 {
     out: Mutex<Vec<u8>>,
+    /// Characters waiting to be read by the guest. The PROM polls LSR for
+    /// data-ready and then reads the receive register, so an empty queue simply
+    /// means "nobody has typed anything".
+    input: Mutex<std::collections::VecDeque<u8>>,
     regs: Mutex<[u8; 8]>,
 }
 
@@ -401,6 +409,8 @@ pub mod com_reg {
 
     /// LCR bit 7: the next accesses to 0 and 1 are the baud divisor.
     pub const LCR_DLAB: u8 = 0x80;
+    /// LSR: a received character is waiting.
+    pub const LSR_DR: u8 = 0x01;
     /// LSR: transmit holding register empty.
     pub const LSR_THRE: u8 = 0x20;
     /// LSR: transmitter completely empty.
@@ -413,7 +423,21 @@ impl Default for Com16550 {
 
 impl Com16550 {
     pub fn new() -> Self {
-        Self { out: Mutex::new(Vec::new()), regs: Mutex::new([0u8; 8]) }
+        Self {
+            out: Mutex::new(Vec::new()),
+            input: Mutex::new(Default::default()),
+            regs: Mutex::new([0u8; 8]),
+        }
+    }
+
+    /// Queue characters for the guest to read.
+    pub fn feed(&self, bytes: &[u8]) {
+        self.input.lock().unwrap().extend(bytes.iter().copied());
+    }
+
+    /// Characters still unread by the guest.
+    pub fn pending_input(&self) -> usize {
+        self.input.lock().unwrap().len()
     }
 
     /// Everything written to the transmit register so far.
@@ -442,8 +466,20 @@ impl Com16550 {
     pub fn read_reg(&self, addr: u32) -> u8 {
         let Some(n) = Self::reg_of(addr) else { return 0 };
         match n {
-            // Always ready to take another byte.
-            com_reg::LSR => com_reg::LSR_THRE | com_reg::LSR_TEMT,
+            // Always ready to take another byte, and data-ready whenever
+            // something has been typed.
+            com_reg::LSR => {
+                let mut v = com_reg::LSR_THRE | com_reg::LSR_TEMT;
+                if !self.input.lock().unwrap().is_empty() {
+                    v |= com_reg::LSR_DR;
+                }
+                v
+            }
+            // Register 0 reads the receive buffer (unless DLAB selects the
+            // divisor, which nothing reads back).
+            com_reg::THR if !self.dlab() => {
+                self.input.lock().unwrap().pop_front().unwrap_or(0)
+            }
             _ => self.regs.lock().unwrap()[n as usize],
         }
     }
@@ -1351,6 +1387,22 @@ mod tests {
         assert_eq!(c.output(), "B");
     }
 
+    /// The PROM polls the line status for data-ready and then reads the
+    /// receive register. Both halves have to work or it waits forever at its
+    /// prompt — which looks exactly like a hang.
+    #[test]
+    fn a_typed_character_becomes_readable() {
+        let c = Com16550::new();
+        let lsr = MACE_COM0 + 0x507;
+        assert_eq!(c.read8(lsr).data & com_reg::LSR_DR, 0, "nothing typed yet");
+
+        c.feed(b"hi");
+        assert_ne!(c.read8(lsr).data & com_reg::LSR_DR, 0, "data-ready must be set");
+        assert_eq!(c.read8(MACE_COM0 + 7).data, b'h');
+        assert_eq!(c.read8(MACE_COM0 + 7).data, b'i');
+        assert_eq!(c.read8(lsr).data & com_reg::LSR_DR, 0, "queue drained");
+    }
+
     #[test]
     fn section_headers_parse() {
         // Two records: a name, a version, a length.
@@ -1437,6 +1489,13 @@ mod bringup {
         let mut reached_post1 = false;
         let mut steps = 0u64;
         let mut max_prom_pc = 0u32;
+        let mut max_post1_pc = 0u32;
+        let mut post1_at = 0u64;
+        let mut fed = false;
+        let mut fed_at = 0u64;
+        let feed_bytes: Option<Vec<u8>> = std::env::var("IRIS_IP32_INPUT")
+            .ok()
+            .map(|v| v.replace("\\r", "\r").into_bytes());
         const LIMIT: u64 = 50_000_000;
 
         let printf = PrintfTap::new(PrintfTap::POST1_PRINTF);
@@ -1450,8 +1509,13 @@ mod bringup {
         while steps < LIMIT {
             let pc = exec.core.pc as u32;
             if pc == POST1_ENTRY {
-                reached_post1 = true;
-                break;
+                if !reached_post1 {
+                    reached_post1 = true;
+                    post1_at = steps;
+                }
+            }
+            if reached_post1 && (POST1_ENTRY..POST1_ENTRY + 0x8000).contains(&pc) && pc > max_post1_pc {
+                max_post1_pc = pc;
             }
             // Publish the PC so devices can attribute the accesses this
             // instruction is about to make.
@@ -1469,6 +1533,17 @@ mod bringup {
                 }
             }
 
+            // Optionally answer sloader's prompt, for experimenting with what
+            // it accepts. Off unless IRIS_IP32_INPUT is set, and `contains` is
+            // only evaluated while it is: scanning the output buffer on every
+            // instruction is not something to do by default.
+            if let Some(feed) = feed_bytes.as_ref() {
+                if !fed && bus.com0.output().contains(SLOADER_PROMPT) {
+                    bus.com0.feed(feed);
+                    fed = true;
+                    fed_at = steps;
+                }
+            }
             if (0xbfc0_0000..0xbfc8_0000).contains(&pc) && pc > max_prom_pc {
                 max_prom_pc = pc;
             }
@@ -1480,6 +1555,9 @@ mod bringup {
         eprintln!("ip32: stopped after {steps} steps at PC 0x{pc:08x}{}",
                   if reached_post1 { "  <-- post1 entry" } else { "" });
         eprintln!("ip32: furthest PC seen inside the PROM: 0x{max_prom_pc:08x}");
+        if reached_post1 {
+            eprintln!("ip32: entered post1 after {post1_at} steps; furthest PC in post1: 0x{max_post1_pc:08x}");
+        }
 
         let msgs = printf.lines();
         eprintln!("ip32: ===== POST messages, recovered at the call site ({}) =====", msgs.len());
@@ -1513,6 +1591,10 @@ mod bringup {
             eprintln!("   | {line}");
         }
         eprintln!("ip32: ===== end console =====");
+        if fed {
+            eprintln!("ip32: answered the prompt at step {fed_at}; {} byte(s) still unread",
+                      bus.com0.pending_input());
+        }
 
         let touched = bus.crime.touched();
         eprintln!("ip32: CRIME registers touched ({}):", touched.len());
