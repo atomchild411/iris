@@ -35,8 +35,20 @@ exhausted there, stopping is what the hardware does rather than running off the
 end, and it is what lets the driver's own restart path run.
 
 Measured: 405 MB at 9.7 MiB/s on NetBSD 11.0, where nothing had ever got past
-16 MB. IRIX regression check — 20 000 flood pings at 1400 bytes, 28 MB, 0.0%
-loss — unaffected.
+16 MB.
+
+IRIX regression-checked on both releases, on throwaway APFS clones:
+
+| guest | test | result |
+|---|---|---|
+| 6.5.7m (R5000) | 20 000 flood pings, 1400 B, 28 MB | 0.0% loss |
+| 6.5.22m (R4400) | 20 000 flood pings, 1400 B, 28 MB | 0.0% loss |
+| 6.5.22m (R4400) | `wget` of a 407 MB file to XFS | exact byte count, `gzip -t` clean |
+
+6.5.22 is the one that matters most — it is what people actually run. The
+407 MB download is the stronger test of the two: flood ping never exhausts the
+receive chain the way a sustained TCP stream does, and `gzip -t` proves every
+byte, not just the count.
 
 ## The instrument that found it
 
