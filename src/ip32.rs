@@ -1484,7 +1484,7 @@ impl BusDevice for Stub {
 /// uses. At this stage legibility and being able to log an unmapped access are
 /// worth more than the lookup.
 pub struct Ip32Bus {
-    ram: Mutex<Vec<u8>>,
+    ram: std::sync::Arc<Mutex<Vec<u8>>>,
     prom: Vec<u8>,
     pub crime: Crime,
     pub mace: Stub,
@@ -1525,9 +1525,10 @@ impl Ip32Bus {
     /// 512 KiB IP32 PROM image.
     pub fn new(ram_bytes: usize, prom: Vec<u8>) -> Self {
         let pc = std::sync::Arc::new(PcTap::default());
+        let ram = std::sync::Arc::new(Mutex::new(vec![0u8; ram_bytes & !7]));
         let ust = std::sync::Arc::new(MaceUst::new());
         let bus = Self {
-            ram: Mutex::new(vec![0u8; ram_bytes & !7]),
+            ram: ram.clone(),
             prom,
             crime: Crime::new(ust.clone()),
             mace: Stub::new("mace"),
@@ -1560,7 +1561,10 @@ impl Ip32Bus {
         // controller a real O2 has there is how we learn how much of it the
         // PROM insists on.
         if std::env::var("IRIS_IP32_SCSI").is_ok() {
-            let scsi = std::sync::Arc::new(crate::aic7880::Aic7880::new());
+            // The controller fetches its work from host memory, so it
+            // needs to reach RAM directly rather than through the bus that
+            // owns it.
+            let scsi = std::sync::Arc::new(crate::aic7880::Aic7880::new(ram.clone()));
             bus.macepci.attach(
                 IP32_SCSI_SLOT,
                 std::sync::Arc::new(
@@ -1576,6 +1580,12 @@ impl Ip32Bus {
                     .with_ops(scsi.clone()),
                 ),
             );
+            if let Ok(path) = std::env::var("IRIS_IP32_DISK") {
+                match scsi.attach_disk(std::path::Path::new(&path)) {
+                    Ok(blocks) => eprintln!("ip32: SCSI disk {path}: {blocks} blocks"),
+                    Err(e) => eprintln!("ip32: SCSI disk {path}: {e}"),
+                }
+            }
             *bus.scsi.lock().unwrap() = Some(scsi);
         }
         // So a hot offset can name the code polling it.
@@ -3460,13 +3470,12 @@ mod bringup {
         if let Some(scsi) = bus.scsi.lock().unwrap().as_ref() {
             eprintln!("ip32: SCSI controller: {} bytes of sequencer program downloaded",
                       scsi.seqram_len());
-            for n in scsi.notes().iter().take(24) {
+            eprintln!("   sequencer paused/restarted {} times", scsi.pauses());
+            for n in scsi.notes().iter().rev().take(10).rev() {
                 eprintln!("   {n}");
             }
-            for (i, scb) in scsi.queued().iter().take(8) {
-                let b: Vec<String> = scb.iter().map(|x| format!("{x:02x}")).collect();
-                eprintln!("   SCB {i}: {}", b.join(" "));
-            }
+            let ex = scsi.executed();
+            eprintln!("   {} command(s) fetched and run", ex.len());
         }
         let probed = bus.macepci.probed();
         eprintln!("ip32: PCI config addresses selected ({}):", probed.len());
