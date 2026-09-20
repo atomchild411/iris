@@ -185,6 +185,9 @@ pub mod eeprom_93c56;
 pub mod platform;
 pub mod hpc3;
 pub mod ioc;
+/// IP32 (SGI O2) bring-up scaffold — see `docs/ip32-o2-bringup.md`. Not wired
+/// into `Physical`; it drives the CPU against its own bus.
+pub mod ip32;
 pub mod physical;
 pub mod ds1x86;
 pub mod z85c30;

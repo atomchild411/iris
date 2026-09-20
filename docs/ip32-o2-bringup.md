@@ -126,9 +126,57 @@ After that, in order: MACE register file → `com0` (first console output, and
 the first time the PROM talks to us) → RTC → then decide how much of PCI/`ahc`
 POST insists on.
 
+## First milestone: what the PROM actually did
+
+`src/ip32.rs` drives the real `MipsExecutor` against a minimal IP32 bus (RAM at
+0, CRIME, a MACE stub, PROM). `cargo test --lib ip32::bringup -- --nocapture`,
+with a PROM image present. It executes — and answered the question the
+milestone existed to answer, on the first run.
+
+**CRIME registers POST touches** (first-touch order):
+
+| offset | | meaning |
+|---|---|---|
+| 0x0008 | R, then W | `CRIME_CONTROL` |
+| 0x0208 … 0x0240 | W | eight consecutive qwords — the memory bank controls |
+
+So the PROM reads CRIME_CONTROL, writes it, then programs **eight memory banks
+at a linear 8-byte stride**. Worth noting against NetBSD's `crimereg.h`, which
+names these in an interleaved order (`BANK_CTRL0` 0x208, `CTRL1` 0x218,
+`CTRL2` 0x210 …). The PROM writes them straight through, which is the better
+guide to what the hardware is.
+
+Nothing else in CRIME was touched: no `TIME`, no interrupt registers, no ECC.
+The memory-error handler installed at reset never fired, which is the outcome
+we want.
+
+**MACE**: 5 reads, 20 writes, against a stub returning zero — so MACE is needed
+earlier than expected, but is evidently satisfied by benign answers for now.
+
+**Where it stops.** At PC 0xbfc05c9c the PROM writes physical 0x40000000 and
+then reads a register block at 0x40000080–0x400000dc. From
+`mace/macereg.h`:
+
+```c
+#define MACE_PCI_NATIVE_VIEW    0x40000000
+```
+
+It is enumerating the **PCI bus**, looking for the Adaptec SCSI controller.
+With nothing there it takes a bus error, wanders, and is lost by 2 M
+instructions (ending in RAM at 0x00780824).
+
+**So the gate is not CRIME — CRIME is nearly free.** Eight bank-control writes
+and a control register is all POST asked for. The gate is the MACE PCI host
+bridge. That is a much better position than the assessment above assumed, and
+it changes the order of work: PCI config space next, not more CRIME.
+
 ## Open questions
 
-- How much does `post1` insist on? Unknown until we run it. It is the gate.
+- ~~How much does `post1` insist on?~~ Answered: CRIME is cheap, MACE PCI is
+  the gate. See above.
+- What does the PROM expect to find on PCI? An empty bus may be acceptable if
+  config reads return all-ones for absent devices, which is the next thing to
+  try — cheaper than emulating `ahc`.
 - Does the PROM require a framebuffer to be present even with `console=d`? The
   Indy PROM does not; the O2's `crt_option=1` in the default env suggests it at
   least looks.
