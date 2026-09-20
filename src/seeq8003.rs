@@ -132,6 +132,13 @@ pub struct SeeqState {
     ctl:          u8,
     /// Interrupt pending — set when an unacknowledged interrupt is outstanding.
     pub intpend:  bool,
+    /// Diagnostic tallies for the receive pump, printed by `seeq status`.
+    /// Which of these stops moving at a stall says whether we are refusing
+    /// frames, have none to give, or are delivering into a guest that has
+    /// stopped reaping them.
+    rx_delivered: u64,
+    rx_refused: u64,
+    rx_nothing: u64,
     /// Monotonic lock counter — incremented on every mutex acquisition.
     /// Prefix all debug messages with this to correlate across threads.
     pub ts:       u32,
@@ -230,6 +237,9 @@ impl Seeq8003 {
                 pktgap:       0,
                 ctl:          0,
                 intpend:      false,
+                rx_delivered: 0,
+                rx_refused: 0,
+                rx_nothing: 0,
                 ts:           0,
             })),
             callback, rx_dma, tx_dma,
@@ -684,6 +694,7 @@ impl Device for Seeq8003 {
                 match rx_result {
                     RxPumpResult::Delivered { dma_irq: irq, writeback, frame_len } => {
                         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX delivered {} bytes dma_irq={}", st.ts, frame_len, irq);
+                        st.rx_delivered += 1;
                         st.rx_stat = rx_stat::GOOD | rx_stat::END;
                         if let Some((addr, val)) = writeback {
                             if let Some(ref mem) = sys_mem_enet {
@@ -695,10 +706,11 @@ impl Device for Seeq8003 {
                     }
                     RxPumpResult::Refused => {
                         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX DMA refused, retrying next tick", st.ts);
+                        st.rx_refused += 1;
                     }
                     // Filtered never reaches here (the drain loop consumes it), but
                     // keep the match exhaustive over RxPumpResult.
-                    RxPumpResult::Nothing | RxPumpResult::Filtered => {}
+                    RxPumpResult::Nothing | RxPumpResult::Filtered => { st.rx_nothing += 1; }
                 }
 
                 // Only call raise_interrupt if something actually happened this iteration.
@@ -753,6 +765,8 @@ impl Device for Seeq8003 {
                         writeln!(w, "Gateway IP  : {}", self.config.gateway_ip).ok();
                         writeln!(w, "Client IP   : {}", self.config.client_ip).ok();
                         writeln!(w, "Netmask     : {}", self.config.netmask).ok();
+                        writeln!(w, "intpend={} rx_delivered={} rx_refused={} rx_nothing={}",
+                                 st.intpend, st.rx_delivered, st.rx_refused, st.rx_nothing).ok();
                         writeln!(w, "rx_cmd={:#04x} rx_stat={:#04x} tx_cmd={:#04x} tx_stat={:#04x}",
                                  st.rx_cmd, st.rx_stat, st.tx_cmd, st.tx_stat).ok();
                         writeln!(w, "threads: {}", if self.is_running() { "running" } else { "stopped" }).ok();
