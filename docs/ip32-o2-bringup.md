@@ -1331,6 +1331,51 @@ the obvious next milestone and a substantial one.
 - `time invalid, resetting clock to epoch` — the RTC answers, but not with
   anything the firmware accepts as a valid time.
 
+## A shell
+
+```text
+Enter pathname of shell or RETURN for /bin/sh:
+# df -k
+Filesystem      1K-blocks         Used        Avail %Cap Mounted on
+root_device       4064590       236756      3624606   7% /
+#
+```
+
+NetBSD 11 running interactively on the emulated O2, reading its own
+filesystem off the emulated controller.
+
+### The console needed interrupts, and a reason to keep talking
+
+A PROM polls; a kernel does not. Two things were missing and each had a
+distinct symptom.
+
+**Receive.** Typing at a prompt did nothing: the character sat in the receive
+register and nobody looked. `com0` hangs off CRIME input 4, which is the ISA
+cascade — NetBSD's handler reads `MACE_ISA_INT_STATUS` and matches each
+device's mask against it, so raising CRIME alone is not enough; the
+demultiplexer has to find something. The masks are the ones the kernel prints
+for itself: "com0 at mace0 offset 0x390000 intr 4 intrmask 0x3f00000".
+
+**Transmit.** The prompt arrived as `Enter pathname o` and stopped — in the
+middle of a word. The driver fills the transmit FIFO and waits to be told it
+has drained, and our `IIR` always said "nothing pending". A UART that is
+always ready but never says so leaves a kernel waiting forever. Implementing
+`IIR` properly — receive-data above transmit-empty above none — finished the
+sentence.
+
+The `WARNING: preposterous TOD clock time` is still outstanding: the RTC
+answers, but not with a time anything believes.
+
+### An accidental half-hour
+
+Worth recording because the instrument caused it. The script matcher called
+`com0.output()` — which copies the whole console buffer — on **every
+instruction**. Boots that had taken minutes stopped finishing at all; the
+first run was killed after half an hour still in the device probe, and it
+looked like a guest bug. Checking `bytes_out()` first and only scanning when
+the guest has actually said something took the same boot to a shell in under
+four minutes.
+
 ## Driving the machine: `IRIS_IP32_SCRIPT`
 
 Booting to multi-user means answering three different things in turn — the

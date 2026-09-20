@@ -542,6 +542,17 @@ pub const PCI_DEVICE_AIC7880: u16 = 0x8078;
 pub const PCI_CLASS_SCSI: u32 = 0x0100_00;
 /// The slot the PROM looks in first.
 pub const IP32_SCSI_SLOT: u8 = 1;
+/// MACE's own interrupt status, which CRIME input 4 cascades from. NetBSD's
+/// handler reads this register and matches each device's mask against it, so
+/// raising CRIME alone is not enough -- the demultiplexer has to find
+/// something.
+pub const MACE_ISA_INT_STATUS: u32 = MACE_BASE + 0x0031_0010;
+/// CRIME input 4 is the ISA cascade; `com0` sits behind it.
+pub const IP32_ISA_CRIME_INT: u32 = 4;
+/// The bits NetBSD's `com0` attaches with, as it prints them:
+/// "com0 at mace0 offset 0x390000 intr 4 intrmask 0x3f00000".
+pub const MACE_ISA_SERIAL0_MASK: u64 = 0x03f0_0000;
+
 /// Which of CRIME's interrupt inputs the controller in that slot drives.
 /// NetBSD works this out for itself and prints it: "interrupting at crime
 /// interrupt 8".
@@ -737,6 +748,16 @@ pub mod com_reg {
     pub const MSR: u32 = 6;
     pub const SCR: u32 = 7;
 
+    /// IER: interrupt on received data, and on the transmitter draining.
+    pub const IER_RX: u8 = 0x01;
+    pub const IER_TX: u8 = 0x02;
+    /// IIR: bit 0 clear means "something to service"; the cause is above it.
+    pub const IIR_NONE: u8 = 0x01;
+    pub const IIR_TX_EMPTY: u8 = 0x02;
+    pub const IIR_RX_DATA: u8 = 0x04;
+    /// The two high bits a 16550 sets once its FIFOs are enabled.
+    pub const IIR_FIFO: u8 = 0xc0;
+
     /// LCR bit 7: the next accesses to 0 and 1 are the baud divisor.
     pub const LCR_DLAB: u8 = 0x80;
     /// LSR: a received character is waiting.
@@ -820,9 +841,42 @@ impl Com16550 {
         self.regs.lock().unwrap()[com_reg::MCR as usize] & com_reg::MCR_LOOP != 0
     }
 
+    /// What the chip wants serviced, in the form the driver reads it.
+    ///
+    /// A kernel does not poll: it fills the transmit FIFO and waits to be
+    /// told it has drained. Reporting "nothing pending" here leaves it
+    /// waiting forever, and the visible symptom is output that stops in the
+    /// middle of a word.
+    fn iir(&self) -> u8 {
+        let ier = self.regs.lock().unwrap()[com_reg::IER as usize];
+        if ier & com_reg::IER_RX != 0 && !self.input.lock().unwrap().is_empty() {
+            return com_reg::IIR_RX_DATA;
+        }
+        if ier & com_reg::IER_TX != 0 {
+            // The transmitter is always drained here; there is no wire.
+            return com_reg::IIR_TX_EMPTY;
+        }
+        com_reg::IIR_NONE
+    }
+
+    /// True while the chip is asking for attention.
+    pub fn interrupting(&self) -> bool {
+        self.iir() & com_reg::IIR_NONE == 0
+    }
+
     pub fn read_reg(&self, addr: u32) -> u8 {
         let Some(n) = Self::reg_of(addr) else { return 0 };
         match n {
+            // Reading IIR is how the driver asks what to do next, and on a
+            // 16550 it also acknowledges a transmit interrupt.
+            com_reg::IIR_FCR => {
+                let fifo = if self.regs.lock().unwrap()[com_reg::IIR_FCR as usize] & 1 != 0 {
+                    com_reg::IIR_FIFO
+                } else {
+                    0
+                };
+                self.iir() | fifo
+            }
             // Always ready to take another byte, and data-ready whenever
             // something has been typed.
             com_reg::LSR => {
@@ -1486,6 +1540,9 @@ impl Stub {
     }
     fn cell(&self, addr: u32) -> u64 {
         *self.cells.lock().unwrap().get(&(addr & 0x007f_ffff & !7)).unwrap_or(&0)
+    }
+    pub fn set_cell_pub(&self, addr: u32, val: u64) {
+        self.set_cell(addr, val)
     }
     fn set_cell(&self, addr: u32, val: u64) {
         self.cells.lock().unwrap().insert(addr & 0x007f_ffff & !7, val);
@@ -3042,6 +3099,7 @@ mod bringup {
             .unwrap_or_default();
         script.reverse();
         let mut script_seen = 0usize;
+        let mut last_out_len = usize::MAX;
         // post1 contains real timed delays — one of them waits a full second
         // of UST, which at UST_TICKS_DEN instructions per tick is 100M steps
         // on its own. The default budget clears that with room to spare;
@@ -3250,15 +3308,25 @@ mod bringup {
             // only evaluated while it is: scanning the output buffer on every
             // instruction is not something to do by default.
             // Script steps fire in order, each waiting for its own prompt.
-            if let Some((wait, text)) = script.last() {
-                if bus.com0.output()[script_seen..].contains(wait.as_str()) {
-                    bus.com0.feed(text);
-                    script_seen = bus.com0.output().len();
-                    script.pop();
+            //
+            // Only look when the guest has actually said something new.
+            // `output()` copies the whole console buffer, and calling it on
+            // every instruction costs more than the emulation -- it turned a
+            // boot into something that had not finished after half an hour.
+            let out_len = bus.com0.bytes_out();
+            let said_something = out_len != last_out_len;
+            last_out_len = out_len;
+            if said_something {
+                if let Some((wait, text)) = script.last() {
+                    if bus.com0.output()[script_seen..].contains(wait.as_str()) {
+                        bus.com0.feed(text);
+                        script_seen = out_len;
+                        script.pop();
+                    }
                 }
             }
             if let Some(feed) = feed_bytes.as_ref() {
-                if !fed && bus.com0.output().contains(expect.as_str()) {
+                if !fed && said_something && bus.com0.output().contains(expect.as_str()) {
                     bus.com0.feed(feed);
                     fed = true;
                     fed_at = steps;
@@ -3284,6 +3352,14 @@ mod bringup {
                 if let Some(scsi) = bus.scsi.lock().unwrap().as_ref() {
                     bus.crime.set_int(IP32_SCSI_CRIME_INT, scsi.interrupting());
                 }
+                // The console's receive interrupt. The PROM polls the UART
+                // and never needed this; a kernel does not poll, so without
+                // it every character typed at a prompt sits in the receive
+                // register unread and the machine looks hung.
+                let com_irq = bus.com0.interrupting();
+                let isa = if com_irq { MACE_ISA_SERIAL0_MASK } else { 0 };
+                bus.mace.set_cell_pub(MACE_ISA_INT_STATUS, isa);
+                bus.crime.set_int(IP32_ISA_CRIME_INT, com_irq);
                 let bits = &exec.core.hot.interrupts;
                 let cur = bits.load(std::sync::atomic::Ordering::Relaxed);
                 let ip2 = crate::mips_core::CAUSE_IP2 as u64;
