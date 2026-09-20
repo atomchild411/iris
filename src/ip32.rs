@@ -1546,6 +1546,9 @@ impl Stub {
     fn cell(&self, addr: u32) -> u64 {
         *self.cells.lock().unwrap().get(&(addr & 0x007f_ffff & !7)).unwrap_or(&0)
     }
+    pub fn cell_pub(&self, addr: u32) -> u64 {
+        self.cell(addr)
+    }
     pub fn set_cell_pub(&self, addr: u32, val: u64) {
         self.set_cell(addr, val)
     }
@@ -3471,10 +3474,20 @@ mod bringup {
                 // and never needed this; a kernel does not poll, so without
                 // it every character typed at a prompt sits in the receive
                 // register unread and the machine looks hung.
+                // Set and clear only this device's bits. Overwriting the
+                // whole register would erase whatever else the guest has put
+                // there -- other devices' pending bits, or an acknowledgement
+                // it is in the middle of -- and a kernel that finds its own
+                // writes disappearing has no way to make progress.
                 let com_irq = bus.com0.interrupting();
-                let isa = if com_irq { MACE_ISA_SERIAL0_MASK } else { 0 };
+                let isa = bus.mace.cell_pub(MACE_ISA_INT_STATUS);
+                let isa = if com_irq {
+                    isa | MACE_ISA_SERIAL0_MASK
+                } else {
+                    isa & !MACE_ISA_SERIAL0_MASK
+                };
                 bus.mace.set_cell_pub(MACE_ISA_INT_STATUS, isa);
-                bus.crime.set_int(IP32_ISA_CRIME_INT, com_irq);
+                bus.crime.set_int(IP32_ISA_CRIME_INT, isa != 0);
                 let bits = &exec.core.hot.interrupts;
                 let cur = bits.load(std::sync::atomic::Ordering::Relaxed);
                 let ip2 = crate::mips_core::CAUSE_IP2 as u64;
