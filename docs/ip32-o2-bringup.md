@@ -359,6 +359,35 @@ advances, a PCI bridge answering all-ones, a memory window that absorbs
 accesses to unpopulated banks instead of bus-erroring, and a low-memory alias.
 No PCI enumeration, no `ahc`, no graphics, no 1-Wire, no console.
 
+## POST completes, and the PROM talks
+
+Letting it run past post1 rather than stopping there: post1 executes, returns
+to sloader, and sloader **prints to `com0`**. 522 bytes:
+
+    ^@^A^B ... !"#$%&'()*+,-./0123456789:;<=>?@ABC ... ~^?  (the whole byte range)
+    SL-9600-8E>
+
+A character-set sweep — the UART testing itself — followed by **sloader's
+prompt**: "SL", 9600 baud, 8 data bits, even parity. It then sits polling
+`com0`'s line status for data-ready, which the disassembly confirms directly:
+
+    0xbfc01ea0 -> 0xbf390507      com0 + 0x507, LSR
+    0xbfc01e8c -> 0xbf390007      com0 + 0x007, RBR
+
+exactly the MACE register layout implemented here. So **POST is finished and
+the machine is waiting for console input.**
+
+Receive is implemented (`Com16550::feed`) and the PROM does consume what it is
+given — the queue drains — but neither `?` nor a bare carriage return draws any
+response. `SL-9600-8E>` is a *serial loader* prompt, which most likely expects
+a download protocol rather than typed commands; that is the next thing to
+establish. Set `IRIS_IP32_INPUT` to experiment.
+
+An open question this raises: on a healthy O2, does sloader stop here, or
+should it hand off to the `firmware` section (4.18, at 0x81000000) — the actual
+ARCS monitor? If the latter, something is still steering it into a fallback
+path, and finding what is the next real gate.
+
 ## The console will not help during post1## Open questions
 
 - ~~How much does `post1` insist on?~~ Answered: CRIME is cheap, MACE PCI is
