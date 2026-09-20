@@ -233,6 +233,22 @@ impl MemoryController {
     ///   inst_size_per_rank = size_mb_bytes >> inst_rank.
     /// Encode a MEMCFG half-word for a bank at `base` with `size_mb` installed.
     /// Inverse of [`memcfg_bank_info`] for the sizes IRIS supports.
+    /// How far the MEMCFG base field is shifted to give a physical address.
+    ///
+    /// IP22/IP24 use 22 (a 4 MB granule). IP28 appears to use 24: its PROM
+    /// writes base byte 0x60 and then probes 0x60000000, and base byte 0x20
+    /// gives 0x20000000, which is where NetBSD loads IP28 kernels. Both fall
+    /// out of a 24-bit shift and neither does out of 22.
+    ///
+    /// Env-gated while IP28 has no machine profile of its own. It must not
+    /// change IP22/IP24, which this default preserves.
+    fn memcfg_base_shift() -> u32 {
+        static SHIFT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *SHIFT.get_or_init(|| {
+            if std::env::var_os("IRIS_IP28").is_some() { 24 } else { 22 }
+        })
+    }
+
     pub fn encode_memcfg_half(base: u32, size_mb: u32) -> Option<u16> {
         if size_mb == 0 {
             return None;
@@ -245,7 +261,7 @@ impl MemoryController {
             128 => (15, 1),
             _   => return None,
         };
-        let base_byte = (base >> 22) & 0xFF;
+        let base_byte = (base >> Self::memcfg_base_shift()) & 0xFF;
         Some(
             (base_byte as u16)
                 | (1 << 13) // VLD
@@ -258,10 +274,10 @@ impl MemoryController {
         if size_mb == 0 { return None; }
         if (half >> 13) & 1 == 0 { return None; }
 
-        let base = ((half as u32) & 0xFF) << 22;
+        let base = ((half as u32) & 0xFF) << Self::memcfg_base_shift();
         let conf_rank = ((half >> 14) & 1) as u32;
         let conf_size_field = ((half >> 8) & 0x1F) as u32;
-        let conf_total = (conf_size_field + 1) << 22;
+        let conf_total = (conf_size_field + 1) << Self::memcfg_base_shift();
 
         // SIMM size → (size_field, rank) in register format (one unit = 4MB)
         let (simm_size_field, simm_rank): (u32, u32) = match size_mb {
@@ -274,8 +290,8 @@ impl MemoryController {
         };
 
         let conf_size = conf_total >> conf_rank;
-        let minus_size = (simm_size_field + 1) << (22 - simm_rank);
-        let plus_size = (simm_size_field + 1) << (22 + simm_rank);
+        let minus_size = (simm_size_field + 1) << (Self::memcfg_base_shift() - simm_rank);
+        let plus_size = (simm_size_field + 1) << (Self::memcfg_base_shift() + simm_rank);
         // BNK=0 (aliasing phase): wrap at inst_size so alias is detected at base+inst_size
         // BNK=1 (subbank/walkingbit): wrap at full bank size so both ranks are independent
         let addr_mask = if conf_rank == 0 { minus_size - 1 } else { plus_size - 1 };
@@ -301,6 +317,31 @@ impl MemoryController {
             return false;
         }
         self.write32(MC_BASE + REG_MEMCFG0, memcfg0) == BUS_OK
+    }
+
+    /// Map banks 2/3 at HIMEM_BASE straight away, without waiting for a PROM
+    /// to program MEMCFG.
+    ///
+    /// EXPERIMENT (IP28 bring-up). The IP28 PROM never writes MEMCFG at all —
+    /// the monitor shows both halves still zero when it gives up with "No
+    /// usable memory found" — yet it does write the MC's timing registers, so
+    /// it is talking to this MC. On Power Indigo2 the SIMMs sit on the CPU
+    /// module rather than the motherboard, which would explain both that and
+    /// why the PROM looks for RAM at 0x20000000 instead of 0x08000000.
+    ///
+    /// If that is right, RAM has to be present at HIMEM from reset, the way it
+    /// would be on a board whose memory this MC does not place. If it is
+    /// wrong, this is a plausible mapping with nothing behind it — delete it.
+    pub fn map_himem_banks_now(&self) -> bool {
+        use crate::physical::{BANK_SIZE, HIMEM_BASE};
+        let half = |i: usize, base: u32| {
+            Self::encode_memcfg_half(base, self.ram_sizes[i]).unwrap_or(0) as u32
+        };
+        let memcfg1 = (half(2, HIMEM_BASE) << 16) | half(3, HIMEM_BASE + BANK_SIZE);
+        if memcfg1 == 0 {
+            return false;
+        }
+        self.write32(MC_BASE + REG_MEMCFG1, memcfg1) == BUS_OK
     }
 
     /// Parse MEMCFG0/1 registers into 4 bank (base, addr_mask, limit) triples using the
@@ -682,12 +723,18 @@ impl BusDevice for MemoryController {
                 BUS_OK
             }
             REG_MEMCFG0 => {
+                if Self::memcfg_base_shift() != 22 {
+                    eprintln!("iris: ip28: guest writes MEMCFG0 = {val:#010x}");
+                }
                 dlog_dev!(LogModule::Mc, "MC: Write MEMCFG0 = {:08x}", val);
                 state.regs[(REG_MEMCFG0 / 4) as usize] = val;
                 self.on_memcfg_updated(&mut state);
                 BUS_OK
             }
             REG_MEMCFG1 => {
+                if Self::memcfg_base_shift() != 22 {
+                    eprintln!("iris: ip28: guest writes MEMCFG1 = {val:#010x}");
+                }
                 dlog_dev!(LogModule::Mc, "MC: Write MEMCFG1 = {:08x}", val);
                 state.regs[(REG_MEMCFG1 / 4) as usize] = val;
                 self.on_memcfg_updated(&mut state);

@@ -213,6 +213,7 @@ const ALIAS_BASE: u32   = 0x00000000;
 const ALIAS_END: u32    = 0x00080000;
 const ALIAS_OFFSET: u32 = LOMEM_BASE;
 
+
 // Mystery Black Hole (64KB at 0x02080000)
 const MYSTERY_HOLE_BASE: u32 = 0x02080000;
 const MYSTERY_HOLE_END: u32  = 0x02090000;
@@ -593,6 +594,7 @@ impl Physical {
         self.vino_gio_alias.target = self as *const Physical as *const dyn BusDevice;
         let vino_gio_alias_ptr: *const dyn BusDevice = &self.vino_gio_alias;
         self.device_map[(0x1F080000u32 >> 16) as usize] = vino_gio_alias_ptr;
+
     }
 
     /// Remap memory banks in device_map.
@@ -636,6 +638,9 @@ impl Physical {
                 continue;
             };
 
+            if std::env::var_os("IRIS_IP28").is_some() {
+                eprintln!("iris: IP28 experiment: bank {bank_idx} -> base {conf_base:#010x} mask {addr_mask:#010x} limit {limit:#010x}");
+            }
             dlog_dev!(LogModule::Mc, "[MEMCFG] bank {} mapped at 0x{:08x}..0x{:08x} addr_mask={:08x} limit={:08x} ({}MB visible, {}MB per rank)",
                 bank_idx, conf_base, conf_base + limit,
                 addr_mask, limit, limit >> 20, (addr_mask + 1) >> 20);

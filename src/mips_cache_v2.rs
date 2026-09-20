@@ -1057,6 +1057,7 @@ pub struct CpuCache<
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
     const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize,
+    const MODEL: u8,
 > {
     downstream: Arc<dyn BusDevice>,
 
@@ -1134,12 +1135,12 @@ unsafe impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, co
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> Send for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {}
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Send for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {}
 unsafe impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> Sync for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {}
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Sync for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {}
 
 // Per-level cache types, parameterised so each CPU model monomorphises its own.
 type ICacheT<const S: usize, const L: usize, const W: usize, const T: usize> =
@@ -1149,24 +1150,40 @@ type DCacheT<const S: usize, const L: usize, const W: usize, const T: usize, con
 type L2CacheT<const S: usize, const L: usize, const T: usize, const D: usize, const N: usize> =
     Cache<L2Tag, S, L, 1, { CacheKind::L2 as u8 }, T, D, N>;
 
+/// Which processor a monomorphisation models, as the `MODEL` const parameter.
+///
+/// This exists because the thing that distinguishes these parts *in this file*
+/// is not any one of the shape parameters. It was originally inferred from
+/// `IC_WAYS == 2`, which worked only while "2-way" and "R5000" named the same
+/// processor. They do not: the R10000 is also 2-way, and it shares neither the
+/// R5000's TagLo layout nor its cache-op semantics. Inferring identity from
+/// shape would have quietly given an R10000 every R5000 behaviour in the 40-odd
+/// places that branch on it, each one individually plausible.
+pub mod model {
+    pub const R4400: u8 = 0;
+    pub const R5000: u8 = 1;
+    pub const R10000: u8 = 2;
+}
+
 /// SGI Indy R4400: direct-mapped 16K L1s, 1 MB unified L2 owning the decode slots.
 pub type R4400Cache = CpuCache<16384, 16, 1, 1024,
                                16384, 16, 1, 1024, 2048,
                                1048576, 128, 8192, 131072, 262144, true,
-                               false, 0x0000_0440, 0x0000_0500, 48>;
+                               false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }>;
 /// SGI Indy R5000: 2-way 32K L1s, no secondary cache; L1I owns its decode slots.
 pub type R5000Cache = CpuCache<32768, 32, 2, 1024,
                                32768, 32, 2, 1024, 4096,
                                128, 128, 1, 16, 0, false,
-                               true, 0x0000_2321, 0x0000_2300, 48>;
+                               true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }>;
 
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     // Model discriminator: folds to a literal, so it replaces #[cfg(feature = "r5k")].
-    const IS_R5K: bool = IC_WAYS == 2;
+    // Keyed on MODEL, not on associativity — see `mod model`.
+    const IS_R5K: bool = MODEL == model::R5000;
     // Logical L2 size; 0 means the model has no secondary cache.
     pub const L2_SIZE: usize = if HAS_L2 { L2_CACHE_SIZE } else { 0 };
 
@@ -1291,7 +1308,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> From<Arc<dyn BusDevice>> for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> From<Arc<dyn BusDevice>> for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn from(downstream: Arc<dyn BusDevice>) -> Self {
         Self::new(downstream)
     }
@@ -1301,7 +1318,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     /// Check if we're tracking this physical address (for debug purposes)
     #[cfg(feature = "debug_cache")]
     #[inline]
@@ -2804,19 +2821,23 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> CpuModel for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuModel for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     const MIPS4: bool = MIPS4;
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
-    const NAME: &'static str = if IC_WAYS == 2 { "R5000" } else { "R4400" };
+    const NAME: &'static str = match MODEL {
+        model::R5000 => "R5000",
+        model::R10000 => "R10000",
+        _ => "R4400",
+    };
 }
 
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> MipsCache for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> MipsCache for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn set_l1i_counters(&mut self, hit: Arc<AtomicU64>, fetch: Arc<AtomicU64>) {
         self.l1i_hit_count = hit;
         self.l1i_fetch_count = fetch;
@@ -4020,7 +4041,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> Drop for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Drop for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn drop(&mut self) {
         self.ic.stop.store(true, Ordering::Relaxed);
     }
@@ -4032,7 +4053,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> Resettable for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Resettable for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn power_on(&self) {
         self.ic.tags_mut().fill(L1ITag::default());
         self.dc.tags_mut().fill(L1DTag::default());
@@ -4063,7 +4084,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn save_tags_as_u32<TAG: Copy + Into<u32>>(tags: &[TAG]) -> Vec<u32> {
         tags.iter().map(|&t| t.into()).collect()
     }
@@ -4210,6 +4231,32 @@ mod tests {
 
     fn make_cache(mem: Arc<Memory>) -> R4400Cache {
         R4400Cache::new(mem as Arc<dyn BusDevice>)
+    }
+
+    /// Deliberately the R5000's exact shape, differing *only* in `MODEL`. If
+    /// model identity is ever inferred from a shape parameter again, this
+    /// aliases onto the R5000 and the test below fails.
+    type NotAnR5000 = CpuCache<32768, 32, 2, 1024,
+                               32768, 32, 2, 1024, 4096,
+                               128, 128, 1, 16, 0, false,
+                               true, 0x0000_0900, 0x0000_0900, 64, { model::R10000 }>;
+
+    /// Two-way associativity is not an identity.
+    ///
+    /// `IS_R5K` used to be `IC_WAYS == 2`, which was true of every 2-way part
+    /// the file knew about. The R10000 is also 2-way and shares neither the
+    /// R5000's TagLo layout nor its cache-op semantics, so that inference would
+    /// have handed it R5000 behaviour at all 40-odd sites that branch on it —
+    /// silently, and each one plausible on its own.
+    #[test]
+    fn model_identity_is_explicit_and_not_inferred_from_associativity() {
+        assert_eq!(<R4400Cache as CpuModel>::NAME, "R4400");
+        assert_eq!(<R5000Cache as CpuModel>::NAME, "R5000");
+        assert_eq!(<NotAnR5000 as CpuModel>::NAME, "R10000");
+
+        assert!(R5000Cache::IS_R5K, "the R5000 is the R5000");
+        assert!(!NotAnR5000::IS_R5K, "a 2-way cache is not what makes an R5000");
+        assert!(!R4400Cache::IS_R5K);
     }
 
     // Same helper for whichever CPU model a test wants to exercise.
