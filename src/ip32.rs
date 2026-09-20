@@ -104,6 +104,13 @@ pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 pub const PROM_BASE: u32 = 0x1fc0_0000;
 pub const PROM_SIZE: u32 = 0x0008_0000; // 512 KiB
 
+/// Where the `firmware` section's SHDR says it loads: KSEG0 0x81000000, i.e.
+/// physical 0x01000000. If sloader is meant to hand off to the ARCS monitor,
+/// this is where it would put it and where the PC would end up.
+pub const FIRMWARE_LOAD_VA: u32 = 0x8100_0000;
+pub const FIRMWARE_LOAD_PA: u32 = 0x0100_0000;
+pub const FIRMWARE_SPAN: u32 = 0x0006_0000;
+
 /// sloader's serial prompt: "SL", 9600 baud, 8 data bits, even parity. Seeing
 /// this means POST has completed and the PROM is waiting on console input.
 pub const SLOADER_PROMPT: &str = "SL-9600-8E>";
@@ -662,6 +669,8 @@ pub struct Ip32Bus {
     unmapped: Mutex<Vec<(u32, bool, u32)>>,
     /// The PC of the instruction currently executing.
     pub pc: PcTap,
+    /// Count of writes into the firmware load region.
+    fw_writes: Mutex<u64>,
     /// 64-bit RAM accesses at the addresses POST's memory sizing uses, as
     /// `(addr, is_write, value, pc)`. The test writes `(!a << 32) | a` to each and
     /// reads it back, so seeing both halves is what tells us whether the store
@@ -687,6 +696,7 @@ impl Ip32Bus {
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
             pc: PcTap::default(),
+            fw_writes: Mutex::new(0),
             sizemem: Mutex::new(Vec::new()),
         }
     }
@@ -745,6 +755,11 @@ impl Ip32Bus {
         !self.in_ram(addr)
             && addr >= RAM_BASE
             && addr < RAM_BASE.wrapping_add(RAM_WINDOW_SIZE)
+    }
+
+    /// Writes landing where the `firmware` section would be loaded.
+    pub fn firmware_writes(&self) -> u64 {
+        *self.fw_writes.lock().unwrap()
     }
 
     /// Offset of `addr` within RAM, if it is in RAM.
@@ -842,6 +857,9 @@ impl Ip32Bus {
     }
 
     fn write_bytes(&self, addr: u32, n: usize, val: u64) -> bool {
+        if (FIRMWARE_LOAD_PA..FIRMWARE_LOAD_PA + FIRMWARE_SPAN).contains(&addr) {
+            *self.fw_writes.lock().unwrap() += 1;
+        }
         let addr = self.resolve(addr);
         // Writes into an empty bank are swallowed by the memory controller.
         if self.in_unpopulated_ram(addr) {
@@ -1491,6 +1509,12 @@ mod bringup {
         let mut max_prom_pc = 0u32;
         let mut max_post1_pc = 0u32;
         let mut post1_at = 0u64;
+        let mut entered_firmware = false;
+        // A short ring of recent PCs, snapshotted the moment the PROM first
+        // writes to the console. Whatever branch chose serial-loader mode is
+        // in here.
+        let mut ring: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        let mut path_to_console: Vec<u32> = Vec::new();
         let mut fed = false;
         let mut fed_at = 0u64;
         let feed_bytes: Option<Vec<u8>> = std::env::var("IRIS_IP32_INPUT")
@@ -1514,12 +1538,30 @@ mod bringup {
                     post1_at = steps;
                 }
             }
+            if (FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN).contains(&pc) {
+                entered_firmware = true;
+            }
             if reached_post1 && (POST1_ENTRY..POST1_ENTRY + 0x8000).contains(&pc) && pc > max_post1_pc {
                 max_post1_pc = pc;
             }
             // Publish the PC so devices can attribute the accesses this
             // instruction is about to make.
             bus.pc.set(pc);
+
+            if path_to_console.is_empty() {
+                ring.push_back(pc);
+                if ring.len() > 400 {
+                    ring.pop_front();
+                }
+                if bus.com0.bytes_out() > 0 {
+                    // Keep only the distinct PCs, in order of last visit.
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut v: Vec<u32> = ring.iter().rev().copied()
+                        .filter(|p| seen.insert(*p)).collect();
+                    v.reverse();
+                    path_to_console = v;
+                }
+            }
 
             if pc == printf.entry {
                 let a = &exec.core.gpr;
@@ -1591,6 +1633,13 @@ mod bringup {
             eprintln!("   | {line}");
         }
         eprintln!("ip32: ===== end console =====");
+        eprintln!("ip32: path to the first console byte ({} distinct PCs, most recent last):",
+                  path_to_console.len());
+        for chunk in path_to_console.chunks(8) {
+            eprintln!("   {}", chunk.iter().map(|p| format!("{p:08x}")).collect::<Vec<_>>().join(" "));
+        }
+        eprintln!("ip32: firmware section: {} write(s) to its load region, PC entered it: {}",
+                  bus.firmware_writes(), entered_firmware);
         if fed {
             eprintln!("ip32: answered the prompt at step {fed_at}; {} byte(s) still unread",
                       bus.com0.pending_input());

@@ -383,10 +383,45 @@ response. `SL-9600-8E>` is a *serial loader* prompt, which most likely expects
 a download protocol rather than typed commands; that is the next thing to
 establish. Set `IRIS_IP32_INPUT` to experiment.
 
-An open question this raises: on a healthy O2, does sloader stop here, or
-should it hand off to the `firmware` section (4.18, at 0x81000000) — the actual
-ARCS monitor? If the latter, something is still steering it into a fallback
-path, and finding what is the next real gate.
+### It should hand off, and it is not
+
+Answered, and the answer is that we are on the wrong path.
+
+**It must hand off.** The `firmware` section (v4.18) exists precisely to be
+loaded at 0x81000000, and it is the ARCS monitor — the thing `arcbios_init`
+finds and NetBSD requires on IP32. A machine that never runs it has no ARCS and
+can boot nothing.
+
+**It never does.** Watching the load region directly:
+
+    firmware section: 0 write(s) to its load region, PC entered it: false
+
+Not copied, not entered. So `SL-9600-8E>` is not a resting place on the way to
+booting; it is somewhere else entirely.
+
+**It is post1 that takes us there, not sloader.** Capturing the distinct PCs
+leading to the first console byte shows them all inside post1's copy in RAM
+(0xa0004xxx–0xa00054xx), calling back into the PROM's serial routines at
+0xbfc01xxx. So post1 runs, and then *post1* prints the byte-range self-test and
+the prompt and waits.
+
+The prompt itself is assembled from a baud table at 0xbfc01e50 — 4800, 9600,
+19200, 38400, 57600, 115200 — around the fragments `\n\rSL-` and `-8E`. "SL"
+is **serial loader**: a download/diagnostic mode, not the boot path.
+
+### The hypothesis to test next
+
+Something is selecting that mode. The most likely candidate is what we feed it
+where a real machine has persistent state: the run touches MACE + 0x3a3f04
+(the RTC/NVRAM region, 2 reads and a write) and gets zeros, because nothing
+backs it. An all-zero NVRAM is exactly the sort of thing firmware reads as
+"diagnostic mode requested" — and the 1-Wire serial-ID chip, which holds the
+machine's identity and is also unimplemented, is a second candidate.
+
+So the next gate is probably **persistent state**: NVRAM behind the RTC at
+MACE + 0x3a0000, and the 1-Wire ID chip at `MACE_ISA_FLASH_NIC_REG`. Both are
+small, and both are the IP32 counterparts of things IRIS already models for the
+Indy (`eeprom_93c56`, `ds1x86`).
 
 ## The console will not help during post1## Open questions
 
