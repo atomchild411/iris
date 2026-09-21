@@ -85,49 +85,47 @@ no special case.
 ## Where it stops
 
 ```
-Secondary Cache Failure: Address: 0xa800000020000000 TAG walking 1s
-                         Expected: 0x0000000000000001 SRAM U1
+Secondary Cache Failure: Address: 0xa800000020000000 MRU bit set
+                         Expected: 0x0000000100000000 SRAM U2
+                         Actual:   0x0000000000000000
 ```
 
-Open, and the next thing to work on. What is known:
+The **tag tests pass** — both walking phases, after TagHi was carried
+properly, TagLo widened to 64 bits, and the shadow given its two ways. What
+remains is the MRU (most-recently-used) bit, which the PROM sets by writing
+TagHi[31] and reads back at TagHi[0]. Different bits, which is what says it is
+hardware state and not stored tag.
 
-- The PROM **never issues `Index_Load_Tag`**, so it is not reading tags back
-  through the CACHE instruction. Whatever the tag test checks, it infers.
-- It never issues `Index_Load_Data` either. It stores data by index and must be
-  reading it back by ordinary load — which only works if the line's tag and
-  state make that load hit.
-- Implementing `Index_Store_Data` as a direct write into `l2.data` appeared to
-  make things worse — the PROM started stalling part-way through its failure
-  message. It did not; see below.
+Modelling it as "one MRU way per set, set by the command bit" is not what the
+PROM wants. From the trace it marks way 0 of a set, immediately overwrites
+that same tag with zero, then reads a way back — and the geometry of those
+addresses changes with the Config `SS` field, so the PROM is computing set
+strides from the cache size we report. Each further hypothesis costs a build
+and a boot.
 
-That apparent regression was a misreading. The PROM does not hang: it reaches a
-deliberate dead stop.
+### Skipping the diagnostic does not work either
 
-```
-bfc012cc: beq fp, zero, 5   -> bfc012e4    ; no continuation registered?
-bfc012e4: beq zero, zero,-1 -> bfc012e4    ; then spin here forever
-```
+Two levers were tried, and both fail for the same underlying reason.
 
-`fp` is zero, so it takes the second branch. This is the PROM's panic path —
-jump to a registered continuation, or halt. The truncated failure message is
-just output unflushed when the run is killed; the message repeats five times
-across retries before the PROM gives up.
+`diagmode=dc` makes this PROM family continue past failed diagnostics — both
+the IP22 and IP28 PROMs carry the strings `Diagnostics failed.` and
+`Continuing with diagmode=dc.`. A valid NVRAM was produced for it by booting
+**IP22** in this emulator, setting `diagmode` and `console` from its own PROM
+monitor, and saving the image (`nveeprom save`) — the two machines share the
+93CS56 and the PROM family, so the format matches. It changes nothing: on IP22
+the console shows `NVRAM checksum is incorrect` and `Running power-on
+diagnostics` *before* anything else, while on IP28 the cache failure is the
+**first** output with no preamble at all. The secondary cache test runs in
+early POST, before the PROM has read its environment, so `diagmode` is never
+consulted.
 
-A physical-address watch on `0x20000000` (`IRIS_IP28_WATCH`) records **no
-accesses at all**, so the address in the failure text is a label for the region
-under test, not something the test reached. It fails before touching memory.
+Sweeping the Config `SS` field does not skip the test either. It does change
+it — `SS=4` runs longer and reports the `Actual:` line the other values omit —
+so the PROM sizes its walk from `SS`, but no value makes it decide there is no
+secondary cache to test.
 
-CP0 `Config` was then found to be presented in R4000 format, which an R10000
-PROM reads as "primary caches minimal, secondary cache size zero" — see below.
-Fixing the layout did not clear the gate either; sweeping the 3-bit `SS` field
-across 0..3 fails at every value. (An apparent pass at `SS=3` was a timing
-artefact of too short a run. It is recorded here because it was briefly
-believed.)
-
-**Next step**: stop inferring and use the debugger. Put a breakpoint on
-`0xbfc012cc` — the give-up decision — and read the stack there. The diagnostic's
-own return addresses should be on it, which names the test routine directly
-instead of guessing at its mechanism from op traces.
+That NVRAM image is worth keeping regardless (`ip28/nveeprom-ip28.bin`): it
+carries `console=d`, which is what IRIX will want later.
 
 ## The CPU model
 
