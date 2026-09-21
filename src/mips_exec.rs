@@ -2670,9 +2670,16 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             c |= log2(32768) << 26;          // 32 KB L1D
             c |= 1 << 15;                    // big endian
             if C::L2_LINE == 128 { c |= 1 << 13; }
-            // The SS encoding is not documented in anything to hand, and it is
-            // three bits. Sweepable rather than guessed: let the PROM say which
-            // value it believes, then pin it and delete this.
+            // Secondary cache size. The encoding is not in anything to hand,
+            // so it was swept against the PROM rather than guessed.
+            //
+            // 1 is the value to keep: IRIX reports "Secondary unified
+            // instruction/data cache size: 1 Mbyte", which agrees with this
+            // model's own `L2_SIZE`, and the PROM's power-on diagnostics pass
+            // and IRIX boots with it. 4 also passes POST but has IRIX report
+            // 8 MB, contradicting the model — it was only ever the value the
+            // bring-up scripts happened to pass. `IRIS_IP28_SS` still
+            // overrides, for sweeping it again.
             let ss: u32 = std::env::var("IRIS_IP28_SS")
                 .ok()
                 .and_then(|v| v.parse().ok())

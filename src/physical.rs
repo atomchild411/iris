@@ -224,13 +224,9 @@ const ALIAS_END: u32    = 0x00080000;
 /// loads its firmware pointer straight out of 0x1018 — so the PROM's writes
 /// were being discarded and sash then dereferenced the null it read back.
 ///
-/// Env-gated to match `MemoryController::memcfg_base_shift`; IP28 has no
-/// machine profile of its own yet, and this must not move IP22/IP24.
-fn alias_offset() -> u32 {
-    static OFFSET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *OFFSET.get_or_init(|| {
-        if std::env::var_os("IRIS_IP28").is_some() { HIMEM_BASE } else { LOMEM_BASE }
-    })
+/// Taken from the machine profile, never from the environment.
+fn alias_offset_for(ip28: bool) -> u32 {
+    if ip28 { HIMEM_BASE } else { LOMEM_BASE }
 }
 
 
@@ -304,6 +300,10 @@ pub struct Physical {
     // Maps (address >> 16) to device pointer (non-null, always valid)
     device_map: [*const dyn BusDevice; 65536],
 
+    /// Where the 512 KB alias at physical 0 points — see `alias_offset_for`.
+    alias_offset: u32,
+    /// This machine is an IP28. Only used to label the bank-map trace.
+    is_ip28: bool,
     /// 64 KB slots the last `remap_banks` placed a RAM bank in.
     ///
     /// `remap_banks` wipes the lomem and himem windows before re-placing, but
@@ -369,6 +369,8 @@ impl Physical {
         mc: MemoryController,
         hpc3: Hpc3,
         prom: PromPort,
+        // IP28: RAM starts at 0x20000000, so the low-memory alias follows it.
+        ip28: bool,
     ) -> Self {
         let host_freq = crate::platform::get_host_tick_frequency();
         let start_tick = crate::platform::get_host_ticks();
@@ -379,7 +381,7 @@ impl Physical {
         let gio_bus_error = GioBusErrorDevice { mc: mc.clone() };
         // Alias targets will be set in build_device_map once Physical is in final location
         let unmapped_ram = UnmappedRam;
-        let alias_bus = AliasBus::new(std::ptr::null::<ErrorBus>(), alias_offset());
+        let alias_bus = AliasBus::new(std::ptr::null::<ErrorBus>(), alias_offset_for(ip28));
         // VINO GIO alias: 0x1F08xxxx → 0x0008xxxx (subtract 0x1F000000 = add 0xFF000000)
         // GIO64 VINO aperture sits at 0x1F080000; the chip's primary registers
         // live at physical 0x00080000 (VINO_BASE). To map 0x1F080000 → 0x00080000
@@ -465,6 +467,8 @@ impl Physical {
             vino_gio_alias,
             black_hole,
             device_map,
+            alias_offset: alias_offset_for(ip28),
+            is_ip28: ip28,
             mapped_bank_slots: Vec::new(),
             trace: AtomicBool::new(false),
             start_tick,
@@ -696,7 +700,7 @@ impl Physical {
                 continue;
             };
 
-            if std::env::var_os("IRIS_IP28").is_some() {
+            if self.is_ip28 {
                 eprintln!("iris: IP28 experiment: bank {bank_idx} -> base {conf_base:#010x} mask {addr_mask:#010x} limit {limit:#010x}");
             }
             dlog_dev!(LogModule::Mc, "[MEMCFG] bank {} mapped at 0x{:08x}..0x{:08x} addr_mask={:08x} limit={:08x} ({}MB visible, {}MB per rank)",
@@ -770,7 +774,7 @@ impl Physical {
         // equivalent; both see identical memory.
         #[cfg(feature = "ppmem")]
         if let Some(sp) = &self.ppmem_space {
-            let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _)| base == alias_offset());
+            let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _)| base == self.alias_offset);
             if bank0_mapped {
                 let alias_len = (ALIAS_END - ALIAS_BASE) as u64;
                 if (self.banks[0].size() as u64) >= alias_len {

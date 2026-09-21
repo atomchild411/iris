@@ -441,8 +441,29 @@ impl Ioc {
         Self::new_inner(guinness, true)
     }
 
+    /// As `new`/`new_ci`, with the machine profile's IP28 flag: an IP28
+    /// baseboard must report a high enough HPC3 board revision.
+    pub fn new_for_profile(guinness: bool, ci_mode: bool, ip28: bool) -> Self {
+        Self::new_inner_profile(guinness, ci_mode, ip28)
+    }
+
     fn new_inner(guinness: bool, ci_mode: bool) -> Self {
-        let sys_id = if guinness { 0x26 } else { 0x11 }; // primarily prom looks at bit 1 to detect full house.
+        Self::new_inner_profile(guinness, ci_mode, false)
+    }
+
+    fn new_inner_profile(guinness: bool, ci_mode: bool, ip28: bool) -> Self {
+        // HPC3 SYS_ID: [7:5] chip rev, [4:1] board rev, [0] 1 = fullhouse.
+        // The PROM looks at bit 0 to tell fullhouse from guinness. IRIX reads
+        // the board revision to tell an IP28 baseboard from an IP26 one and
+        // warns "CPU baseboard downrev (IP26 not IP28)" below 13, so an IP28
+        // has to report at least that.
+        let sys_id: u8 = if guinness {
+            0x26
+        } else if ip28 {
+            0x1B // board rev 13, fullhouse
+        } else {
+            0x11 // board rev 8, fullhouse
+        };
         let state = Arc::new(Mutex::new(IocState {
             sys_id,
             l0_stat: 0,

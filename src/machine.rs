@@ -290,7 +290,8 @@ impl Machine {
 
         // 1. Create all devices first
         // Memory Controller
-        let mc = MemoryController::new(eeprom_mc.clone(), guinness, cfg.banks);
+        let mc = MemoryController::new_for_profile(
+            eeprom_mc.clone(), guinness, cfg.banks, cfg.machine.profile.ip28());
 
         // RAM banks sized per config. addr_mask is initialized to mem_size-1;
         // remap_banks() updates it via set_addr_mask() when MEMCFG0/1 are written during POST.
@@ -324,7 +325,7 @@ impl Machine {
 
         // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
         // bindings so multiple `--ci` instances can coexist.
-        let ioc = if ci_enabled { Ioc::new_ci(guinness) } else { Ioc::new(guinness) };
+        let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28());
 
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket
@@ -634,6 +635,7 @@ impl Machine {
             mc.clone(),
             hpc3.clone(),
             prom_port,
+            cfg.machine.profile.ip28(),
         );
 
         // Wrap Physical in Arc
