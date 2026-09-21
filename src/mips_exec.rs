@@ -6861,6 +6861,44 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if C::R10K_CACHE_OPS {
             self.cache.set_cache_ecc(self.core.cp0_ecc);
         }
+        // IP28 cache-error investigation (`IRIS_IP28_CACHEDIAG=1`). Two kinds
+        // of op are worth seeing: one carrying non-zero check bits, which is a
+        // guest staging a parity error on purpose, and any op from outside the
+        // PROM — i.e. from a loaded diagnostic, which runs out of XKPHYS.
+        //
+        // Both halves of that gate were learned the hard way. Gating on ECC
+        // alone hid every op the IDE issued, because the IDE's ECC reads back
+        // zero: the exact symptom under investigation was also blinding the
+        // instrument to its cause. The cap then has to be generous, because a
+        // cap of 600 silently truncated a run at precisely the boundary and
+        // made a partial picture look like the whole one. It exists only so a
+        // hot loop cannot rewrite the timing it is measuring.
+        if crate::mips_core::cachediag_on() {
+            let from_prom = (self.core.pc >> 32) == 0xFFFF_FFFF;
+            // CBARRIER is pure ordering: it names no line and carries no check
+            // bits, and it outnumbers everything else ~8:1 (83534 of 94322 in
+            // one IDE run). Tracing it swamped the log and slowed the guest
+            // enough that the run no longer reached the loop being studied —
+            // so drop it unless it is carrying staged check bits.
+            let noise = op == C_R10K_CBARRIER && self.core.cp0_ecc == 0;
+            if (self.core.cp0_ecc != 0 || !from_prom) && !noise {
+                const CACHE_TRACE_CAP: u32 = 200_000;
+                static SEEN: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < CACHE_TRACE_CAP {
+                    eprintln!(
+                        "ip28cd: CACHE op={:#04x} sel={} vaddr={:#018x} ECC={:#010x} \
+                         TagHi:Lo={:#010x}:{:#018x} pc={:#018x}",
+                        op, sel, virt_addr, self.core.cp0_ecc,
+                        self.core.cp0_taghi, self.core.cp0_taglo, self.core.pc,
+                    );
+                } else if n == CACHE_TRACE_CAP {
+                    eprintln!("ip28cd: CACHE trace capped at {CACHE_TRACE_CAP} ops \
+                               — output past this point is incomplete");
+                }
+            }
+        }
         // Call unified cache interface
         let result = self.cache.cache_op(cache_op, virt_addr, phys_addr_or_taglo);
         if C::R10K_CACHE_OPS && op == C_R10K_ILD {

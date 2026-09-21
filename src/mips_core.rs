@@ -28,6 +28,28 @@ pub const STATUS_CU1: u32 = 1 << 29;    // Coprocessor 1 (FPU) Usable
 pub const STATUS_CU2: u32 = 1 << 30;    // Coprocessor 2 Usable
 pub const STATUS_CU3: u32 = 1 << 31;    // Coprocessor 3 Usable
 
+/// IP28 bring-up: `IRIS_IP28_CACHEDIAG=1` traces everything the cache-error
+/// machinery touches — CP0 ECC (26) and CacheErr (27) accesses, Status.DE
+/// transitions, and CACHE ops.
+///
+/// Built to explain why SGI's own IDE field diagnostic reports "Failure
+/// detected on the CPU module" on an otherwise healthy emulated R10000. What
+/// it found: the IDE ends in a bounded 3712-iteration loop reading CacheErr
+/// and ECC, both of which return zero every pass, because nothing in this
+/// emulator ever writes CacheErr — we do not detect or log a cache error at
+/// all. Note it does this with Status.DE *set*: DE suppresses only the trap,
+/// while real hardware still records the error, which is what a poll-based
+/// parity test relies on. (An earlier guess that the IDE wanted a Cache Error
+/// *exception* was refuted by this tracer — DE is never cleared outside the
+/// PROM's own memory sizing.)
+///
+/// One cached bool; unarmed it is a predictable branch.
+#[inline(always)]
+pub fn cachediag_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_IP28_CACHEDIAG").is_some())
+}
+
 // CP0 Cause Register bit definitions
 pub const CAUSE_EXCCODE_MASK: u32 = 0x1F << 2; // Exception Code mask
 pub const CAUSE_EXCCODE_SHIFT: u32 = 2;        // Exception Code shift
@@ -1566,8 +1588,20 @@ impl MipsCore {
                 eprintln!("[ip7] MFC0 PerfCnt (reg 25) read -> 0");
                 0
             }
-            26 => self.cp0_ecc as u64,
-            27 => self.cp0_cacheerr as u64,
+            26 => {
+                if cachediag_on() {
+                    eprintln!("ip28cd: MFC0 ECC -> {:#010x} pc={:#018x}",
+                              self.cp0_ecc, self.pc);
+                }
+                self.cp0_ecc as u64
+            }
+            27 => {
+                if cachediag_on() {
+                    eprintln!("ip28cd: MFC0 CacheErr -> {:#010x} pc={:#018x}",
+                              self.cp0_cacheerr, self.pc);
+                }
+                self.cp0_cacheerr as u64
+            }
             28 => self.cp0_taglo,
             29 => self.cp0_taghi as u64,
             30 => self.cp0_errorepc,
@@ -2056,6 +2090,18 @@ impl MipsCore {
             12 => {
                 let old = self.cp0_status;
                 self.cp0_status = value as u32;
+                // Status.DE gates cache error exceptions. A diagnostic that
+                // means to provoke one has to clear it first, so a DE
+                // transition is the guest announcing its intent.
+                if cachediag_on() && (old ^ self.cp0_status) & STATUS_DE != 0 {
+                    eprintln!("ip28cd: Status.DE {} pc={:#018x}",
+                              if self.cp0_status & STATUS_DE != 0 {
+                                  "SET (cache exceptions DISABLED)"
+                              } else {
+                                  "CLEAR (cache exceptions ENABLED)"
+                              },
+                              self.pc);
+                }
                 // Trace every change to the IP7 mask bit (Status.IM7). Linux's
                 // mips_cpu_irq_controller masks IM7 on interrupt entry
                 // (irq_ack) and unmasks on EOI; if the unmask never comes, no
@@ -2137,8 +2183,20 @@ impl MipsCore {
                 #[cfg(feature = "developer_ip7")]
                 eprintln!("[ip7] MTC0 PerfCnt (reg 25) write {:#018x} (ignored)", value);
             }
-            26 => self.cp0_ecc = value as u32,
-            27 => self.cp0_cacheerr = value as u32,
+            26 => {
+                if cachediag_on() {
+                    eprintln!("ip28cd: MTC0 ECC = {:#010x} (was {:#010x}) pc={:#018x}",
+                              value as u32, self.cp0_ecc, self.pc);
+                }
+                self.cp0_ecc = value as u32;
+            }
+            27 => {
+                if cachediag_on() {
+                    eprintln!("ip28cd: MTC0 CacheErr = {:#010x} (was {:#010x}) pc={:#018x}",
+                              value as u32, self.cp0_cacheerr, self.pc);
+                }
+                self.cp0_cacheerr = value as u32;
+            }
             28 => self.cp0_taglo = value,
             29 => self.cp0_taghi = value as u32,
             30 => self.cp0_errorepc = value,
