@@ -97,11 +97,37 @@ TagHi[31] and reads back at TagHi[0]. Different bits, which is what says it is
 hardware state and not stored tag.
 
 Modelling it as "one MRU way per set, set by the command bit" is not what the
-PROM wants. From the trace it marks way 0 of a set, immediately overwrites
-that same tag with zero, then reads a way back — and the geometry of those
-addresses changes with the Config `SS` field, so the PROM is computing set
-strides from the cache size we report. Each further hypothesis costs a build
-and a boot.
+PROM wants. The exact sequence, with `IRIS_SHADOW_CACHEOPS=1`
+(which now traces tag operations only — tracing all of them is slower than the
+emulation, because the PROM issues 65k+ `Index_Store_Data` ops and an
+`eprintln` each stops the boot finishing at all):
+
+```
+IST va=…20000000  stores 0          + MRU command (TagHi[31])
+IST va=…20000080  stores 0
+ILT va=…20000001  -> our model returns 0x00000007ffffcdff
+```
+
+and the PROM reports `Expected: 0x0000000100000000, Actual: 0x0`.
+
+Two things do not reconcile, and naming them is the useful part:
+
+- The PROM expects a tag whose address bits are **zero** plus the MRU bit. The
+  only slots holding zero at that point are `…20000000` and `…20000080`, not
+  `…20000001`, which still holds a tag from the previous phase.
+- `Actual: 0x0` is not what we return for `…20000001` either. So the read the
+  PROM is failing on may not be the last one this trace captures — tracing
+  perturbs the timing enough that the message and the operations interleave.
+
+The tempting reading is that `va + 0x80` — one line — selects the other *way*
+rather than the next *set*. That cannot be right on its own: the walking-tag
+phase writes different tags to `…0000` and `…0001` and reads both back
+distinctly, which passes only because bit 0 selects the way, and would fail if
+`0x80` did. Both facts are solid and they do not yet fit one index scheme.
+
+**Resume here**: get a trace that is definitely complete through the failing
+read, without the tracing changing what gets interleaved — write the trace to
+a file descriptor rather than stderr, or buffer it and dump on exit.
 
 ### Skipping the diagnostic does not work either
 

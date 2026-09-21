@@ -325,7 +325,14 @@ impl<
         let sel = cache_op & 3;
         let op = cache_op & 0x1C;
 
-        if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
+        // Tracing every operation costs more than the emulation: the PROM
+        // issues 65k+ Index_Store_Data ops walking the data array, and an
+        // eprintln each turns a two-minute boot into one that does not finish.
+        // Default to tag operations only, which is what diagnosis needs.
+        if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some()
+            && (matches!(op, C_IST | C_ILT)
+                || matches!(std::env::var("IRIS_SHADOW_CACHEOPS").as_deref(), Ok("all")))
+        {
             eprintln!(
                 "shadow: {:<22} raw={cache_op:#04x} va={virt_addr:#018x} arg={phys_addr:#018x}",
                 cache_op_name(cache_op)
@@ -340,7 +347,8 @@ impl<
                 let idx = self.tag_slot(sel, virt_addr);
                 let mask = if matches!(sel, CACH_SI | CACH_SD) { L2_TAG_MASK } else { u64::MAX };
                 if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
-                    eprintln!("shadow:   -> IST slot={idx} stores {:#018x}", phys_addr & mask & !MRU_SET_BIT);
+                    eprintln!("shadow:   -> IST va={virt_addr:#012x} idx={idx} stores {:#018x}",
+                              phys_addr & mask & !MRU_SET_BIT);
                 }
                 let s = self.shadow(sel);
                 if idx < s.tags.len() {
@@ -350,7 +358,11 @@ impl<
                     // position — which is what makes it hardware state rather
                     // than storage.
                     if phys_addr & MRU_SET_BIT != 0 {
-                        s.mru[(idx / WAYS).min(s.mru.len() - 1)] = (idx % WAYS) as u8;
+                        let set = (idx / WAYS).min(s.mru.len() - 1);
+                        s.mru[set] = (idx % WAYS) as u8;
+                        if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
+                            eprintln!("shadow:   -> MRU set={set} := way {}", idx % WAYS);
+                        }
                     }
                     // Strip only the command bit. Bit 32 is *not* spare:
                     // TagHi[3:0] are tag address bits 35:32, so clearing it
@@ -363,9 +375,15 @@ impl<
             C_ILT => {
                 let idx = self.tag_slot(sel, virt_addr);
                 let s = self.shadow(sel);
+                let set = (idx / WAYS).min(s.mru.len() - 1);
+                let way = (idx % WAYS) as u8;
                 let mut v = if idx < s.tags.len() { s.tags[idx] } else { 0 };
-                if s.mru[(idx / WAYS).min(s.mru.len() - 1)] == (idx % WAYS) as u8 {
+                if s.mru[set] == way {
                     v |= MRU_READ_BIT;
+                }
+                if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
+                    eprintln!("shadow:   -> ILT va={virt_addr:#012x} idx={idx} set={set} way={way} mru={} tag={:#018x}",
+                              s.mru[set], if idx < s.tags.len() { s.tags[idx] } else { 0 });
                 }
                 if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
                     eprintln!("shadow:   -> ILT slot={idx} returns {v:#018x}");
