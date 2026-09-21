@@ -116,8 +116,8 @@ pub const HPC3_INT2_BASE: u32 = PBUS_PIO_BASE + 4 * PBUS_PIO_STRIDE;
 pub const HPC3_INT2_SIZE: u32 = crate::ioc::INT2_REG_COUNT * 4;
 
 /// IP22 fullhouse only: Full House's "extended register" (PBUS PIO channel
-/// 5). `kern/sys/hpc3.h`: "Address of Full House's extended register. PX at
-/// 0x1fbd9400. (IP22 Only)" — sits right before `HPC3_EXT_IO_ADDR`
+/// 5). Full House's extended register lives at 0x1fbd9400, IP22 only — it
+/// sits right before `HPC3_EXT_IO_ADDR`
 /// (`0x1fbd9900`, PIO channel 6 offset 0x100) in that header, but is itself
 /// unimplemented here; not yet reverse-engineered, so accesses are only
 /// logged (see `read8`/`write8`/`read16`/`write16`/`read32`/`write32`), not

@@ -24,16 +24,10 @@
 //! ## Translation is the normal case
 //!
 //! Address translation is **on** for essentially every transfer IRIX starts.
-//! `MCdma()` — the single entry point for REX3 image up/download, in
-//! `irix/kern/io/vdma.c` — ORs in `VDMA_C_XLATE` on both arms of its only
-//! branch; just the interrupt-enable bit varies:
-//!
-//! ```c
-//! if ((ena_int) && (ena_int != REX_BUG))
-//!     VDMAREG (DMA_CTL) = VDMAREG(DMA_CTL) | VDMA_C_XLATE | VDMA_C_IE;
-//! else
-//!     VDMAREG (DMA_CTL) = (VDMAREG(DMA_CTL)|VDMA_C_XLATE )&~VDMA_C_IE;
-//! ```
+//! Every REX3 image up/download observed from the guest sets `VDMA_C_XLATE` in
+//! `DMA_CTL`; only the interrupt-enable bit varies between transfers. So the
+//! translated path is the normal one and the untranslated path is the rare
+//! case, which is the opposite of what the register layout suggests.
 //!
 //! and `vdma_set_tlb()` exists to populate the µTLB before each one. Only two
 //! callers disable it: `MCdma_desc()` (the descriptor-list path, which carries

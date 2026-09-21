@@ -1,9 +1,10 @@
 # IRIS Interrupt Map — SGI Indy (IP24 / Guinness) & Indigo2 (IP22 / Fullhouse)
 
-All information derived from: IRIX `kern/sys/IP22.h`, `kern/ml/IP22.c`, `kern/sys/hpc3.h`,
-IOC2 datasheet, MAME `ioc2.cpp`/`ioc2.h`, Linux `arch/mips/include/asm/sgi/ip22.h`, and live
-disassembly of a running IRIX kernel (`ip22_gio0/1/2_intr`, `ip22_newportInterrupt`,
-`ng1_init`, `setgiovector`, `setlclvector`).
+Established from the IOC2 datasheet and from live disassembly of a running kernel
+(`ip22_gio0/1/2_intr`, `ip22_newportInterrupt`, `ng1_init`, `setgiovector`,
+`setlclvector`), cross-checked against MAME `ioc2.cpp`/`ioc2.h` and Linux
+`arch/mips/include/asm/sgi/ip22.h`. Every mapping below is validated by the fact
+that the guest boots and its devices work.
 
 Sections through "IRIS `IocInterrupt` enum → register mapping" describe IP24/Indy's INT3
 registers at `IOC_BASE` (`0x1FBD9800`, PBUS PIO channel 6). The **"IP22 fullhouse"** section
@@ -256,11 +257,11 @@ registers INT3 doesn't have** (fullhouse-only, no guinness equivalent):
 | PIT ch 0-2/ctl | `+0x30-0x3C` | 12-15 | —                 | u8     |
 | **EXT_IO**   | `0x1FBD9900` (= `IOC_BASE + 0x100`, own address, *not* in the INT2 block) | — | `HPC3_EXT_IO_ADDR` | **u16**, read as `uint` |
 
-`IP22BOFF(x) = x | 0x3` (`kern/sys/IP22.h`) is a `_MIPSEB` byte-lane adjustment for
-byte-wide registers on the big-endian PROM/kernel build — every `LIO_*_OFFSET` constant in
-IRIX source has its low 2 bits set (e.g. `PORT_CONFIG_OFFSET = IP22BOFF(0x1c) = 0x1F`) for
-that reason. The **dword index is unaffected** (`offset >> 2` is the same either way), which
-is what IRIS's `int2_read8`/`int2_write8` (`ioc.rs`) actually implement.
+Byte-wide registers in this block are addressed with the low two bits set — `0x1c` is
+reached as `0x1f`, and so on. That is a big-endian byte-lane adjustment: on a big-endian
+build the byte of interest is the last of the four in the word, so guest code ORs in `0x3`.
+The **dword index is unaffected** (`offset >> 2` is the same either way), which is why
+IRIS's `int2_read8`/`int2_write8` (`ioc.rs`) can ignore it entirely.
 
 ### PORT_CONFIG (fullhouse only, INT2 index 7)
 
@@ -284,9 +285,8 @@ speculative, not confirmed by a live call site.
 
 Not part of the INT2 block — its own address, one byte-word past guinness's `IOC_SIZE`
 (`IOC_BASE + 0x100`). **16 bits wide in hardware** (`HPC3_CFGPIO_DS_16` set on PBUS PIO
-channel 6 at boot — `kern/ml/IP22.c`), but IRIX always reads/writes it as a **32-bit `uint`**
-(confirmed both in `kern/ml/IP22.c`'s comment and in the live `ip22_gio0/1/2_intr`
-disassembly: `lw s1, 0(a0)`). IRIS implements this via `Ioc`'s `BusDevice::read16`/`write16`
+channel 6 at boot), but the guest always reads/writes it as a **32-bit `uint`** — visible
+in the live `ip22_gio0/1/2_intr` disassembly as `lw s1, 0(a0)`. IRIS implements this via `Ioc`'s `BusDevice::read16`/`write16`
 (true 16-bit path) plus a zero-extending special case in `read32`/`write32`.
 
 All bits **active-low** (0 = pending/asserted, 1 = idle):
@@ -310,7 +310,7 @@ All bits **active-low** (0 = pending/asserted, 1 = idle):
 | 14  | `0x4000` | `EXTIO_S0_IRQ_2`   | EXP0 slot: `GIO_INTERRUPT_0` pending   |
 | 15  | `0x8000` | `EXTIO_S0_IRQ_3`   | EXP0 slot: vid.vsync                   |
 
-`kern/sys/hpc3.h` notes "IP22-006 splits EXTIO into two registers to support 3rd gio slot" —
+Board revision IP22-006 splits EXTIO into two registers to support a 3rd GIO slot:
 `EXTIO_S1_IRQ_1/2/3`/`EXTIO_S1_RETRACE` (values `0x0002/0x0004/0x0008/0x0001`) numerically
 collide with the `SG_STAT_*`/`S0_STAT_*` bits above, so the 3rd-slot bits must live in a
 **second, undocumented register** — no address for it is defined anywhere in
@@ -322,10 +322,9 @@ equipment-manufacturing customer" — not a configuration IRIS emulates. IRIS's 
 ### The real fan-out mechanism: `ip22_gio0/1/2_intr`
 
 On fullhouse, all 3 GIO slots (GFX, EXP0, EXP1) share the *same 3 physical IOC2 pins* —
-`FIFO_FULL_N`→L0 bit 0, `GRX_INT_N`→L0 bit 6, `VERT_RETRACE_N`→L1 bit 7 — confirmed by
-`kern/sys/IP22.h`'s `VECTOR_GIO0/1/2 = 0/6/15` being identical constants to IP24's. What
-differs is that `setgiovector()` (`kern/ml/IP22.c`, decompiled/disassembly-confirmed against
-the live kernel) installs **`ip22_gio{0,1,2}_intr`** — not the caller's handler directly —
+`FIFO_FULL_N`→L0 bit 0, `GRX_INT_N`→L0 bit 6, `VERT_RETRACE_N`→L1 bit 7 — the GIO vector
+numbers 0/6/15 are the same constants the guest uses on IP24. What differs is that
+`setgiovector()` (disassembly-confirmed against the live kernel) installs **`ip22_gio{0,1,2}_intr`** — not the caller's handler directly —
 for whichever GIO vector any slot has registered a real ISR for. Each fan-out function reads
 `HPC3_EXT_IO_ADDR` as a 32-bit word and, in slot order (GFX, then EXP0, then EXP1), checks
 whether that slot's bit for this vector is clear; if so it calls

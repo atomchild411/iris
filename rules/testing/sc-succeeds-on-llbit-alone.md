@@ -35,9 +35,9 @@ architectural reason for an SC to fail already clears the LLbit:
 
 ## Why it matters more than it looks
 
-IRIX builds **every** kernel atomic on LL/SC loops (`kern/sys/atomic_ops.h`),
-including the `mutex_bitlock` on `k_flags` that `kern/sys/kthread.h:74` says
-guards *"all locking in the sync routines"* — i.e. sleep and wakeup. An SC that
+The guest builds **every** kernel atomic on LL/SC loops, including the
+`mutex_bitlock` on `k_flags` that guards the locking in the sync routines —
+that is, sleep and wakeup. An SC that
 spuriously fails there is exactly the shape of "processes sleep forever while
 everything else runs".
 
