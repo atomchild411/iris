@@ -98,23 +98,75 @@ The ELF loader is 32-bit only (`crate::elf::parse` → `Elf32`), though the
 structures it fills already carry 64-bit addresses. `--load-elf` and
 `Machine::load_elf_bytes` exist and work.
 
-## What is genuinely unknown
+## Phase 0 result: what IRIX actually calls
 
-Everything above describes what *NetBSD* needs. **IRIX is the actual target,
-and no source may be consulted for it.** `sash` and `unix.IP28` may well call
-entries NetBSD never touches — `GetDirectoryEntry`, `GetFileInformation` and
-`Mount` are all plausible for a loader that reads a volume header.
+Measured, not guessed. `IRIS_ARCS_TRACE=1` logs every jump whose target is a
+firmware vector entry (`src/arcs_trace.rs`); the trace below is a real IRIX
+6.5.22 boot on the Indy, from the maintenance menu through to multi-user.
 
-That is measurable rather than guessable, and cheaply: the vector table lives
-at a known address, so the emulator can log every call into it while the **real
-PROM** boots IRIX on a machine that already works. Which is the same oracle
-method that found every real defect during the IP28 work.
+Arming alone confirmed the interface a third independent time: **35 entries, 33
+populated, and the two null slots are exactly 8 (`ReturnFromMain`) and 19
+(`Signal`)** — the two NetBSD marks absent on sgimips.
+
+**IRIX uses seven entries. Thirty-one calls, all of them before the kernel
+starts.**
+
+| calls | entry | also used by NetBSD? |
+|------:|-------|---|
+| 14 | `GetMemoryDescriptor` | yes |
+| 6 | `GetChild` | yes |
+| 4 | `Read` | yes |
+| 3 | `GetPeer` | yes |
+| 2 | `Open` | bootloader only |
+| 1 | `Close` | bootloader only |
+| 1 | `FlushAllCaches` | **never** |
+
+The sequence is legible end to end: walk the component tree
+(`GetChild(NULL)`, then `GetChild`/`GetPeer` alternating); `Open`; two full
+passes over the memory map; `Open` again, then four `Read`s — 5 bytes, then
+0x2f, then 0x60, then **0x3300f0** straight into `0xffffffff88004094`, which is
+the ELF header, the program headers, and the kernel image, landing in the
+`0x88…` window; `Close`; and finally `FlushAllCaches` immediately before
+entering the kernel, which is exactly what you would do having just written
+3 MB of code through the data cache.
+
+### Three things this changes
+
+**`FlushAllCaches` is required.** It is in NetBSD's dead list — one of 23
+entries no NetBSD code calls anywhere — so an ARCS built from NetBSD's usage
+alone would have omitted it, and the omission would have surfaced as a kernel
+running against a stale instruction cache. Precisely the class of bug that is
+agony to diagnose.
+
+**`GetEnvironmentVariable` is never called.** NetBSD's single hottest entry, 15
+call sites, and IRIX does not touch it during boot at all. Whatever IRIX needs
+from the environment it gets another way. That removes what the earlier scoping
+called "where the boot will actually stall" — for IRIX, at least.
+
+**`Seek` is never called either**, though NetBSD's bootloader uses it. IRIX
+reads the kernel sequentially.
+
+The memory-descriptor cursors are worth noting for the implementation: the
+returned pointers are `…4c4, …4e0, …4a8, …898, …87c, …830` — not monotonic and
+not a single reused buffer, so the PROM returns pointers to seven distinct
+static descriptors. A cursor token is still a legitimate implementation, but
+the real one does not behave that way.
+
+### What the trace does not cover
+
+The PROM's own menu and command monitor do not go through the vector table, and
+neither does anything after the kernel is up — the count stops at 31 and stays
+there through multi-user. This is IP24 with 6.5.22; the ARCS contract is the
+same on IP28, but the trace should be repeated there once it boots.
+
+Union of what IRIX and NetBSD need, which is what to implement: the seven
+above, plus `GetEnvironmentVariable`, `GetSystemId`, `Write`, `GetReadStatus`,
+`Seek`, `Reboot`, `PowerDown`, `EnterInteractiveMode`.
 
 ## Phasing
 
-**Phase 0 — measure (half a day).** Log ARCS calls during a real IRIX boot on
-the working Indy/Indigo2. Produces the exact set IRIX uses, including arguments
-and return values. De-risks everything after it, and needs no new firmware.
+**Phase 0 — measure. Done**, see above. `src/arcs_trace.rs`, armed with
+`IRIS_ARCS_TRACE=1`; `summary` instead of `1` suppresses the per-call lines.
 
 **Phase 1 — 32-bit ARCS (one to two days).** SPB, vector table, dispatch, the
 13 entries, environment, memory map, component tree. Validate by booting

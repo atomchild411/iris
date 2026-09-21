@@ -1144,6 +1144,11 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     cheritest_dump_hook: bool,
     pub tlb: T,
     pub cache: C,
+    /// ARCS firmware call tracer (`IRIS_ARCS_TRACE`). `None` unless asked for,
+    /// so the disarmed cost is one predictable branch per `jalr` — and only
+    /// `jalr`, because every ARCS call goes through the firmware vector table
+    /// by register. See `src/arcs_trace.rs`.
+    arcs: Option<Box<crate::arcs_trace::ArcsTrace>>,
     #[cfg(feature = "developer")]
     undo_buffer: UndoBuffer,
     #[cfg(feature = "developer")]
@@ -2699,6 +2704,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             core,
             sysad,
             cheritest_dump_hook: false,
+            arcs: std::env::var_os("IRIS_ARCS_TRACE")
+                .map(|_| Box::new(crate::arcs_trace::ArcsTrace::new())),
             tlb,
             cache,
             #[cfg(feature = "jitstats")]
@@ -5406,7 +5413,38 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let target = self.core.read_gpr(d.rs as u32);
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, self.core.pc + 8);
+        if self.arcs.is_some() {
+            self.note_arcs_call(target);
+        }
         self.branch_delay(target)
+    }
+
+    /// Record a call into the ARCS firmware vector, if this jump is one.
+    ///
+    /// Split out of `exec_jalr` so the armed path's cost stays off the
+    /// instruction stream the common case executes.
+    #[cold]
+    fn note_arcs_call(&mut self, target: u64) {
+        let Some(mut t) = self.arcs.take() else { return };
+        if !t.is_armed() && !t.exhausted() {
+            t.try_arm(self.sysad.as_ref());
+        }
+        if let Some(idx) = t.entry_for(target) {
+            let args = [
+                self.core.read_gpr(4),
+                self.core.read_gpr(5),
+                self.core.read_gpr(6),
+                self.core.read_gpr(7),
+            ];
+            let ra = self.core.read_gpr(31);
+            t.note(idx, args, ra);
+        }
+        self.arcs = Some(t);
+    }
+
+    /// Summary of which ARCS entries the guest used. Empty when not tracing.
+    pub fn arcs_report(&self) -> String {
+        self.arcs.as_ref().map(|t| t.report()).unwrap_or_default()
     }
     /// Answer a host call (system calls 3000-3009, see iris-hostcall) if this
     /// `syscall` is one and a service is registered for it. Only from user
