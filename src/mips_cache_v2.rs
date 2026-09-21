@@ -641,7 +641,10 @@ pub trait MipsCache: Send + Sync {
     ///
     /// For Index_Load_Tag operations, returns the tag value in TagLo CP0 register format
     /// For other operations, returns 0
-    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u32;
+    /// Perform a CACHE operation. For `Index_Load_Tag` the return is the
+    /// tag as software sees it, full width — an R10000 secondary tag does not
+    /// fit in 32 bits.
+    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64;
 
     /// Write back dirty L1-D (and, if present, L2) lines covering
     /// `[phys_addr, phys_addr + size)` to memory, without invalidating them.
@@ -808,7 +811,7 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
         self.downstream.write64(aligned_addr, new_val)
     }
 
-    fn cache_op(&self, _cache_op: u32, _virt_addr: u64, _phys_addr: u64) -> u32 {
+    fn cache_op(&self, _cache_op: u32, _virt_addr: u64, _phys_addr: u64) -> u64 {
         // No-op for passthrough cache - just return 0
         0
     }
@@ -3402,7 +3405,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
     }
 
-    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u32 {
+    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
         if Self::R10K_CACHE_OPS && std::env::var_os("IRIS_IP28_CACHEOPS").is_some() {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -3437,9 +3440,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     // so it drops out without any special case.
                     let slot = (virt_addr as usize) >> 3;
                     if is_l2 && HAS_L2 {
-                        return self.l2.data()[slot & (L2_DATA - 1)] as u32;
+                        return self.l2.data()[slot & (L2_DATA - 1)];
                     }
-                    return self.dc.data()[slot & (DC_DATA - 1)] as u32;
+                    return self.dc.data()[slot & (DC_DATA - 1)];
                 }
                 C_R10K_ISD if matches!(sel, CACH_SI | CACH_SD) => {
                     let slot = (virt_addr as usize) >> 3;
@@ -3552,7 +3555,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                         L2_CS_DIRTY_SHARED => 7,
                         _ => 0,
                     };
-                    (tag.ptag() << 13) | (state << 10) | (tag.pidx() << 7)
+                    (((tag.ptag() << 13) | (state << 10) | (tag.pidx() << 7)) as u64)
                 } else if is_icache {
                     let tag: L1ITag = self.ic.get_tag(idx);
                     let raw_ptag = (tag.ptag >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
@@ -3560,11 +3563,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                         // R5000 L1-I TagLo:  [31:8] ptag  [7] L (lock)  [6] V
                         // Not the R4400 2-bit PState. We model no lock bit, so L=0.
                         let v = if tag.is_valid() { 1u32 << 6 } else { 0 };
-                        (raw_ptag << 8) | v
+                        ((raw_ptag << 8) | v) as u64
                     } else {
                         // R4400 L1-I TagLo:  [31:8] raw_ptag  [7:6] pstate (2=valid, 0=invalid)
                         let pstate = if tag.is_valid() { 2u32 } else { 0u32 };
-                        (raw_ptag << 8) | (pstate << 6)
+                        ((raw_ptag << 8) | (pstate << 6)) as u64
                     }
                 } else {
                     let tag: L1DTag = self.dc.get_tag(idx);
@@ -3579,7 +3582,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                         let v = if valid { 1u32 << 6 } else { 0 };
                         let d = if valid && (tag.dirty
                                     || tag.cs as u32 == L1D_CS_DIRTY_EXCLUSIVE) { 1u32 << 7 } else { 0 };
-                        (raw_ptag << 8) | d | v
+                        ((raw_ptag << 8) | d | v) as u64
                     } else {
                         // R4400 L1-D TagLo:  [31:8] raw_ptag  [7:6] pstate
                         // dirty=true promotes CleanExclusive→DirtyExclusive in TagLo output
@@ -3590,14 +3593,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                             L1D_CS_DIRTY_EXCLUSIVE => 3u32,
                             _ => 0u32,
                         };
-                        (raw_ptag << 8) | (pstate << 6)
+                        ((raw_ptag << 8) | (pstate << 6)) as u64
                     }
                 }
             }
 
             // Index Store Tag — write CP0 TagLo into internal tag
             C_IST => {
-                let tag_lo = phys_addr as u32;
+                let tag_lo = phys_addr as u32;  // R4000-family tags are 32-bit
 
                 if is_l2 {
                     if MODEL == model::R10000 {
@@ -4464,7 +4467,7 @@ mod tests {
             cache.cache_op(C_IST | CACH_PD, va, written as u64);
             let read_back = cache.cache_op(C_ILT | CACH_PD, va, idx);
             assert_eq!((read_back >> 6) & 0x3, 3, "R4400 DirtyExclusive must round-trip");
-            assert_eq!(read_back >> 8, raw_ptag, "physical tag must round-trip");
+            assert_eq!(read_back >> 8, raw_ptag as u64, "physical tag must round-trip");
         }
 
         // R5000: valid+dirty is D=1,V=1 (0xC0). Under the old code this was
@@ -4483,9 +4486,9 @@ mod tests {
                 let read_back = cache.cache_op(C_ILT | CACH_PD, va, idx);
                 assert_ne!(read_back & (1 << 6), 0,
                            "R5000 {label} line must read back V=1");
-                assert_eq!(read_back & (1 << 7), d_bit,
+                assert_eq!(read_back & (1 << 7), d_bit as u64,
                            "R5000 {label} line must round-trip its D bit");
-                assert_eq!(read_back >> 8, raw_ptag, "physical tag must round-trip");
+                assert_eq!(read_back >> 8, raw_ptag as u64, "physical tag must round-trip");
             }
         }
     }

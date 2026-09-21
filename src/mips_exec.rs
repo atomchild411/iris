@@ -249,7 +249,7 @@ struct CpuSnapshot {
     cp0_xcontext: u64,
     cp0_ecc: u32,
     cp0_cacheerr: u32,
-    cp0_taglo: u32,
+    cp0_taglo: u64,
     cp0_taghi: u32,
     cp0_errorepc: u64,
 
@@ -4336,6 +4336,31 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// the nutlb flush, and the trailing `in_delay_slot = false`.
     #[cfg(feature = "jitv2")]
     fn handle_exception_at(&mut self, status: ExecStatus, fault_pc: u64, bd: bool) -> ExecStatus {
+        // IP28 bring-up: report the first N exceptions with everything needed
+        // to place them. Costs one atomic load per exception on the R10000
+        // model and folds away entirely on every other model, so it can stay
+        // until IP28 boots. Exceptions are rare; this is not a hot path.
+        if C::R10K_CACHE_OPS {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let limit = *LIMIT.get_or_init(|| {
+                std::env::var("IRIS_IP28_EXC")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            });
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < limit {
+                let code = (status & CAUSE_EXCCODE_MASK) >> 2;
+                eprintln!(
+                    "ip28exc: #{n} code={code} pc={fault_pc:#018x} bd={bd}                      badvaddr={:#018x} ra={:#018x} sp={:#018x}",
+                    self.core.cp0_badvaddr,
+                    self.core.read_gpr(31),
+                    self.core.read_gpr(29),
+                );
+            }
+        }
         #[cfg(feature = "developerx")]
         {
             let was_exl = (self.core.cp0_status & STATUS_EXL) != 0;
@@ -6700,9 +6725,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         // For Index_Store_Tag, pass TagLo via phys_addr
         let op = cache_op & 0x1C;
+        // A cache tag is TagHi:TagLo, not TagLo alone. The IP28 PROM writes
+        // the low 32 bits to $28 and the bits above to $29 — a 36-bit
+        // secondary tag arrives as TagLo=0xffffcdfe, TagHi=0xf — so a model
+        // that reads only TagLo sees a different tag from the one written.
+        // Harmless for R4400/R5000, whose tags fit in 32 bits and who leave
+        // TagHi zero: the shift-in contributes nothing there.
         let stores_taglo = op == C_IST || (r10k_index_op && op == C_R10K_ISD);
         let phys_addr_or_taglo = if stores_taglo {
-            self.core.cp0_taglo as u64
+            ((self.core.cp0_taghi as u64) << 32) | (self.core.cp0_taglo as u32 as u64)
         } else {
             phys_addr
         };
@@ -6712,8 +6743,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         // For Index_Load_Tag, update CP0 TagLo from result
         if op == C_ILT || (r10k_index_op && op == C_R10K_ILD) {
-            self.core.cp0_taglo = result;
-            self.core.cp0_taghi = 0;
+            // Split back the way it arrived. Zeroing TagHi unconditionally
+            // threw away the top of every tag wider than 32 bits.
+            self.core.cp0_taglo = result & 0xFFFF_FFFF;
+            self.core.cp0_taghi = (result >> 32) as u32;
         }
 
         self.handle_exec_complete()
@@ -6941,6 +6974,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
         let value = self.core.read_cp0(rd_val);
+        self.ip28_cp0_trace("mfc0", rd_val, value);
         // Sign-extend 32-bit value to 64 bits
         self.core.write_gpr(rt_reg, value as u32 as i32 as i64 as u64);
         self.handle_exec_complete()
@@ -6951,6 +6985,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
         let value = self.core.read_cp0(rd_val);
+        self.ip28_cp0_trace("dmfc0", rd_val, value);
         self.core.write_gpr(rt_reg, value);
         self.handle_exec_complete()
     }
@@ -6958,6 +6993,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     // MTC0 - Move To CP0
     fn exec_mtc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
+        self.ip28_cp0_trace("mtc0", d.rd as u32, rt_val);
         let rd_val = d.rd as u32;
         // Sign-extend from 32 bits
         self.core.write_cp0(rd_val, rt_val as u32 as i32 as i64 as u64);
@@ -6966,8 +7002,21 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     // DMTC0 - Doubleword Move To CP0 (MIPS III)
+    /// IP28 bring-up: watch the cache-tag CP0 registers (26 ECC, 28 TagLo,
+    /// 29 TagHi). Only the R10000 model compiles this in.
+    #[inline(always)]
+    fn ip28_cp0_trace(&self, what: &str, reg: u32, val: u64) {
+        if C::R10K_CACHE_OPS
+            && matches!(reg, 26 | 28 | 29)
+            && std::env::var_os("IRIS_IP28_CP0").is_some()
+        {
+            eprintln!("ip28cp0: {what} ${reg} = {val:#018x}");
+        }
+    }
+
     fn exec_dmtc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
+        self.ip28_cp0_trace("dmtc0", d.rd as u32, rt_val);
         let rd_val = d.rd as u32;
         self.core.write_cp0(rd_val, rt_val);
         self.handle_cp0_side_effects(rd_val);
@@ -14214,7 +14263,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         cp0u32!(cp0_status); cp0u32!(cp0_cause);
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
         cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
-        cp0u32!(cp0_taglo); cp0u32!(cp0_taghi);
+        cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
         cp0u64!(cp0_badvaddr); cp0u64!(cp0_epc); cp0u64!(cp0_errorepc);
         cp0u64!(cp0_entrylo0); cp0u64!(cp0_entrylo1); cp0u64!(cp0_context);
         cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext);
@@ -14279,7 +14328,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);
             ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
             ld32!(cp0_config); ld32!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
-            ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld32!(cp0_taglo); ld32!(cp0_taghi);
+            ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
             ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
             ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
             ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);

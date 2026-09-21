@@ -40,9 +40,16 @@ use crate::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
 use crate::traits::{BusDevice, BusRead64};
 
 /// Shadow tag and data arrays for one cache.
+///
+/// Indexed `set * WAYS + way`. The ways are here and nowhere else: a CACHE
+/// index operation addresses one *way* of one set, so software can see them,
+/// and the IP28 PROM's tag diagnostic depends on it — it writes different tags
+/// to the two ways of a set and reads one back. Keeping them costs an array
+/// dimension in a structure no load or store ever consults.
 struct Shadow {
-    /// One raw tag word per line, stored and returned verbatim.
-    tags: Box<[u32]>,
+    /// One raw tag per line, stored and returned verbatim. 64 bits: an
+    /// R10000 secondary tag carries a 40-bit physical address.
+    tags: Box<[u64]>,
     /// Data array in u64 slots. Empty where the model has no data shadow.
     data: Box<[u64]>,
 }
@@ -50,11 +57,25 @@ struct Shadow {
 impl Shadow {
     fn new(lines: usize, data_words: usize) -> Self {
         Self {
-            tags: vec![0u32; lines.max(1)].into_boxed_slice(),
+            tags: vec![0u64; lines.max(1)].into_boxed_slice(),
             data: vec![0u64; data_words].into_boxed_slice(),
         }
     }
 }
+
+/// Ways per set, as CACHE index operations address them. Bit 0 of the index
+/// selects the way on an R10000; the set starts above the line offset.
+const WAYS: usize = 2;
+
+/// Bits a secondary-cache tag retains.
+///
+/// All of them, now. A 36-bit mask was inferred here from the PROM's
+/// walking-0s phase, which writes an all-ones TagLo and expects back
+/// 0x0000000f_ffffcdfe — but that truncation comes from the tag being
+/// assembled as `(TagHi << 32) | TagLo[31:0]`, not from the array dropping
+/// bits. Once the executor carried TagHi properly the mask did nothing except
+/// discard the MRU bit, which the PROM writes as TagHi[31] and reads back.
+const L2_TAG_MASK: u64 = u64::MAX;
 
 /// A `MipsCache` whose contents are only ever observed through CACHE ops.
 ///
@@ -137,11 +158,18 @@ impl<
         }
     }
 
-    /// Line index for a CACHE index operation. The way-select bit that real
-    /// two-way hardware keeps at bit 0 is below the line granularity and
-    /// simply folds away, which is what makes a direct-mapped shadow able to
-    /// answer for a set-associative part.
-    fn line_index(&self, sel: u32, virt_addr: u64) -> usize {
+    /// Tag slot for a CACHE index operation.
+    ///
+    /// Bit 0 of the index selects the way; the set number starts above the
+    /// line offset. Observed directly: the PROM initialises the secondary
+    /// cache at `…1000`, `…1001`, `…1080`, `…1081`, stepping by the 128-byte
+    /// line with the low bit alternating.
+    ///
+    /// Folding the way bit away instead — on the reasoning that it sits below
+    /// line granularity — made the two ways of a set alias onto one slot, so
+    /// a tag written to way 1 overwrote way 0 and the PROM read back the
+    /// wrong one. That is the whole of the "TAG walking 1s" failure.
+    fn tag_slot(&self, sel: u32, virt_addr: u64) -> usize {
         let (line, lines) = match sel {
             CACH_PI => (IC_LINE, Self::IC_LINES),
             CACH_PD => (DC_LINE, Self::DC_LINES),
@@ -150,7 +178,23 @@ impl<
         if line == 0 || lines == 0 {
             return 0;
         }
-        ((virt_addr as usize) / line) % lines
+        let way = (virt_addr as usize) & (WAYS - 1);
+        let set = ((virt_addr as usize) / line) % (lines / WAYS).max(1);
+        (set * WAYS + way) % lines
+    }
+
+    /// Data slot for an R10000 `Index_Load_Data` / `Index_Store_Data`.
+    ///
+    /// Same shape: way in bit 0, the rest addressing the array. The PROM walks
+    /// it at `…00`, `…01`, `…10`, `…11`, `…20` — one doubleword per operation
+    /// with the way bit shifted in beneath it.
+    fn data_slot(&self, len: usize, virt_addr: u64) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let way = (virt_addr as usize) & (WAYS - 1);
+        let word = (virt_addr as usize) >> 4;
+        (word * WAYS + way) % len
     }
 }
 
@@ -260,7 +304,7 @@ impl<
     /// cache and memory can never disagree. The operations that move data
     /// between the cache and a register are the ones with observable effects,
     /// and those are served from the shadow.
-    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u32 {
+    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
         let sel = cache_op & 3;
         let op = cache_op & 0x1C;
 
@@ -276,32 +320,39 @@ impl<
             // a tag test is a round trip, and round trips do not require
             // knowing what the bits mean.
             C_IST => {
-                let idx = self.line_index(sel, virt_addr);
+                let idx = self.tag_slot(sel, virt_addr);
+                let mask = if matches!(sel, CACH_SI | CACH_SD) { L2_TAG_MASK } else { u64::MAX };
+                if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
+                    eprintln!("shadow:   -> IST slot={idx} stores {:#018x}", phys_addr & mask);
+                }
                 let s = self.shadow(sel);
                 if idx < s.tags.len() {
-                    s.tags[idx] = phys_addr as u32;
+                    s.tags[idx] = phys_addr & mask;
                 }
                 0
             }
             C_ILT => {
-                let idx = self.line_index(sel, virt_addr);
+                let idx = self.tag_slot(sel, virt_addr);
                 let s = self.shadow(sel);
-                if idx < s.tags.len() { s.tags[idx] } else { 0 }
+                let v = if idx < s.tags.len() { s.tags[idx] } else { 0 };
+                if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
+                    eprintln!("shadow:   -> ILT slot={idx} returns {v:#018x}");
+                }
+                v
             }
 
             // R10000 reassigns 5/6/7, scoped to particular cache selects.
             C_R10K_CBARRIER if R10K_OPS && sel == CACH_PI => 0,
             C_R10K_ILD if R10K_OPS && matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
                 let s = self.shadow(sel);
-                let slot = (virt_addr as usize) >> 3;
-                if s.data.is_empty() { 0 } else { s.data[slot % s.data.len()] as u32 }
+                let slot = self.data_slot(s.data.len(), virt_addr);
+                if s.data.is_empty() { 0 } else { s.data[slot] }
             }
             C_R10K_ISD if R10K_OPS && matches!(sel, CACH_SI | CACH_SD) => {
                 let s = self.shadow(sel);
-                let slot = (virt_addr as usize) >> 3;
+                let slot = self.data_slot(s.data.len(), virt_addr);
                 if !s.data.is_empty() {
-                    let n = s.data.len();
-                    s.data[slot % n] = phys_addr;
+                    s.data[slot] = phys_addr;
                 }
                 0
             }
@@ -370,9 +421,9 @@ mod tests {
     #[test]
     fn tags_round_trip_every_bit() {
         let c = cache();
-        for bit in 0..32 {
-            let v = 1u32 << bit;
-            c.cache_op(C_IST | CACH_SD, 0, v as u64);
+        for bit in 0..64 {
+            let v = 1u64 << bit;
+            c.cache_op(C_IST | CACH_SD, 0, v);
             assert_eq!(
                 c.cache_op(C_ILT | CACH_SD, 0, 0),
                 v,
@@ -399,13 +450,42 @@ mod tests {
         assert_eq!(c.cache_op(C_ILT | CACH_SD, 128, 0), 0x2222_2222);
     }
 
-    /// The way-select bit real hardware keeps at bit 0 is below line
-    /// granularity, so it folds away rather than selecting a second array.
+    /// Bit 0 of a CACHE index selects the **way**, and the two ways of a set
+    /// must not alias.
+    ///
+    /// This is exactly the IP28 PROM's secondary-cache tag test: it stores one
+    /// tag to way 0 and a different one to way 1 of the same set, then reads
+    /// way 0 back. Folding the way bit away let the second store clobber the
+    /// first, and the PROM reported
+    /// `Expected: 0x0000000000000001 ... TAG walking 1s`.
     #[test]
-    fn the_way_bit_folds_away() {
+    fn the_two_ways_of_a_set_are_independent() {
         let c = cache();
-        c.cache_op(C_IST | CACH_SD, 0x100, 0xabcd);
-        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0x101, 0), 0xabcd);
+        c.cache_op(C_IST | CACH_SD, 0x2000_0000, 0x0000_0001);
+        c.cache_op(C_IST | CACH_SD, 0x2000_0001, 0xffff_cdfe);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0x2000_0000, 0), 0x0000_0001,
+                   "way 1's tag overwrote way 0's");
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0x2000_0001, 0), 0xffff_cdfe);
+    }
+
+    /// Adjacent sets stay distinct once the way bit is accounted for.
+    #[test]
+    fn adjacent_sets_do_not_alias_through_the_way_bit() {
+        let c = cache();
+        for set in 0..4u64 {
+            for way in 0..2u64 {
+                let va = set * 128 + way;
+                c.cache_op(C_IST | CACH_SD, va, 0x1000 + set * 16 + way);
+            }
+        }
+        for set in 0..4u64 {
+            for way in 0..2u64 {
+                let va = set * 128 + way;
+                assert_eq!(c.cache_op(C_ILT | CACH_SD, va, 0),
+                           0x1000 + set * 16 + way,
+                           "set {set} way {way} aliased");
+            }
+        }
     }
 
     /// Nothing is ever held, so a load must see the store that preceded it

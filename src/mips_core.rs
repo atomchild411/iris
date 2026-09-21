@@ -816,7 +816,14 @@ pub struct MipsCore {
     pub cp0_xcontext: u64,    // 20: Extended Context (64-bit)
     pub cp0_ecc: u32,         // 26: ECC Register
     pub cp0_cacheerr: u32,    // 27: Cache Error
-    pub cp0_taglo: u32,       // 28: Cache Tag Low
+    /// 28: Cache Tag Low. 64 bits, not 32.
+    ///
+    /// An R4000's TagLo fits in 32, but an R10000's secondary cache tag does
+    /// not — it carries a 40-bit physical address, and the IP28 PROM's tag
+    /// diagnostic writes and expects back values like 0x0000000f_ffffcdfe.
+    /// Truncating to 32 lost the top nibble and the PROM reported the
+    /// difference.
+    pub cp0_taglo: u64,       // 28: Cache Tag Low
     pub cp0_taghi: u32,       // 29: Cache Tag High
     pub cp0_errorepc: u64,    // 30: Error Exception PC
 
@@ -1547,7 +1554,7 @@ impl MipsCore {
             }
             26 => self.cp0_ecc as u64,
             27 => self.cp0_cacheerr as u64,
-            28 => self.cp0_taglo as u64,
+            28 => self.cp0_taglo,
             29 => self.cp0_taghi as u64,
             30 => self.cp0_errorepc,
             _ => 0, // Unimplemented registers read as 0
@@ -1579,7 +1586,7 @@ impl MipsCore {
             20 => self.cp0_xcontext,
             26 => self.cp0_ecc as u64,
             27 => self.cp0_cacheerr as u64,
-            28 => self.cp0_taglo as u64,
+            28 => self.cp0_taglo,
             29 => self.cp0_taghi as u64,
             30 => self.cp0_errorepc,
             _ => 0,
@@ -2079,7 +2086,7 @@ impl MipsCore {
             }
             26 => self.cp0_ecc = value as u32,
             27 => self.cp0_cacheerr = value as u32,
-            28 => self.cp0_taglo = value as u32,
+            28 => self.cp0_taglo = value,
             29 => self.cp0_taghi = value as u32,
             30 => self.cp0_errorepc = value,
             _ => {} // Writes to unimplemented registers are ignored
