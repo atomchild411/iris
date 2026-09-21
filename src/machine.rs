@@ -301,15 +301,6 @@ impl Machine {
             RamBank::new(cfg.banks[3].max(1) as usize),
         ];
 
-        // IP28 bring-up experiment: present RAM at HIMEM from reset, because
-        // the IP28 PROM never programs MEMCFG. See `map_himem_banks_now`.
-        // Env-gated rather than profile-gated for now — there is no IP28
-        // profile yet, and this must not change what IP22/IP24 do.
-        if std::env::var_os("IRIS_IP28_HIMEM").is_some() {
-            let mapped = mc.map_himem_banks_now();
-            eprintln!("iris: IP28 experiment: himem banks mapped = {mapped}");
-        }
-
         // PROM (1MB at 0x1FC00000). IP22 (Indigo2) uses a different PROM image
         // than Indy: try cfg.prom, then 070-1367-012.bin in cwd, then fall back
         // to the embedded PROM0701367012 (see prombini2.rs) rather than Indy's PROM.

@@ -159,7 +159,17 @@ impl MemoryController {
         regs[(REG_SYSID / 4) as usize] = if Self::memcfg_base_shift() == 22 {
             0x00000013
         } else {
-            0x00000015
+            // IP28's chip revision lives in the low nibble. 5 is the lowest
+            // the PROM accepts, but the 6.5 kernel prints "CPU baseboard
+            // downrev (IP26 not IP28)" at that value and turns on a set of
+            // early-board workarounds. `IRIS_IP28_MCREV` makes the nibble
+            // sweepable without a rebuild while we find what it wants.
+            let rev = std::env::var("IRIS_IP28_MCREV")
+                .ok()
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(5)
+                & 0xF;
+            0x00000010 | rev
         };
 
         // Initialize RPSS_DIVIDER: DIV=9, INC=3 (for 33MHz)
@@ -260,19 +270,61 @@ impl MemoryController {
         })
     }
 
+    /// A bank's installed size in MB → `(size_field, rank)` in register format.
+    ///
+    /// The size field counts per-subbank units of `1 << memcfg_base_shift()`
+    /// bytes, minus one, and the rank bit doubles the bank. The granule
+    /// therefore follows the base shift: 4 MB where the shift is 22, 16 MB
+    /// where it is 24. The same 64 MB bank is size field 15 on IP22 and size
+    /// field **3** on IP28 — which is what the IP28 PROM is observed to write
+    /// for its own banks (MEMCFG0 = 0x2320_2324, two 64 MB banks at
+    /// 0x20000000 and 0x24000000).
+    ///
+    /// The shift-22 rows are left exactly as they were, rank bits included:
+    /// they describe real IP22 SIMM topology, and more than one of them has
+    /// more than one arithmetically-equivalent encoding.
+    fn memcfg_size_rank(size_mb: u32) -> Option<(u32, u32)> {
+        Self::memcfg_size_rank_at(Self::memcfg_base_shift(), size_mb)
+    }
+
+    /// `memcfg_size_rank` with the granule passed in, so both can be tested in
+    /// one process — the live shift is read from the environment once and
+    /// cached for the life of the program.
+    fn memcfg_size_rank_at(shift: u32, size_mb: u32) -> Option<(u32, u32)> {
+        if shift == 24 {
+            // 16 MB granule.
+            return match size_mb {
+                16  => Some((0,  0)),
+                32  => Some((1,  0)),
+                64  => Some((3,  0)),
+                128 => Some((7,  0)),
+                256 => Some((15, 0)),
+                _   => None,
+            };
+        }
+        // 4 MB granule.
+        match size_mb {
+            8   => Some((0,  1)),
+            16  => Some((3,  0)),
+            32  => Some((3,  1)),
+            64  => Some((15, 0)),
+            128 => Some((15, 1)),
+            _   => None,
+        }
+    }
+
     pub fn encode_memcfg_half(base: u32, size_mb: u32) -> Option<u16> {
+        Self::encode_memcfg_half_at(Self::memcfg_base_shift(), base, size_mb)
+    }
+
+    /// `encode_memcfg_half` with the granule passed in. See
+    /// [`memcfg_size_rank_at`](Self::memcfg_size_rank_at).
+    fn encode_memcfg_half_at(shift: u32, base: u32, size_mb: u32) -> Option<u16> {
         if size_mb == 0 {
             return None;
         }
-        let (simm_size_field, simm_rank): (u32, u32) = match size_mb {
-            8   => (0,  1),
-            16  => (3,  0),
-            32  => (3,  1),
-            64  => (15, 0),
-            128 => (15, 1),
-            _   => return None,
-        };
-        let base_byte = (base >> Self::memcfg_base_shift()) & 0xFF;
+        let (simm_size_field, simm_rank) = Self::memcfg_size_rank_at(shift, size_mb)?;
+        let base_byte = (base >> shift) & 0xFF;
         Some(
             (base_byte as u16)
                 | (1 << 13) // VLD
@@ -282,27 +334,27 @@ impl MemoryController {
     }
 
     pub fn memcfg_bank_info(half: u16, size_mb: u32) -> Option<(u32, u32, u32)> {
+        Self::memcfg_bank_info_at(Self::memcfg_base_shift(), half, size_mb)
+    }
+
+    /// `memcfg_bank_info` with the granule passed in. See
+    /// [`memcfg_size_rank_at`](Self::memcfg_size_rank_at).
+    fn memcfg_bank_info_at(shift: u32, half: u16, size_mb: u32) -> Option<(u32, u32, u32)> {
         if size_mb == 0 { return None; }
         if (half >> 13) & 1 == 0 { return None; }
 
-        let base = ((half as u32) & 0xFF) << Self::memcfg_base_shift();
+        let base = ((half as u32) & 0xFF) << shift;
         let conf_rank = ((half >> 14) & 1) as u32;
         let conf_size_field = ((half >> 8) & 0x1F) as u32;
-        let conf_total = (conf_size_field + 1) << Self::memcfg_base_shift();
+        let conf_total = (conf_size_field + 1) << shift;
 
-        // SIMM size → (size_field, rank) in register format (one unit = 4MB)
-        let (simm_size_field, simm_rank): (u32, u32) = match size_mb {
-            8   => (0,  1),
-            16  => (3,  0),
-            32  => (3,  1),
-            64  => (15, 0),
-            128 => (15, 1),
-            _   => return None,
-        };
+        // SIMM size → (size_field, rank) in register format; the unit follows
+        // the base shift — see `memcfg_size_rank_at`.
+        let (simm_size_field, simm_rank) = Self::memcfg_size_rank_at(shift, size_mb)?;
 
         let conf_size = conf_total >> conf_rank;
-        let minus_size = (simm_size_field + 1) << (Self::memcfg_base_shift() - simm_rank);
-        let plus_size = (simm_size_field + 1) << (Self::memcfg_base_shift() + simm_rank);
+        let minus_size = (simm_size_field + 1) << (shift - simm_rank);
+        let plus_size = (simm_size_field + 1) << (shift + simm_rank);
         // BNK=0 (aliasing phase): wrap at inst_size so alias is detected at base+inst_size
         // BNK=1 (subbank/walkingbit): wrap at full bank size so both ranks are independent
         let addr_mask = if conf_rank == 0 { minus_size - 1 } else { plus_size - 1 };
@@ -330,31 +382,6 @@ impl MemoryController {
         self.write32(MC_BASE + REG_MEMCFG0, memcfg0) == BUS_OK
     }
 
-    /// Map banks 2/3 at HIMEM_BASE straight away, without waiting for a PROM
-    /// to program MEMCFG.
-    ///
-    /// EXPERIMENT (IP28 bring-up). The IP28 PROM never writes MEMCFG at all —
-    /// the monitor shows both halves still zero when it gives up with "No
-    /// usable memory found" — yet it does write the MC's timing registers, so
-    /// it is talking to this MC. On Power Indigo2 the SIMMs sit on the CPU
-    /// module rather than the motherboard, which would explain both that and
-    /// why the PROM looks for RAM at 0x20000000 instead of 0x08000000.
-    ///
-    /// If that is right, RAM has to be present at HIMEM from reset, the way it
-    /// would be on a board whose memory this MC does not place. If it is
-    /// wrong, this is a plausible mapping with nothing behind it — delete it.
-    pub fn map_himem_banks_now(&self) -> bool {
-        use crate::physical::{BANK_SIZE, HIMEM_BASE};
-        let half = |i: usize, base: u32| {
-            Self::encode_memcfg_half(base, self.ram_sizes[i]).unwrap_or(0) as u32
-        };
-        let memcfg1 = (half(2, HIMEM_BASE) << 16) | half(3, HIMEM_BASE + BANK_SIZE);
-        if memcfg1 == 0 {
-            return false;
-        }
-        self.write32(MC_BASE + REG_MEMCFG1, memcfg1) == BUS_OK
-    }
-
     /// Parse MEMCFG0/1 registers into 4 bank (base, addr_mask, limit) triples using the
     /// configured ram_sizes. Returns None for invalid/empty banks.
     pub fn parse_memcfg(&self, memcfg0: u32, memcfg1: u32) -> [Option<(u32, u32, u32)>; 4] {
@@ -371,6 +398,18 @@ impl MemoryController {
     /// MEMCFG1 entries for configured banks 2–3 so IRIX sees extended RAM.
     fn synthesize_himem_banks(&self, state: &mut MemoryControllerState) -> bool {
         use crate::physical::{BANK_SIZE, HIMEM_BASE};
+
+        // Only for a PROM that POSTs lomem and stops. The IP28 PROM sizes all
+        // four banks itself, walking them one at a time through a probe window
+        // at base byte 0x60; it finishes MEMCFG0 before it has finished with
+        // MEMCFG1. Synthesizing here fired on that intermediate state and
+        // overwrote the walk in progress, leaving banks 2 and 3 describing
+        // 256 MB apiece — bank 2 on top of bank 0 — and the PROM then never
+        // converged. HIMEM_BASE and BANK_SIZE are lomem/himem constants that
+        // mean nothing on a machine whose RAM starts at 0x20000000 anyway.
+        if Self::memcfg_base_shift() != 22 {
+            return false;
+        }
 
         let memcfg0 = state.regs[(REG_MEMCFG0 / 4) as usize];
         let memcfg1 = state.regs[(REG_MEMCFG1 / 4) as usize];
@@ -1363,5 +1402,62 @@ mod tests {
         assert!(addrs[2].is_some(), "bank 2 should be synthesized");
         assert!(addrs[3].is_some(), "bank 3 should be synthesized");
         assert_eq!(addrs[2].unwrap().0, crate::physical::HIMEM_BASE);
+    }
+
+    /// The IP28 PROM's own MEMCFG0 write, copied from a POST trace:
+    /// `0x2320_2324` — two 64 MB banks at 0x20000000 and 0x24000000.
+    ///
+    /// Size field 3 means four units of 16 MB, because the IP28 granule is the
+    /// base shift (24), not IP22's 22. Decoding it with IP22's table called the
+    /// same bank 256 MB, which is how banks 2 and 3 came to claim memory that
+    /// was not there.
+    #[test]
+    fn ip28_memcfg_matches_what_the_prom_writes() {
+        const OBSERVED: u32 = 0x2320_2324;
+        let h0 = (OBSERVED >> 16) as u16;
+        let h1 = (OBSERVED & 0xFFFF) as u16;
+
+        assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2000_0000, 64), Some(h0));
+        assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2400_0000, 64), Some(h1));
+
+        let (base0, mask0, limit0) = MemoryController::memcfg_bank_info_at(24, h0, 64).unwrap();
+        assert_eq!(base0, 0x2000_0000);
+        assert_eq!(limit0, 64 << 20, "a 64 MB bank must not claim more");
+        assert_eq!(mask0, (64 << 20) - 1, "and must alias within its own 64 MB");
+
+        let (base1, _, limit1) = MemoryController::memcfg_bank_info_at(24, h1, 64).unwrap();
+        assert_eq!(base1, 0x2400_0000);
+        assert_eq!(base1, base0 + limit0, "banks 0 and 1 are contiguous, not overlapping");
+        assert_eq!(limit1, 64 << 20);
+    }
+
+    /// Four 64 MB banks must tile 0x20000000..0x30000000 with no overlap and no
+    /// gap. The failure this pins is the one that stalled the IRIX install:
+    /// bank 2 landed on top of bank 0 and bank 3 claimed 256 MB, so the top of
+    /// "memory" was 0x38000000 and the miniroot was loaded into nothing.
+    #[test]
+    fn ip28_four_banks_tile_without_overlap() {
+        let mut next = 0x2000_0000u32;
+        for bank in 0..4 {
+            let half = MemoryController::encode_memcfg_half_at(24, next, 64)
+                .unwrap_or_else(|| panic!("bank {bank} did not encode"));
+            let (base, _, limit) = MemoryController::memcfg_bank_info_at(24, half, 64).unwrap();
+            assert_eq!(base, next, "bank {bank} base");
+            assert_eq!(limit, 64 << 20, "bank {bank} limit");
+            next = base + limit;
+        }
+        assert_eq!(next, 0x3000_0000, "256 MB total, ending where RAM ends");
+    }
+
+    /// The IP22 encodings are unchanged by the granule work.
+    #[test]
+    fn ip22_memcfg_encodings_are_unchanged() {
+        for (size_mb, want) in [(8, (0, 1)), (16, (3, 0)), (32, (3, 1)), (64, (15, 0)), (128, (15, 1))] {
+            assert_eq!(MemoryController::memcfg_size_rank_at(22, size_mb), Some(want), "{size_mb} MB");
+        }
+        let half = MemoryController::encode_memcfg_half_at(22, crate::physical::LOMEM_BASE, 64).unwrap();
+        let (base, _, limit) = MemoryController::memcfg_bank_info_at(22, half, 64).unwrap();
+        assert_eq!(base, crate::physical::LOMEM_BASE);
+        assert_eq!(limit, 64 << 20);
     }
 }
