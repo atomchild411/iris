@@ -4980,10 +4980,30 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.cp0_context = ptebase | badvpn2;
 
         // XContext: PTEBase[63:33] preserved, Region[63:62] → bits[32:31], BadVPN2[39:13] → bits[30:4].
-        let xptebase = self.core.cp0_xcontext & 0xFFFF_FFFE_0000_0000;
-        let xbadvpn2 = ((virt_addr & EH_VPN2_64) >> 13) << 4;
+        // XContext's fields are laid out around the width of BadVPN2, which is
+        // VA[VA_BITS-1:13] — 27 bits on a 40-bit CPU, 31 on the R10000's
+        // 44-bit one. Region sits directly above it and PTEBase above that, so
+        // all three move together: PTEBase[63:VA_BITS-7],
+        // Region[VA_BITS-8:VA_BITS-9], BadVPN2[VA_BITS-10:4].
+        //
+        // Using the 40-bit layout on an R10000 puts Region and PTEBase four
+        // bits too low. A 64-bit kernel reads XContext in its TLB refill
+        // handler to find the page-table entry for the faulting address, so
+        // the address it computes lands outside the page table it wired, the
+        // nested miss is unrecoverable, and IRIX panics with "Entered tlbmiss
+        // with invalid vaddr".
+        //
+        // EntryHi keeps the 40-bit VPN2 field on every model: a 64-bit kernel
+        // zero-fills those upper bits itself when it builds an EntryHi value,
+        // and widening the mask here breaks it.
+        const XC_PTEBASE_GAP: u32 = 7;
+        const XC_REGION_GAP: u32 = 9;
+        let xc_vpn2_mask: u64 = (((1u64 << (C::VA_BITS - 13)) - 1) << 13) & !0xFFFu64;
+        let xptebase = self.core.cp0_xcontext & (!0u64 << (C::VA_BITS - XC_PTEBASE_GAP));
+        let xbadvpn2 = ((virt_addr & xc_vpn2_mask) >> 13) << 4;
         let region = (virt_addr >> 62) & 0x3;
-        self.core.cp0_xcontext = xptebase | (region << 31) | xbadvpn2;
+        self.core.cp0_xcontext =
+            xptebase | (region << (C::VA_BITS - XC_REGION_GAP)) | xbadvpn2;
     }
 
     // ========== Memory Access Wrapper Methods ==========
@@ -7416,6 +7436,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // TLBWI - Write Indexed TLB Entry
     // Writes CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask to the TLB entry indexed by CP0.Index
+    /// IP28 bring-up: report every TLB write. `IRIS_IP28_TLBW=1` reports all
+    /// of them; `IRIS_IP28_TLBW=wired` reports only writes below CP0 Wired,
+    /// which is what a kernel uses for mappings that must never be evicted.
+    #[inline]
+    fn ip28_trace_tlb_write(&self, op: &str, index: usize, entry: &crate::mips_tlb::TlbEntry) {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let mode = *MODE.get_or_init(|| match std::env::var("IRIS_IP28_TLBW").as_deref() {
+            Ok("wired") => 2,
+            Ok(v) if !v.is_empty() && v != "0" => 1,
+            _ => 0,
+        });
+        if mode == 0 || (mode == 2 && index >= self.core.cp0_wired as usize) {
+            return;
+        }
+        eprintln!(
+            "ip28tlbw: {op} idx={index:<2} wired={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} \
+             mask={:#x} pc={:#018x}",
+            self.core.cp0_wired, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1],
+            entry.page_mask, self.core.pc,
+        );
+    }
+
     fn exec_tlbwi(&mut self) -> ExecStatus {
         // The slot is Index[5:0]. Masking rather than `%` matters twice:
         //
@@ -7441,7 +7483,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return self.handle_exec_complete();
         }
         let entry = self.create_tlb_entry_from_cp0();
-        //eprintln!("TLBWI idx={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} pc={:#018x}", index, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1], self.core.pc);
+        self.ip28_trace_tlb_write("tlbwi", index, &entry);
         self.tlb.write(index, entry);
         // Flushes the nutlb too — the TLB it caches just changed.
         self.nanotlb_invalidate();
@@ -7465,6 +7507,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.update_random();
         let index = (self.core.cp0_random as usize) % self.tlb.num_entries();
         let entry = self.create_tlb_entry_from_cp0();
+        self.ip28_trace_tlb_write("tlbwr", index, &entry);
         self.tlb.write(index, entry);
         self.nanotlb_invalidate();
 

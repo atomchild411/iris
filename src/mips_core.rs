@@ -1934,6 +1934,20 @@ impl MipsCore {
                 self.reanchor_count_and_reschedule();
             }
             10 => { // always use 64bit mask because the entries need to be valid in 64 bit mode even when they were set from 32 bit mode
+                // IP28 bring-up: IRIS_IP28_EHI=1 shows what the guest wrote
+                // against what survives the mask. The mask is R4400's 40-bit
+                // virtual address; the R10000 implements 44.
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *ON.get_or_init(|| std::env::var_os("IRIS_IP28_EHI").is_some())
+                    && (value & !0xC000_00FF_FFFF_E0FF) != 0
+                {
+                    eprintln!(
+                        "ip28ehi: wrote {value:#018x} -> kept {:#018x} (lost {:#018x}) pc={:#018x}",
+                        value & 0xC000_00FF_FFFF_E0FF,
+                        value & !0xC000_00FF_FFFF_E0FF,
+                        self.pc,
+                    );
+                }
                 self.cp0_entryhi = value & 0xC000_00FF_FFFF_E0FF;
             },
             11 => {

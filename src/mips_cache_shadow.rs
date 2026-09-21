@@ -248,6 +248,10 @@ impl<
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
+    // The R10000 implements 44 virtual address bits where the R4x00 implements
+    // 40; the shadow cache is only used for it, but key this off the same flag
+    // that selects its cache encodings rather than asserting it unconditionally.
+    const VA_BITS: u32 = if R10K_OPS { 44 } else { 40 };
     const NAME: &'static str = "shadow";
     const R10K_CACHE_OPS: bool = R10K_OPS;
 }
