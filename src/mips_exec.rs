@@ -1144,6 +1144,9 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     cheritest_dump_hook: bool,
     pub tlb: T,
     pub cache: C,
+    /// ARCS firmware we provide ourselves, when booting with no PROM. `None`
+    /// on a PROM-booted machine, where the real firmware is in ROM.
+    arcs_fw: Option<Box<crate::arcs::Arcs>>,
     /// ARCS firmware call tracer (`IRIS_ARCS_TRACE`). `None` unless asked for,
     /// so the disarmed cost is one predictable branch per `jalr` — and only
     /// `jalr`, because every ARCS call goes through the firmware vector table
@@ -2704,6 +2707,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             core,
             sysad,
             cheritest_dump_hook: false,
+            arcs_fw: None,
             arcs: std::env::var_os("IRIS_ARCS_TRACE")
                 .map(|_| Box::new(crate::arcs_trace::ArcsTrace::new())),
             tlb,
@@ -3916,6 +3920,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     pub fn step_int(&mut self) -> ExecStatus {
         step_preamble!(self);
         let pc = self.core.pc;
+
+        // A firmware call, if this PC is one. Checked before the fetch: the
+        // trap window has no memory behind it, so fetching would bus-error.
+        // Checked on arrival rather than at the `jalr`, because the branch
+        // delay slot must run first.
+        if self.arcs_fw.is_some() {
+            if let Some(status) = self.arcs_firmware_call(pc) {
+                return status;
+            }
+        }
 
         let fetch = self.fetch_instr(pc);
         let result = if fetch.status == EXEC_COMPLETE {
@@ -5440,6 +5454,57 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             t.note(idx, args, ra);
         }
         self.arcs = Some(t);
+    }
+
+    /// Install firmware for a machine with no PROM: build the SPB, the vector
+    /// table and the firmware-owned structures in guest memory, and start
+    /// answering calls. `ram_bytes` is the contiguous RAM at physical 0.
+    pub fn install_arcs(&mut self, ram_bytes: u64) -> &mut crate::arcs::Arcs {
+        let mut fw = Box::new(crate::arcs::Arcs::new(ram_bytes));
+        fw.install(self.sysad.as_ref());
+        self.arcs_fw = Some(fw);
+        self.arcs_fw.as_mut().unwrap()
+    }
+
+    /// Service a firmware call if `pc` is a vector entry.
+    ///
+    /// Returns `None` for an ordinary instruction, so the common path costs
+    /// one range check.
+    #[inline]
+    fn arcs_firmware_call(&mut self, pc: u64) -> Option<ExecStatus> {
+        let idx = crate::arcs::Arcs::entry_for_pc(pc)?;
+        let mut fw = self.arcs_fw.take()?;
+        let args = [
+            self.core.read_gpr(4),
+            self.core.read_gpr(5),
+            self.core.read_gpr(6),
+            self.core.read_gpr(7),
+        ];
+        let result = fw.dispatch(idx, args, self.sysad.as_ref());
+        self.arcs_fw = Some(fw);
+
+        let v0 = match result {
+            crate::arcs::CallResult::Value(v) => v,
+            crate::arcs::CallResult::Console(bytes) => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(&bytes);
+                let _ = out.flush();
+                crate::arcs::ESUCCESS
+            }
+            crate::arcs::CallResult::Halt => {
+                eprintln!("arcs: guest asked the firmware to stop the machine");
+                return Some(EXEC_BREAKPOINT);
+            }
+        };
+
+        // Return to the caller. A firmware call is a function call: it leaves
+        // its result in v0 and resumes at ra.
+        self.core.write_gpr(2, v0);
+        let ra = self.core.read_gpr(31);
+        self.core.pc = ra;
+        self.core.in_delay_slot = false;
+        Some(EXEC_COMPLETE)
     }
 
     /// Summary of which ARCS entries the guest used. Empty when not tracing.

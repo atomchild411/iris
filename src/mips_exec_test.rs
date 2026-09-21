@@ -195,6 +195,117 @@ mod tests {
         (exec, mem)
     }
 
+    // ===================== ARCS firmware calls =========================
+    //
+    // These exercise the whole path a guest takes: jump to an address out of
+    // the firmware vector table, have the emulator service it, and come back
+    // with a result in v0. See src/arcs.rs and docs/arcs-scoping.md.
+
+    /// The guest's side of a firmware call is `jalr t9` with the entry address
+    /// in `t9`. The instruction *after* it is a branch delay slot and must
+    /// still execute — skipping it would quietly corrupt the caller, and it is
+    /// why the call is intercepted on arrival rather than at the jump.
+    #[test]
+    fn a_firmware_call_runs_its_delay_slot_and_returns_to_ra() {
+        let (mut exec, mem) = create_executor();
+        exec.install_arcs(128 * 1024 * 1024);
+
+        let entry = crate::arcs::Arcs::trap_addr(crate::arcs::entry::GET_SYSTEM_ID) as u64;
+        // t9 = entry, t0 = 0
+        exec.core.write_gpr(25, entry);
+        exec.core.write_gpr(8, 0);
+        // ra is not set here on purpose: `jalr t9` writes it itself, to the
+        // instruction after the delay slot. That is the return address a real
+        // call produces, and the firmware has to honour it.
+        exec.core.write_gpr(31, 0xdead_beef);
+
+        // jalr t9  /  addiu t0, t0, 1   (the delay slot).
+        // Code goes at a physical address clear of the firmware's own pages;
+        // kseg0 0x8000_3000 fetches from physical 0x3000.
+        mem.set_word(0x3000, 0x0320_F809);
+        mem.set_word(0x3004, 0x2508_0001);
+        exec.core.pc = 0x8000_3000;
+
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "jalr");
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "delay slot");
+        assert_eq!(exec.core.read_gpr(8), 1, "the delay slot must have run");
+        assert_eq!(
+            exec.core.pc & 0x1fff_ffff,
+            entry & 0x1fff_ffff,
+            "control should now be at the firmware entry"
+        );
+
+        // Arriving at the entry is the call.
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "the firmware call");
+        assert_eq!(
+            exec.core.pc, 0x8000_3008,
+            "must return to the address jalr put in ra — past the delay slot"
+        );
+        assert_ne!(exec.core.read_gpr(2), 0, "GetSystemId must return a pointer");
+    }
+
+    /// Walking the memory map is the first thing a kernel does with firmware.
+    /// It must terminate and hand back descriptors the guest can read.
+    #[test]
+    fn a_guest_can_walk_the_memory_map_through_the_vector_table() {
+        let (mut exec, mem) = create_executor();
+        exec.install_arcs(64 * 1024 * 1024);
+
+        let entry = crate::arcs::Arcs::trap_addr(crate::arcs::entry::GET_MEMORY_DESCRIPTOR) as u64;
+        let mut token = 0u64;
+        let mut seen = 0;
+        for _ in 0..16 {
+            exec.core.write_gpr(4, token); // a0
+            exec.core.write_gpr(31, 0x8000_2000); // ra
+            exec.core.pc = entry;
+            assert_eq!(exec.step_int(), EXEC_COMPLETE);
+            assert_eq!(exec.core.pc, 0x8000_2000);
+            let v0 = exec.core.read_gpr(2);
+            if v0 == 0 {
+                break;
+            }
+            // Every descriptor the guest is given must be readable and have a
+            // non-zero size, or it is describing nothing.
+            let at = (v0 as u32) & 0x1fff_ffff;
+            assert_ne!(mem.get_word(at as u64 + 8), 0, "descriptor with no pages");
+            token = v0;
+            seen += 1;
+        }
+        assert!(seen >= 3, "expected several descriptors, saw {seen}");
+    }
+
+    /// An ordinary jump anywhere else must not be mistaken for a firmware
+    /// call — the check is a range test on the PC, and a false positive would
+    /// silently replace guest code with a firmware return.
+    #[test]
+    fn ordinary_code_is_not_mistaken_for_a_firmware_call() {
+        let (mut exec, mem) = create_executor();
+        exec.install_arcs(128 * 1024 * 1024);
+        // addiu t0, t0, 1 at a perfectly normal address
+        mem.set_word(0x3000, 0x2508_0001);
+        exec.core.write_gpr(8, 7);
+        exec.core.write_gpr(31, 0xdead_beef);
+        exec.core.pc = 0x8000_3000;
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(8), 8, "the instruction must have run");
+        assert_eq!(exec.core.pc, 0x8000_3004, "and fallen through, not returned to ra");
+    }
+
+    /// With no firmware installed the trap window is just unmapped memory, and
+    /// a machine booting from a real PROM must be entirely unaffected.
+    #[test]
+    fn without_installed_firmware_nothing_is_intercepted() {
+        let (mut exec, mem) = create_executor();
+        let entry = crate::arcs::Arcs::trap_addr(crate::arcs::entry::GET_SYSTEM_ID) as u64;
+        mem.set_word(entry, 0x2508_0001); // addiu t0, t0, 1
+        exec.core.write_gpr(8, 0);
+        exec.core.write_gpr(31, 0x8000_1000);
+        exec.core.pc = entry;
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(8), 1, "the word there must execute as code");
+        assert_ne!(exec.core.pc, 0x8000_1000, "must not have returned to ra");
+    }
+
     /// A model's identity must be live the moment the executor exists — MipsCore::new
     /// runs reset_registers before the model is known, so the constructor has to set
     /// both the reset value and the live register. Caught a real bug: the guest read
