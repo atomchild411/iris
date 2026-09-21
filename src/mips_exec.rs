@@ -4266,7 +4266,91 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// Handle an exception: update CP0 registers and jump to handler vector.
     /// Takes an ExecStatus with EXEC_IS_EXCEPTION set; extracts code and TLB-refill flag.
+    /// IP28 bring-up: dump everything about the one exception whose BadVAddr
+    /// is `IRIS_IP28_EXC_VADDR`.
+    ///
+    /// A first-N trace is useless for a fault that lands after thousands of
+    /// ordinary TLB misses, and reading the register file from the monitor
+    /// afterwards shows the guest's panic handler, not the fault. Costs one
+    /// relaxed load per exception on the R10000 model and folds away on every
+    /// other; exceptions are not a hot path.
+    #[inline]
+    fn ip28_trace_exception(&self, status: ExecStatus) {
+        if !C::R10K_CACHE_OPS {
+            return;
+        }
+        static WANT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let want = *WANT.get_or_init(|| {
+            std::env::var("IRIS_IP28_EXC_VADDR").ok().and_then(|v| {
+                let v = v.trim();
+                if v.is_empty() { return None; }
+                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()
+            })
+        });
+        let Some(want) = want else { return };
+
+        // Keep the run-up. The exception that panics the guest is the second
+        // one: the first is an ordinary miss, and its handler then faults.
+        // Only the run-up says what the handler was handed, and BadVAddr has
+        // already been overwritten by the time the match fires.
+        static RING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        const KEEP: usize = 12;
+        let line = format!(
+            "code={:<2} pc={:#018x} bd={} badvaddr={:#018x} xcontext={:#018x} \
+             context={:#018x} entryhi={:#018x} ra={:#018x}",
+            (status & CAUSE_EXCCODE_MASK) >> 2,
+            self.core.pc,
+            self.core.in_delay_slot as u8,
+            self.core.cp0_badvaddr,
+            self.core.cp0_xcontext,
+            self.core.cp0_context,
+            self.core.cp0_entryhi,
+            self.core.read_gpr(31),
+        );
+        if let Ok(mut ring) = RING.lock() {
+            if ring.len() == KEEP {
+                ring.remove(0);
+            }
+            ring.push(line);
+            if want == self.core.cp0_badvaddr {
+                eprintln!("ip28exc: --- last {} exceptions, oldest first ---", ring.len());
+                for (i, l) in ring.iter().enumerate() {
+                    eprintln!("ip28exc: [{i}] {l}");
+                }
+            }
+        }
+
+        if want != self.core.cp0_badvaddr {
+            return;
+        }
+        const NAMES: [&str; 32] = [
+            "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+            "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+        ];
+        let code = (status & CAUSE_EXCCODE_MASK) >> 2;
+        eprintln!(
+            "ip28exc: code={code} pc={:#018x} delay_slot={} badvaddr={:#018x} status={:#010x}",
+            self.core.pc, self.core.in_delay_slot, self.core.cp0_badvaddr,
+            self.core.cp0_status,
+        );
+        for i in 0..32u32 {
+            if self.core.read_gpr(i) == self.core.cp0_badvaddr {
+                eprintln!("ip28exc:   {} (${i}) holds the bad address", NAMES[i as usize]);
+            }
+        }
+        for chunk in (0..32u32).collect::<Vec<_>>().chunks(4) {
+            let mut line = String::from("ip28exc: ");
+            for &i in chunk {
+                line.push_str(&format!(" {:>4}={:#018x}", NAMES[i as usize], self.core.read_gpr(i)));
+            }
+            eprintln!("{line}");
+        }
+    }
+
     fn handle_exception(&mut self, status: ExecStatus) -> ExecStatus {
+        self.ip28_trace_exception(status);
         // In developer builds, bus/address error exceptions break into the
         // monitor at the fault site rather than dispatching to the MIPS
         // vector — must be decided before deliver_exception runs, since that
@@ -4357,31 +4441,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// the nutlb flush, and the trailing `in_delay_slot = false`.
     #[cfg(feature = "jitv2")]
     fn handle_exception_at(&mut self, status: ExecStatus, fault_pc: u64, bd: bool) -> ExecStatus {
-        // IP28 bring-up: report the first N exceptions with everything needed
-        // to place them. Costs one atomic load per exception on the R10000
-        // model and folds away entirely on every other model, so it can stay
-        // until IP28 boots. Exceptions are rare; this is not a hot path.
-        if C::R10K_CACHE_OPS {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static N: AtomicU64 = AtomicU64::new(0);
-            static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let limit = *LIMIT.get_or_init(|| {
-                std::env::var("IRIS_IP28_EXC")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0)
-            });
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            if n < limit {
-                let code = (status & CAUSE_EXCCODE_MASK) >> 2;
-                eprintln!(
-                    "ip28exc: #{n} code={code} pc={fault_pc:#018x} bd={bd}                      badvaddr={:#018x} ra={:#018x} sp={:#018x}",
-                    self.core.cp0_badvaddr,
-                    self.core.read_gpr(31),
-                    self.core.read_gpr(29),
-                );
-            }
-        }
         #[cfg(feature = "developerx")]
         {
             let was_exl = (self.core.cp0_status & STATUS_EXL) != 0;

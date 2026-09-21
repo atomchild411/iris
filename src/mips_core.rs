@@ -2079,7 +2079,19 @@ impl MipsCore {
             17 => self.cp0_lladdr = value as u32,
             18 => self.cp0_watchlo = value as u32,
             19 => self.cp0_watchhi = value as u32,
-            20 => self.cp0_xcontext = value,
+            20 => {
+                // IP28 bring-up: IRIX's XTLB refill handler builds the page
+                // table base itself and expects XContext's PTEBase to be
+                // zero, so anything landing in bits [63:33] becomes a wild
+                // pointer inside the handler. Armed with IRIS_IP28_XCTX=1.
+                if std::env::var_os("IRIS_IP28_XCTX").is_some() {
+                    eprintln!(
+                        "ip28xctx: write {value:#018x} (ptebase={:#018x}) pc={:#018x}",
+                        value & 0xFFFF_FFFE_0000_0000, self.pc,
+                    );
+                }
+                self.cp0_xcontext = value;
+            }
             25 => {
                 #[cfg(feature = "developer_ip7")]
                 eprintln!("[ip7] MTC0 PerfCnt (reg 25) write {:#018x} (ignored)", value);
