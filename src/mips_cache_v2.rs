@@ -646,6 +646,15 @@ pub trait MipsCache: Send + Sync {
     /// fit in 32 bits.
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64;
 
+    /// CP0 `ECC` ($26) on the way in to a cache-data store.
+    ///
+    /// On an R10000 the check bits ride with the data: `Index_Store_Data`
+    /// takes them from this register and `Index_Load_Data` returns them
+    /// there. Models that do not keep them ignore both of these.
+    fn set_cache_ecc(&self, _v: u32) {}
+    /// CP0 `ECC` after the last cache operation.
+    fn cache_op_ecc(&self) -> u32 { 0 }
+
     /// Write back dirty L1-D (and, if present, L2) lines covering
     /// `[phys_addr, phys_addr + size)` to memory, without invalidating them.
     ///

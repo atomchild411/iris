@@ -161,8 +161,18 @@ pub struct Arcs {
 }
 
 impl Arcs {
-    /// `ram_bytes` is the contiguous RAM the machine has at physical 0.
-    pub fn new(ram_bytes: u64) -> Self {
+    /// `ram_base` is where the machine's RAM actually starts in physical
+    /// address space and `ram_bytes` how much there is.
+    ///
+    /// The base is not always zero, and getting it wrong is not subtle: an
+    /// Indy has its RAM at 0x08000000, and a kernel told otherwise places its
+    /// stack at the top of a region that is not there.
+    ///
+    /// The firmware's own structures still live at low physical addresses,
+    /// because that is where a guest looks for the SPB. Those addresses alias
+    /// into the start of RAM, which is why the first pages of the map below
+    /// are described as firmware-owned rather than free.
+    pub fn new(ram_base: u64, ram_bytes: u64) -> Self {
         let mut a = Self {
             descriptors: Vec::new(),
             descriptor_addrs: Vec::new(),
@@ -175,42 +185,83 @@ impl Arcs {
             sysid_addr: 0,
             unimplemented: std::collections::BTreeSet::new(),
         };
-        a.build_memory_map(ram_bytes);
+        a.build_memory_map(ram_base, ram_bytes);
         a
     }
 
     /// The map a guest is handed. Low memory is carved up so that nothing we
     /// own is offered as free: the exception block, the SPB page holding the
     /// vector table, and our scratch area.
-    fn build_memory_map(&mut self, ram_bytes: u64) {
-        let page = |addr: u32| addr / ARCBIOS_PAGESIZE;
+    fn build_memory_map(&mut self, ram_base: u64, ram_bytes: u64) {
+        let base_page = (ram_base / ARCBIOS_PAGESIZE as u64) as u32;
         let total_pages = (ram_bytes / ARCBIOS_PAGESIZE as u64) as u32;
+        let data_pages = DATA_SIZE / ARCBIOS_PAGESIZE;
+        // Pages the firmware occupies, at the very start of RAM: the
+        // exception block, the SPB page carrying the vector table, and our
+        // scratch. Their low-address aliases are what the guest reads.
+        let reserved = (DATA_PHYS / ARCBIOS_PAGESIZE) + data_pages;
 
-        let mut d = Vec::new();
-        d.push(MemDescriptor {
-            mem_type: mem_type::EXCEPTION_BLOCK,
-            base_page: 0,
-            page_count: page(SPB_PHYS),
-        });
-        d.push(MemDescriptor {
-            mem_type: mem_type::SYSTEM_PARAMETER_BLOCK,
-            base_page: page(SPB_PHYS),
-            page_count: page(DATA_PHYS) - page(SPB_PHYS),
-        });
-        d.push(MemDescriptor {
-            mem_type: mem_type::FIRMWARE_PERMANENT,
-            base_page: page(DATA_PHYS),
-            page_count: DATA_SIZE / ARCBIOS_PAGESIZE,
-        });
-        let free_base = page(DATA_PHYS + DATA_SIZE);
-        if total_pages > free_base {
+        let mut d = vec![
+            MemDescriptor {
+                mem_type: mem_type::EXCEPTION_BLOCK,
+                base_page,
+                page_count: SPB_PHYS / ARCBIOS_PAGESIZE,
+            },
+            MemDescriptor {
+                mem_type: mem_type::SYSTEM_PARAMETER_BLOCK,
+                base_page: base_page + SPB_PHYS / ARCBIOS_PAGESIZE,
+                page_count: (DATA_PHYS - SPB_PHYS) / ARCBIOS_PAGESIZE,
+            },
+            MemDescriptor {
+                mem_type: mem_type::FIRMWARE_PERMANENT,
+                base_page: base_page + DATA_PHYS / ARCBIOS_PAGESIZE,
+                page_count: data_pages,
+            },
+        ];
+        if total_pages > reserved {
             d.push(MemDescriptor {
                 mem_type: mem_type::FREE_MEMORY,
-                base_page: free_base,
-                page_count: total_pages - free_base,
+                base_page: base_page + reserved,
+                page_count: total_pages - reserved,
             });
         }
         self.descriptors = d;
+    }
+
+    /// Carve a range out of the free memory as `LoadedProgram`.
+    ///
+    /// Firmware that loads a program says so in the memory map; otherwise the
+    /// kernel is told the pages holding its own text are free, and hands them
+    /// to its page allocator. Splits the containing free descriptor, keeping
+    /// the map ascending and gapless.
+    pub fn reserve_loaded_program(&mut self, phys_start: u64, phys_end: u64) {
+        let page = |a: u64| (a / ARCBIOS_PAGESIZE as u64) as u32;
+        let start = page(phys_start);
+        let end = page(phys_end + ARCBIOS_PAGESIZE as u64 - 1);
+        let mut out: Vec<MemDescriptor> = Vec::new();
+        for d in self.descriptors.drain(..) {
+            let d_end = d.base_page + d.page_count;
+            let is_free =
+                d.mem_type == mem_type::FREE_MEMORY || d.mem_type == mem_type::FREE_CONTIGUOUS;
+            if !is_free || end <= d.base_page || start >= d_end {
+                out.push(d);
+                continue;
+            }
+            let lo = start.max(d.base_page);
+            let hi = end.min(d_end);
+            if lo > d.base_page {
+                out.push(MemDescriptor { page_count: lo - d.base_page, ..d });
+            }
+            out.push(MemDescriptor {
+                mem_type: mem_type::LOADED_PROGRAM,
+                base_page: lo,
+                page_count: hi - lo,
+            });
+            if hi < d_end {
+                out.push(MemDescriptor { mem_type: d.mem_type, base_page: hi, page_count: d_end - hi });
+            }
+        }
+        self.descriptors = out;
     }
 
     pub fn descriptors(&self) -> &[MemDescriptor] {
@@ -417,6 +468,12 @@ impl Arcs {
 
             GET_ENVIRONMENT_VARIABLE => {
                 let name = Self::read_cstr(bus, Self::phys(args[0]), 64);
+                if std::env::var_os("IRIS_ARCS_TRACE").is_some() {
+                    eprintln!(
+                        "arcs:   getenv({name:?}) -> {:?}",
+                        self.env_get(&name).unwrap_or("<unset>")
+                    );
+                }
                 match self.env_value_addr(bus, &name) {
                     Some(a) => CallResult::Value(0xa000_0000u64 | a as u64),
                     None => CallResult::Value(0),
@@ -465,6 +522,18 @@ impl Arcs {
         }
     }
 
+    /// Publish an argv array in guest memory: 32-bit pointers to
+    /// NUL-terminated strings. Returns `(argc, address of argv)`.
+    pub fn publish_argv(&mut self, bus: &dyn BusDevice, args: &[String]) -> (usize, u32) {
+        let strs: Vec<u32> = args.iter().map(|a| self.put_cstr(bus, a)).collect();
+        let vec_at = self.alloc((strs.len() as u32 + 1) * 4);
+        for (i, a) in strs.iter().enumerate() {
+            bus.write32(vec_at + (i as u32) * 4, 0xa000_0000 | a);
+        }
+        bus.write32(vec_at + (strs.len() as u32) * 4, 0);
+        (strs.len(), 0xa000_0000 | vec_at)
+    }
+
     /// Address of an environment value in guest memory, published on first ask.
     fn env_value_addr(&mut self, bus: &dyn BusDevice, name: &str) -> Option<u32> {
         let key = name.to_ascii_lowercase();
@@ -496,7 +565,9 @@ mod tests {
 
     fn arcs_on(ram: u64) -> (Arcs, Arc<Memory>) {
         let mem = Arc::new(Memory::new(16));
-        let mut a = Arcs::new(ram);
+        // base 0 keeps the tests' arithmetic simple; the base-aware case has
+        // its own test below.
+        let mut a = Arcs::new(0, ram);
         a.install(mem.as_ref());
         (a, mem)
     }
@@ -573,6 +644,62 @@ mod tests {
                 assert_ne!(d.mem_type, mem_type::FREE_CONTIGUOUS);
             }
         }
+    }
+
+    /// RAM does not start at physical zero on these machines, and a map that
+    /// says otherwise is not a small error: a kernel places its stack at the
+    /// top of the region it is told about, so an Indy booted with a
+    /// base-zero map faults just below 0x08000000 — the top of a 128 MB
+    /// region that is not there. Found exactly that way.
+    #[test]
+    fn the_map_describes_ram_where_it_actually_is() {
+        let base = 0x0800_0000u64;
+        let ram = 128 * 1024 * 1024u64;
+        let a = Arcs::new(base, ram);
+        let d = a.descriptors();
+        let base_page = (base / ARCBIOS_PAGESIZE as u64) as u32;
+        assert_eq!(d[0].base_page, base_page, "map must start at the real RAM base");
+        let last = d.last().unwrap();
+        assert_eq!(
+            (last.base_page + last.page_count) as u64 * ARCBIOS_PAGESIZE as u64,
+            base + ram,
+            "map must end where RAM ends"
+        );
+        // Still contiguous and ascending when based.
+        for w in d.windows(2) {
+            assert_eq!(w[0].base_page + w[0].page_count, w[1].base_page);
+        }
+    }
+
+    /// The pages holding the kernel's own text must not be offered as free,
+    /// or its page allocator will hand them out and it will overwrite itself.
+    /// Firmware that loads a program records it as LoadedProgram.
+    #[test]
+    fn the_loaded_kernel_is_carved_out_of_free_memory() {
+        let base = 0x0800_0000u64;
+        let mut a = Arcs::new(base, 128 * 1024 * 1024);
+        let (ks, ke) = (0x0806_0000u64, 0x0854_5810u64);
+        a.reserve_loaded_program(ks, ke);
+
+        // Still ascending and gapless after the split.
+        for w in a.descriptors().windows(2) {
+            assert_eq!(w[0].base_page + w[0].page_count, w[1].base_page, "gap or overlap");
+        }
+        // Every page of the kernel is accounted for, and none of it is free.
+        for addr in [ks, (ks + ke) / 2, ke - 1] {
+            let p = (addr / ARCBIOS_PAGESIZE as u64) as u32;
+            let d = a
+                .descriptors()
+                .iter()
+                .find(|d| p >= d.base_page && p < d.base_page + d.page_count)
+                .unwrap_or_else(|| panic!("{addr:#x} not described"));
+            assert_eq!(d.mem_type, mem_type::LOADED_PROGRAM, "{addr:#x} must be reserved");
+        }
+        // And free memory survives on both sides of it.
+        assert!(a.descriptors().iter().any(|d| d.mem_type == mem_type::FREE_MEMORY
+            && d.base_page + d.page_count <= (ks / ARCBIOS_PAGESIZE as u64) as u32));
+        assert!(a.descriptors().iter().any(|d| d.mem_type == mem_type::FREE_MEMORY
+            && d.base_page >= (ke / ARCBIOS_PAGESIZE as u64) as u32));
     }
 
     /// The memory types are SGI's, not the ARC standard's. Getting this wrong

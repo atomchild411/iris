@@ -149,7 +149,18 @@ impl MemoryController {
         // unconditionally lets vino_init proceed; with it set, `vlinfo`
         // reports `vino 0` with 5 nodes (digital input = IndyCam, analog
         // input, two memory drains, controls).
-        regs[(REG_SYSID / 4) as usize] = 0x00000013;
+        // IP28 raises the bar: its power-on diagnostic reads the chip
+        // revision out of SYSID and rejects anything below 5 with "FATAL
+        // ERROR: Rev A/BC MC detected--Need rev D or greater." It needs a
+        // rev D part because that is what supports the high memory mapping
+        // IP28 uses. Report 5 there; every other machine keeps the rev C (3)
+        // it has always seen. Bit 4 stays set in both — that is the EISA /
+        // vino gate, not part of the revision.
+        regs[(REG_SYSID / 4) as usize] = if Self::memcfg_base_shift() == 22 {
+            0x00000013
+        } else {
+            0x00000015
+        };
 
         // Initialize RPSS_DIVIDER: DIV=9, INC=3 (for 33MHz)
         // 33MHz: Divide by 10 (9+1), Increment by 3 -> 300ns per tick

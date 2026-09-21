@@ -1170,6 +1170,26 @@ impl Machine {
         Ok(Self::note_banks(mapped, out))
     }
 
+    /// Boot a kernel with no PROM: map RAM, load the ELF, install ARCS, and
+    /// put the CPU in the state firmware enters a kernel in.
+    pub fn boot_arcs(&self, path: &str, ram_bytes: u64, bootpath: &str) -> Result<String, String> {
+        // RAM does not start at physical zero on these machines.
+        let ram_base = crate::physical::LOMEM_BASE as u64;
+        let mapped = self.mc.post_map_banks();
+        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let elf = crate::elf::parse(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        // Physical extent of everything the ELF puts in memory, so the
+        // firmware can report it as loaded rather than free.
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        for seg in &elf.segments {
+            lo = lo.min(seg.vaddr & 0x1fff_ffff);
+            hi = hi.max((seg.vaddr & 0x1fff_ffff) + seg.memsz);
+        }
+        let mut out = self.cpu.load_elf_bytes(&bytes, path)?;
+        out.push_str(&self.cpu.boot_arcs(ram_base, ram_bytes, bootpath, lo, hi)?);
+        Ok(Self::note_banks(mapped, out))
+    }
+
     /// `load_elf` for an image already in memory — see
     /// `MipsCpu::load_elf_bytes`. `name` only labels errors.
     pub fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String> {

@@ -52,13 +52,15 @@ struct Shadow {
     tags: Box<[u64]>,
     /// Data array in u64 slots. Empty where the model has no data shadow.
     data: Box<[u64]>,
-    /// Which way of each set was most recently used, or `MRU_NONE` before
-    /// anything has claimed it. Hardware state, not storage — see
-    /// MRU_SET_BIT. It starts as "none" rather than way 0 so that a tag read
-    /// on an untouched set returns the tag alone; defaulting to way 0 made
-    /// every way-0 read come back flagged and broke the tag tests that
-    /// already pass.
-    mru: Box<[u8]>,
+    /// The check bits stored with each data slot. On an R10000 these ride
+    /// with the data: `Index_Store_Data` takes them from CP0 ECC and
+    /// `Index_Load_Data` returns them there, so they are storage like the
+    /// data itself, not a computed value.
+    ecc: Box<[u32]>,
+    /// The most-recently-used bit for each set. Shared across the set's ways
+    /// — see `MRU_BIT`. Hardware state rather than tag storage, which is why
+    /// it is kept here and re-applied on read instead of living in `tags`.
+    mru: Box<[bool]>,
 }
 
 impl Shadow {
@@ -66,19 +68,22 @@ impl Shadow {
         Self {
             tags: vec![0u64; lines.max(1)].into_boxed_slice(),
             data: vec![0u64; data_words].into_boxed_slice(),
-            mru: vec![MRU_NONE; (lines.max(1) / WAYS).max(1)].into_boxed_slice(),
+            ecc: vec![0u32; data_words].into_boxed_slice(),
+            mru: vec![false; (lines.max(1) / WAYS).max(1)].into_boxed_slice(),
         }
     }
 }
 
-/// No way of this set has been marked most-recently-used yet.
-const MRU_NONE: u8 = 0xFF;
-/// Written to a tag to mark that way most-recently-used: TagHi[31], i.e. bit
-/// 63 of the assembled tag. It is a command, not a stored bit.
-const MRU_SET_BIT: u64 = 1 << 63;
-/// Read back from a tag to say that way *is* most-recently-used: TagHi[0],
-/// i.e. bit 32 of the assembled tag.
-const MRU_READ_BIT: u64 = 1 << 32;
+/// The most-recently-used bit: TagHi[31], i.e. bit 63 of the assembled tag.
+///
+/// It is **one bit per set, shared between the ways** — not a per-way tag bit.
+/// Writing a tag with it set through either way marks the set, and reading
+/// the tag of *either* way reports it. The IP28 PROM's diagnostic tests
+/// exactly that: it writes the bit through way 0, writes the next set to
+/// clobber the signal line, then reads way 1 back and requires the bit to be
+/// there. Storing "which way is MRU" and reporting it only on that way passes
+/// nothing, because the way that is read is never the way that was written.
+const MRU_BIT: u64 = 1 << 63;
 
 /// Ways per set, as CACHE index operations address them. Bit 0 of the index
 /// selects the way on an R10000; the set starts above the line offset.
@@ -116,6 +121,9 @@ pub struct ShadowCache<
     lladdr: UnsafeCell<u32>,
     /// Somewhere to decode into. Not a cache line — there is no caching.
     fetch_scratch: UnsafeCell<DecodedInstr>,
+    /// CP0 ECC on the way in to a store, and on the way out of a load.
+    ecc_in: UnsafeCell<u32>,
+    ecc_out: UnsafeCell<u32>,
     ic: UnsafeCell<Shadow>,
     dc: UnsafeCell<Shadow>,
     l2: UnsafeCell<Shadow>,
@@ -156,6 +164,8 @@ impl<
             llbit: UnsafeCell::new(false),
             lladdr: UnsafeCell::new(0),
             fetch_scratch: UnsafeCell::new(DecodedInstr::default()),
+            ecc_in: UnsafeCell::new(0),
+            ecc_out: UnsafeCell::new(0),
             ic: UnsafeCell::new(Shadow::new(Self::IC_LINES, 0)),
             dc: UnsafeCell::new(Shadow::new(Self::DC_LINES, 0)),
             // Only the secondary keeps a data shadow: it is the one a PROM
@@ -348,27 +358,18 @@ impl<
                 let mask = if matches!(sel, CACH_SI | CACH_SD) { L2_TAG_MASK } else { u64::MAX };
                 if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
                     eprintln!("shadow:   -> IST va={virt_addr:#012x} idx={idx} stores {:#018x}",
-                              phys_addr & mask & !MRU_SET_BIT);
+                              phys_addr & mask & !MRU_BIT);
                 }
                 let s = self.shadow(sel);
                 if idx < s.tags.len() {
-                    // TagHi[31] is a request to make this way most recently
-                    // used, not a bit of the tag. The PROM sets it and then
-                    // expects to read MRU back at TagHi[0] — a different
-                    // position — which is what makes it hardware state rather
-                    // than storage.
-                    if phys_addr & MRU_SET_BIT != 0 {
-                        let set = (idx / WAYS).min(s.mru.len() - 1);
-                        s.mru[set] = (idx % WAYS) as u8;
-                        if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
-                            eprintln!("shadow:   -> MRU set={set} := way {}", idx % WAYS);
-                        }
-                    }
-                    // Strip only the command bit. Bit 32 is *not* spare:
-                    // TagHi[3:0] are tag address bits 35:32, so clearing it
-                    // here destroyed real tag and the walking-0s phase
-                    // regressed. Only bit 63 is the MRU request.
-                    s.tags[idx] = phys_addr & mask & !MRU_SET_BIT;
+                    // The MRU bit belongs to the set, not to this way, so it
+                    // is lifted out and kept separately. Everything else is
+                    // stored verbatim: bit 32 in particular is *not* spare —
+                    // TagHi[3:0] are tag address bits 35:32, and clearing it
+                    // here destroyed real tag bits.
+                    let set = (idx / WAYS).min(s.mru.len() - 1);
+                    s.mru[set] = phys_addr & MRU_BIT != 0;
+                    s.tags[idx] = phys_addr & mask & !MRU_BIT;
                 }
                 0
             }
@@ -376,13 +377,12 @@ impl<
                 let idx = self.tag_slot(sel, virt_addr);
                 let s = self.shadow(sel);
                 let set = (idx / WAYS).min(s.mru.len() - 1);
-                let way = (idx % WAYS) as u8;
                 let mut v = if idx < s.tags.len() { s.tags[idx] } else { 0 };
-                if s.mru[set] == way {
-                    v |= MRU_READ_BIT;
+                if s.mru[set] {
+                    v |= MRU_BIT;
                 }
                 if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
-                    eprintln!("shadow:   -> ILT va={virt_addr:#012x} idx={idx} set={set} way={way} mru={} tag={:#018x}",
+                    eprintln!("shadow:   -> ILT va={virt_addr:#012x} idx={idx} set={set} mru={} tag={:#018x}",
                               s.mru[set], if idx < s.tags.len() { s.tags[idx] } else { 0 });
                 }
                 if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
@@ -396,13 +396,25 @@ impl<
             C_R10K_ILD if R10K_OPS && matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
                 let s = self.shadow(sel);
                 let slot = self.data_slot(s.data.len(), virt_addr);
-                if s.data.is_empty() { 0 } else { s.data[slot] }
+                if s.data.is_empty() {
+                    0
+                } else {
+                    unsafe { *self.ecc_out.get() = s.ecc[slot] };
+                    if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
+                        eprintln!("shadow:   -> ILD slot={slot} data={:#018x} ecc={:#x}", s.data[slot], s.ecc[slot]);
+                    }
+                    s.data[slot]
+                }
             }
             C_R10K_ISD if R10K_OPS && matches!(sel, CACH_SI | CACH_SD) => {
                 let s = self.shadow(sel);
                 let slot = self.data_slot(s.data.len(), virt_addr);
                 if !s.data.is_empty() {
                     s.data[slot] = phys_addr;
+                    s.ecc[slot] = unsafe { *self.ecc_in.get() };
+                    if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
+                        eprintln!("shadow:   -> ISD slot={slot} data={phys_addr:#018x} ecc={:#x}", s.ecc[slot]);
+                    }
                 }
                 0
             }
@@ -419,6 +431,16 @@ impl<
             CACH_PD => (DC_SIZE, DC_LINE),
             _ => (L2_SIZE, L2_LINE),
         }
+    }
+
+    /// The check bits ride with cache data on an R10000: a store takes them
+    /// from CP0 ECC and a load returns them there.
+    fn set_cache_ecc(&self, v: u32) {
+        unsafe { *self.ecc_in.get() = v };
+    }
+
+    fn cache_op_ecc(&self) -> u32 {
+        unsafe { *self.ecc_out.get() }
     }
 
     fn downstream(&self) -> Arc<dyn BusDevice> {
@@ -492,33 +514,75 @@ mod tests {
         assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, 0x40, 0), 0xdeadbeef);
     }
 
-    /// Marking a way most-recently-used is a command written at TagHi[31] and
-    /// read back at TagHi[0] — a *different* bit, which is the tell that MRU
-    /// is hardware state rather than a stored tag bit. The IP28 PROM writes
-    /// the one and expects the other.
+    /// The MRU bit is **shared between the ways of a set**: written through
+    /// one way, it must read back through the other. The IP28 PROM's
+    /// diagnostic does exactly this and nothing else satisfies it — a model
+    /// that records which way was marked reports nothing on the way that is
+    /// actually read.
     #[test]
-    fn marking_a_way_mru_reads_back_at_the_other_bit() {
+    fn the_mru_bit_is_shared_between_the_ways_of_a_set() {
         let c = cache();
-        c.cache_op(C_IST | CACH_SD, 0, MRU_SET_BIT);
-        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0), MRU_READ_BIT);
+        // Way 0 of set 0, then way 1 of set 0.
+        c.cache_op(C_IST | CACH_SD, 0, MRU_BIT);
+        assert_ne!(
+            c.cache_op(C_ILT | CACH_SD, 1, 0) & MRU_BIT,
+            0,
+            "written through way 0, must be visible through way 1"
+        );
+        // And the other direction.
+        c.cache_op(C_IST | CACH_SD, 1, MRU_BIT);
+        assert_ne!(c.cache_op(C_ILT | CACH_SD, 0, 0) & MRU_BIT, 0);
     }
 
-    /// Exactly one way of a set is MRU, and marking the other moves it.
+    /// Writing a tag without the bit clears it, again for the whole set.
     #[test]
-    fn mru_is_one_way_per_set() {
+    fn writing_a_tag_without_the_mru_bit_clears_it() {
         let c = cache();
-        c.cache_op(C_IST | CACH_SD, 0, MRU_SET_BIT);
-        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0) & MRU_READ_BIT, MRU_READ_BIT);
-        assert_eq!(c.cache_op(C_ILT | CACH_SD, 1, 0) & MRU_READ_BIT, 0);
-        c.cache_op(C_IST | CACH_SD, 1, MRU_SET_BIT);
-        assert_eq!(c.cache_op(C_ILT | CACH_SD, 1, 0) & MRU_READ_BIT, MRU_READ_BIT);
-        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0) & MRU_READ_BIT, 0);
+        c.cache_op(C_IST | CACH_SD, 0, MRU_BIT);
+        c.cache_op(C_IST | CACH_SD, 0, 0);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 1, 0) & MRU_BIT, 0);
     }
 
-    /// An untouched set claims no MRU way, so an ordinary tag read is not
-    /// contaminated by it. Defaulting to way 0 broke every tag test.
+    /// Marking one set must not mark its neighbour. The PROM writes the
+    /// following set specifically to clobber the signal line between the two
+    /// checks, so a model where the bit leaks across sets passes the first
+    /// check and fails the next.
     #[test]
-    fn an_untouched_set_has_no_mru_way() {
+    fn the_mru_bit_does_not_leak_between_sets() {
+        let c = cache();
+        let next_set = 128; // one line
+        c.cache_op(C_IST | CACH_SD, 0, MRU_BIT);
+        c.cache_op(C_IST | CACH_SD, next_set, 0);
+        assert_ne!(c.cache_op(C_ILT | CACH_SD, 1, 0) & MRU_BIT, 0, "set 0 keeps its bit");
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, next_set, 0) & MRU_BIT, 0, "set 1 has none");
+    }
+
+    /// Check bits are stored with the data and returned on load. The PROM's
+    /// ECC walk writes a different value through each way and reads them
+    /// back, so both the round trip and the separation matter.
+    ///
+    /// This exists because the methods carrying ECC were once declared on the
+    /// trait with defaults and simply never implemented here: the data
+    /// round-tripped perfectly and every check bit read back as zero.
+    #[test]
+    fn check_bits_travel_with_the_data() {
+        let c = cache();
+        c.set_cache_ecc(0x001);
+        c.cache_op(C_R10K_ISD | CACH_SD, 0, 0x1111_2222_3333_4444);
+        c.set_cache_ecc(0x3fe);
+        c.cache_op(C_R10K_ISD | CACH_SD, 1, 0xaaaa_bbbb_cccc_dddd);
+
+        c.set_cache_ecc(0);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, 0, 0), 0x1111_2222_3333_4444);
+        assert_eq!(c.cache_op_ecc(), 0x001, "way 0's check bits");
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, 1, 0), 0xaaaa_bbbb_cccc_dddd);
+        assert_eq!(c.cache_op_ecc(), 0x3fe, "way 1's check bits");
+    }
+
+    /// An untouched set reports no MRU, so an ordinary tag read is not
+    /// contaminated by it.
+    #[test]
+    fn an_untouched_set_has_no_mru_bit() {
         let c = cache();
         c.cache_op(C_IST | CACH_SD, 0, 0xdead_beef);
         assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0), 0xdead_beef);

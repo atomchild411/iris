@@ -66,6 +66,26 @@ fn main() {
     // PROM's boot path. RAM is already mapped at this point (Machine::new fires
     // an initial remap_banks with the MC's power-on MEMCFG), so this lands in
     // real RAM without POST having run.
+    // IRIS_ARCS_BOOT=<kernel.elf>: boot with firmware we provide ourselves
+    // instead of a PROM. See docs/arcs-scoping.md.
+    if let Ok(path) = std::env::var("IRIS_ARCS_BOOT") {
+        let ram = std::env::var("IRIS_ARCS_RAM")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(128)
+            * 1024
+            * 1024;
+        let bootpath = std::env::var("IRIS_ARCS_BOOTPATH")
+            .unwrap_or_else(|_| "scsi(0)disk(1)rdisk(0)partition(0)".to_string());
+        match machine.boot_arcs(&path, ram, &bootpath) {
+            Ok(summary) => eprint!("iris: ARCS boot {}\n{}", path, summary),
+            Err(e) => {
+                eprintln!("iris: IRIS_ARCS_BOOT {}: {}", path, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Some(path) = &load_elf {
         match machine.load_elf(path) {
             Ok(summary) => eprint!("iris: loaded {}\n{}", path, summary),

@@ -5458,9 +5458,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// Install firmware for a machine with no PROM: build the SPB, the vector
     /// table and the firmware-owned structures in guest memory, and start
-    /// answering calls. `ram_bytes` is the contiguous RAM at physical 0.
-    pub fn install_arcs(&mut self, ram_bytes: u64) -> &mut crate::arcs::Arcs {
-        let mut fw = Box::new(crate::arcs::Arcs::new(ram_bytes));
+    /// answering calls. `ram_base`/`ram_bytes` describe where the machine's
+    /// RAM actually is — see `Arcs::new`.
+    pub fn install_arcs(&mut self, ram_base: u64, ram_bytes: u64) -> &mut crate::arcs::Arcs {
+        let mut fw = Box::new(crate::arcs::Arcs::new(ram_base, ram_bytes));
         fw.install(self.sysad.as_ref());
         self.arcs_fw = Some(fw);
         self.arcs_fw.as_mut().unwrap()
@@ -6841,8 +6842,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             phys_addr
         };
 
+        // On an R10000 the check bits travel with cache data through CP0 ECC.
+        if C::R10K_CACHE_OPS {
+            self.cache.set_cache_ecc(self.core.cp0_ecc);
+        }
         // Call unified cache interface
         let result = self.cache.cache_op(cache_op, virt_addr, phys_addr_or_taglo);
+        if C::R10K_CACHE_OPS && op == C_R10K_ILD {
+            self.core.cp0_ecc = self.cache.cache_op_ecc();
+        }
 
         // For Index_Load_Tag, update CP0 TagLo from result
         if op == C_ILT || (r10k_index_op && op == C_R10K_ILD) {
@@ -10726,6 +10734,59 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         Ok(out)
     }
 
+    /// Install ARCS firmware and put the CPU in the state a kernel is entered
+    /// in, for a machine with no PROM.
+    ///
+    /// A kernel is not merely jumped to. SGI firmware enters it as
+    /// `mach_init(argc, argv, magic, bootinfo)`, and at least one kernel reads
+    /// `argv[0]` for its boot path and scans the rest for options. `magic` is
+    /// only meaningful when bootinfo is supplied, which we do not: a kernel
+    /// that finds no bootinfo says so and carries on.
+    ///
+    /// The environment matters more than the arguments. `cpufreq` in
+    /// particular is a hard panic in NetBSD if it is missing — the firmware,
+    /// not the kernel, is what knows how fast the machine is.
+    pub fn boot_arcs(&self, ram_base: u64, ram_bytes: u64, bootpath: &str, kern_lo: u64, kern_hi: u64) -> Result<String, String> {
+        self.check_stopped()?;
+        let mut exec = self.try_lock_executor()?;
+
+        // Clone the bus handle first: `install_arcs` borrows the executor
+        // mutably and the firmware needs the bus to publish into.
+        let bus = exec.sysad.clone();
+        let fw = exec.install_arcs(ram_base, ram_bytes);
+        fw.reserve_loaded_program(kern_lo, kern_hi);
+        // Values a PROM would have derived from NVRAM and the hardware.
+        fw.set_env("cpufreq", "150");
+        fw.set_env("ConsoleOut", "serial(0)");
+        fw.set_env("ConsoleIn", "serial(0)");
+        fw.set_env("console", "d");
+        fw.set_env("dbaud", "9600");
+        fw.set_env("eaddr", "08:00:69:12:34:56");
+        fw.set_env("OSLoadPartition", bootpath);
+        fw.set_env("OSLoadFilename", "netbsd");
+        fw.set_env("OSLoadOptions", "auto");
+        fw.set_env("SystemPartition", bootpath);
+
+        // argv lives in guest memory: an array of 32-bit pointers, each to a
+        // NUL-terminated string.
+        let args = [bootpath.to_string(), "OSLoadOptions=auto".to_string()];
+        let (argc, argv_addr) = fw.publish_argv(bus.as_ref(), &args);
+
+        exec.core.write_gpr(4, argc as u64);
+        exec.core.write_gpr(5, argv_addr as u64);
+        exec.core.write_gpr(6, 0); // magic: no bootinfo
+        exec.core.write_gpr(7, 0); // bootinfo pointer
+        Ok(format!(
+            "  ARCS firmware installed, {} MB at {:#010x}\n  kernel {:#010x}..{:#010x} reserved\n  argc {} argv {:#010x}\n",
+            ram_bytes / (1024 * 1024),
+            ram_base,
+            kern_lo,
+            kern_hi,
+            argc,
+            argv_addr
+        ))
+    }
+
     /// Load raw bytes at a virtual address. PC is not touched.
     pub fn load_bin(&self, path: &str, vaddr: u64) -> Result<String, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
@@ -14234,6 +14295,9 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn core_ptr(&self) -> *const crate::mips_core::MipsCore;
     fn register_locks(&self);
     fn load_elf(&self, path: &str) -> Result<String, String>;
+    /// Install ARCS firmware and set up the kernel entry state, for a
+    /// machine booting with no PROM. See `src/arcs.rs`.
+    fn boot_arcs(&self, ram_base: u64, ram_bytes: u64, bootpath: &str, kern_lo: u64, kern_hi: u64) -> Result<String, String>;
     fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String>;
     fn step_n_inline(&self, n: u64) -> Result<u64, String>;
     #[cfg(feature = "developer")]
@@ -14281,6 +14345,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn core_ptr(&self) -> *const crate::mips_core::MipsCore { MipsCpu::core_ptr(self) }
     fn register_locks(&self) { MipsCpu::register_locks(self) }
     fn load_elf(&self, p: &str) -> Result<String, String> { MipsCpu::load_elf(self, p) }
+    fn boot_arcs(&self, rb: u64, r: u64, b: &str, kl: u64, kh: u64) -> Result<String, String> { MipsCpu::boot_arcs(self, rb, r, b, kl, kh) }
     fn load_elf_bytes(&self, b: &[u8], n: &str) -> Result<String, String> { MipsCpu::load_elf_bytes(self, b, n) }
     fn step_n_inline(&self, n: u64) -> Result<u64, String> { MipsCpu::step_n_inline(self, n) }
     #[cfg(feature = "developer")]

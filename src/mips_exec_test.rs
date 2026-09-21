@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn a_firmware_call_runs_its_delay_slot_and_returns_to_ra() {
         let (mut exec, mem) = create_executor();
-        exec.install_arcs(128 * 1024 * 1024);
+        exec.install_arcs(0, 128 * 1024 * 1024);
 
         let entry = crate::arcs::Arcs::trap_addr(crate::arcs::entry::GET_SYSTEM_ID) as u64;
         // t9 = entry, t0 = 0
@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn a_guest_can_walk_the_memory_map_through_the_vector_table() {
         let (mut exec, mem) = create_executor();
-        exec.install_arcs(64 * 1024 * 1024);
+        exec.install_arcs(0, 64 * 1024 * 1024);
 
         let entry = crate::arcs::Arcs::trap_addr(crate::arcs::entry::GET_MEMORY_DESCRIPTOR) as u64;
         let mut token = 0u64;
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn ordinary_code_is_not_mistaken_for_a_firmware_call() {
         let (mut exec, mem) = create_executor();
-        exec.install_arcs(128 * 1024 * 1024);
+        exec.install_arcs(0, 128 * 1024 * 1024);
         // addiu t0, t0, 1 at a perfectly normal address
         mem.set_word(0x3000, 0x2508_0001);
         exec.core.write_gpr(8, 7);
