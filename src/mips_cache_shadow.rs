@@ -52,6 +52,13 @@ struct Shadow {
     tags: Box<[u64]>,
     /// Data array in u64 slots. Empty where the model has no data shadow.
     data: Box<[u64]>,
+    /// Which way of each set was most recently used, or `MRU_NONE` before
+    /// anything has claimed it. Hardware state, not storage — see
+    /// MRU_SET_BIT. It starts as "none" rather than way 0 so that a tag read
+    /// on an untouched set returns the tag alone; defaulting to way 0 made
+    /// every way-0 read come back flagged and broke the tag tests that
+    /// already pass.
+    mru: Box<[u8]>,
 }
 
 impl Shadow {
@@ -59,9 +66,19 @@ impl Shadow {
         Self {
             tags: vec![0u64; lines.max(1)].into_boxed_slice(),
             data: vec![0u64; data_words].into_boxed_slice(),
+            mru: vec![MRU_NONE; (lines.max(1) / WAYS).max(1)].into_boxed_slice(),
         }
     }
 }
+
+/// No way of this set has been marked most-recently-used yet.
+const MRU_NONE: u8 = 0xFF;
+/// Written to a tag to mark that way most-recently-used: TagHi[31], i.e. bit
+/// 63 of the assembled tag. It is a command, not a stored bit.
+const MRU_SET_BIT: u64 = 1 << 63;
+/// Read back from a tag to say that way *is* most-recently-used: TagHi[0],
+/// i.e. bit 32 of the assembled tag.
+const MRU_READ_BIT: u64 = 1 << 32;
 
 /// Ways per set, as CACHE index operations address them. Bit 0 of the index
 /// selects the way on an R10000; the set starts above the line offset.
@@ -323,18 +340,33 @@ impl<
                 let idx = self.tag_slot(sel, virt_addr);
                 let mask = if matches!(sel, CACH_SI | CACH_SD) { L2_TAG_MASK } else { u64::MAX };
                 if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
-                    eprintln!("shadow:   -> IST slot={idx} stores {:#018x}", phys_addr & mask);
+                    eprintln!("shadow:   -> IST slot={idx} stores {:#018x}", phys_addr & mask & !MRU_SET_BIT);
                 }
                 let s = self.shadow(sel);
                 if idx < s.tags.len() {
-                    s.tags[idx] = phys_addr & mask;
+                    // TagHi[31] is a request to make this way most recently
+                    // used, not a bit of the tag. The PROM sets it and then
+                    // expects to read MRU back at TagHi[0] — a different
+                    // position — which is what makes it hardware state rather
+                    // than storage.
+                    if phys_addr & MRU_SET_BIT != 0 {
+                        s.mru[(idx / WAYS).min(s.mru.len() - 1)] = (idx % WAYS) as u8;
+                    }
+                    // Strip only the command bit. Bit 32 is *not* spare:
+                    // TagHi[3:0] are tag address bits 35:32, so clearing it
+                    // here destroyed real tag and the walking-0s phase
+                    // regressed. Only bit 63 is the MRU request.
+                    s.tags[idx] = phys_addr & mask & !MRU_SET_BIT;
                 }
                 0
             }
             C_ILT => {
                 let idx = self.tag_slot(sel, virt_addr);
                 let s = self.shadow(sel);
-                let v = if idx < s.tags.len() { s.tags[idx] } else { 0 };
+                let mut v = if idx < s.tags.len() { s.tags[idx] } else { 0 };
+                if s.mru[(idx / WAYS).min(s.mru.len() - 1)] == (idx % WAYS) as u8 {
+                    v |= MRU_READ_BIT;
+                }
                 if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
                     eprintln!("shadow:   -> ILT slot={idx} returns {v:#018x}");
                 }
@@ -422,6 +454,8 @@ mod tests {
     fn tags_round_trip_every_bit() {
         let c = cache();
         for bit in 0..64 {
+            // 32 and 63 are MRU control/state, not tag storage.
+            if bit == 32 || bit == 63 { continue; }
             let v = 1u64 << bit;
             c.cache_op(C_IST | CACH_SD, 0, v);
             assert_eq!(
@@ -438,6 +472,38 @@ mod tests {
         let c = cache();
         c.cache_op(C_R10K_ISD | CACH_SD, 0x40, 0xdeadbeef);
         assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, 0x40, 0), 0xdeadbeef);
+    }
+
+    /// Marking a way most-recently-used is a command written at TagHi[31] and
+    /// read back at TagHi[0] — a *different* bit, which is the tell that MRU
+    /// is hardware state rather than a stored tag bit. The IP28 PROM writes
+    /// the one and expects the other.
+    #[test]
+    fn marking_a_way_mru_reads_back_at_the_other_bit() {
+        let c = cache();
+        c.cache_op(C_IST | CACH_SD, 0, MRU_SET_BIT);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0), MRU_READ_BIT);
+    }
+
+    /// Exactly one way of a set is MRU, and marking the other moves it.
+    #[test]
+    fn mru_is_one_way_per_set() {
+        let c = cache();
+        c.cache_op(C_IST | CACH_SD, 0, MRU_SET_BIT);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0) & MRU_READ_BIT, MRU_READ_BIT);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 1, 0) & MRU_READ_BIT, 0);
+        c.cache_op(C_IST | CACH_SD, 1, MRU_SET_BIT);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 1, 0) & MRU_READ_BIT, MRU_READ_BIT);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0) & MRU_READ_BIT, 0);
+    }
+
+    /// An untouched set claims no MRU way, so an ordinary tag read is not
+    /// contaminated by it. Defaulting to way 0 broke every tag test.
+    #[test]
+    fn an_untouched_set_has_no_mru_way() {
+        let c = cache();
+        c.cache_op(C_IST | CACH_SD, 0, 0xdead_beef);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0), 0xdead_beef);
     }
 
     /// Separate lines must not alias onto one another.
