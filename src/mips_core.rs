@@ -2055,7 +2055,20 @@ impl MipsCore {
                 let mask = CAUSE_IP0 | CAUSE_IP1;
                 self.cp0_cause = (self.cp0_cause & !mask) | ((value as u32) & mask);
             }
-            14 => self.cp0_epc = value,
+            14 => {
+                // IP28 bring-up: a guest write of a 32-bit value here is where
+                // a 64-bit return address would lose its top half, so the ERET
+                // that follows lands at a truncated PC. Armed with
+                // IRIS_IP28_EPC=1.
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *ON.get_or_init(|| std::env::var_os("IRIS_IP28_EPC").is_some()) {
+                    eprintln!(
+                        "ip28epc: write EPC={value:#018x} (was {:#018x}) from pc={:#018x}",
+                        self.cp0_epc, self.pc,
+                    );
+                }
+                self.cp0_epc = value;
+            }
             15 => { /* PRId is read-only */ }
             16 => {
                 // Bits 5:0 always writable (K0, CU, DB, IB).
