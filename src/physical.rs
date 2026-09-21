@@ -211,7 +211,27 @@ const PROM_END: u32  = 0x1FD00000;
 // accesses go through the normal lomem device_map entries — no direct bank pointer needed.
 const ALIAS_BASE: u32   = 0x00000000;
 const ALIAS_END: u32    = 0x00080000;
-const ALIAS_OFFSET: u32 = LOMEM_BASE;
+
+/// Where the 512 KB alias at physical 0 points.
+///
+/// The MC mirrors the bottom 512 KB of *memory*, and which physical address
+/// that is depends on the machine: LOMEM_BASE on IP22/IP24, 0x20000000 on
+/// IP28, whose RAM starts there and has nothing at lomem at all. With the
+/// offset fixed at LOMEM_BASE the whole window read back as zero on IP28.
+///
+/// That window is not spare space. ARCS builds its system parameter block at
+/// physical 0x1000 and its firmware vector table at 0x1800, and a 64-bit sash
+/// loads its firmware pointer straight out of 0x1018 — so the PROM's writes
+/// were being discarded and sash then dereferenced the null it read back.
+///
+/// Env-gated to match `MemoryController::memcfg_base_shift`; IP28 has no
+/// machine profile of its own yet, and this must not move IP22/IP24.
+fn alias_offset() -> u32 {
+    static OFFSET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        if std::env::var_os("IRIS_IP28").is_some() { HIMEM_BASE } else { LOMEM_BASE }
+    })
+}
 
 
 // Mystery Black Hole (64KB at 0x02080000)
@@ -284,6 +304,16 @@ pub struct Physical {
     // Maps (address >> 16) to device pointer (non-null, always valid)
     device_map: [*const dyn BusDevice; 65536],
 
+    /// 64 KB slots the last `remap_banks` placed a RAM bank in.
+    ///
+    /// `remap_banks` wipes the lomem and himem windows before re-placing, but
+    /// MEMCFG can park a bank anywhere its 8-bit base field reaches — the IP28
+    /// PROM parks bank 3 at 0x60000000 while it sizes the others. A bank
+    /// mapped outside those two windows was never cleared again, so the slot
+    /// kept pointing at a bank the MC had since declared invalid. Recording
+    /// what was actually mapped makes the wipe exact.
+    mapped_bank_slots: Vec<u32>,
+
     trace: AtomicBool,
     start_tick: u64,
     host_freq: u64,
@@ -349,7 +379,7 @@ impl Physical {
         let gio_bus_error = GioBusErrorDevice { mc: mc.clone() };
         // Alias targets will be set in build_device_map once Physical is in final location
         let unmapped_ram = UnmappedRam;
-        let alias_bus = AliasBus::new(std::ptr::null::<ErrorBus>(), ALIAS_OFFSET);
+        let alias_bus = AliasBus::new(std::ptr::null::<ErrorBus>(), alias_offset());
         // VINO GIO alias: 0x1F08xxxx → 0x0008xxxx (subtract 0x1F000000 = add 0xFF000000)
         // GIO64 VINO aperture sits at 0x1F080000; the chip's primary registers
         // live at physical 0x00080000 (VINO_BASE). To map 0x1F080000 → 0x00080000
@@ -361,9 +391,21 @@ impl Physical {
         let vino_gio_alias = AliasBus::new(std::ptr::null::<ErrorBus>(), 0xE1000000u32);
         let black_hole = BlackHoleRegion::new();
 
-        // Initialize lookup table with null - will be filled in init()
-        const NULL_PTR: *const dyn BusDevice = std::ptr::null::<ErrorBus>();
-        let device_map: [*const dyn BusDevice; 65536] = [NULL_PTR; 65536];
+        // Fill the lookup table with a dispatchable device from the moment it
+        // exists; `init()` then lays the real map over it.
+        //
+        // It used to start as null pointers. Every slot is written before the
+        // guest runs, so that looked safe — but the MC's DMA worker is on its
+        // own thread, and `remap_banks` rewrites these 16-byte fat pointers
+        // non-atomically while that thread dispatches through them. A torn
+        // read that picks up the null data pointer with a live vtable is a
+        // segfault, not a bus error: the emulator dies on something the guest
+        // did. A static with no state costs nothing and takes null out of the
+        // table for good, so the worst a tear can do now is dispatch to the
+        // wrong device.
+        static BOOT_ERR: ErrorBus = ErrorBus { debug: AtomicBool::new(false) };
+        const BOOT_PTR: *const dyn BusDevice = &BOOT_ERR;
+        let device_map: [*const dyn BusDevice; 65536] = [BOOT_PTR; 65536];
 
         // ppmem: reserve the 4GB window over these banks. A failure here is
         // not fatal — the bus path works regardless — so log and carry on
@@ -423,6 +465,7 @@ impl Physical {
             vino_gio_alias,
             black_hole,
             device_map,
+            mapped_bank_slots: Vec::new(),
             trace: AtomicBool::new(false),
             start_tick,
             host_freq,
@@ -578,7 +621,7 @@ impl Physical {
             self.device_map[i as usize] = prom_ptr;
         }
 
-        // Alias: points back into Physical itself with ALIAS_OFFSET added.
+        // Alias: points back into Physical itself with `alias_offset()` added.
         // So alias accesses go: AliasBus → Physical::read/write(addr + LOMEM_BASE)
         // → device_map lookup → whichever bank is mapped at LOMEM_BASE.
         // This way alias automatically tracks whatever MEMCFG maps at LOMEM_BASE.
@@ -625,11 +668,26 @@ impl Physical {
             sp.clear_mappings();
         }
 
-        // Wipe lomem (0x08000000..0x18000000) and himem (0x20000000..0x30000000) slots
+        // Build the intended placement first, then store only the slots that
+        // actually change.
+        //
+        // The old shape wiped both 256 MB windows to UnmappedRam and mapped
+        // the banks back over them — about 8200 non-atomic stores to 16-byte
+        // fat pointers, every time MEMCFG is written. The PROM's memory-sizing
+        // walk writes MEMCFG dozens of times and moves one bank per write,
+        // while its own DMA memory fill is running on the MC's thread and
+        // dispatching through this very table. A torn read there is a
+        // segfault in the emulator, not a bus error in the guest. Writing
+        // only the differences takes the usual walk step from ~8200 stores to
+        // a few hundred, and a no-op MEMCFG write to none at all.
+        let mut intended: Vec<(u32, *const dyn BusDevice)> = Vec::new();
         for base in [LOMEM_BASE, HIMEM_BASE] {
-            for i in (base >> 16)..((base + 0x10000000) >> 16) {
-                self.device_map[i as usize] = unmapped_ptr;
+            for i in (base >> 16)..((base + 0x1000_0000) >> 16) {
+                intended.push((i, unmapped_ptr));
             }
+        }
+        for slot in std::mem::take(&mut self.mapped_bank_slots) {
+            intended.push((slot, unmapped_ptr));
         }
 
         for (bank_idx, maybe_bank) in bank_addrs.iter().enumerate() {
@@ -651,7 +709,13 @@ impl Physical {
             // Slots beyond limit remain UnmappedRam → reads return 0.
             for slot in 0..(limit >> 16) {
                 let phys = conf_base + (slot << 16);
-                self.device_map[(phys >> 16) as usize] = bank_ptrs[bank_idx];
+                let idx = phys >> 16;
+                intended.push((idx, bank_ptrs[bank_idx]));
+                let in_wiped_window = (LOMEM_BASE..LOMEM_BASE + 0x1000_0000).contains(&phys)
+                    || (HIMEM_BASE..HIMEM_BASE + 0x1000_0000).contains(&phys);
+                if !in_wiped_window {
+                    self.mapped_bank_slots.push(idx);
+                }
             }
 
             // ppmem: express the same placement as real host mappings. An
@@ -682,6 +746,23 @@ impl Physical {
             }
         }
 
+        // Collapse to one entry per slot first — later wins, so a bank placed
+        // over a wiped window overrides it. Applying the list as-is would
+        // store UnmappedRam and then the bank into the same slot, which is
+        // the transient this is here to avoid. Then store only the slots
+        // whose contents actually differ.
+        let mut final_map: std::collections::HashMap<u32, *const dyn BusDevice> =
+            std::collections::HashMap::with_capacity(intended.len());
+        for (idx, ptr) in intended {
+            final_map.insert(idx, ptr);
+        }
+        for (idx, ptr) in final_map {
+            let slot = &mut self.device_map[idx as usize];
+            if !std::ptr::addr_eq(*slot, ptr) {
+                *slot = ptr;
+            }
+        }
+
         // ppmem: the low-512KB alias of bank 0 (MC spec — the bottom 512KB
         // mirrors 0x08000000..0x0807ffff). Mapped as real pages rather than
         // routed through AliasBus, so it is the same physical memory with no
@@ -689,7 +770,7 @@ impl Physical {
         // equivalent; both see identical memory.
         #[cfg(feature = "ppmem")]
         if let Some(sp) = &self.ppmem_space {
-            let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _)| base == LOMEM_BASE);
+            let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _)| base == alias_offset());
             if bank0_mapped {
                 let alias_len = (ALIAS_END - ALIAS_BASE) as u64;
                 if (self.banks[0].size() as u64) >= alias_len {
