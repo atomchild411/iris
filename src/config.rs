@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
 /// Valid memory bank sizes in MB.
-pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128];
+pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256];
 
 /// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
 /// `kind = "cdrom"`; either works and they mean the same thing.
