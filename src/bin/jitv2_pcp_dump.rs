@@ -84,6 +84,11 @@ fn main() {
         if dump.current_gen == dump.entry_gen { "(func/compiled ARE fresh vs this snapshot's gen)" }
         else { "(func/compiled are STALE vs this snapshot's current_gen — page mutated after last publish)" });
     println!("fr1={}", dump.fr1);
+    // v2 field; a v1 file reads it back as 0 ("unknown"), so only print it
+    // when there's something to say rather than showing a misleading 0.
+    if dump.call_count > 0 {
+        println!("call_count={} (dispatches into this page's compiled code)", dump.call_count);
+    }
     println!();
 
     // §13: `is_requested`/`is_compiled`/`is_denylisted` are WORD-indexed
@@ -209,6 +214,21 @@ fn fmt_offsets(offsets: &[u16]) -> String {
 
 fn run_compile_attempt(analyzer: &mut Analyzer, fr1: bool) {
     use iris::jitv2::codegen::Codegen;
+    // Match what the emulator would emit, not this binary's bare defaults.
+    // Both are process-wide statics read at `Codegen::new()`/compile time, so
+    // they must be set before the `Codegen` is built. Without this the tool
+    // silently disassembles `opt_level=none`, `intrun=1` code whatever the
+    // caller asked for — which made an `IRIS_INTRUN` comparison print two
+    // byte-identical listings.
+    if std::env::var_os("IRIS_OPT_SPEED").is_some() {
+        Codegen::set_opt_level_speed(true);
+    }
+    if let Some(n) = std::env::var("IRIS_INTRUN").ok().and_then(|v| v.parse::<u32>().ok()) {
+        Codegen::set_interrupt_run(n);
+    }
+    println!("(codegen: opt_level={} intrun={})",
+        if Codegen::opt_level_speed() { "speed" } else { "none" },
+        Codegen::interrupt_run());
     let mut codegen = Codegen::new();
     // `analyzer`'s scratch buffer already holds the merged walk from
     // `main`'s own `walk_multi_entry` call — codegen needs an owned,
