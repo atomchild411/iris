@@ -125,9 +125,22 @@ phase writes different tags to `…0000` and `…0001` and reads both back
 distinctly, which passes only because bit 0 selects the way, and would fail if
 `0x80` did. Both facts are solid and they do not yet fit one index scheme.
 
-**Resume here**: get a trace that is definitely complete through the failing
-read, without the tracing changing what gets interleaved — write the trace to
-a file descriptor rather than stderr, or buffer it and dump on exit.
+And then the decisive one. Across a whole run — **67 tag reads** — not a
+single `Index_Load_Tag` returns zero. So `Actual: 0x0` cannot be the result of
+any tag read this model services. Whatever the PROM compares for the MRU check,
+it is not reading it through the path we implement.
+
+The CP0 trace shows what it does read: after *every* tag read it also reads
+`$26` (ECC), and `$26` is always zero here because nothing sets it. That is the
+only register in the sequence whose value matches the reported `Actual`.
+
+**Resume here**: find where the MRU state is actually read from before
+modelling it further. The ECC register is the obvious candidate — trace what a
+real sequence expects in `$26` — and note that CP0 26 is `u32` in this
+emulator, so if an R10000 reports anything above bit 31 there it needs the same
+widening TagLo just got. Do not add more MRU behaviour to `Index_Load_Tag`
+until the read path is known; three hypotheses have now been spent on the
+assumption that it goes through the tag.
 
 ### Skipping the diagnostic does not work either
 
