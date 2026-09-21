@@ -216,7 +216,7 @@ mod tests {
 
     /// Build a fake SPB and vector table in memory, the shape a real one has.
     fn machine_with_arcs(vector_va: u32, entries: &[u32]) -> Arc<Memory> {
-        let mem = Arc::new(Memory::new(1024 * 1024));
+        let mem = Arc::new(Memory::new(4));
         mem.write32(SPB_PHYS, SPB_SIGNATURE);
         mem.write32(SPB_PHYS + SPB_FIRMWARE_VECTOR, vector_va);
         mem.write32(
@@ -277,7 +277,7 @@ mod tests {
     /// tracer must not claim otherwise or match arbitrary jumps.
     #[test]
     fn does_not_arm_without_a_signature() {
-        let mem = Arc::new(Memory::new(1024 * 1024));
+        let mem = Arc::new(Memory::new(4));
         let mut t = ArcsTrace::new();
         t.try_arm(mem.as_ref());
         assert!(!t.is_armed());
@@ -288,7 +288,7 @@ mod tests {
     /// costing a bus read on every jump it makes.
     #[test]
     fn arming_gives_up_eventually() {
-        let mem = Arc::new(Memory::new(1024 * 1024));
+        let mem = Arc::new(Memory::new(4));
         let mut t = ArcsTrace::new();
         for _ in 0..ArcsTrace::MAX_ATTEMPTS {
             t.try_arm(mem.as_ref());

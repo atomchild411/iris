@@ -458,7 +458,7 @@ mod tests {
     use crate::mips_cache_v2::{CACH_PD, CACH_SD};
 
     fn cache() -> R10000ShadowCache {
-        let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1024 * 1024));
+        let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(4));
         R10000ShadowCache::from(mem)
     }
 
