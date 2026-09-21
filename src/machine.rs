@@ -715,7 +715,7 @@ impl Machine {
         //    arm below monomorphises its own CPU — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         macro_rules! build_cpu { ($cache:ty) => {{
-        let cfg = MipsCpuConfig::indy();
+        let cfg = MipsCpuConfig::for_model::<$cache>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
 

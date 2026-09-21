@@ -3126,7 +3126,7 @@ mod bringup {
         let bus_prom = prom.clone();
         let bus = Arc::new(Ip32Bus::new(128 << 20, prom));
         let sysad: Arc<dyn crate::traits::BusDevice> = bus.clone();
-        let cfg = MipsCpuConfig::indy();
+        let cfg = MipsCpuConfig::for_model::<R5000Cache>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, R5000Cache> = MipsExecutor::new(sysad, tlb, &cfg);
 

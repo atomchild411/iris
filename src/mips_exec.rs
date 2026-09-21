@@ -1075,6 +1075,18 @@ impl MipsCpuConfig {
     pub const fn indy() -> Self {
         Self { tlb_entries: 48 }
     }
+
+    /// The JTLB size the CPU model declares.
+    ///
+    /// `core.tlb_entries` is already taken from the model, so sizing the TLB
+    /// itself from anything else leaves the two disagreeing: Random cycles
+    /// over a range the array does not have, and a TLBWI to an index past the
+    /// end is silently dropped. The R10000 has 64 entries where the R4400 has
+    /// 48, and SGI's IP28 diagnostic writes index 48 on its first cache-alias
+    /// test — every one of its reported failures was that write going nowhere.
+    pub fn for_model<C: crate::mips_cache_v2::CpuModel>() -> Self {
+        Self { tlb_entries: C::TLB_ENTRIES }
+    }
 }
 
 /// MIPS Execution Engine - combines CPU core with memory interface and TLB
