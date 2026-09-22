@@ -5932,6 +5932,11 @@ enum BranchCond {
     GtZero, // BGTZ: rs as i64 > 0
     LtZero, // BLTZ (REGIMM rt=0): rs as i64 < 0
     GeZero, // BGEZ (REGIMM rt=1): rs as i64 >= 0
+    /// BC1F/BC1T/BC1FL/BC1TL: FCSR condition code `cc` (raw[20:18]) equals
+    /// `tf` (raw[16]). The only `BranchCond` whose predicate comes from the
+    /// FPU rather than a GPR — and the only one that can raise an exception
+    /// while evaluating it (CU1), which `emit_cond` handles.
+    Fcc,
 }
 
 /// A branch or jump instruction's shape, as far as codegen cares: how the
@@ -5983,6 +5988,13 @@ fn lookup_branch_or_jump(raw: u32) -> Option<BranchOrJump> {
         },
         OP_J => Some(BranchOrJump { cond: BranchCond::Always, link: false, annul: false }),
         OP_JAL => Some(BranchOrJump { cond: BranchCond::Always, link: true, annul: false }),
+        // BC1F/BC1T/BC1FL/BC1TL. `rt` is not a register here: bit 0 is `tf`
+        // (consumed by emit_fcc_taken via the raw word) and bit 1 is `nd`,
+        // the nullify/"likely" flag, which is this table's `annul` exactly as
+        // for BEQL/BNEL. Only OP_COP1 — for OP_COP1X the same `rs` position
+        // is an indexed load/store's base register, never a branch selector.
+        OP_COP1 if ((raw >> 21) & 0x1F) == RS_BC1 =>
+            Some(BranchOrJump { cond: BranchCond::Fcc, link: false, annul: (rt & 2) != 0 }),
         _ => None,
     }
 }
@@ -7228,28 +7240,50 @@ fn emit_nested_regjump_slot(
 /// compare `rs`/`rt` directly with no sign interpretation needed since
 /// equality doesn't care).
 fn emit_cond(ctx: &mut EmitCtx, raw: u32, cond: BranchCond) -> Value {
-    let rs_val = emit_read_gpr(ctx, field_rs(raw));
+    // `rs` is read lazily rather than up front: for `Fcc` the `rs` field is
+    // the COP1 format selector (RS_BC1 = 0x08), not a register number, and
+    // loading GPR 8 there would be dead IR at best and misleading at worst.
     match cond {
         BranchCond::Always => unreachable!("Always has no condition to evaluate"),
         BranchCond::Eq => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             let rt_val = emit_read_gpr(ctx, field_rt(raw));
             ctx.builder.ins().icmp(IntCC::Equal, rs_val, rt_val)
         }
         BranchCond::Ne => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             let rt_val = emit_read_gpr(ctx, field_rt(raw));
             ctx.builder.ins().icmp(IntCC::NotEqual, rs_val, rt_val)
         }
         BranchCond::LeZero => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, rs_val, 0)
         }
         BranchCond::GtZero => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             ctx.builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, rs_val, 0)
         }
         BranchCond::LtZero => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, rs_val, 0)
         }
         BranchCond::GeZero => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             ctx.builder.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, rs_val, 0)
+        }
+        // BC1's predicate is an FPU read, so unlike every other branch it can
+        // fault: `exec_bc1` checks STATUS_CU1 first and raises Coprocessor
+        // Unusable when it is clear. Branches reach codegen through
+        // `lookup_branch_or_jump`, which — unlike `lookup_cp1_semantics` —
+        // gets no automatic `emit_cp1_cu1_guard`, so it is emitted here.
+        //
+        // Position matters: every `emit_cond` call site evaluates the
+        // condition *before* `emit_slot` inlines the delay slot, which is
+        // the interpreter's order too (the CU1 exception is raised before
+        // the delay-slot instruction runs). Do not sink this past the slot.
+        BranchCond::Fcc => {
+            emit_cp1_cu1_guard(ctx);
+            emit_fcc_taken(ctx, raw)
         }
     }
 }
@@ -7516,8 +7550,20 @@ fn emit_fmov_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 /// returns the `taken` boolean `Value`. Mirrors `emit_movci`'s identical
 /// FCSR bit extraction (cc0 at bit 23, cc1..cc7 at bits 24..30).
 fn emit_fmovcf_taken(ctx: &mut EmitCtx) -> Value {
-    let cc = (ctx.raw >> 18) & 0x7;
-    let tf = ((ctx.raw >> 16) & 0x1) != 0;
+    let raw = ctx.raw;
+    emit_fcc_taken(ctx, raw)
+}
+
+/// `FCSR[cc] == tf`, for any instruction using the MIPS `cc`/`tf` encoding —
+/// MOVCF.s/d, MOVF/MOVT, and BC1F/BC1T/BC1FL/BC1TL, which all place `cc` at
+/// raw[20:18] and `tf` at raw[16]. Mirrors `MipsCore::get_fpu_cc`'s bit
+/// layout: cc0 lives at FCSR bit 23, cc1..cc7 at bits 25..31 (`24 + cc`).
+///
+/// Takes `raw` explicitly rather than reading `ctx.raw` because the branch
+/// path calls it while `ctx.raw` may have been swapped to a delay-slot word.
+fn emit_fcc_taken(ctx: &mut EmitCtx, raw: u32) -> Value {
+    let cc = (raw >> 18) & 0x7;
+    let tf = ((raw >> 16) & 0x1) != 0;
     let bit = if cc == 0 { 23 } else { 24 + cc };
 
     let mem = MemFlagsData::trusted();

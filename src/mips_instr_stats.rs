@@ -336,6 +336,9 @@ impl InstrKind {
             Jr | Jalr
             | Bltz | Bgez | Bltzl | Bgezl | Bltzal | Bgezal | Bltzall | Bgezall
             | J | Jal | Beq | Bne | Blez | Bgtz | Beql | Bnel | Blezl | Bgtzl
+            // BC1F/BC1T/BC1FL/BC1TL — an ordinary PC-relative conditional
+            // branch whose predicate happens to be an FCSR condition code.
+            | Bc1
         ) || self.has_jitv2_emitter()
     }
 

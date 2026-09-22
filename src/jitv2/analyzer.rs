@@ -171,16 +171,22 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
         // not just a subset, and is a codegen concern (materialize state
         // before the op so a raised CP1 exception can be delivered
         // correctly), not a reachability one — see the design doc's Phase 3
-        // note. RS_BC1 is the one real exception: it's a CP1-conditional
-        // branch, and the walker doesn't resolve condition-code-dependent
-        // targets, so it stays a region boundary. `rs == RS_BC1` (0x08) is
-        // only meaningful as a format selector for OP_COP1 — for OP_COP1X
-        // the same bit position is the *base register* for indexed loads/
-        // stores (LWXC1/SWXC1/etc.), not a branch selector, so OP_COP1X
-        // must never share this arm (a legitimate `lwxc1 $f0, ($8)` would
-        // otherwise be misread as a BC1 branch and wrongly excluded).
+        // note. RS_BC1 is a CP1-*conditional branch* and is classified as one:
+        // its target is PC-relative and statically resolvable from the
+        // instruction word, exactly like BEQ's. Only the predicate differs —
+        // an FCSR condition-code bit instead of a GPR comparison — and BEQ's
+        // predicate is equally a runtime value. (This used to be `Excluded`,
+        // described as having a "condition-code-dependent target"; that
+        // conflated the condition with the target. The target never depended
+        // on the condition code. See rules/jitv2/bc1-is-an-ordinary-branch.md.)
+        //
+        // `rs == RS_BC1` (0x08) is only meaningful as a format selector for
+        // OP_COP1 — for OP_COP1X the same bit position is the *base register*
+        // for indexed loads/stores (LWXC1/SWXC1/etc.), not a branch selector,
+        // so OP_COP1X must never share this arm (a legitimate
+        // `lwxc1 $f0, ($8)` would otherwise be misread as a BC1 branch).
         OP_COP1 => match rs {
-            RS_BC1 => Classify::Excluded,
+            RS_BC1 => branch_category_gate(raw, branch_target(raw, offset_word)),
             _ => sequential_or_excluded(raw),
         },
         OP_COP1X => sequential_or_excluded(raw),
@@ -1376,10 +1382,25 @@ mod tests {
     }
 
     #[test]
-    fn classify_bc1_is_excluded() {
-        // BC1F/BC1T — CP1 conditional branch, condition-code-dependent target.
+    fn classify_bc1_is_an_ordinary_pc_relative_branch() {
+        // BC1F/BC1T/BC1FL/BC1TL. The predicate is an FCSR condition code, but
+        // the *target* is the same PC-relative 16-bit offset every other
+        // conditional branch uses, so it classifies as a Branch and the walker
+        // resolves the target statically. (This asserted Excluded until
+        // 2026-09-22 — see the comment in `classify`.)
+        //
+        // offset_word 5, immediate 0 => target is the word after the delay
+        // slot: 5 + 1 + 0 = 6.
         let instr = r_type(OP_COP1, RS_BC1, 0, 0, 0, 0);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        assert_eq!(classify(instr, 5, 0), Classify::Branch { target: Some(6) });
+
+        // A non-zero displacement resolves too, and all four tf/nd encodings
+        // are branches — nd (bit 1 of rt) only selects annulling.
+        for rt in 0..4u32 {
+            let instr = (OP_COP1 << 26) | (RS_BC1 << 21) | (rt << 16) | 3;
+            assert_eq!(classify(instr, 5, 0), Classify::Branch { target: Some(9) },
+                       "rt={rt} (tf={}, nd={})", rt & 1, (rt >> 1) & 1);
+        }
     }
 
     #[test]

@@ -1082,6 +1082,160 @@ mod tests {
         assert_eq!(jit, interp, "JIT and interpreter diverged for page={:x?} entry_word={} pc=0x{:x}", page, entry_word, pc);
     }
 
+    // ---- BC1 (CP1 conditional branch) page harness ------
+    //
+    // BC1 needs what neither existing harness provides on its own: a
+    // multi-word page (branch + delay slot, like the integer branch tests)
+    // AND CP1 state (CU1 set, a seeded FCSR condition code, like the FPU
+    // tests). Rather than widen the shared page harness — every non-FPU test
+    // depends on CU1 being irrelevant there — these mirror
+    // `run_interpreter_page`/`run_jit_page` with the CP1 seeding added.
+
+    /// Seed one FPU condition code through `set_fpu_cc` rather than writing
+    /// `fpu_fcsr` directly, so the derived `fpu_fccr` stays consistent — a
+    /// hand-written FCSR would leave `fccr` stale and `CoreSnapshot` compares
+    /// both.
+    fn run_interpreter_page_bc1(page: &[(u16, u32)], gpr: [u64; 32], cc: u32, cc_val: bool,
+                                pc: u64, steps: usize, cu1: bool, fr1: bool) -> CoreSnapshot {
+        let (mut exec, mem) = seeded_executor_over(MockMemory::new_not_compilable(), gpr, pc);
+        exec.set_cp0_status(
+            (if cu1 { crate::mips_core::STATUS_CU1 } else { 0 })
+            | (if fr1 { crate::mips_core::STATUS_FR } else { 0 }));
+        exec.core.set_fpu_cc(cc, cc_val);
+        let page_base = pc & !(PAGE_SIZE as u64 - 1);
+        for &(word, raw) in page {
+            mem.set_word(page_base + (word as u64) * 4, raw);
+        }
+        for _ in 0..steps {
+            let fetch_pc = exec.core.pc;
+            let instr = mem.get_word(fetch_pc & !3);
+            exec.exec(instr);
+        }
+        CoreSnapshot::capture(&exec.core)
+    }
+
+    fn run_jit_page_bc1(page: &[(u16, u32)], gpr: [u64; 32], cc: u32, cc_val: bool,
+                        pc: u64, entry_word: u16, max_instrs: usize, cu1: bool, fr1: bool) -> Option<CoreSnapshot> {
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(word, raw) in page {
+            page_words[word as usize] = raw;
+        }
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, entry_word, page_base, max_instrs);
+        assert!(non_empty, "entry instruction must not be excluded — check the test's encoding");
+        let mut instrs_owned = *walked;
+
+        let mut codegen = Codegen::new();
+        // The FR mode the code is pinned to MUST match the mode the core is
+        // actually in, or emit_fr_mode_guard fires at entry and calls
+        // jit_kill_entry — which this harness has no tracked
+        // PhysicalCodePage for, so it aborts rather than recompiling. Any
+        // region containing a CP1 instruction gets that guard, and BC1 is
+        // one, so unlike the integer page harness this cannot hardcode
+        // `true`.
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, entry_word, fr1, false)?;
+
+        let (exec, mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.set_cp0_status(
+            (if cu1 { crate::mips_core::STATUS_CU1 } else { 0 })
+            | (if fr1 { crate::mips_core::STATUS_FR } else { 0 }));
+        exec.core.set_fpu_cc(cc, cc_val);
+        let phys_base = (page_base & 0x1FFF_FFFF) as u64;
+        for &(word, raw) in page {
+            mem.set_word(page_base as u64 + (word as u64) * 4, raw);
+            mem.set_word(phys_base + (word as u64) * 4, raw);
+        }
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        Some(CoreSnapshot::capture(&exec.core))
+    }
+
+    fn assert_bc1_matches_interpreter(page: &[(u16, u32)], gpr: [u64; 32], cc: u32, cc_val: bool,
+                                      steps: usize, max_instrs: usize, cu1: bool, fr1: bool) {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let interp = run_interpreter_page_bc1(page, gpr, cc, cc_val, pc, steps, cu1, fr1);
+        let jit = run_jit_page_bc1(page, gpr, cc, cc_val, pc, 0, max_instrs, cu1, fr1)
+            .expect("BC1 region must be compilable for this test to be meaningful");
+        assert_eq!(jit, interp,
+            "JIT and interpreter diverged for BC1 page={page:x?} cc={cc} cc_val={cc_val} cu1={cu1} fr1={fr1}");
+    }
+
+    /// `BC1F`/`BC1T`/`BC1FL`/`BC1TL`. `rt` is not a register: bits are
+    /// `cc<<2 | nd<<1 | tf`, sitting at raw[20:16].
+    fn make_bc1(cc: u32, tf: bool, nd: bool, imm: u16) -> u32 {
+        let rt = (cc << 2) | ((nd as u32) << 1) | (tf as u32);
+        (crate::mips_isa::OP_COP1 << 26) | (crate::mips_isa::RS_BC1 << 21) | (rt << 16) | (imm as u32)
+    }
+
+    fn bc1_layout(cc: u32, tf: bool, nd: bool) -> Vec<(u16, u32)> {
+        vec![
+            (0, make_bc1(cc, tf, nd, BRANCH_IMM)),
+            // r5 = 1 marks that the delay slot ran (annulled on a not-taken
+            // "likely", exactly as for BEQL).
+            (1, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+        ]
+    }
+
+    /// Every combination that changes BC1's behaviour: all 8 condition codes,
+    /// both `tf` polarities, both `nd` (likely) settings, and the condition
+    /// both set and clear — so taken, not-taken, and annulled-not-taken are
+    /// all covered for each.
+    #[test]
+    fn bc1_all_conditions_match_interpreter() {
+        for cc in 0..8u32 {
+            for tf in [false, true] {
+                for nd in [false, true] {
+                    for cc_val in [false, true] {
+                        for fr1 in [false, true] {
+                            let page = bc1_layout(cc, tf, nd);
+                            let taken = cc_val == tf;
+                            // A not-taken "likely" annuls its slot, so only
+                            // one instruction retires; everything else two.
+                            let steps = if !taken && nd { 1 } else { 2 };
+                            assert_bc1_matches_interpreter(&page, [0u64; 32], cc, cc_val, steps, 1, true, fr1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The delay slot must actually be annulled on the not-taken path of
+    /// BC1FL/BC1TL — asserted directly, not just via agreement with the
+    /// interpreter, so a harness that ran neither side's slot couldn't pass.
+    #[test]
+    fn bc1_likely_not_taken_annuls_its_delay_slot() {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        // BC1TL with cc0 clear: not taken, so the slot is annulled.
+        let page = bc1_layout(0, true, true);
+        let jit = run_jit_page_bc1(&page, [0u64; 32], 0, false, pc, 0, 1, true, true)
+            .expect("compilable");
+        assert_eq!(jit.gpr[5], 0, "annulled delay slot must not execute");
+
+        // Same encoding, condition set: taken, so the slot DOES run. Without
+        // this the assertion above would also pass on a broken emitter that
+        // simply never ran the slot.
+        let jit = run_jit_page_bc1(&page, [0u64; 32], 0, true, pc, 0, 1, true, true)
+            .expect("compilable");
+        assert_eq!(jit.gpr[5], 1, "taken branch must still execute its delay slot");
+    }
+
+    /// BC1 reads the FPU, so unlike every other branch it faults when CU1 is
+    /// clear (`exec_bc1`'s first line). Branches do not go through
+    /// `lookup_cp1_semantics`, so they get no automatic CU1 guard — codegen
+    /// emits one in `emit_cond`'s `Fcc` arm, and this is what proves it.
+    #[test]
+    fn bc1_without_cu1_raises_coprocessor_unusable_like_the_interpreter() {
+        let page = bc1_layout(0, true, false);
+        // cc set, so it would be TAKEN if CU1 were on — the exception must
+        // win over the branch. One step: the exception is the only thing
+        // that retires.
+        assert_bc1_matches_interpreter(&page, [0u64; 32], 0, true, 1, 1, false, true);
+    }
+
     // ---- FPU (CP1) test harness ------
     //
     // Separate from the integer harness above: FPU tests need FPR contents

@@ -18,14 +18,18 @@ plus the atomics `Ll Sc Lld Scd`. These need to trap into the emulator by
 nature. (CP0 access *ending* a compiled region is a separate, known cost —
 see the jit-atomized notes — not an emitter-coverage problem.)
 
-**MIPS IV FP arithmetic (13) — this is the opportunity.**
+**MIPS IV FP arithmetic (13) — DONE 2026-09-22, ~3x on FP code.**
 `Madd_s Madd_d Msub_s Msub_d Nmadd_s Nmadd_d Nmsub_s Nmsub_d`,
 `Frecip_s Frecip_d Frsqrt_s Frsqrt_d`, `Prefx`.
 
-**`Bc1` (1) — worse than a fallback: it is a region boundary.**
-`analyzer.rs`'s `classify` returns `Classify::Excluded` for `RS_BC1`, so
-branch-on-FP-condition *terminates* the compiled region rather than merely
-bailing for one instruction.
+**`Bc1` (1) — DONE 2026-09-22, ~4x on a BC1-heavy loop.** It had been worse
+than a fallback: `classify` returned `Classify::Excluded` for `RS_BC1`, so
+branch-on-FP-condition *terminated* the compiled region rather than merely
+bailing for one instruction. It is now classified as the ordinary
+PC-relative branch it always was.
+
+**So the remaining 17 are all privileged or atomic**, and belong in the
+interpreter. On emitter coverage alone there is nothing left worth taking.
 
 **MIPS III has no gaps at all.** Every MIPS III compute instruction already
 has an emitter. There is nothing to win by looking there.
@@ -76,7 +80,7 @@ computed value across all twelve modules was identical.** That technique is
 worth reusing for any future emitter: it compares JIT against interpreter on
 real code in a single boot, no harness required.
 
-What remains below is `Bc1` plus the privileged/atomic set.
+What remains is the privileged/atomic set — `Bc1` landed too (below).
 
 ## Ranked, with the work each needs
 
@@ -96,12 +100,13 @@ What remains below is `Bc1` plus the privileged/atomic set.
    negate the result. Flags: Invalid iff any of the *three* sources is a
    signalling NaN (`fpu_arith_flags_snan_only3_d`).
 
-2. **`Bc1` — 852 sites in libm, and the cost compounds.**
-   Not just the interpreted branch: the region ends there, so a hot FP loop
-   containing one `bc1t` gets chopped up. Harder than group 1 — the analyzer
-   comment explains it is excluded because the target is condition-code
-   dependent — so read that reasoning before assuming it is merely
-   unimplemented.
+2. ~~**`Bc1` — 852 sites in libm, and the cost compounds.**~~ **Done
+   2026-09-22 — worth ~4x on a BC1-heavy loop.** The analyzer's "the target is
+   condition-code dependent" reasoning turned out to be wrong: the target is
+   the same PC-relative offset every conditional branch uses, and only the
+   predicate is CP1. See
+   [`bc1-is-an-ordinary-branch.md`](bc1-is-an-ordinary-branch.md), including
+   why measuring it required writing the kernel in assembly.
 
 3. **RECIP/RSQRT — 4 emitters, 17 sites.** Low value, but trivial next to the
    MADD work and shares its shape.
