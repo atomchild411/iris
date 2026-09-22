@@ -7,27 +7,44 @@ around for weeks contained two flags that did nothing.
 
 ```bash
 # A — graphics: IRIX desktop, Quake, X11, anything that draws
-cargo build --release --features jitv2,lightning,rex-jit,idle-pause,chd,mips4
+cargo build --release --features jitv2,lightning,rex-jit,chd,mips4
 
 # B — headless: NetBSD on serial, network and SCSI bringup, long unattended runs
-cargo build --release --features jitv2,lightning,idle-pause,chd,mips4
+cargo build --release --features jitv2,lightning,chd,mips4
 
 # C — debug: packet logs, breakpoints, tracebacks
 cargo build --release --features jitv2,developer,rex-jit,chd,mips4
 ```
+
+## `idle-pause` dropped 2026-09-22
+
+It is on its way out upstream ("does nothing for him"), and it does nothing
+for us on IP28 either. Same binary, `IRIS_NO_IDLE=1` as the control, guest at
+a login prompt, host CPU as a `ps -o cputime` **delta** over 60 s:
+
+| | idle host CPU |
+|---|---|
+| idle-pause on | 325% of a core |
+| idle-pause off | 341% of a core |
+
+~5%, inside the noise — against the 2.6-2.8x it buys on the R4400 guests
+measured in [`../perf/idle-pause-what-it-buys.md`](../perf/idle-pause-what-it-buys.md).
+Not worth carrying or relying on. The IP28 still idles at ~3.3 host cores and
+nobody has diagnosed why; `idle_profile_arm`/`idle_profile_report` in
+`mips_exec.rs` is the tool if anyone wants to.
+
+(Measuring trap, for whoever repeats this: macOS `ps -o %cpu` is an average
+since exec, so a CPU-heavy boot dominates it and every arm reads ~330%
+regardless. Use a `cputime` delta.)
 
 `mips4` is right for every guest we currently run — IP28 is an R10000 and the
 Indy configs are R5000, all MIPS IV. **Drop it, and only it, when building for
 the R4400 config**; see the section below for why it cannot simply go in
 `default`.
 
-Two omissions worth checking against a build you already have, because both
-are silent:
-
-- **`idle-pause`** is in A and B and the IP28 build had been missing it. The
-  symptom is not a failure, it is the emulator holding ~376% host CPU while
-  the guest sits idle at a login prompt.
-- **`mips4`** costs ~20% of integer throughput when absent (below).
+**`mips4` costs ~20% of integer throughput when absent**, and its absence is
+silent — nothing fails, the emulator is just slower. Check it against any
+build you already have, via the startup banner.
 
 `chd` is in all three on purpose. It is one dependency, and it is the
 difference between an IRIX `.chd` image loading and `fatal: CHD image support
