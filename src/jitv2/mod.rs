@@ -2,6 +2,7 @@
 
 pub mod jitv2;
 pub mod comp;
+pub mod isa;
 pub mod opcode_support;
 pub mod analyzer;
 pub mod codegen;

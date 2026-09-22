@@ -7,14 +7,87 @@ around for weeks contained two flags that did nothing.
 
 ```bash
 # A — graphics: IRIX desktop, Quake, X11, anything that draws
-cargo build --release --features jitv2,lightning,rex-jit,chd,mips4
+cargo build --release --features jitv2,lightning,rex-jit,chd
 
 # B — headless: NetBSD on serial, network and SCSI bringup, long unattended runs
-cargo build --release --features jitv2,lightning,chd,mips4
+cargo build --release --features jitv2,lightning,chd
 
 # C — debug: packet logs, breakpoints, tracebacks
-cargo build --release --features jitv2,developer,rex-jit,chd,mips4
+cargo build --release --features jitv2,developer,rex-jit,chd
 ```
+
+`chd` is in all three on purpose. It is one dependency, and it is the
+difference between an IRIX `.chd` image loading and `fatal: CHD image support
+not compiled in`. Leaving it out of some builds only produces a confusing
+failure later.
+
+## Two flags we were passing for nothing
+
+We had been building with
+`jitv2,opcodefusion,idle-pause,rex-jit,lightning,tlbvmap`. Verified by
+comparing banners, that is **identical** to `jitv2,lightning,rex-jit,idle-pause`:
+
+- `lightning = ["opcodefusion"]` — lightning already implies it.
+- `tlbvmap` is in `default`, and its own comment says it is always on and the
+  flag exists only so tooling that passes it still compiles. Passing it
+  explicitly changes nothing.
+
+## `mips4` dropped 2026-09-22 — ISA level follows the CPU now
+
+**You no longer need to pass it, and passing it changes nothing in a real
+run**, so it is gone from the sets above. It remains *declared* in Cargo.toml
+so existing build commands and `r5k = ["mips4"]` keep working; all it does now
+is seed the runtime flag before any CPU exists (unit tests that compile
+without constructing an executor).
+
+ISA level is a property of the CPU model, which is a **runtime** choice, so
+both engines now read it from there: the interpreter from `C::MIPS4`
+directly, jitv2 from `jitv2::isa`, which `MipsExecutor::new` publishes
+`C::MIPS4` into as the CPU is constructed.
+
+Verified end to end: a binary built with **no** `mips4` feature, booted on
+IP28, reports `fpu 78/78` and `loadstore 29/29` — identical coverage *and*
+performance to the feature build, because the R10000 turns it on at runtime.
+The R4400 direction is covered by unit test at the gate (`jitv2::isa::tests`,
+and `classify_cop1x_madd_follows_emitter_coverage` asserting both
+polarities), **not** end to end: an R4400 pointed at an IP28 config never
+gets far enough to answer the monitor.
+
+### What it used to be, and what that cost
+
+Its Cargo.toml comment claimed a "decode gate" that made an R4400 raise
+Reserved Instruction. It never did: **45 of its 47 `cfg` sites were inside
+`src/jitv2/`**, the interpreter gated on `C::MIPS4` instead (17 uses), and
+jitv2 read that const **zero** times.
+
+| model | `MIPS4` const | our configs |
+|---|---|---|
+| `R4400Cache` | `false` | `iris-atomchild-hostx.toml.r4400` |
+| `R5000Cache` | `true` | `iris-atomchild-hostx.toml`, `iris-657.toml` |
+| `R10000Cache`| `true` | `ip28irix.toml` |
+
+One binary serves all three, so build-time and run-time could only agree by
+coincidence. Both directions were live bugs. A `mips4` build on the r4400
+config had jitv2 executing `MOVZ`/`COP1X` where the interpreter trapped. The
+reverse is the one we actually paid: every IP28 run had an R10000 with MIPS IV
+compilation off, worth ~20% of integer throughput —
+
+| | Dhrystone 50M, warm | Whetstone 1M |
+|---|---|---|
+| ISA level off | 41.8 s | 18.5 s |
+| ISA level on | **34.3 s** | 19.5 s |
+
+— measured over four arms of five reps, fresh disk clone and fresh boot per
+arm, timed by **host** wall clock (the guest's own `times()` is not
+trustworthy; see
+[`../perf/guest-cpu-time-accounting-undercounts.md`](../perf/guest-cpu-time-accounting-undercounts.md)).
+The win is MIPS IV's *integer* `MOVZ`/`MOVN` conditional moves, which let
+MIPSpro emit branch-free sequences jitv2 then compiles instead of bailing to
+the interpreter. Whetstone was already fully covered, hence flat.
+
+Nothing was ever *wrong* without it — the interpreter absorbed every MIPS IV
+instruction correctly. That is exactly why it survived: the only symptom was
+being slower.
 
 ## `idle-pause` dropped 2026-09-22
 
@@ -36,84 +109,6 @@ nobody has diagnosed why; `idle_profile_arm`/`idle_profile_report` in
 (Measuring trap, for whoever repeats this: macOS `ps -o %cpu` is an average
 since exec, so a CPU-heavy boot dominates it and every arm reads ~330%
 regardless. Use a `cputime` delta.)
-
-`mips4` is right for every guest we currently run — IP28 is an R10000 and the
-Indy configs are R5000, all MIPS IV. **Drop it, and only it, when building for
-the R4400 config**; see the section below for why it cannot simply go in
-`default`.
-
-**`mips4` costs ~20% of integer throughput when absent**, and its absence is
-silent — nothing fails, the emulator is just slower. Check it against any
-build you already have, via the startup banner.
-
-`chd` is in all three on purpose. It is one dependency, and it is the
-difference between an IRIX `.chd` image loading and `fatal: CHD image support
-not compiled in`. Leaving it out of some builds only produces a confusing
-failure later.
-
-## Add `mips4` when the guest CPU is one — which is all of them but the R4400
-
-Measured 2026-09-22 on the IP28 (R10000, IRIX 6.5.7, MIPSpro `-Ofast -mips4`
-binaries), four arms of five reps each, fresh disk clone and fresh boot per
-arm, timed by **host** wall clock for a fixed workload:
-
-| build | Dhrystone 50M, warm | Whetstone 1M |
-|---|---|---|
-| without `mips4` | 41.8 s | 18.5 s |
-| with `mips4`    | **34.3 s** | 19.5 s |
-
-**About 20% on integer code, nothing on this FP code.** The win is MIPS IV's
-integer `MOVZ`/`MOVN` conditional moves, which let MIPSpro emit branch-free
-sequences that jitv2 then compiles instead of bailing to the interpreter.
-Whetstone was already fully covered, hence flat.
-
-Without the flag nothing is *wrong* — the interpreter gates on the runtime
-`C::MIPS4` and absorbs every MIPS IV instruction correctly. It is purely
-compilation coverage, which is why it went unnoticed: the only symptom is
-being slower.
-
-### The flag does not mean what its Cargo.toml comment says
-
-The comment claims it is a "decode gate" that makes an R4400 build "correctly
-raise Reserved Instruction". It does not. **45 of its 47 `cfg` sites are
-inside `src/jitv2/`**; the other two are a feature listing and a stats gate.
-The interpreter gates on the model const instead (`C::MIPS4`, 17 uses in
-`mips_exec.rs`), and **jitv2 consults that const zero times.**
-
-So the two engines gate the ISA on different axes — jitv2 at build time, the
-interpreter at run time — and they can only agree by coincidence:
-
-| model | `MIPS4` const | our configs |
-|---|---|---|
-| `R4400Cache` | `false` | `iris-atomchild-hostx.toml.r4400` |
-| `R5000Cache` | `true`  | `iris-atomchild-hostx.toml`, `iris-657.toml` |
-| `R10000Cache`| `true`  | `ip28irix.toml` |
-
-**Therefore `mips4` must not go in `default`.** One binary serves all three
-configs; a `mips4` binary pointed at the r4400 config would have jitv2 execute
-`MOVZ`/`COP1X` where the interpreter raises Reserved Instruction. Pass it
-explicitly for R5000/R10000 guests, and build without it for the R4400 config.
-
-The real fix is to make jitv2 gate on `C::MIPS4` like the interpreter does,
-after which the flag would only mean "compile the emitters in" and could be on
-everywhere. The plumbing is contained: `lookup_semantics` /
-`lookup_cp1_semantics` are pure `fn(raw: u32)` and would take a `mips4: bool`,
-with three real call sites in `codegen.rs` plus the analyzer's.
-
-## Two flags we were passing for nothing
-
-We had been building with
-`jitv2,opcodefusion,idle-pause,rex-jit,lightning,tlbvmap`. Verified by
-comparing banners, that is **identical** to `jitv2,lightning,rex-jit,idle-pause`:
-
-- `lightning = ["opcodefusion"]` — lightning already implies it.
-- `tlbvmap` is in `default`, and its own comment says it is always on and the
-  flag exists only so tooling that passes it still compiles. Passing it
-  explicitly changes nothing.
-
-Both builds print:
-
-    iris: build features: jitv2 opcodefusion idle-pause rex-jit lightning tlbvmap chd
 
 ## The banner under-reports
 
@@ -150,4 +145,6 @@ So dropping it from B costs nothing at runtime for a guest that never draws —
 it is build time and dependency weight only.
 
 Related: [`../perf/idle-pause-work.md`](../perf/idle-pause-work.md) for what
-`idle-pause` buys.
+`idle-pause` used to buy, and
+[`../jitv2/instructions-jitv2-still-interprets.md`](../jitv2/instructions-jitv2-still-interprets.md)
+for the emitter-coverage survey the ISA-level work came out of.

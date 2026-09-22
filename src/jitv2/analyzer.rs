@@ -1347,12 +1347,20 @@ mod tests {
     fn classify_cop1x_madd_follows_emitter_coverage() {
         // OP_COP1X is architecturally sequential — no unresolved control
         // flow — so classify tracks emitter coverage, which for the whole
-        // MIPS IV COP1X set is gated on the `mips4` feature.
+        // MIPS IV COP1X set follows the *running CPU model*'s ISA level, so
+        // this asserts both directions in one build rather than whichever the
+        // cargo features happened to select.
         let instr = r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S);
-        #[cfg(feature = "mips4")]
-        assert_eq!(classify(instr, 5, 0), Classify::Sequential);
-        #[cfg(not(feature = "mips4"))]
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        {
+            let _isa = crate::jitv2::isa::test_isa(true);
+            assert_eq!(classify(instr, 5, 0), Classify::Sequential,
+                       "an R5000/R10000 may execute MADD.S");
+        }
+        {
+            let _isa = crate::jitv2::isa::test_isa(false);
+            assert_eq!(classify(instr, 5, 0), Classify::Excluded,
+                       "an R4400 must leave MADD.S to the interpreter, which raises RI");
+        }
     }
 
     #[test]
@@ -1375,10 +1383,15 @@ mod tests {
         // lands this must become Sequential, never get stuck as a phantom
         // branch exclusion.
         let instr = r_type(OP_COP1X, RS_BC1, 2, 3, 4, FUNCT_LWXC1);
-        #[cfg(feature = "mips4")]
-        assert_eq!(classify(instr, 5, 0), Classify::Sequential);
-        #[cfg(not(feature = "mips4"))]
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        {
+            let _isa = crate::jitv2::isa::test_isa(true);
+            assert_eq!(classify(instr, 5, 0), Classify::Sequential);
+        }
+        {
+            let _isa = crate::jitv2::isa::test_isa(false);
+            // Still Excluded for ISA reasons, never for "it looked like BC1".
+            assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        }
     }
 
     #[test]

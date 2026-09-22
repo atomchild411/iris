@@ -115,14 +115,15 @@ What remains is the privileged/atomic set — `Bc1` landed too (below).
    hint; `Pref` is already in the compiled set and `Prefx` is its indexed
    form. Near-zero sites in what we run, but it is a one-line arm.
 
-## Gating
+## Gating — fixed 2026-09-22
 
-All of these are MIPS IV, so any new emitter needs the same `mips4` treatment
-— which is the second argument for moving that gate from a cargo feature to
-the runtime `C::MIPS4` const (see
-[`../build/the-three-builds-we-actually-use.md`](../build/the-three-builds-we-actually-use.md)).
-Adding 13 more `#[cfg(feature = "mips4")]` pairs to a gate that is already on
-the wrong axis makes the eventual fix bigger.
+These are all MIPS IV, and the `mips4` cargo feature that used to gate them
+was on the wrong axis: ISA level belongs to the CPU model, which is a runtime
+choice. jitv2 now asks `jitv2::isa::mips4_enabled()` (published from
+`C::MIPS4` by `MipsExecutor::new`) at one point —
+`opcode_support::has_emitter` — and every MIPS IV emitter is compiled into
+every build. See
+[`../build/the-three-builds-we-actually-use.md`](../build/the-three-builds-we-actually-use.md).
 
 Related: [`../perf/guest-cpu-time-accounting-undercounts.md`](../perf/guest-cpu-time-accounting-undercounts.md)
 for why these must be timed by host wall clock.
