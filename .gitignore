@@ -18,6 +18,13 @@ IRIS.app/
 *.log
 .DS_Store
 
+# Editor scratch. vim swap files are dotfiles next to the file being
+# edited (src/foo/.bar.rs.swp), so `git add -A` sweeps them up — one
+# nearly went into a commit on 2026-09-22.
+*.swp
+*.swo
+*~
+
 # Benchmark build products: the guest ELF, the native oracle and baseline, the
 # per-cell emulator copies, and the JSON results. golden/golden.h is generated
 # but deliberately checked in — building the suite must need nothing but the
