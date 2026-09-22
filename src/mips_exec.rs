@@ -2592,6 +2592,27 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     {
         let mut core = MipsCore::new();
 
+        // Publish this model's ISA level to jitv2 before anything can compile.
+        // The interpreter reads `C::MIPS4` directly at every decode; jitv2
+        // runs on a background compile pool with no `C` in scope, so it reads
+        // a process-global instead, and this is where the two are tied
+        // together. Without it jitv2's ISA level came from a cargo feature —
+        // a different axis entirely, which could only agree with the
+        // configured CPU by coincidence (see `jitv2::isa`'s module docs).
+        //
+        // Not under `cfg(test)`, and that is not a dodge: a real run has one
+        // process and one CPU model, which is what makes a global correct
+        // here. The test harness does not — it builds R4400-, R5000- and
+        // R10000-shaped executors concurrently across threads, so publishing
+        // from every construction had them stomping each other, and FPU
+        // equivalence tests failed intermittently with "entry instruction
+        // must not be excluded" when someone else's R4400 landed between
+        // their walk and their compile. Tests drive the level explicitly
+        // through `jitv2::isa::test_isa`, which serialises them; the publish
+        // itself is covered by `publishes_the_cpu_models_isa_level_to_jitv2`.
+        #[cfg(all(feature = "jitv2", not(test)))]
+        crate::jitv2::isa::set_mips4(C::MIPS4);
+
         // Cache geometry comes from the model type C, so Config describes this CPU.
         // `mut` is only used by the Triton L2-enable sync below.
         #[cfg_attr(not(feature = "r5ksc_triton"), allow(unused_mut))]

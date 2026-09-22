@@ -260,26 +260,36 @@ impl InstrKind {
     /// own dispatch before this would ever be consulted for them (same caveat as the old
     /// `has_emitter`'s doc comment) — this only answers the Sequential-vs-Excluded question
     /// for everything else.
+    /// True for the MIPS IV additions — the set an R4400 must raise Reserved
+    /// Instruction on, and an R5000/R10000 may execute. The single source of
+    /// truth for that membership; `mips_exec.rs`'s decode table gates the
+    /// same encodings on `C::MIPS4`, and `opcode_support::has_emitter` gates
+    /// jitv2 on this plus `jitv2::isa::mips4_enabled()`.
+    ///
+    /// COP1X is listed whole (`Lwxc1`/`Ldxc1`/`Swxc1`/`Sdxc1`/`Prefx` and the
+    /// multiply-add family): no MIPS III encoding uses that opcode at all.
+    pub fn is_mips4(self) -> bool {
+        use InstrKind::*;
+        matches!(self,
+            Movz | Movn | Movci | Pref | Fmovcf_s | Fmovcf_d
+            | Fmovz_s | Fmovn_s | Fmovz_d | Fmovn_d
+            | Lwxc1 | Ldxc1 | Swxc1 | Sdxc1 | Prefx
+            | Madd_s | Madd_d | Msub_s | Msub_d
+            | Nmadd_s | Nmadd_d | Nmsub_s | Nmsub_d
+            | Frecip_s | Frecip_d | Frsqrt_s | Frsqrt_d
+        )
+    }
+
     pub fn has_jitv2_emitter(self) -> bool {
         use InstrKind::*;
-        // Movz/Movn/Movci/Pref/Fmovcf_s/Fmovcf_d are MIPS IV — real jitv2
-        // emitters exist (`lookup_semantics`), but on a non-`mips4` build
-        // they must be excluded here so they fall back to the interpreter,
-        // which raises Reserved Instruction (see `mips_exec.rs`'s decode
-        // table). Keep this arm list in sync with that gate.
-        if !cfg!(feature = "mips4")
-            && matches!(
-                self,
-                Movz | Movn | Movci | Pref | Fmovcf_s | Fmovcf_d
-                    | Fmovz_s | Fmovn_s | Fmovz_d | Fmovn_d
-                    | Lwxc1 | Ldxc1 | Swxc1 | Sdxc1 | Prefx
-                    | Madd_s | Madd_d | Msub_s | Msub_d
-                    | Nmadd_s | Nmadd_d | Nmsub_s | Nmsub_d
-                    | Frecip_s | Frecip_d | Frsqrt_s | Frsqrt_d
-            )
-        {
-            return false;
-        }
+        // NOTE: this answers "is an emitter compiled in", nothing about ISA
+        // level. Every MIPS IV emitter is compiled into every build; whether
+        // the *running CPU model* may use one is a separate, runtime question
+        // asked by `opcode_support::has_emitter` via `InstrKind::is_mips4`
+        // and `jitv2::isa::mips4_enabled`. Keeping ISA out of here matters:
+        // `has_jitv2_support` seeds `opcode_support`'s `ENABLED` table in a
+        // `OnceLock`, so anything it consults is frozen at first touch —
+        // which would be before the CPU publishes its model.
         matches!(self,
             // Integer ALU (mirrors has_integer_emitter's OP_SPECIAL/OP_REGIMM/immediate list)
             Add | Addu | Sub | Subu | And | Or | Xor | Nor | Slt | Sltu

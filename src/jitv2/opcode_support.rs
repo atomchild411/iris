@@ -209,6 +209,18 @@ pub fn has_emitter(raw: u32) -> bool {
     let rt = ((raw >> 16) & 0x1F) as u8;
     let funct = (raw & 0x3F) as u8;
     let kind = classify_instr(op, rs, rt, funct);
+    // ISA level is a property of the *running CPU model*, not of the build:
+    // an R4400 must raise Reserved Instruction on these encodings, an
+    // R5000/R10000 may execute them, and one binary serves both. This is the
+    // single point where jitv2 asks that question, and it is the same
+    // question `mips_exec.rs`'s decode table answers with `C::MIPS4`.
+    //
+    // Deliberately here rather than in `has_jitv2_emitter`: that one seeds
+    // `ENABLED` through a `OnceLock`, so anything it consults is frozen at
+    // first touch, which can precede the CPU publishing its model.
+    if kind.is_mips4() && !crate::jitv2::isa::mips4_enabled() {
+        return false;
+    }
     kind.has_jitv2_emitter() && instr_enabled(kind)
 }
 

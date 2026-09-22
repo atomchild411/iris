@@ -5352,7 +5352,6 @@ fn emit_fpu_arith_flags_snan_only_d(ctx: &mut EmitCtx, fs_bits: Value, ft_bits: 
 /// operand), and only if that is clear, divide-by-zero for a zero operand —
 /// mirrors the inline `flags` block in `exec_frsqrt_s/d`. Note the precedence:
 /// FV wins over FZ, exactly as in DIV.
-#[cfg(feature = "mips4")]
 fn emit_fpu_arith_flags_rsqrt_s(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
     let sqrt_flags = emit_fpu_arith_flags_sqrt_s(ctx, fs_bits);
     let fs_zero = {
@@ -5364,7 +5363,6 @@ fn emit_fpu_arith_flags_rsqrt_s(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
     let sqrt_is_zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, sqrt_flags, 0);
     ctx.builder.ins().select(sqrt_is_zero, z_flag, sqrt_flags)
 }
-#[cfg(feature = "mips4")]
 fn emit_fpu_arith_flags_rsqrt_d(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
     let sqrt_flags = emit_fpu_arith_flags_sqrt_d(ctx, fs_bits);
     let fs_zero = {
@@ -5381,7 +5379,6 @@ fn emit_fpu_arith_flags_rsqrt_d(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
 /// a signalling NaN, else 0 — mirrors `fpu_arith_flags_snan_only3_s/d`.
 /// Separate from the two-operand form above because the multiply-add family
 /// reads `fr` as well as `fs`/`ft`.
-#[cfg(feature = "mips4")]
 fn emit_fpu_arith_flags_snan_only3_s(ctx: &mut EmitCtx, fr_bits: Value, ft_bits: Value, fs_bits: Value) -> Value {
     let fr_snan = emit_is_snan_s(ctx, fr_bits);
     let ft_snan = emit_is_snan_s(ctx, ft_bits);
@@ -5391,7 +5388,6 @@ fn emit_fpu_arith_flags_snan_only3_s(ctx: &mut EmitCtx, fr_bits: Value, ft_bits:
     let any_snan = ctx.builder.ins().uextend(ir::types::I32, any_snan);
     ctx.builder.ins().ishl_imm_s(any_snan, FCSR_FV_I64.trailing_zeros() as i64)
 }
-#[cfg(feature = "mips4")]
 fn emit_fpu_arith_flags_snan_only3_d(ctx: &mut EmitCtx, fr_bits: Value, ft_bits: Value, fs_bits: Value) -> Value {
     let fr_snan = emit_is_snan_d(ctx, fr_bits);
     let ft_snan = emit_is_snan_d(ctx, ft_bits);
@@ -7623,7 +7619,6 @@ fn emit_fmovcf_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     ctx.builder.seal_block(merge_block);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_fmovz_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -7644,7 +7639,6 @@ fn emit_fmovz_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     ctx.builder.seal_block(merge_block);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_fmovn_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -7665,7 +7659,6 @@ fn emit_fmovn_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     ctx.builder.seal_block(merge_block);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_fmovz_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -7686,7 +7679,6 @@ fn emit_fmovz_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     ctx.builder.seal_block(merge_block);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_fmovn_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -8291,7 +8283,6 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
         OP_LDC1 => return Some(emit_ldc1),
         OP_SWC1 => return Some(emit_swc1),
         OP_SDC1 => return Some(emit_sdc1),
-        #[cfg(feature = "mips4")]
         OP_COP1X => {
             let funct = raw & 0x3F;
             return match funct {
@@ -8328,30 +8319,15 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FMUL => Some(emit_fmul_s),
             FUNCT_FDIV => Some(emit_fdiv_s),
             FUNCT_FSQRT => Some(emit_fsqrt_s),
-            #[cfg(feature = "mips4")]
             FUNCT_FRECIP => Some(emit_frecip_s),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FRECIP => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FRSQRT => Some(emit_frsqrt_s),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FRSQRT => None,
             FUNCT_FABS => Some(emit_fabs_s),
             FUNCT_FNEG => Some(emit_fneg_s),
             FUNCT_FMOV => Some(emit_fmov_s),
             // MOVF.fmt/MOVT.fmt is MIPS IV; gate like MOVZ/MOVN/MOVCI above.
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVCF => Some(emit_fmovcf_s),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVCF => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVZ => Some(emit_fmovz_s),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVZ => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVN => Some(emit_fmovn_s),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVN => None,
             FUNCT_FCVT_D => Some(emit_fcvt_d_s),
             FUNCT_FCVT_W => Some(emit_fcvt_w_s),
             FUNCT_FCVT_L => Some(emit_fcvt_l_s),
@@ -8372,29 +8348,14 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FMUL => Some(emit_fmul_d),
             FUNCT_FDIV => Some(emit_fdiv_d),
             FUNCT_FSQRT => Some(emit_fsqrt_d),
-            #[cfg(feature = "mips4")]
             FUNCT_FRECIP => Some(emit_frecip_d),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FRECIP => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FRSQRT => Some(emit_frsqrt_d),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FRSQRT => None,
             FUNCT_FABS => Some(emit_fabs_d),
             FUNCT_FNEG => Some(emit_fneg_d),
             FUNCT_FMOV => Some(emit_fmov_d),
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVCF => Some(emit_fmovcf_d),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVCF => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVZ => Some(emit_fmovz_d),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVZ => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVN => Some(emit_fmovn_d),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVN => None,
             FUNCT_FCVT_S => Some(emit_fcvt_s_d),
             FUNCT_FCVT_W => Some(emit_fcvt_w_d),
             FUNCT_FCVT_L => Some(emit_fcvt_l_d),
@@ -9603,7 +9564,6 @@ fn emit_sdc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_mem_write(ctx, vaddr, value_64, MemSize::B8);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_lwxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let index = emit_read_gpr(ctx, field_rt(ctx.raw));
@@ -9614,7 +9574,6 @@ fn emit_lwxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_write_fpr_w(ctx, field_sa(ctx.raw), value_32, fr_mode);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_ldxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let index = emit_read_gpr(ctx, field_rt(ctx.raw));
@@ -9634,7 +9593,6 @@ fn emit_ldxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_write_fpr_l(ctx, fd, loaded, fr_mode);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_swxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let index = emit_read_gpr(ctx, field_rt(ctx.raw));
@@ -9652,7 +9610,6 @@ fn emit_swxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_mem_write(ctx, vaddr, value_64, MemSize::B4);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_sdxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let index = emit_read_gpr(ctx, field_rt(ctx.raw));
@@ -9707,7 +9664,6 @@ fn emit_sdxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
 ///
 /// Register fields are the COP1X layout, which is not the COP1 one:
 /// `fr = rs`, `ft = rt`, `fs = rd`, `fd = sa`.
-#[cfg(feature = "mips4")]
 fn emit_fternop_s(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_result: bool) {
     let raw = ctx.raw;
     let fr = field_rs(raw);
@@ -9732,7 +9688,6 @@ fn emit_fternop_s(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
     emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
 }
 
-#[cfg(feature = "mips4")]
 fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_result: bool) {
     let raw = ctx.raw;
     let fr = field_rs(raw);
@@ -9758,24 +9713,16 @@ fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
 }
 
 // fd = fs*ft + fr
-#[cfg(feature = "mips4")]
 fn emit_madd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, false, false); }
-#[cfg(feature = "mips4")]
 fn emit_madd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, false, false); }
 // fd = fs*ft - fr
-#[cfg(feature = "mips4")]
 fn emit_msub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, true, false); }
-#[cfg(feature = "mips4")]
 fn emit_msub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, true, false); }
 // fd = -(fs*ft + fr)
-#[cfg(feature = "mips4")]
 fn emit_nmadd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, false, true); }
-#[cfg(feature = "mips4")]
 fn emit_nmadd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, false, true); }
 // fd = -(fs*ft - fr)
-#[cfg(feature = "mips4")]
 fn emit_nmsub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, true, true); }
-#[cfg(feature = "mips4")]
 fn emit_nmsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, true, true); }
 
 /// RECIP.S/D and RSQRT.S/D fd, fs — MIPS IV, `1/fs` and `1/sqrt(fs)`.
@@ -9790,7 +9737,6 @@ fn emit_nmsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mod
 /// reciprocal-estimate instruction: the interpreter computes `1.0 / fs` at
 /// full precision, and MIPS IV permits RECIP to be less accurate than divide
 /// but does not require it. Matching the interpreter is what lockstep needs.
-#[cfg(feature = "mips4")]
 fn emit_frecip_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -9803,7 +9749,6 @@ fn emit_frecip_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
     emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
 }
-#[cfg(feature = "mips4")]
 fn emit_frecip_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -9816,7 +9761,6 @@ fn emit_frecip_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
     emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
 }
-#[cfg(feature = "mips4")]
 fn emit_frsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -9829,7 +9773,6 @@ fn emit_frsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
     emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
 }
-#[cfg(feature = "mips4")]
 fn emit_frsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -9852,7 +9795,6 @@ fn emit_frsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 ///
 /// Note it does NOT compute or validate the address: an unmapped prefetch
 /// address must not fault, so there is deliberately no `emit_mem_read` here.
-#[cfg(feature = "mips4")]
 fn emit_prefx(_ctx: &mut EmitCtx, _fr_mode: FrMode) {}
 
 /// MOVZ rd, rs, rt: rd = rs if rt == 0 (no-op otherwise). Mirrors
@@ -10085,14 +10027,9 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
             // MOVZ/MOVN/MOVCI are MIPS IV; without the feature they must not
             // be compiled here so the analyzer/interpreter fallback can
             // raise Reserved Instruction (mirrors mips_exec.rs's decode gate).
-            #[cfg(feature = "mips4")]
             FUNCT_MOVZ => Some(emit_movz),
-            #[cfg(feature = "mips4")]
             FUNCT_MOVN => Some(emit_movn),
-            #[cfg(feature = "mips4")]
             FUNCT_MOVCI => Some(emit_movci),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_MOVZ | FUNCT_MOVN | FUNCT_MOVCI => None,
             FUNCT_TGE => Some(emit_tge),
             FUNCT_TGEU => Some(emit_tgeu),
             FUNCT_TLT => Some(emit_tlt),
@@ -10113,10 +10050,7 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
         },
         // PREF is MIPS IV; without the feature it must not be compiled here
         // so the interpreter fallback can raise Reserved Instruction.
-        #[cfg(feature = "mips4")]
         OP_PREF => Some(emit_nop),
-        #[cfg(not(feature = "mips4"))]
-        OP_PREF => None,
         OP_ADDI => Some(emit_addi),
         OP_ADDIU => Some(emit_addiu),
         OP_DADDI => Some(emit_daddi),
