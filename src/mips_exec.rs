@@ -127,6 +127,39 @@ fn is_snan_s(bits: u32) -> bool {
     (bits & 0x7F80_0000) == 0x7F80_0000 && (bits & 0x007F_FFFF) != 0 && (bits & 0x0040_0000) == 0
 }
 
+/// Negate by flipping the sign bit, which is what IEEE-754 negation *is*.
+///
+/// These exist because `-x.mul_add(y, z)` cannot be trusted. LLVM rewrites
+/// `-fma(a, b, -c)` into `fma(-a, b, c)` — algebraically identical, and wrong
+/// for signed zeros. It made NMSUB.D(+0, +0, +0) return `+0.0` where MIPS IV
+/// requires `-((fs*ft) - fr)` = `-(+0.0)` = `-0.0`, and it did so only in
+/// NMSUB: MSUB, computing the very same inner FMA without the outer negation,
+/// returned `+0.0` correctly. Two "identical" expressions disagreeing is the
+/// tell.
+///
+/// Found 2026-09-22 by the jitv2 equivalence harness, which flagged a
+/// divergence against a new `fneg`-based JIT emitter that was doing the right
+/// thing. A bit flip is not reassociable, so it stays correct.
+///
+/// Only the *outer* negation needs this. Negating an operand (`-fr_val`
+/// feeding the addend) is a plain unary neg on a value LLVM cannot fold
+/// through an FMA, and is sign-correct as written.
+/// `black_box` is load-bearing, not decoration. A plain
+/// `f64::from_bits(v.to_bits() ^ SIGN)` does **not** survive: LLVM's
+/// InstCombine recognises that idiom as `fneg` and then re-applies the very
+/// reassociation this exists to prevent. Measured — the bit-twiddling version
+/// alone still returned `+0.0` for NMSUB.D(+0, +0, +0). The barrier stops
+/// LLVM tracing the value back to the FMA that produced it.
+#[inline]
+fn fneg_bits_s(v: f32) -> u32 {
+    std::hint::black_box(v).to_bits() ^ 0x8000_0000
+}
+
+#[inline]
+fn fneg_d_exact(v: f64) -> f64 {
+    f64::from_bits(std::hint::black_box(v).to_bits() ^ 0x8000_0000_0000_0000)
+}
+
 /// Same as `is_snan_s`, for IEEE-754 double-precision bit patterns.
 #[inline]
 fn is_snan_d(bits: u64) -> bool {
@@ -8821,7 +8854,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_s(fr_bits, ft_bits, fs_bits);
         let write_w = self.fpr_write_w;
-        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, (-fs_val.mul_add(ft_val, fr_val)).to_bits()))
+        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, fneg_bits_s(fs_val.mul_add(ft_val, fr_val))))
     }
     fn exec_nmadd_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8831,7 +8864,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fs_val = read_d(&self.core, d.rd as u32);
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_d(fr_val.to_bits(), ft_val.to_bits(), fs_val.to_bits());
-        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, -fs_val.mul_add(ft_val, fr_val)))
+        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, fneg_d_exact(fs_val.mul_add(ft_val, fr_val))))
     }
     fn exec_nmsub_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8842,7 +8875,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_s(fr_bits, ft_bits, fs_bits);
         let write_w = self.fpr_write_w;
-        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, (-fs_val.mul_add(ft_val, -fr_val)).to_bits()))
+        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, fneg_bits_s(fs_val.mul_add(ft_val, -fr_val))))
     }
     fn exec_nmsub_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8852,7 +8885,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fs_val = read_d(&self.core, d.rd as u32);
         let flags = Self::fpu_arith_flags_snan_only3_d(fr_val.to_bits(), ft_val.to_bits(), fs_val.to_bits());
         let fd_reg = d.sa as u32;
-        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, -fs_val.mul_add(ft_val, -fr_val)))
+        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, fneg_d_exact(fs_val.mul_add(ft_val, -fr_val))))
     }
 
     // LWC1 - Load Word to FPU

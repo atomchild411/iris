@@ -260,11 +260,18 @@ mod tests {
     }
 
     #[test]
-    fn prefx_has_no_emitter_yet() {
+    fn prefx_emitter_follows_mips4() {
         // PREFX is COP1X-encoded and, unlike plain PREF, exec_prefx checks
-        // STATUS_CU1 and raises cpu_unusable if it's clear — a genuine
-        // COP0-adjacent side effect this codebase's hard-no on
-        // privilege/COP0-touching instructions excludes from jitv2 for now.
+        // STATUS_CU1 and raises cpu_unusable if it's clear. That is not a
+        // reason to keep it out of jitv2: it is routed through
+        // lookup_cp1_semantics, and codegen emits emit_cp1_cu1_guard
+        // immediately before every emitter from that table, so the CU1
+        // exception is delivered identically. Past the guard a prefetch is
+        // architecturally a hint, so the emitter is deliberately empty and
+        // exec_prefx's body is just handle_exec_complete().
+        #[cfg(feature = "mips4")]
+        assert!(has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_PREFX)));
+        #[cfg(not(feature = "mips4"))]
         assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_PREFX)));
     }
 
@@ -289,8 +296,20 @@ mod tests {
     }
 
     #[test]
-    fn cop1x_has_no_emitter_yet() {
+    fn cop1x_madd_emitter_follows_mips4() {
+        #[cfg(feature = "mips4")]
+        assert!(has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S)));
+        #[cfg(not(feature = "mips4"))]
         assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S)));
+    }
+
+    #[test]
+    fn cop1x_paired_single_has_no_emitter_in_any_build() {
+        // The *_PS forms have no interpreter handler either — no MIPS IV
+        // part SGI shipped implements paired-single — so they must keep
+        // falling back even when mips4 is on.
+        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_PS)));
+        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_NMSUB_PS)));
     }
 
     #[test]
