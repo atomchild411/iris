@@ -174,6 +174,55 @@ pub const EXC_WATCH: u32 = 23;    // Reference to WatchHi/WatchLo address
 pub const EXC_VCEI: u32 = 14;     // Virtual Coherency Exception (Instruction)
 pub const EXC_VCED: u32 = 31;     // Virtual Coherency Exception (Data)
 
+/// XContext as hardware writes it on a TLB miss, for a CPU implementing
+/// `va_bits` virtual address bits.
+///
+/// `docs/R4000_um2.pdf`, Figure 5-10 and Table 5-8, gives the layout for a
+/// 40-bit CPU:
+///
+/// ```text
+///  63              33 32 31 30            4 3     0
+///        PTEBase         R      BadVPN2         0
+///          31            2         27           4
+/// ```
+///
+/// with the accompanying text: "The 27-bit BadVPN2 field has bits 39:13 of the
+/// virtual address that caused the TLB miss; bit 12 is excluded because a
+/// single TLB entry maps to an even-odd page pair." R is virtual address bits
+/// 63:62, and PTEBase is written by the operating system.
+///
+/// Every field position follows from that one sentence. BadVPN2 is
+/// `VA[va_bits-1:13]`, so it is `va_bits - 13` bits wide — 27 when va_bits is
+/// 40, which is what the figure shows. It starts at bit 4, so it ends at
+/// `va_bits - 10` (30 for 40 bits, per the figure). R is the two bits directly
+/// above it, `[va_bits-8:va_bits-9]` (32:31 — the figure). PTEBase is
+/// everything above that, `[63:va_bits-7]` (63:33 — the figure). The 40-bit
+/// case therefore reproduces the manual exactly, and the general case is the
+/// same arithmetic with the address width left as a parameter, which is how
+/// the manual itself states it.
+///
+/// The R10000 implements 44 virtual address bits rather than 40, so on that
+/// CPU all three fields sit four bits higher. Using the 40-bit layout there
+/// puts R and PTEBase four bits too low: a 64-bit kernel reads XContext in its
+/// TLB refill handler to find the page-table entry for the faulting address,
+/// so the address it computes lands outside the page table it wired, the
+/// nested miss is unrecoverable, and IRIX panics with "Entered tlbmiss with
+/// invalid vaddr". That is the observable difference — the 6.5 IP28 kernel
+/// boots with 44 and panics with 40.
+#[inline]
+pub fn xcontext_on_miss(va_bits: u32, old_xcontext: u64, virt_addr: u64) -> u64 {
+    // Gaps from the field edges down to the address width, read off the
+    // figure: PTEBase starts at 33 = 40 - 7, R at 31 = 40 - 9.
+    const XC_PTEBASE_GAP: u32 = 7;
+    const XC_REGION_GAP: u32 = 9;
+
+    let vpn2_mask: u64 = (((1u64 << (va_bits - 13)) - 1) << 13) & !0xFFFu64;
+    let ptebase = old_xcontext & (!0u64 << (va_bits - XC_PTEBASE_GAP));
+    let badvpn2 = ((virt_addr & vpn2_mask) >> 13) << 4;
+    let region = (virt_addr >> 62) & 0x3;
+    ptebase | (region << (va_bits - XC_REGION_GAP)) | badvpn2
+}
+
 pub const CONFIG_CM: u32 = 31;    // Master checker mode
 pub const CONFIG_EC: u32 = 28;    // 3 bits, clock ratio  0 - 2, 1 - 3...
 pub const CONFIG_EP: u32 = 24;    // 4 bits transmit data pattern for writeback
@@ -4920,14 +4969,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // EntryHi keeps the 40-bit VPN2 field on every model: a 64-bit kernel
         // zero-fills those upper bits itself when it builds an EntryHi value,
         // and widening the mask here breaks it.
-        const XC_PTEBASE_GAP: u32 = 7;
-        const XC_REGION_GAP: u32 = 9;
-        let xc_vpn2_mask: u64 = (((1u64 << (C::VA_BITS - 13)) - 1) << 13) & !0xFFFu64;
-        let xptebase = self.core.cp0_xcontext & (!0u64 << (C::VA_BITS - XC_PTEBASE_GAP));
-        let xbadvpn2 = ((virt_addr & xc_vpn2_mask) >> 13) << 4;
-        let region = (virt_addr >> 62) & 0x3;
         self.core.cp0_xcontext =
-            xptebase | (region << (C::VA_BITS - XC_REGION_GAP)) | xbadvpn2;
+            xcontext_on_miss(C::VA_BITS, self.core.cp0_xcontext, virt_addr);
     }
 
     // ========== Memory Access Wrapper Methods ==========
@@ -14947,6 +14990,100 @@ impl<T: Tlb, C: CpuModel> iris_hostcall::PageAccess for HostMemory<'_, T, C> {
     }
 }
 
+
+#[cfg(test)]
+mod xcontext_layout_tests {
+    use super::xcontext_on_miss;
+
+    /// Field edges as `docs/R4000_um2.pdf` Figure 5-10 draws them, for the
+    /// 40-bit CPU the manual describes. These are the numbers in the figure,
+    /// not numbers derived from the code under test.
+    const R4000_PTEBASE_LSB: u32 = 33;
+    const R4000_REGION_LSB: u32 = 31;
+    const R4000_REGION_MSB: u32 = 32;
+    const R4000_BADVPN2_LSB: u32 = 4;
+    const R4000_BADVPN2_MSB: u32 = 30;
+    const R4000_BADVPN2_WIDTH: u32 = 27;
+
+    /// A virtual address with a distinct bit in every VPN2 position, so a
+    /// misplaced field shows up as a shifted result rather than a coincidence.
+    /// Region `11` (kernel), and VA bits 43:13 all set.
+    const VA_ALL_VPN2: u64 = 0xFFFF_FFFF_FFFF_E000;
+
+    #[test]
+    fn forty_bit_layout_matches_the_r4000_manual_figure() {
+        // BadVPN2 is VA[39:13] — the manual's own sentence — landing at
+        // bits [30:4], 27 bits wide.
+        let got = xcontext_on_miss(40, 0, VA_ALL_VPN2);
+        let badvpn2 = (got >> R4000_BADVPN2_LSB) & ((1 << R4000_BADVPN2_WIDTH) - 1);
+        assert_eq!(badvpn2, (1u64 << R4000_BADVPN2_WIDTH) - 1,
+                   "VA[39:13] should fill the 27-bit BadVPN2 field");
+        assert_eq!(got & 0xF, 0, "bits [3:0] are the figure's zero field");
+        // Nothing above BadVPN2's top bit except Region, which is next.
+        assert_eq!((got >> R4000_REGION_LSB) & 0x3, 0x3, "Region = VA[63:62] = 11");
+        assert_eq!(R4000_BADVPN2_MSB + 1, R4000_REGION_LSB,
+                   "Region sits directly above BadVPN2");
+        assert_eq!(R4000_REGION_MSB + 1, R4000_PTEBASE_LSB,
+                   "PTEBase sits directly above Region");
+    }
+
+    #[test]
+    fn forty_bit_ptebase_is_preserved_above_bit_32() {
+        // The OS writes PTEBase; hardware must leave it alone.
+        let ptebase = 0xDEAD_BEEF_0000_0000u64 & (!0u64 << R4000_PTEBASE_LSB);
+        let got = xcontext_on_miss(40, ptebase, VA_ALL_VPN2);
+        assert_eq!(got & (!0u64 << R4000_PTEBASE_LSB), ptebase);
+        // And a stale value below PTEBase must not survive.
+        let stale = xcontext_on_miss(40, !0u64, 0);
+        assert_eq!(stale & !(!0u64 << R4000_PTEBASE_LSB), 0,
+                   "everything below PTEBase is rewritten by hardware");
+    }
+
+    #[test]
+    fn region_carries_virtual_address_bits_63_62() {
+        // Table 5-8: 00 user, 01 supervisor, 11 kernel.
+        for (va_top, want) in [(0u64, 0u64), (1, 1), (3, 3)] {
+            let va = va_top << 62;
+            let got = xcontext_on_miss(40, 0, va);
+            assert_eq!((got >> R4000_REGION_LSB) & 0x3, want);
+        }
+    }
+
+    /// The R10000 implements 44 virtual address bits, so BadVPN2 is
+    /// `44 - 13 = 31` bits and every field above it moves up by four.
+    #[test]
+    fn forty_four_bit_layout_shifts_every_field_up_by_four() {
+        const W: u32 = 44 - 13; // 31
+        let got = xcontext_on_miss(44, 0, VA_ALL_VPN2);
+        assert_eq!((got >> 4) & ((1u64 << W) - 1), (1u64 << W) - 1,
+                   "VA[43:13] should fill the 31-bit BadVPN2 field");
+        assert_eq!((got >> (R4000_REGION_LSB + 4)) & 0x3, 0x3,
+                   "Region moves from [32:31] to [36:35]");
+        let ptebase = 0xABCD_0000_0000_0000u64 & (!0u64 << (R4000_PTEBASE_LSB + 4));
+        let kept = xcontext_on_miss(44, ptebase, VA_ALL_VPN2);
+        assert_eq!(kept & (!0u64 << (R4000_PTEBASE_LSB + 4)), ptebase,
+                   "PTEBase moves from [63:33] to [63:37]");
+    }
+
+    /// The bug this layout fixed: on a 44-bit CPU the 40-bit layout puts
+    /// Region and PTEBase four bits too low, so the two disagree.
+    #[test]
+    fn forty_and_forty_four_bit_layouts_actually_differ() {
+        let va = 0xC000_0FFF_FFFF_E000u64;
+        assert_ne!(xcontext_on_miss(40, 0, va), xcontext_on_miss(44, 0, va));
+    }
+
+    /// VA bits above the implemented width must not reach BadVPN2 — on a
+    /// 40-bit CPU, VA[43:40] is not part of the page number.
+    #[test]
+    fn address_bits_above_the_implemented_width_are_excluded() {
+        let only_high = 0x0000_0F00_0000_0000u64; // VA[43:40]
+        assert_eq!(xcontext_on_miss(40, 0, only_high), 0,
+                   "VA[43:40] is outside a 40-bit CPU's BadVPN2");
+        assert_ne!(xcontext_on_miss(44, 0, only_high), 0,
+                   "but it is inside a 44-bit CPU's");
+    }
+}
 
 #[cfg(test)]
 mod round_to_int_mode_tests {
