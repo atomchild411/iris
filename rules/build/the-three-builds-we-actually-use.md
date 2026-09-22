@@ -7,19 +7,81 @@ around for weeks contained two flags that did nothing.
 
 ```bash
 # A — graphics: IRIX desktop, Quake, X11, anything that draws
-cargo build --release --features jitv2,lightning,rex-jit,idle-pause,chd
+cargo build --release --features jitv2,lightning,rex-jit,idle-pause,chd,mips4
 
 # B — headless: NetBSD on serial, network and SCSI bringup, long unattended runs
-cargo build --release --features jitv2,lightning,idle-pause,chd
+cargo build --release --features jitv2,lightning,idle-pause,chd,mips4
 
 # C — debug: packet logs, breakpoints, tracebacks
-cargo build --release --features jitv2,developer,rex-jit,chd
+cargo build --release --features jitv2,developer,rex-jit,chd,mips4
 ```
+
+`mips4` is right for every guest we currently run — IP28 is an R10000 and the
+Indy configs are R5000, all MIPS IV. **Drop it, and only it, when building for
+the R4400 config**; see the section below for why it cannot simply go in
+`default`.
+
+Two omissions worth checking against a build you already have, because both
+are silent:
+
+- **`idle-pause`** is in A and B and the IP28 build had been missing it. The
+  symptom is not a failure, it is the emulator holding ~376% host CPU while
+  the guest sits idle at a login prompt.
+- **`mips4`** costs ~20% of integer throughput when absent (below).
 
 `chd` is in all three on purpose. It is one dependency, and it is the
 difference between an IRIX `.chd` image loading and `fatal: CHD image support
 not compiled in`. Leaving it out of some builds only produces a confusing
 failure later.
+
+## Add `mips4` when the guest CPU is one — which is all of them but the R4400
+
+Measured 2026-09-22 on the IP28 (R10000, IRIX 6.5.7, MIPSpro `-Ofast -mips4`
+binaries), four arms of five reps each, fresh disk clone and fresh boot per
+arm, timed by **host** wall clock for a fixed workload:
+
+| build | Dhrystone 50M, warm | Whetstone 1M |
+|---|---|---|
+| without `mips4` | 41.8 s | 18.5 s |
+| with `mips4`    | **34.3 s** | 19.5 s |
+
+**About 20% on integer code, nothing on this FP code.** The win is MIPS IV's
+integer `MOVZ`/`MOVN` conditional moves, which let MIPSpro emit branch-free
+sequences that jitv2 then compiles instead of bailing to the interpreter.
+Whetstone was already fully covered, hence flat.
+
+Without the flag nothing is *wrong* — the interpreter gates on the runtime
+`C::MIPS4` and absorbs every MIPS IV instruction correctly. It is purely
+compilation coverage, which is why it went unnoticed: the only symptom is
+being slower.
+
+### The flag does not mean what its Cargo.toml comment says
+
+The comment claims it is a "decode gate" that makes an R4400 build "correctly
+raise Reserved Instruction". It does not. **45 of its 47 `cfg` sites are
+inside `src/jitv2/`**; the other two are a feature listing and a stats gate.
+The interpreter gates on the model const instead (`C::MIPS4`, 17 uses in
+`mips_exec.rs`), and **jitv2 consults that const zero times.**
+
+So the two engines gate the ISA on different axes — jitv2 at build time, the
+interpreter at run time — and they can only agree by coincidence:
+
+| model | `MIPS4` const | our configs |
+|---|---|---|
+| `R4400Cache` | `false` | `iris-atomchild-hostx.toml.r4400` |
+| `R5000Cache` | `true`  | `iris-atomchild-hostx.toml`, `iris-657.toml` |
+| `R10000Cache`| `true`  | `ip28irix.toml` |
+
+**Therefore `mips4` must not go in `default`.** One binary serves all three
+configs; a `mips4` binary pointed at the r4400 config would have jitv2 execute
+`MOVZ`/`COP1X` where the interpreter raises Reserved Instruction. Pass it
+explicitly for R5000/R10000 guests, and build without it for the R4400 config.
+
+The real fix is to make jitv2 gate on `C::MIPS4` like the interpreter does,
+after which the flag would only mean "compile the emitters in" and could be on
+everywhere. The plumbing is contained: `lookup_semantics` /
+`lookup_cp1_semantics` are pure `fn(raw: u32)` and would take a `mips4: bool`,
+with three real call sites in `codegen.rs` plus the analyzer's.
 
 ## Two flags we were passing for nothing
 
