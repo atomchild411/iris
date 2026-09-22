@@ -1338,11 +1338,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_cop1x_madd_is_excluded_until_an_emitter_exists() {
-        // OP_COP1X has no emitters at all yet (lookup_cp1_semantics only
-        // matches op == OP_COP1) — sequential_or_excluded correctly reports
-        // Excluded here too, not Sequential.
+    fn classify_cop1x_madd_follows_emitter_coverage() {
+        // OP_COP1X is architecturally sequential — no unresolved control
+        // flow — so classify tracks emitter coverage, which for the whole
+        // MIPS IV COP1X set is gated on the `mips4` feature.
         let instr = r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S);
+        #[cfg(feature = "mips4")]
+        assert_eq!(classify(instr, 5, 0), Classify::Sequential);
+        #[cfg(not(feature = "mips4"))]
+        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+    }
+
+    #[test]
+    fn classify_cop1x_paired_single_stays_excluded() {
+        // MADD.PS and friends have no emitter and no interpreter handler
+        // either — no SGI MIPS IV part implements paired-single — so they
+        // must stay Excluded even in a `mips4` build.
+        let instr = r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_PS);
         assert_eq!(classify(instr, 5, 0), Classify::Excluded);
     }
 

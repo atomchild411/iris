@@ -1349,28 +1349,33 @@ mod tests {
     #[test]
     fn analyzer_admits_unimplemented_instruction_as_a_fallback_entry() {
         let _fb = fallback_on_guard();
-        // PREFX has no emitter (opcode_support::has_emitter) and, unlike most
-        // other gaps closed in this file's history, never will: exec_prefx
-        // checks STATUS_CU1 and raises cpu_unusable when it's clear, a genuine
-        // COP0-adjacent side effect this codebase's hard no on privilege/
-        // COP0-touching instructions excludes from *native* jitv2 codegen
-        // permanently.
+        // MADD.PS has no emitter (opcode_support::has_emitter) and no
+        // interpreter handler either — no MIPS IV part SGI shipped implements
+        // paired-single — so it stays uncompiled in every build, `mips4`
+        // included. That makes it the stable example for this test.
+        //
+        // (This used to use PREFX, which was described as permanently
+        // excluded because exec_prefx raises cpu_unusable when CU1 is clear.
+        // That reasoning was wrong: COP1X is routed through
+        // lookup_cp1_semantics, and codegen emits emit_cp1_cu1_guard before
+        // every emitter from that table, so the CU1 exception is delivered
+        // identically by native code. PREFX now has a — deliberately empty —
+        // emitter under `mips4`.)
         //
         // With interpreter-fallback, "no native emitter" no longer means "not
         // in a region": the analyzer admits an Excluded instruction as a
         // fallback head (is_fallback), and codegen runs it through the real
-        // interpreter (emit_interp_fallback_head), which delivers the
-        // cpu_unusable exception correctly. So a lone PREFX entry is now a
+        // interpreter (emit_interp_fallback_head). So a lone entry here is a
         // one-instruction fallback region, not an empty one. (Pre-fallback this
         // asserted non_empty == false — see git history / the analyzer's own
         // walk_excluded_entry_* tests, updated in the same change.)
-        let instr = make_r(crate::mips_isa::OP_COP1X, 1, 2, 3, 4, crate::mips_isa::FUNCT_PREFX);
+        let instr = make_r(crate::mips_isa::OP_COP1X, 1, 2, 3, 4, crate::mips_isa::FUNCT_MADD_PS);
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = instr;
         let mut analyzer = Analyzer::new();
         let (result, non_empty) = analyzer.walk(&page, 0, 0);
-        assert!(non_empty, "PREFX has no native emitter but is now a compilable fallback region");
-        assert!(result[0].visited && result[0].is_fallback, "PREFX entry must be a fallback head");
+        assert!(non_empty, "MADD.PS has no native emitter but is still a compilable fallback region");
+        assert!(result[0].visited && result[0].is_fallback, "MADD.PS entry must be a fallback head");
     }
 
     fn make_i(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
@@ -5689,6 +5694,129 @@ mod tests {
             }
         }
     }
+
+    /// The multiply-add family, S and D, in both FR modes.
+    ///
+    /// COP1X field layout is not COP1's: fr=rs, ft=rt, fs=rd, fd=sa, and the
+    /// result is fd = ±(fs*ft ± fr).
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn madd_family_matches_interpreter_fr0_and_fr1() {
+        use crate::mips_isa::{OP_COP1X, FUNCT_MADD_S, FUNCT_MADD_D, FUNCT_MSUB_S,
+                              FUNCT_MSUB_D, FUNCT_NMADD_S, FUNCT_NMADD_D,
+                              FUNCT_NMSUB_S, FUNCT_NMSUB_D};
+        // Even registers throughout so the FR=0 pairing rules are satisfied
+        // for the .D forms: fr=2, ft=4, fs=6, fd=8.
+        for fr1 in [false, true] {
+            for (fr_v, ft_v, fs_v) in [
+                (1.25f64, 2.5f64, 3.0f64),
+                (-0.5f64, 4.0f64, 0.25f64),
+                (0.0f64, 0.0f64, 0.0f64),
+                (-0.0f64, 1.0f64, -0.0f64),
+                (f64::INFINITY, 2.0f64, 1.0f64),
+                (1.0f64, f64::INFINITY, 0.0f64),
+                (f64::NAN, 1.0f64, 1.0f64),
+            ] {
+                let mut fpr = [0u64; 32];
+                fpr[2] = fr_v.to_bits();
+                fpr[4] = ft_v.to_bits();
+                fpr[6] = fs_v.to_bits();
+                fpr[8] = 0xDEAD_BEEF_DEAD_BEEF; // pre-existing fd
+                for funct in [FUNCT_MADD_D, FUNCT_MSUB_D, FUNCT_NMADD_D, FUNCT_NMSUB_D] {
+                    let instr = make_r(OP_COP1X, 2, 4, 6, 8, funct);
+                    assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, fr1);
+                }
+
+                let mut fpr_s = [0u64; 32];
+                fpr_s[2] = (fr_v as f32).to_bits() as u64;
+                fpr_s[4] = (ft_v as f32).to_bits() as u64;
+                fpr_s[6] = (fs_v as f32).to_bits() as u64;
+                fpr_s[8] = 0xDEAD_BEEF_DEAD_BEEF;
+                for funct in [FUNCT_MADD_S, FUNCT_MSUB_S, FUNCT_NMADD_S, FUNCT_NMSUB_S] {
+                    let instr = make_r(OP_COP1X, 2, 4, 6, 8, funct);
+                    assert_fpu_matches_interpreter(instr, [0u64; 32], fpr_s, fr1);
+                }
+            }
+        }
+    }
+
+    /// The multiply-add must round ONCE. This case separates a real FMA from
+    /// `fmul` followed by `fadd`, which is the mistake the emitter is most
+    /// likely to make and which no amount of ordinary test values would
+    /// catch.
+    ///
+    /// `0.1f64` is slightly greater than one tenth, so the exact product
+    /// `0.1 * 10.0` is `1.0000000000000000555...`. Rounded to a double that
+    /// is exactly `1.0`, so a two-rounding `mul` then `add -1.0` yields `0.0`.
+    /// A single-rounding FMA keeps the residual and yields `5.551115123125783e-17`.
+    ///
+    /// The interpreter uses `f64::mul_add`, which is fused, so this asserts
+    /// the JIT is fused too — and it fails loudly if anyone "simplifies" the
+    /// emitter into a multiply and an add.
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn madd_d_rounds_once_not_twice() {
+        use crate::mips_isa::{OP_COP1X, FUNCT_MADD_D};
+        let mut fpr = [0u64; 32];
+        fpr[2] = (-1.0f64).to_bits();  // fr
+        fpr[4] = (10.0f64).to_bits();  // ft
+        fpr[6] = (0.1f64).to_bits();   // fs
+        let instr = make_r(OP_COP1X, 2, 4, 6, 8, FUNCT_MADD_D);
+        assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
+
+        // And state plainly what the answer has to be, so a future change to
+        // the interpreter cannot quietly make both sides wrong together.
+        let fused = (0.1f64).mul_add(10.0f64, -1.0f64);
+        assert_ne!(fused, 0.0, "test premise broken: this case no longer distinguishes FMA");
+        assert_eq!(fused, 5.551115123125783e-17);
+        assert_eq!(0.1f64 * 10.0f64 - 1.0f64, 0.0, "test premise broken: two-rounding path changed");
+    }
+
+    /// RECIP/RSQRT, including the operands that drive their flag paths:
+    /// zero (divide-by-zero), negative (Invalid for RSQRT), and sNaN.
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn recip_rsqrt_matches_interpreter_fr0_and_fr1() {
+        use crate::mips_isa::{OP_COP1, RS_S, RS_D, FUNCT_FRECIP, FUNCT_FRSQRT};
+        for fr1 in [false, true] {
+            for v in [4.0f64, 0.25f64, 1.0f64, 0.0f64, -0.0f64, -4.0f64,
+                      f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                let mut fpr = [0u64; 32];
+                fpr[6] = v.to_bits();          // fs = rd
+                fpr[8] = 0x1234_5678_9ABC_DEF0; // pre-existing fd = sa
+                for funct in [FUNCT_FRECIP, FUNCT_FRSQRT] {
+                    let d = make_r(OP_COP1, RS_D, 0, 6, 8, funct);
+                    assert_fpu_matches_interpreter(d, [0u64; 32], fpr, fr1);
+                }
+
+                let mut fpr_s = [0u64; 32];
+                fpr_s[6] = (v as f32).to_bits() as u64;
+                fpr_s[8] = 0x1234_5678_9ABC_DEF0;
+                for funct in [FUNCT_FRECIP, FUNCT_FRSQRT] {
+                    let s = make_r(OP_COP1, RS_S, 0, 6, 8, funct);
+                    assert_fpu_matches_interpreter(s, [0u64; 32], fpr_s, fr1);
+                }
+            }
+        }
+    }
+
+    /// PREFX is a hint: past the CU1 guard it must change nothing at all.
+    /// The emitter is empty, so this is really asserting that "empty" is the
+    /// same as what `exec_prefx` does.
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn prefx_matches_interpreter_and_changes_nothing() {
+        use crate::mips_isa::{OP_COP1X, FUNCT_PREFX};
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_8000_2000;
+        gpr[2] = 0x40;
+        let mut fpr = [0u64; 32];
+        fpr[8] = 0xA5A5_A5A5_A5A5_A5A5;
+        let instr = make_r(OP_COP1X, 1, 2, 3, 8, FUNCT_PREFX);
+        assert_fpu_matches_interpreter(instr, gpr, fpr, true);
+        assert_fpu_matches_interpreter(instr, gpr, fpr, false);
+    }
+
 
     #[test]
     #[cfg(feature = "mips4")]

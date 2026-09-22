@@ -272,7 +272,10 @@ impl InstrKind {
                 self,
                 Movz | Movn | Movci | Pref | Fmovcf_s | Fmovcf_d
                     | Fmovz_s | Fmovn_s | Fmovz_d | Fmovn_d
-                    | Lwxc1 | Ldxc1 | Swxc1 | Sdxc1
+                    | Lwxc1 | Ldxc1 | Swxc1 | Sdxc1 | Prefx
+                    | Madd_s | Madd_d | Msub_s | Msub_d
+                    | Nmadd_s | Nmadd_d | Nmsub_s | Nmsub_d
+                    | Frecip_s | Frecip_d | Frsqrt_s | Frsqrt_d
             )
         {
             return false;
@@ -296,7 +299,11 @@ impl InstrKind {
             | Swl | Swr | Sdl | Sdr
             | Pref
             // CP1 (mirrors has_cp1_emitter's OP_LWC1/LDC1/SWC1/SDC1 + OP_COP1 coverage)
-            | Lwc1 | Ldc1 | Swc1 | Sdc1 | Lwxc1 | Ldxc1 | Swxc1 | Sdxc1
+            | Lwc1 | Ldc1 | Swc1 | Sdc1 | Lwxc1 | Ldxc1 | Swxc1 | Sdxc1 | Prefx
+            // COP1X multiply-add family and MIPS IV RECIP/RSQRT
+            | Madd_s | Madd_d | Msub_s | Msub_d
+            | Nmadd_s | Nmadd_d | Nmsub_s | Nmsub_d
+            | Frecip_s | Frecip_d | Frsqrt_s | Frsqrt_d
             | Fadd_s | Fsub_s | Fmul_s | Fdiv_s | Fsqrt_s
             | Fabs_s | Fneg_s | Fmov_s | Fmovcf_s | Fmovz_s | Fmovn_s
             | Fcvt_d_s | Fcvt_w_s | Fcvt_l_s

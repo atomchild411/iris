@@ -5348,9 +5348,63 @@ fn emit_fpu_arith_flags_snan_only_d(ctx: &mut EmitCtx, fs_bits: Value, ft_bits: 
     ctx.builder.ins().ishl_imm_s(any_snan, FCSR_FV_I64.trailing_zeros() as i64)
 }
 
-/// DIV (S or D — the only JIT caller today; RECIP has no JIT codegen):
-/// Invalid takes priority over divide-by-zero, else Z when the divisor is
-/// zero — mirrors `fpu_arith_flags_div_s/d`.
+/// RSQRT (S or D): the SQRT Invalid rule first (sNaN or a negative non-zero
+/// operand), and only if that is clear, divide-by-zero for a zero operand —
+/// mirrors the inline `flags` block in `exec_frsqrt_s/d`. Note the precedence:
+/// FV wins over FZ, exactly as in DIV.
+#[cfg(feature = "mips4")]
+fn emit_fpu_arith_flags_rsqrt_s(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
+    let sqrt_flags = emit_fpu_arith_flags_sqrt_s(ctx, fs_bits);
+    let fs_zero = {
+        let masked = ctx.builder.ins().band_imm_s(fs_bits, 0x7FFF_FFFFu32 as i64);
+        ctx.builder.ins().icmp_imm_s(IntCC::Equal, masked, 0)
+    };
+    let z_flag = ctx.builder.ins().uextend(ir::types::I32, fs_zero);
+    let z_flag = ctx.builder.ins().ishl_imm_s(z_flag, FCSR_FZ_I64.trailing_zeros() as i64);
+    let sqrt_is_zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, sqrt_flags, 0);
+    ctx.builder.ins().select(sqrt_is_zero, z_flag, sqrt_flags)
+}
+#[cfg(feature = "mips4")]
+fn emit_fpu_arith_flags_rsqrt_d(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
+    let sqrt_flags = emit_fpu_arith_flags_sqrt_d(ctx, fs_bits);
+    let fs_zero = {
+        let masked = ctx.builder.ins().band_imm_s(fs_bits, 0x7FFF_FFFF_FFFF_FFFFu64 as i64);
+        ctx.builder.ins().icmp_imm_s(IntCC::Equal, masked, 0)
+    };
+    let z_flag = ctx.builder.ins().uextend(ir::types::I32, fs_zero);
+    let z_flag = ctx.builder.ins().ishl_imm_s(z_flag, FCSR_FZ_I64.trailing_zeros() as i64);
+    let sqrt_is_zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, sqrt_flags, 0);
+    ctx.builder.ins().select(sqrt_is_zero, z_flag, sqrt_flags)
+}
+
+/// MADD/MSUB/NMADD/NMSUB (S or D): Invalid if *any of the three* sources is
+/// a signalling NaN, else 0 — mirrors `fpu_arith_flags_snan_only3_s/d`.
+/// Separate from the two-operand form above because the multiply-add family
+/// reads `fr` as well as `fs`/`ft`.
+#[cfg(feature = "mips4")]
+fn emit_fpu_arith_flags_snan_only3_s(ctx: &mut EmitCtx, fr_bits: Value, ft_bits: Value, fs_bits: Value) -> Value {
+    let fr_snan = emit_is_snan_s(ctx, fr_bits);
+    let ft_snan = emit_is_snan_s(ctx, ft_bits);
+    let fs_snan = emit_is_snan_s(ctx, fs_bits);
+    let any_snan = ctx.builder.ins().bor(fr_snan, ft_snan);
+    let any_snan = ctx.builder.ins().bor(any_snan, fs_snan);
+    let any_snan = ctx.builder.ins().uextend(ir::types::I32, any_snan);
+    ctx.builder.ins().ishl_imm_s(any_snan, FCSR_FV_I64.trailing_zeros() as i64)
+}
+#[cfg(feature = "mips4")]
+fn emit_fpu_arith_flags_snan_only3_d(ctx: &mut EmitCtx, fr_bits: Value, ft_bits: Value, fs_bits: Value) -> Value {
+    let fr_snan = emit_is_snan_d(ctx, fr_bits);
+    let ft_snan = emit_is_snan_d(ctx, ft_bits);
+    let fs_snan = emit_is_snan_d(ctx, fs_bits);
+    let any_snan = ctx.builder.ins().bor(fr_snan, ft_snan);
+    let any_snan = ctx.builder.ins().bor(any_snan, fs_snan);
+    let any_snan = ctx.builder.ins().uextend(ir::types::I32, any_snan);
+    ctx.builder.ins().ishl_imm_s(any_snan, FCSR_FV_I64.trailing_zeros() as i64)
+}
+
+/// DIV (S or D), and RECIP/RSQRT, which pass a constant `1.0` as the
+/// dividend — mirrors `fpu_arith_flags_div_s/d`. Invalid takes priority over
+/// divide-by-zero, else Z when the divisor is zero.
 fn emit_fpu_arith_flags_div_s(ctx: &mut EmitCtx, fs_bits: Value, ft_bits: Value) -> Value {
     let snan = emit_fpu_arith_flags_snan_only_s(ctx, fs_bits, ft_bits);
     let ft_zero = {
@@ -8199,6 +8253,18 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
                 FUNCT_LDXC1 => Some(emit_ldxc1),
                 FUNCT_SWXC1 => Some(emit_swxc1),
                 FUNCT_SDXC1 => Some(emit_sdxc1),
+                FUNCT_PREFX => Some(emit_prefx),
+                FUNCT_MADD_S => Some(emit_madd_s),
+                FUNCT_MADD_D => Some(emit_madd_d),
+                FUNCT_MSUB_S => Some(emit_msub_s),
+                FUNCT_MSUB_D => Some(emit_msub_d),
+                FUNCT_NMADD_S => Some(emit_nmadd_s),
+                FUNCT_NMADD_D => Some(emit_nmadd_d),
+                FUNCT_NMSUB_S => Some(emit_nmsub_s),
+                FUNCT_NMSUB_D => Some(emit_nmsub_d),
+                // The *_PS (paired-single) forms are deliberately absent:
+                // the interpreter has no handlers for them either, and no
+                // MIPS IV part SGI shipped implements paired-single.
                 _ => None,
             };
         }
@@ -8216,6 +8282,14 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FMUL => Some(emit_fmul_s),
             FUNCT_FDIV => Some(emit_fdiv_s),
             FUNCT_FSQRT => Some(emit_fsqrt_s),
+            #[cfg(feature = "mips4")]
+            FUNCT_FRECIP => Some(emit_frecip_s),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FRECIP => None,
+            #[cfg(feature = "mips4")]
+            FUNCT_FRSQRT => Some(emit_frsqrt_s),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FRSQRT => None,
             FUNCT_FABS => Some(emit_fabs_s),
             FUNCT_FNEG => Some(emit_fneg_s),
             FUNCT_FMOV => Some(emit_fmov_s),
@@ -8252,6 +8326,14 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FMUL => Some(emit_fmul_d),
             FUNCT_FDIV => Some(emit_fdiv_d),
             FUNCT_FSQRT => Some(emit_fsqrt_d),
+            #[cfg(feature = "mips4")]
+            FUNCT_FRECIP => Some(emit_frecip_d),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FRECIP => None,
+            #[cfg(feature = "mips4")]
+            FUNCT_FRSQRT => Some(emit_frsqrt_d),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FRSQRT => None,
             FUNCT_FABS => Some(emit_fabs_d),
             FUNCT_FNEG => Some(emit_fneg_d),
             FUNCT_FMOV => Some(emit_fmov_d),
@@ -9540,6 +9622,192 @@ fn emit_sdxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
 
     emit_mem_write(ctx, vaddr, value_64, MemSize::B8);
 }
+
+/// MADD/MSUB/NMADD/NMSUB.S/D — COP1X multiply-add, `fd = ±(fs*ft ± fr)`.
+///
+/// Three things here are deliberately *unlike* `emit_fbinop_s/d`, because
+/// they are unlike the interpreter's `exec_madd_*` too, and lockstep compares
+/// against the interpreter rather than against the other emitters:
+///
+/// - **No `emit_check_denorm_operand`.** The binop handlers call
+///   `fpu_check_denorm_operand_*` on each operand and can trap before
+///   computing; `exec_madd_d` does not.
+/// - **No flush-to-zero on a denormal result.** The binops route through
+///   `fpu_update_fcsr_full` with a `Some(is_negative)` denorm argument;
+///   `exec_madd_d` uses plain `fpu_update_fcsr`, i.e. `denorm = None`, so the
+///   result is written as computed.
+/// - **Invalid is computed over all three sources**, not two.
+///
+/// (Whether the interpreter *should* do the denormal handling for this family
+/// as it does for ADD/SUB/MUL is a real question, but it is a question about
+/// the interpreter. Diverging here would only break lockstep while leaving
+/// the behaviour just as wrong.)
+///
+/// The multiply-add must be a genuine FMA: the interpreter is
+/// `fs.mul_add(ft, fr)`, which rounds once, and Cranelift's `fma` is
+/// specified the same way ("computes `a := xy+z` without any intermediate
+/// rounding of the product"). Emitting `fmul` then `fadd` would round twice
+/// and differ in the last bit on a large fraction of real inputs.
+///
+/// **Host-portable by construction — do not `cfg` this to one target.**
+/// Cranelift is the portability layer: `fma` lowers to `FMADD` on aarch64
+/// (and `fma(x, y, fneg(z))` straight to `FNMSUB`), to FMA3 instructions on
+/// an x86-64 with `use_fma`, and to a `LibCall.FmaF32/F64` on one without.
+/// Every one of those rounds exactly once, so a guest gets bit-identical
+/// results whichever host it runs on — which is what lockstep, and any
+/// snapshot taken on one machine and resumed on another, depend on. The only
+/// difference is speed: a pre-Haswell x86-64 pays a function call per
+/// multiply-add.
+///
+/// Register fields are the COP1X layout, which is not the COP1 one:
+/// `fr = rs`, `ft = rt`, `fs = rd`, `fd = sa`.
+#[cfg(feature = "mips4")]
+fn emit_fternop_s(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_result: bool) {
+    let raw = ctx.raw;
+    let fr = field_rs(raw);
+    let ft = field_rt(raw);
+    let fs = field_rd(raw);
+    let fd = field_sa(raw);
+
+    let fr_bits = emit_read_fpr_w(ctx, fr, fr_mode);
+    let ft_bits = emit_read_fpr_w(ctx, ft, fr_mode);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let flags = emit_fpu_arith_flags_snan_only3_s(ctx, fr_bits, ft_bits, fs_bits);
+
+    let fr_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fr_bits);
+    let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+
+    let addend = if negate_fr { ctx.builder.ins().fneg(fr_val) } else { fr_val };
+    let product = ctx.builder.ins().fma(fs_val, ft_val, addend);
+    let result = if negate_result { ctx.builder.ins().fneg(product) } else { product };
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+}
+
+#[cfg(feature = "mips4")]
+fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_result: bool) {
+    let raw = ctx.raw;
+    let fr = field_rs(raw);
+    let ft = field_rt(raw);
+    let fs = field_rd(raw);
+    let fd = field_sa(raw);
+
+    let fr_bits = emit_read_fpr_l(ctx, fr, fr_mode);
+    let ft_bits = emit_read_fpr_l(ctx, ft, fr_mode);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let flags = emit_fpu_arith_flags_snan_only3_d(ctx, fr_bits, ft_bits, fs_bits);
+
+    let fr_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fr_bits);
+    let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+
+    let addend = if negate_fr { ctx.builder.ins().fneg(fr_val) } else { fr_val };
+    let product = ctx.builder.ins().fma(fs_val, ft_val, addend);
+    let result = if negate_result { ctx.builder.ins().fneg(product) } else { product };
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+}
+
+// fd = fs*ft + fr
+#[cfg(feature = "mips4")]
+fn emit_madd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, false, false); }
+#[cfg(feature = "mips4")]
+fn emit_madd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, false, false); }
+// fd = fs*ft - fr
+#[cfg(feature = "mips4")]
+fn emit_msub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, true, false); }
+#[cfg(feature = "mips4")]
+fn emit_msub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, true, false); }
+// fd = -(fs*ft + fr)
+#[cfg(feature = "mips4")]
+fn emit_nmadd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, false, true); }
+#[cfg(feature = "mips4")]
+fn emit_nmadd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, false, true); }
+// fd = -(fs*ft - fr)
+#[cfg(feature = "mips4")]
+fn emit_nmsub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, true, true); }
+#[cfg(feature = "mips4")]
+fn emit_nmsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, true, true); }
+
+/// RECIP.S/D and RSQRT.S/D fd, fs — MIPS IV, `1/fs` and `1/sqrt(fs)`.
+///
+/// Mirrors `exec_frecip_*`/`exec_frsqrt_*`: the flags come from the DIV rule
+/// with a constant `1.0` as the dividend (so a zero operand raises
+/// divide-by-zero), and the FCSR tail is plain `fpu_update_fcsr` — no denorm
+/// operand check and no flush-to-zero, same as the multiply-add family above
+/// and unlike `emit_fbinop_*`.
+///
+/// Computed as a real divide (and `1/sqrt` as divide-of-sqrt) rather than any
+/// reciprocal-estimate instruction: the interpreter computes `1.0 / fs` at
+/// full precision, and MIPS IV permits RECIP to be less accurate than divide
+/// but does not require it. Matching the interpreter is what lockstep needs.
+#[cfg(feature = "mips4")]
+fn emit_frecip_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let one = ctx.builder.ins().f32const(1.0);
+    let one_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), one);
+    let flags = emit_fpu_arith_flags_div_s(ctx, one_bits, fs_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().fdiv(one, fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+}
+#[cfg(feature = "mips4")]
+fn emit_frecip_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let one = ctx.builder.ins().f64const(1.0);
+    let one_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), one);
+    let flags = emit_fpu_arith_flags_div_d(ctx, one_bits, fs_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().fdiv(one, fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+}
+#[cfg(feature = "mips4")]
+fn emit_frsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let one = ctx.builder.ins().f32const(1.0);
+    let flags = emit_fpu_arith_flags_rsqrt_s(ctx, fs_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let root = ctx.builder.ins().sqrt(fs_val);
+    let result = ctx.builder.ins().fdiv(one, root);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+}
+#[cfg(feature = "mips4")]
+fn emit_frsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let one = ctx.builder.ins().f64const(1.0);
+    let flags = emit_fpu_arith_flags_rsqrt_d(ctx, fs_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let root = ctx.builder.ins().sqrt(fs_val);
+    let result = ctx.builder.ins().fdiv(one, root);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+}
+
+/// PREFX — indexed prefetch. A prefetch is architecturally a hint with no
+/// effect on program state, and `exec_prefx` does nothing beyond the CU1
+/// check that every CP1-table entry already gets from
+/// `emit_cp1_cu1_guard`. So the emitter is empty *on purpose*: the point is
+/// that the instruction stops being a fallback and no longer interrupts the
+/// compiled run, not that it does any work.
+///
+/// Note it does NOT compute or validate the address: an unmapped prefetch
+/// address must not fault, so there is deliberately no `emit_mem_read` here.
+#[cfg(feature = "mips4")]
+fn emit_prefx(_ctx: &mut EmitCtx, _fr_mode: FrMode) {}
 
 /// MOVZ rd, rs, rt: rd = rs if rt == 0 (no-op otherwise). Mirrors
 /// `MipsExecutor::exec_movz` exactly, including that `rd` isn't touched at
