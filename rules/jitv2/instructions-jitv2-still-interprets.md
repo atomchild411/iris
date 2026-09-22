@@ -54,9 +54,33 @@ FP program calls:
 | `msub.d` / `madd.s` / `msub.s` / `nmsub.s` / `nmadd.d` | 180 |
 | `recip.d` / `recip.s` | 17 |
 
+## DONE 2026-09-22: the multiply-add family, RECIP/RSQRT and PREFX
+
+Thirteen emitters landed. Measured on IP28, 5 reps, fresh clone and boot,
+host wall clock:
+
+| | Dhrystone 50M | Whetstone 1M |
+|---|---|---|
+| mips4, before | 33 s | 19 s |
+| mips4, after | 33 s | **6-7 s** |
+
+**About 3x on FP code.** Dhrystone is unchanged to the second, exactly as the
+site counts predicted — it contains no MADD at all. Coverage went
+`fpu 64 -> 77`, `loadstore 28 -> 29`.
+
+Correctness was checked on the real workload, not just in unit tests: build
+Whetstone with `-DPRINTOUT` so it prints its computed values, run it, then
+`cpu stop` / `j2 fpu off` / `j2 flush` / `cpu start` to force the whole FPU
+category back to the interpreter and run the identical binary again. **Every
+computed value across all twelve modules was identical.** That technique is
+worth reusing for any future emitter: it compares JIT against interpreter on
+real code in a single boot, no harness required.
+
+What remains below is `Bc1` plus the privileged/atomic set.
+
 ## Ranked, with the work each needs
 
-1. **MADD/MSUB/NMADD/NMSUB — 8 emitters. Do this one.**
+1. ~~**MADD/MSUB/NMADD/NMSUB — 8 emitters. Do this one.**~~ **Done — see above.**
    ~3300 sites in libm alone. Pure arithmetic with no memory or addressing
    complexity; the existing `fadd`/`fmul` emitters are the template.
 
