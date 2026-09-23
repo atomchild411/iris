@@ -180,5 +180,8 @@ fn main() {
 /// The list itself lives in the library — see `iris::build_features::enabled`.
 fn print_build_features() {
     eprintln!("iris: build features: {}", iris::build_features::banner());
+    // Validate and announce IRIS_BREAK here, not on first use — see the
+    // module docs for why a lazily-validated fault injector is a trap.
+    iris::faultinject::init();
 }
 

@@ -61,6 +61,10 @@ struct Shadow {
     /// — see `MRU_BIT`. Hardware state rather than tag storage, which is why
     /// it is kept here and re-applied on read instead of living in `tags`.
     mru: Box<[bool]>,
+    /// Which *way* of each set was last marked, as the model recorded it
+    /// before the bit was understood to belong to the set. Only the
+    /// `mru-per-way` fault reads this; see `crate::faultinject`.
+    mru_way: Box<[u8]>,
 }
 
 impl Shadow {
@@ -70,6 +74,7 @@ impl Shadow {
             data: vec![0u64; data_words].into_boxed_slice(),
             ecc: vec![0u32; data_words].into_boxed_slice(),
             mru: vec![false; (lines.max(1) / WAYS).max(1)].into_boxed_slice(),
+            mru_way: vec![MRU_NO_WAY; (lines.max(1) / WAYS).max(1)].into_boxed_slice(),
         }
     }
 }
@@ -84,6 +89,15 @@ impl Shadow {
 /// there. Storing "which way is MRU" and reporting it only on that way passes
 /// nothing, because the way that is read is never the way that was written.
 const MRU_BIT: u64 = 1 << 63;
+
+/// Where the `mru-read-at-taghi0` fault reports the bit instead: TagHi[0].
+/// The position was believed to differ between write and read for three
+/// hypotheses' worth of work; the model that passes uses one position for
+/// both, and this exists to show what the other choice costs.
+const MRU_BIT_TAGHI0: u64 = 1 << 32;
+
+/// No way of this set has been marked yet, for the `mru-per-way` fault.
+const MRU_NO_WAY: u8 = 0xFF;
 
 /// Ways per set, as CACHE index operations address them. Bit 0 of the index
 /// selects the way on an R10000; the set starts above the line offset.
@@ -373,6 +387,9 @@ impl<
                     // here destroyed real tag bits.
                     let set = (idx / WAYS).min(s.mru.len() - 1);
                     s.mru[set] = phys_addr & MRU_BIT != 0;
+                    if phys_addr & MRU_BIT != 0 {
+                        s.mru_way[set] = (idx % WAYS) as u8;
+                    }
                     s.tags[idx] = phys_addr & mask & !MRU_BIT;
                 }
                 0
@@ -382,8 +399,22 @@ impl<
                 let s = self.shadow(sel);
                 let set = (idx / WAYS).min(s.mru.len() - 1);
                 let mut v = if idx < s.tags.len() { s.tags[idx] } else { 0 };
-                if s.mru[set] {
-                    v |= MRU_BIT;
+                // The bit belongs to the set: whichever way is read reports
+                // it. `mru-per-way` reports it only on the way that was
+                // marked, which is the model this one replaced.
+                let marked = if crate::faultinject::broken("mru-per-way") {
+                    s.mru[set] && s.mru_way[set] == (idx % WAYS) as u8
+                } else {
+                    s.mru[set]
+                };
+                if marked {
+                    v |= if crate::faultinject::broken("mru-read-at-taghi0") {
+                        MRU_BIT_TAGHI0
+                    } else if crate::faultinject::broken("mru-read-at-both") {
+                        MRU_BIT | MRU_BIT_TAGHI0
+                    } else {
+                        MRU_BIT
+                    };
                 }
                 if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
                     eprintln!("shadow:   -> ILT va={virt_addr:#012x} idx={idx} set={set} mru={} tag={:#018x}",
@@ -403,7 +434,16 @@ impl<
                 if s.data.is_empty() {
                     0
                 } else {
-                    unsafe { *self.ecc_out.get() = s.ecc[slot] };
+                    // `l2-ecc-not-stored`: the check bits are a computed
+                    // value that nothing keeps, which is what the model did
+                    // before Index_Store_Data was seen to carry them.
+                    unsafe {
+                        *self.ecc_out.get() = if crate::faultinject::broken("l2-ecc-not-stored") {
+                            0
+                        } else {
+                            s.ecc[slot]
+                        }
+                    };
                     if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
                         eprintln!("shadow:   -> ILD slot={slot} data={:#018x} ecc={:#x}", s.data[slot], s.ecc[slot]);
                     }

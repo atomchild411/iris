@@ -4,20 +4,22 @@ Running account, in the style of `ip32-o2-bringup.md`. IP28 is "Pacecar" — an
 Indigo2 chassis with an R10000 CPU module, the last machine IRIX 6.5.22
 supports, and the reason to want it is IRIX64 and a 1 GB memory ceiling.
 
-**Status: the real PROM reaches the secondary cache diagnostic.** Memory sizing
-passes. The cache test does not.
+**Status: the whole of POST passes and IRIX 6.5.7 boots.** Memory sizing, the
+secondary cache diagnostic and the rest of power-on all pass. The section
+below is kept because the cache diagnostic was the hard part and what it
+wanted is worth knowing; what finally satisfied it is at the end of it.
 
 ## Running it
 
 ```
-IRIS_IP28=1 ./target/release/iris --config ip28.toml
+./target/release/iris --config ip28irix.toml
 ```
 
-`IRIS_IP28` is a temporary gate, not a machine profile. Everything IP28 needs
-so far is a *decode* difference inside devices IP22 already has, and the
-default of every gate reproduces IP22/IP24 exactly. A `MachineProfile::
-Indigo2Ip28` replaces it once the shape of the machine is known; inventing the
-profile first would have meant guessing which differences exist.
+The machine is `[machine] profile = "indigo2_ip28"` now. It began as an
+`IRIS_IP28=1` environment gate — everything IP28 needed at first was a
+*decode* difference inside devices IP22 already had — and became a real
+profile once the shape of the machine was known. Inventing the profile first
+would have meant guessing which differences exist.
 
 `IRIS_IP28_CACHEOPS=1` logs the first occurrence of each distinct CACHE
 operation the guest issues. That is what identified the op encodings below.
@@ -82,7 +84,7 @@ Bit 0 of the index selects the way on real silicon. This model is
 direct-mapped, and bit 0 falls below the u64 slot index, so it drops out with
 no special case.
 
-## Where it stops
+## Where it stopped, and what the diagnostic actually wanted
 
 ```
 Secondary Cache Failure: Address: 0xa800000020000000 MRU bit set
@@ -134,13 +136,40 @@ The CP0 trace shows what it does read: after *every* tag read it also reads
 `$26` (ECC), and `$26` is always zero here because nothing sets it. That is the
 only register in the sequence whose value matches the reported `Actual`.
 
-**Resume here**: find where the MRU state is actually read from before
-modelling it further. The ECC register is the obvious candidate — trace what a
-real sequence expects in `$26` — and note that CP0 26 is `u32` in this
-emulator, so if an R10000 reports anything above bit 31 there it needs the same
-widening TagLo just got. Do not add more MRU behaviour to `Index_Load_Tag`
-until the read path is known; three hypotheses have now been spent on the
-assumption that it goes through the tag.
+### Resolved
+
+Three things were wrong, all of them in how the secondary cache reports state
+that is *not* tag storage:
+
+- **The MRU bit is one bit per set, shared between the ways.** Written through
+  either way it marks the set, and reading the tag of either way reports it.
+  The model above recorded which way had been marked and reported it only on
+  that way, which satisfies nothing — the way the diagnostic reads is never
+  the way it wrote.
+- **The check bits ride with the data.** `Index_Store_Data` takes them from
+  CP0 `ECC` and `Index_Load_Data` returns them there, so they are storage,
+  not a computed value.
+- **The MC must report revision 5 or better**, which the PROM reads out of
+  SYSID.
+
+Two claims made above are **wrong**, and are left in place because the wrong
+turn is the instructive part:
+
+- "the PROM sets TagHi[31] and reads back at TagHi[0] — different bits". It
+  reads it back at TagHi[31], where it wrote it. Reporting it at TagHi[0]
+  instead fails; reporting it at *both* passes, so bit 32 is simply a
+  don't-care.
+- "`Actual: 0x0` cannot be the result of any tag read this model services".
+  True, and the reason is that it was never a tag read: the PROM prints both
+  this test's and the ECC test's expectation in a 10-bit field at bits 41:32
+  of the printed word. That is also where the `Expected: 0x0000000100000000`
+  that suggested TagHi[0] comes from.
+
+All three contracts were re-confirmed 2026-09-23 by switching each one off
+and watching the PROM reject the result — see
+[`../rules/irix/ip28-secondary-cache-contracts.md`](../rules/irix/ip28-secondary-cache-contracts.md),
+which also has the full MRU protocol as traced and the measurement of the
+check-bit field (ten bits per 64-bit word).
 
 ### Skipping the diagnostic does not work either
 
@@ -190,8 +219,10 @@ from shape. It used to be inferred from `IC_WAYS == 2`, which held only while
 
 ## Open questions
 
-- `Index_Store_Data` semantics. Still unverified: nothing has yet confirmed
-  what state it should leave a line in.
+- `Index_Store_Data` semantics. Partly answered: it carries ten check bits
+  from CP0 `ECC` alongside the data, and the PROM walks a bit through them
+  (confirmed 2026-09-23). What state it should leave the *line* in is still
+  unverified.
 - The CP0 `Config` `SS` (secondary size) encoding. The layout is from NetBSD's
   `MIPS4_CONFIG_*`; the other fields are `4096 << field`, but `SS` is not
   decoded anywhere to hand, so its base is unknown. `IRIS_IP28_SS` overrides it

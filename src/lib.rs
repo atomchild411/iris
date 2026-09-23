@@ -172,6 +172,7 @@ pub mod mips_dis;
 pub mod mips_core;
 pub mod mips_tlb;
 pub mod mips_cache_v2;
+pub mod faultinject;
 pub mod mips_cache_shadow;
 pub mod arcs;
 pub mod arcs_trace;
