@@ -3113,6 +3113,24 @@ mod bringup {
     /// next gate findable — but the milestone itself is now checked.
     #[test]
     fn trace_the_prom_from_reset() {
+        // `MipsExecutor` and `MipsTlb` carry their arrays inline, and in a
+        // debug build the construction temporaries overflow a test thread's
+        // default stack — the whole binary aborts with SIGABRT, taking every
+        // other test with it. `main.rs` solves the same problem the same way
+        // for `Machine::new`.
+        //
+        // It went unnoticed because every test run in this project passes
+        // `--release`, where the temporaries collapse. `cargo test` on its
+        // own is what someone reviewing a patch would run.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(trace_the_prom_from_reset_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn trace_the_prom_from_reset_inner() {
         let Some(prom) = prom_image() else { return };
 
         let sections = parse_prom_sections(&prom);

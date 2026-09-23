@@ -462,13 +462,28 @@ fn tlb_size_follows_the_cpu_model() {
 
 /// An index past the live count is dropped; one inside it is kept.
 #[test]
-fn tlb_write_respects_the_live_entry_count() {
+fn tlb_write_past_the_live_entry_count_is_dropped() {
     let mut entry = TlbEntry::new();
     entry.entry_hi = 0xC000_0000_0004_0000;
 
     let mut r4400 = MipsTlb::new(48);
     r4400.write(48, entry);
     assert_eq!(r4400.read(48).entry_hi, 0, "48-entry TLB must drop index 48");
+}
+
+/// The other half of the pair, deliberately in its own `#[test]`.
+///
+/// `MipsTlb` carries its arrays inline and is large enough that **two** of
+/// them alive at once overflows a test thread's stack in a debug build — the
+/// single test these two replace aborted the whole binary with SIGABRT. It
+/// went unnoticed because every test run in this project passes `--release`,
+/// where the temporaries collapse; `cargo test` on its own is what an
+/// upstream reviewer would run. One TLB per test, as every neighbouring test
+/// already does.
+#[test]
+fn tlb_write_inside_a_larger_entry_count_is_kept() {
+    let mut entry = TlbEntry::new();
+    entry.entry_hi = 0xC000_0000_0004_0000;
 
     let mut r10000 = MipsTlb::new(64);
     r10000.write(48, entry);
