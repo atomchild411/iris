@@ -24,6 +24,8 @@ pub const MIPS_LOG_INSN: u32 = 0x0001; // per-instruction disassembly trace
 pub const MIPS_LOG_TLB:  u32 = 0x0002; // TLB read/write/probe
 pub const MIPS_LOG_MEM:  u32 = 0x0004; // uncached memory accesses
 pub const MIPS_LOG_FPU:  u32 = 0x0008; // FP compare/condmove/convert operand+result trace
+pub const MIPS_LOG_CP0:  u32 = 0x0010; // CP0 register traffic: EPC/EntryHi/XContext writes,
+                                       // ECC and CacheErr accesses, Status.DE transitions
 
 /// Opt-in gate for the `developerx` Coprocessor-Unusable break (see the three
 /// `handle_exception*` wrappers). Off unless `IRIS_BREAK_CPU=1`.
@@ -41,6 +43,17 @@ fn cpu_unusable_break_enabled() -> bool {
 #[cfg(feature = "developer")]
 #[inline(always)]
 fn mips_log(bit: u32) -> bool {
+    devlog_is_active(LogModule::Mips) && (devlog_mask(LogModule::Mips) & bit) != 0
+}
+
+/// Like `mips_log`, but live in every build.
+///
+/// The IP28 bring-up traces this gates were plain environment variables that
+/// worked in release, and the machines they diagnose are booted in release —
+/// so they keep that reach. The cost is two relaxed atomic loads, against the
+/// `getenv` per call some of them used to do.
+#[inline(always)]
+fn mips_log_always(bit: u32) -> bool {
     devlog_is_active(LogModule::Mips) && (devlog_mask(LogModule::Mips) & bit) != 0
 }
 
@@ -6958,7 +6971,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if C::R10K_CACHE_OPS {
             self.cache.set_cache_ecc(self.core.cp0_ecc);
         }
-        // IP28 cache-error investigation (`IRIS_IP28_CACHEDIAG=1`). Two kinds
+        // IP28 cache-error investigation (`log mips mask cp0`). Two kinds
         // of op are worth seeing: one carrying non-zero check bits, which is a
         // guest staging a parity error on purpose, and any op from outside the
         // PROM — i.e. from a loaded diagnostic, which runs out of XKPHYS.
@@ -6984,15 +6997,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     std::sync::atomic::AtomicU32::new(0);
                 let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n < CACHE_TRACE_CAP {
-                    eprintln!(
+                    crate::dlog!(LogModule::Mips,
                         "ip28cd: CACHE op={:#04x} sel={} vaddr={:#018x} ECC={:#010x} \
                          TagHi:Lo={:#010x}:{:#018x} pc={:#018x}",
                         op, sel, virt_addr, self.core.cp0_ecc,
-                        self.core.cp0_taghi, self.core.cp0_taglo, self.core.pc,
-                    );
+                        self.core.cp0_taghi, self.core.cp0_taglo, self.core.pc);
                 } else if n == CACHE_TRACE_CAP {
-                    eprintln!("ip28cd: CACHE trace capped at {CACHE_TRACE_CAP} ops \
-                               — output past this point is incomplete");
+                    crate::dlog!(LogModule::Mips,
+                        "ip28cd: CACHE trace capped at {CACHE_TRACE_CAP} ops \
+                         — output past this point is incomplete");
                 }
             }
         }
@@ -7316,14 +7329,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // DMTC0 - Doubleword Move To CP0 (MIPS III)
     /// IP28 bring-up: watch the cache-tag CP0 registers (26 ECC, 28 TagLo,
-    /// 29 TagHi). Only the R10000 model compiles this in.
+    /// 29 TagHi) under `log mips mask cp0`. Only the R10000 model compiles
+    /// this in.
+    ///
+    /// The env-var form this replaced did an uncached `getenv` on every
+    /// DMTC0/MTC0, armed or not.
     #[inline(always)]
     fn ip28_cp0_trace(&self, what: &str, reg: u32, val: u64) {
-        if C::R10K_CACHE_OPS
-            && matches!(reg, 26 | 28 | 29)
-            && std::env::var_os("IRIS_IP28_CP0").is_some()
-        {
-            eprintln!("ip28cp0: {what} ${reg} = {val:#018x}");
+        if C::R10K_CACHE_OPS && matches!(reg, 26 | 28 | 29) && mips_log_always(MIPS_LOG_CP0) {
+            crate::dlog!(LogModule::Mips, "ip28cp0: {what} ${reg} = {val:#018x}");
         }
     }
 
@@ -7495,26 +7509,29 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // TLBWI - Write Indexed TLB Entry
     // Writes CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask to the TLB entry indexed by CP0.Index
-    /// IP28 bring-up: report every TLB write. `IRIS_IP28_TLBW=1` reports all
-    /// of them; `IRIS_IP28_TLBW=wired` reports only writes below CP0 Wired,
-    /// which is what a kernel uses for mappings that must never be evicted.
+    /// Report every TLB write, under `log mips mask tlb`.
+    ///
+    /// `IRIS_IP28_TLBW=wired` additionally narrows it to writes below CP0
+    /// Wired — the mappings a kernel means never to be evicted. That stays an
+    /// environment variable because it selects a *subset*, which the module
+    /// mask has no way to express; the on/off is devlog's.
     #[inline]
     fn ip28_trace_tlb_write(&self, op: &str, index: usize, entry: &crate::mips_tlb::TlbEntry) {
-        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let mode = *MODE.get_or_init(|| match std::env::var("IRIS_IP28_TLBW").as_deref() {
-            Ok("wired") => 2,
-            Ok(v) if !v.is_empty() && v != "0" => 1,
-            _ => 0,
-        });
-        if mode == 0 || (mode == 2 && index >= self.core.cp0_wired as usize) {
+        if !mips_log_always(MIPS_LOG_TLB) {
             return;
         }
-        eprintln!(
+        static WIRED_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let wired_only = *WIRED_ONLY.get_or_init(|| {
+            matches!(std::env::var("IRIS_IP28_TLBW").as_deref(), Ok("wired"))
+        });
+        if wired_only && index >= self.core.cp0_wired as usize {
+            return;
+        }
+        crate::dlog!(LogModule::Mips,
             "ip28tlbw: {op} idx={index:<2} wired={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} \
              mask={:#x} pc={:#018x}",
             self.core.cp0_wired, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1],
-            entry.page_mask, self.core.pc,
-        );
+            entry.page_mask, self.core.pc);
     }
 
     fn exec_tlbwi(&mut self) -> ExecStatus {
@@ -7736,16 +7753,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // *guarantees* the next access misses and therefore calls `translate_fn`.
         self.resync_privilege_state();
 
-        // IP28 bring-up: see `IRIS_IP28_EPC`. If the target's top half is
-        // already gone by the time we get here, the guest wrote a truncated
-        // EPC; if it is intact and the next fetch is truncated anyway, the
-        // loss is downstream of this.
-        static ERET_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if C::R10K_CACHE_OPS && *ERET_ON.get_or_init(|| std::env::var_os("IRIS_IP28_EPC").is_some()) {
-            eprintln!(
+        // `log mips mask cp0`. If the target's top half is already gone by
+        // the time we get here, the guest wrote a truncated EPC; if it is
+        // intact and the next fetch is truncated anyway, the loss is
+        // downstream of this.
+        if C::R10K_CACHE_OPS && mips_log_always(MIPS_LOG_CP0) {
+            crate::dlog!(LogModule::Mips,
                 "ip28epc: eret -> {target:#018x} (epc={:#018x} errorepc={:#018x} status={:#010x})",
-                self.core.cp0_epc, self.core.cp0_errorepc, self.core.cp0_status,
-            );
+                self.core.cp0_epc, self.core.cp0_errorepc, self.core.cp0_status);
         }
 
         // ERET jumps immediately without delay slot

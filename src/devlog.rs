@@ -151,7 +151,8 @@ impl LogModule {
                 if mask & 0x0002 != 0 { parts.push("tlb"); }
                 if mask & 0x0004 != 0 { parts.push("mem"); }
                 if mask & 0x0008 != 0 { parts.push("fpu"); }
-                let rest = mask & !0x000F;
+                if mask & 0x0010 != 0 { parts.push("cp0"); }
+                let rest = mask & !0x001F;
                 let mut s = parts.join("+");
                 if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
                 if s.is_empty() { format!("{:#010x}", mask) } else { s }
@@ -188,6 +189,7 @@ impl LogModule {
                 "tlb"  => Some(0x0002),
                 "mem"  => Some(0x0004),
                 "fpu"  => Some(0x0008),
+                "cp0"  => Some(0x0010),
                 "on" | "all"   => Some(0xFFFF_FFFF),
                 "off" | "none" => Some(0x0000_0000),
                 _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
@@ -453,7 +455,7 @@ impl Device for DevLog {
             "[DEV] log <module|all> <on|off>  |  log <module> mask <cat|hex>  |  log <module> file <path|off>  |  log status\n\
              \x20             modules: net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c\n\
              \x20             pdma mask categories: hal enet scsi on/all off/none <hex>\n\
-             \x20             mips mask categories: insn tlb mem fpu on/all off/none <hex>\n\
+             \x20             mips mask categories: insn tlb mem fpu cp0 on/all off/none <hex>\n\
              \x20             l1i/l1d/l2c mask categories: hit miss op on/all off/none <hex>\n\
              \x20             [DEV] = requires --features developer build to produce output".to_string(),
         )]

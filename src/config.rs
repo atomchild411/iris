@@ -601,22 +601,32 @@ impl Default for DebugConfig {
 
 impl DebugConfig {
     /// Apply to current process environment (CLI and iris-gui before Machine::new).
+    /// Publish `[debug]` into the environment, **without** overwriting a
+    /// variable the caller set.
+    ///
+    /// The caller's comment has always promised "env vars still override if
+    /// set externally" and the code did the opposite: a config with no
+    /// `debug_log` key called `remove_var`, so `IRIS_DEBUG_LOG=l2c ./iris
+    /// --config foo.toml` silently deleted its own setting and produced no
+    /// logging at all. Found 2026-09-23 while porting the IP28 tracers onto
+    /// devlog — the facility looked dead when only its bootstrap was.
     pub fn apply_env(&self) {
-        if self.no_idle {
-            std::env::set_var("IRIS_NO_IDLE", "1");
-        } else {
-            std::env::remove_var("IRIS_NO_IDLE");
-        }
-        if self.gui_gl_capture {
-            std::env::set_var("IRIS_GUI_GL", "1");
-        } else {
-            std::env::remove_var("IRIS_GUI_GL");
-        }
+        set_or_remove_env("IRIS_NO_IDLE", if self.no_idle { "1" } else { "" });
+        set_or_remove_env("IRIS_GUI_GL", if self.gui_gl_capture { "1" } else { "" });
         set_or_remove_env("IRIS_DEBUG_LOG", &self.debug_log);
     }
 }
 
+/// Set `key` from the config, unless the environment already says otherwise.
+///
+/// An empty config value means "the config does not mention this", which is
+/// not the same as "unset it": only a variable this function itself could
+/// have set is cleared, and one that arrived from the caller's environment is
+/// left alone.
 fn set_or_remove_env(key: &str, val: &str) {
+    if std::env::var_os(key).is_some() && val.is_empty() {
+        return;
+    }
     if val.is_empty() {
         std::env::remove_var(key);
     } else {
@@ -1904,5 +1914,40 @@ mod rtc_offset_tests {
         cfg.rtc_offset = RtcOffset { years: -3, seconds: 27, ..Default::default() };
         let text = toml::to_string_pretty(&cfg).unwrap();
         assert_eq!(toml::from_str::<MachineConfig>(&text).unwrap().rtc_offset, cfg.rtc_offset);
+    }
+}
+
+#[cfg(test)]
+mod apply_env_tests {
+    use super::set_or_remove_env;
+
+    /// Keys unique to this test, so nothing here races another test's
+    /// environment — `std::env` is process-global and the suite runs
+    /// threaded.
+    const EXTERNAL: &str = "IRIS_TEST_APPLY_ENV_EXTERNAL";
+    const OURS: &str = "IRIS_TEST_APPLY_ENV_OURS";
+
+    #[test]
+    fn an_empty_config_value_does_not_clobber_the_caller_s_environment() {
+        std::env::set_var(EXTERNAL, "l2c");
+        set_or_remove_env(EXTERNAL, "");
+        assert_eq!(
+            std::env::var(EXTERNAL).ok().as_deref(),
+            Some("l2c"),
+            "a config that does not mention the key must leave the caller's value alone: \
+             `IRIS_DEBUG_LOG=l2c iris --config foo.toml` used to silently delete itself",
+        );
+        std::env::remove_var(EXTERNAL);
+    }
+
+    #[test]
+    fn a_config_value_still_wins_over_nothing_and_still_clears_itself() {
+        std::env::remove_var(OURS);
+        set_or_remove_env(OURS, "mips");
+        assert_eq!(std::env::var(OURS).ok().as_deref(), Some("mips"));
+        // Nothing external set it, so an empty config value clears it.
+        std::env::remove_var(OURS);
+        set_or_remove_env(OURS, "");
+        assert!(std::env::var_os(OURS).is_none());
     }
 }

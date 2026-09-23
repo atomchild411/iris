@@ -28,9 +28,10 @@ pub const STATUS_CU1: u32 = 1 << 29;    // Coprocessor 1 (FPU) Usable
 pub const STATUS_CU2: u32 = 1 << 30;    // Coprocessor 2 Usable
 pub const STATUS_CU3: u32 = 1 << 31;    // Coprocessor 3 Usable
 
-/// IP28 bring-up: `IRIS_IP28_CACHEDIAG=1` traces everything the cache-error
-/// machinery touches — CP0 ECC (26) and CacheErr (27) accesses, Status.DE
-/// transitions, and CACHE ops.
+/// Is CP0 register tracing on? `log mips mask cp0` on the monitor.
+///
+/// Traces everything the cache-error machinery touches — CP0 ECC (26) and
+/// CacheErr (27) accesses, Status.DE transitions, and CACHE ops.
 ///
 /// Built to explain why SGI's own IDE field diagnostic reports "Failure
 /// detected on the CPU module" on an otherwise healthy emulated R10000. What
@@ -43,11 +44,20 @@ pub const STATUS_CU3: u32 = 1 << 31;    // Coprocessor 3 Usable
 /// *exception* was refuted by this tracer — DE is never cleared outside the
 /// PROM's own memory sizing.)
 ///
-/// One cached bool; unarmed it is a predictable branch.
+/// Two relaxed atomic loads when off, and unlike the `IRIS_IP28_CACHEDIAG`
+/// environment variable this replaced it can be turned on, masked and
+/// redirected to a file part-way through a boot.
 #[inline(always)]
 pub fn cachediag_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("IRIS_IP28_CACHEDIAG").is_some())
+    cp0_log()
+}
+
+/// `log mips mask cp0` — CP0 register traffic.
+#[inline(always)]
+pub fn cp0_log() -> bool {
+    crate::devlog::devlog_is_active(crate::devlog::LogModule::Mips)
+        && (crate::devlog::devlog_mask(crate::devlog::LogModule::Mips)
+            & crate::mips_exec::MIPS_LOG_CP0) != 0
 }
 
 // CP0 Cause Register bit definitions
@@ -1506,7 +1516,11 @@ impl MipsCore {
                 std::env::var("IRIS_IP28_WATCHGPR").ok().and_then(|v| v.trim().parse().ok())
             });
             if watch == Some(reg) {
-                eprintln!("ip28gpr: ${reg} = {value:#018x} at pc={:#018x}", self.pc);
+                // The register number is a parameter, so it stays an
+                // environment variable; only the output moves, so it can be
+                // redirected with `log mips file <path>`.
+                crate::dlog!(crate::devlog::LogModule::Mips,
+                             "ip28gpr: ${reg} = {value:#018x} at pc={:#018x}", self.pc);
             }
         }
         unsafe { *self.gpr.get_unchecked_mut(reg as usize) = value; }
@@ -1968,19 +1982,15 @@ impl MipsCore {
                 self.reanchor_count_and_reschedule();
             }
             10 => { // always use 64bit mask because the entries need to be valid in 64 bit mode even when they were set from 32 bit mode
-                // IP28 bring-up: IRIS_IP28_EHI=1 shows what the guest wrote
-                // against what survives the mask. The mask is R4400's 40-bit
-                // virtual address; the R10000 implements 44.
-                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *ON.get_or_init(|| std::env::var_os("IRIS_IP28_EHI").is_some())
-                    && (value & !0xC000_00FF_FFFF_E0FF) != 0
-                {
-                    eprintln!(
+                // `log mips mask cp0` shows what the guest wrote against
+                // what survives the mask. The mask is R4400's 40-bit virtual
+                // address; the R10000 implements 44.
+                if cp0_log() && (value & !0xC000_00FF_FFFF_E0FF) != 0 {
+                    crate::dlog!(crate::devlog::LogModule::Mips,
                         "ip28ehi: wrote {value:#018x} -> kept {:#018x} (lost {:#018x}) pc={:#018x}",
                         value & 0xC000_00FF_FFFF_E0FF,
                         value & !0xC000_00FF_FFFF_E0FF,
-                        self.pc,
-                    );
+                        self.pc);
                 }
                 self.cp0_entryhi = value & 0xC000_00FF_FFFF_E0FF;
             },
@@ -2130,16 +2140,13 @@ impl MipsCore {
                 self.cp0_cause = (self.cp0_cause & !mask) | ((value as u32) & mask);
             }
             14 => {
-                // IP28 bring-up: a guest write of a 32-bit value here is where
-                // a 64-bit return address would lose its top half, so the ERET
-                // that follows lands at a truncated PC. Armed with
-                // IRIS_IP28_EPC=1.
-                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *ON.get_or_init(|| std::env::var_os("IRIS_IP28_EPC").is_some()) {
-                    eprintln!(
+                // A guest write of a 32-bit value here is where a 64-bit
+                // return address would lose its top half, so the ERET that
+                // follows lands at a truncated PC. `log mips mask cp0`.
+                if cp0_log() {
+                    crate::dlog!(crate::devlog::LogModule::Mips,
                         "ip28epc: write EPC={value:#018x} (was {:#018x}) from pc={:#018x}",
-                        self.cp0_epc, self.pc,
-                    );
+                        self.cp0_epc, self.pc);
                 }
                 self.cp0_epc = value;
             }
@@ -2170,12 +2177,11 @@ impl MipsCore {
                 // IP28 bring-up: IRIX's XTLB refill handler builds the page
                 // table base itself and expects XContext's PTEBase to be
                 // zero, so anything landing in bits [63:33] becomes a wild
-                // pointer inside the handler. Armed with IRIS_IP28_XCTX=1.
-                if std::env::var_os("IRIS_IP28_XCTX").is_some() {
-                    eprintln!(
+                // pointer inside the handler. `log mips mask cp0`.
+                if cp0_log() {
+                    crate::dlog!(crate::devlog::LogModule::Mips,
                         "ip28xctx: write {value:#018x} (ptebase={:#018x}) pc={:#018x}",
-                        value & 0xFFFF_FFFE_0000_0000, self.pc,
-                    );
+                        value & 0xFFFF_FFFE_0000_0000, self.pc);
                 }
                 self.cp0_xcontext = value;
             }

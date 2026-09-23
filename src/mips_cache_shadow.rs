@@ -38,6 +38,7 @@ use crate::mips_cache_v2::{
 };
 use crate::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
 use crate::traits::{BusDevice, BusRead64};
+use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 
 /// Shadow tag and data arrays for one cache.
 ///
@@ -112,6 +113,24 @@ const WAYS: usize = 2;
 /// bits. Once the executor carried TagHi properly the mask did nothing except
 /// discard the MRU bit, which the PROM writes as TagHi[31] and reads back.
 const L2_TAG_MASK: u64 = u64::MAX;
+
+/// Is the shadow cache's operation trace on, at this level of detail?
+///
+/// `log l2c mask op` traces the tag operations a diagnostic actually cares
+/// about; `log l2c mask op+hit` adds the data-array walk as well. That
+/// distinction is load-bearing rather than tidy: the IP28 PROM issues 65k+
+/// `Index_Store_Data` ops walking the array, and tracing all of them once
+/// slowed the guest so much a run never reached the test it was there to
+/// observe.
+///
+/// This used to be `std::env::var_os("IRIS_SHADOW_CACHEOPS")`, uncached, six
+/// times per `cache_op` — a getenv on every CACHE instruction in every build.
+/// `devlog` costs two relaxed atomic loads and can be turned on, masked and
+/// redirected to a file while the machine runs.
+#[inline(always)]
+fn l2_op_log(bit: u32) -> bool {
+    devlog_is_active(LogModule::L2c) && (devlog_mask(LogModule::L2c) & bit) != 0
+}
 
 /// A `MipsCache` whose contents are only ever observed through CACHE ops.
 ///
@@ -353,18 +372,12 @@ impl<
         let sel = cache_op & 3;
         let op = cache_op & 0x1C;
 
-        // Tracing every operation costs more than the emulation: the PROM
-        // issues 65k+ Index_Store_Data ops walking the data array, and an
-        // eprintln each turns a two-minute boot into one that does not finish.
-        // Default to tag operations only, which is what diagnosis needs.
-        if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some()
-            && (matches!(op, C_IST | C_ILT)
-                || matches!(std::env::var("IRIS_SHADOW_CACHEOPS").as_deref(), Ok("all")))
-        {
-            eprintln!(
+        // Tag operations under `op`, the whole data-array walk only under
+        // `hit` as well — see `l2_op_log`.
+        if l2_op_log(if matches!(op, C_IST | C_ILT) { CACHE_LOG_OP } else { CACHE_LOG_HIT }) {
+            crate::dlog!(LogModule::L2c,
                 "shadow: {:<22} raw={cache_op:#04x} va={virt_addr:#018x} arg={phys_addr:#018x}",
-                cache_op_name(cache_op)
-            );
+                cache_op_name(cache_op));
         }
 
         match op {
@@ -374,9 +387,9 @@ impl<
             C_IST => {
                 let idx = self.tag_slot(sel, virt_addr);
                 let mask = if matches!(sel, CACH_SI | CACH_SD) { L2_TAG_MASK } else { u64::MAX };
-                if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
-                    eprintln!("shadow:   -> IST va={virt_addr:#012x} idx={idx} stores {:#018x}",
-                              phys_addr & mask & !MRU_BIT);
+                if l2_op_log(CACHE_LOG_OP) {
+                    crate::dlog!(LogModule::L2c, "shadow:   -> IST va={virt_addr:#012x} idx={idx} stores {:#018x}",
+                                 phys_addr & mask & !MRU_BIT);
                 }
                 let s = self.shadow(sel);
                 if idx < s.tags.len() {
@@ -416,12 +429,10 @@ impl<
                         MRU_BIT
                     };
                 }
-                if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
-                    eprintln!("shadow:   -> ILT va={virt_addr:#012x} idx={idx} set={set} mru={} tag={:#018x}",
-                              s.mru[set], if idx < s.tags.len() { s.tags[idx] } else { 0 });
-                }
-                if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
-                    eprintln!("shadow:   -> ILT slot={idx} returns {v:#018x}");
+                if l2_op_log(CACHE_LOG_OP) {
+                    crate::dlog!(LogModule::L2c, "shadow:   -> ILT va={virt_addr:#012x} idx={idx} set={set} mru={} tag={:#018x}",
+                                 s.mru[set], if idx < s.tags.len() { s.tags[idx] } else { 0 });
+                    crate::dlog!(LogModule::L2c, "shadow:   -> ILT slot={idx} returns {v:#018x}");
                 }
                 v
             }
@@ -444,8 +455,9 @@ impl<
                             s.ecc[slot]
                         }
                     };
-                    if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
-                        eprintln!("shadow:   -> ILD slot={slot} data={:#018x} ecc={:#x}", s.data[slot], s.ecc[slot]);
+                    if l2_op_log(CACHE_LOG_HIT) {
+                        crate::dlog!(LogModule::L2c, "shadow:   -> ILD slot={slot} data={:#018x} ecc={:#x}",
+                                     s.data[slot], s.ecc[slot]);
                     }
                     s.data[slot]
                 }
@@ -456,8 +468,9 @@ impl<
                 if !s.data.is_empty() {
                     s.data[slot] = phys_addr;
                     s.ecc[slot] = unsafe { *self.ecc_in.get() };
-                    if std::env::var_os("IRIS_SHADOW_CACHEOPS").is_some() {
-                        eprintln!("shadow:   -> ISD slot={slot} data={phys_addr:#018x} ecc={:#x}", s.ecc[slot]);
+                    if l2_op_log(CACHE_LOG_HIT) {
+                        crate::dlog!(LogModule::L2c, "shadow:   -> ISD slot={slot} data={phys_addr:#018x} ecc={:#x}",
+                                     s.ecc[slot]);
                     }
                 }
                 0
