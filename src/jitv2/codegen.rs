@@ -1301,6 +1301,27 @@ impl Codegen {
             // (emit_interp_fallback_head), so it's exempt from the
             // must-have-an-emitter rule below.
             if instr.is_fallback {
+                // The gate that makes admitting `MTC0 Status` safe, and the
+                // structural backstop for `emit_fr_mode_guard`'s region-wide
+                // STATUS_FR check: that check runs ONCE, in entry_block, on
+                // behalf of every FPR access in this region, which is only
+                // legitimate while nothing in the region can change FR
+                // mid-flight. A region with no CP1 instruction has no
+                // FPR-access emitter and no guard at all, so a Status write
+                // there has nothing to invalidate — and that is exactly the
+                // shape of the kernel exception and timer paths this exists
+                // for. When the two DO meet, decline: the interpreter runs
+                // the region instead, which costs compilation and cannot
+                // cost correctness.
+                //
+                // Not conditional on anything, deliberately: the blanket
+                // `j2 fallback on` toggle admits `MTC0 Status` as a fallback
+                // head too, and has done since interpreter fallback landed,
+                // so without this the same stale-FR hazard already existed on
+                // that path. One comparison closes it for both.
+                if has_fpu && crate::jitv2::cop0::writes_cp0_status(instr.raw) {
+                    return None;
+                }
                 continue;
             }
             if lookup_semantics(instr.raw).is_none()
@@ -2517,10 +2538,20 @@ fn emit_pending_interrupt_preamble(ctx: &mut EmitCtx, exit_block: Block, word_of
 
 /// Region-wide FR-mode guard: emitted once, in `entry_block`, only when the
 /// region being compiled contains at least one CP1 instruction — legitimate
-/// as a region-wide check because `STATUS_FR` cannot change mid-region (the
-/// only instructions that touch CP0.Status, MTC0/ERET, are `Excluded` and
-/// end the region on contact, §4.4), so the very first entry checks it once
-/// on behalf of everything the rest of the region will FPR-access-emit.
+/// as a region-wide check because `STATUS_FR` cannot change mid-region, so
+/// the very first entry checks it once on behalf of everything the rest of
+/// the region will FPR-access-emit.
+///
+/// That invariant used to rest on "all of CP0 is `Excluded` and ends the
+/// region on contact" (§4.4), which stopped being the whole story once
+/// interpreter-fallback heads could keep an `Excluded` word *in* a region
+/// (`j2 fallback on`, and `jitv2::cop0`'s narrower COP0 subset). It now rests
+/// on an enforced condition instead: **this guard is only ever emitted for a
+/// region with a CP1 instruction in it, and `compile_region_uncommitted`
+/// declines any region that combines `has_fpu` with a Status-writing fallback
+/// head** (`cop0::writes_cp0_status`). So wherever this check exists, nothing
+/// between here and the region's exits can move FR. ERET is admitted and needs
+/// no gate — it clears EXL/ERL and restores PC without touching FR.
 ///
 /// **Does NOT check CU1** — see `emit_cp1_cu1_guard`'s own doc comment for
 /// why that must be a per-CP1-instruction check, not a region/entry-wide

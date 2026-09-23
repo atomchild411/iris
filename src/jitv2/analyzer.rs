@@ -935,10 +935,19 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
         return false;
     }
 
-    if class == Classify::Excluded && !fallback_enabled() {
+    if class == Classify::Excluded && !fallback_enabled()
+        && !crate::jitv2::cop0::stays_in_region(raw)
+    {
         // Fallback disabled (the default): an excluded instruction ends the
         // region here, exactly as it always did — never visited, the caller
         // records StopReason::Excluded on its own edge.
+        //
+        // The CP0 exception: `OP_COP0` stays `Excluded` (there is no native
+        // emitter and there must not be one), but the safe subset is kept
+        // *in* the region as an interpreter-fallback head rather than ending
+        // it, because ending on every mfc0/mtc0/eret is a large part of why
+        // the kernel interprets so much — 677 COP0 sites in `unix.B`. See
+        // `jitv2::cop0` for which words qualify and why the rest do not.
         return false;
     }
 
@@ -1239,7 +1248,14 @@ fn compute_cycles_flush(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], entry_wo
         if !instrs[word as usize].visited {
             continue;
         }
-        let mut flush = instrs[word as usize].is_region_exit();
+        // A fallback head flushes too. `emit_account_for_cycles` runs
+        // before the word's own semantics, so `hot.cycles` ends up
+        // including this instruction — the same convention as the
+        // interpreter's `step_preamble!`, which bumps cycles before
+        // dispatching. Flushing *on* the fallback word rather than on its
+        // predecessor is what makes the count come out exactly right.
+        let mut flush = instrs[word as usize].is_region_exit()
+            || instrs[word as usize].is_fallback;
         if let Some(t) = instrs[word as usize].continues_to_fallthrough {
             flush |= instrs[t as usize].is_branch_target || instrs[t as usize].is_entry_point || t == entry_word;
         }
@@ -1277,6 +1293,89 @@ mod tests {
     /// module's fallback tests share the one lock with every other module's.
     fn fallback_on_guard() -> super::TestFallbackGuard {
         super::test_fallback_guard()
+    }
+
+    // --- COP0 kept in-region as a fallback head (jitv2::cop0) --------------
+    //
+    // The analyzer half only: does the region continue past the COP0 word, or
+    // stop on it as it always did. That the admitted instructions produce the
+    // same architectural result is the interpreter's job — they run through
+    // `exec_cop0` unchanged, which is the whole point of admitting them as
+    // fallback heads rather than writing a second CP0 implementation.
+
+    /// A COP0 word, then real work, then an exit. If the COP0 word ends the
+    /// region, word 1 is never walked.
+    fn cop0_then_work_page(cop0_word: u32) -> [u32; ENTRIES_PER_PAGE] {
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = cop0_word;
+        page[1] = i_type(OP_ADDIU, 0, 9, 0x55);
+        page[2] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        page[3] = 0; // jr's delay slot
+        page
+    }
+
+    #[test]
+    fn admitted_cop0_stays_in_the_region_as_a_fallback_head() {
+        let _lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (what, word) in [
+            ("mfc0 t1, Count",    r_type(OP_COP0, RS_MFC0, 9, 9, 0, 0)),
+            ("dmfc0 t1, Status",  r_type(OP_COP0, RS_DMFC0, 9, 12, 0, 0)),
+            ("mtc0 t1, Compare",  r_type(OP_COP0, RS_MTC0, 9, 11, 0, 0)),
+            ("mtc0 t1, Status",   r_type(OP_COP0, RS_MTC0, 9, 12, 0, 0)),
+            ("eret",              (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_ERET),
+        ] {
+            let page = cop0_then_work_page(word);
+            let mut a = Analyzer::new();
+            let (result, non_empty) = a.walk_bounded(&page, 0, 0, 8);
+            assert!(non_empty, "{what}: must form a region");
+            assert!(result[0].visited, "{what}: the COP0 word itself must be visited");
+            assert!(result[0].is_fallback, "{what}: it must be a fallback head, never a native emitter");
+            // ERET is a control transfer, so nothing follows it in-region;
+            // the others must let the walk continue to real work.
+            if word & 0x3F != FUNCT_ERET {
+                assert!(result[1].visited, "{what}: the walk must continue past it");
+            }
+        }
+    }
+
+    #[test]
+    fn unsafe_cop0_still_ends_the_region() {
+        let _lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (what, word) in [
+            // Cause: its IP0/IP1 software-interrupt bits are invisible to the
+            // compiled preamble's `hot.interrupts` sample.
+            ("mtc0 t1, Cause", r_type(OP_COP0, RS_MTC0, 9, 13, 0, 0)),
+            ("tlbwi",  (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBWI),
+            ("tlbwr",  (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBWR),
+            ("tlbp",   (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP),
+        ] {
+            let page = cop0_then_work_page(word);
+            let mut a = Analyzer::new();
+            let (result, non_empty) = a.walk_bounded(&page, 0, 0, 8);
+            assert!(!non_empty, "{what}: an excluded entry must not form a region");
+            assert!(!result[1].visited, "{what}: nothing past it may be walked");
+        }
+    }
+
+    #[test]
+    fn j2_cop0_off_switches_the_behaviour_back_off() {
+        // The monitor half: a divergence found on a live boot must be
+        // bisectable without relaunching.
+        let _lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::mips_instr_stats::InstrKind;
+        use crate::jitv2::opcode_support::{instr_enabled, set_instr_enabled};
+
+        let word = r_type(OP_COP0, RS_MFC0, 9, 9, 0, 0);
+        let page = cop0_then_work_page(word);
+
+        let before = instr_enabled(InstrKind::Mfc0);
+        set_instr_enabled(InstrKind::Mfc0, false);
+        let mut a = Analyzer::new();
+        let (result, non_empty) = a.walk_bounded(&page, 0, 0, 8);
+        set_instr_enabled(InstrKind::Mfc0, before);
+
+        assert!(!non_empty, "with Mfc0 disabled the COP0 word must end the region again");
+        assert!(!result[1].visited);
     }
 
     fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {

@@ -12,11 +12,18 @@ diffing the enum against `has_jitv2_emitter()` + `has_jitv2_support()` in
 
 They fall into three groups:
 
-**Privileged / system (17) — correctly interpreted, leave alone.**
+**Privileged / system (17) — correctly interpreted, and they stay that way.**
 `Syscall Break Mfc0 Dmfc0 Mtc0 Dmtc0 Tlbr Tlbwi Tlbwr Tlbp Eret Wait Cache`
 plus the atomics `Ll Sc Lld Scd`. These need to trap into the emulator by
-nature. (CP0 access *ending* a compiled region is a separate, known cost —
-see the jit-atomized notes — not an emitter-coverage problem.)
+nature, and none of them will ever get a native emitter.
+
+That was never the expensive part, though. CP0 access *ending* a compiled
+region was — a separate problem from emitter coverage, and **fixed 2026-09-22**:
+the safe subset now stays in-region as an interpreter-fallback head, worth
+~13-15% on syscall-bound work. See
+[`cop0-does-not-have-to-end-a-region.md`](cop0-does-not-have-to-end-a-region.md),
+including why three different measurements said "no change" before one found
+it.
 
 **MIPS IV FP arithmetic (13) — DONE 2026-09-22, ~3x on FP code.**
 `Madd_s Madd_d Msub_s Msub_d Nmadd_s Nmadd_d Nmsub_s Nmsub_d`,
