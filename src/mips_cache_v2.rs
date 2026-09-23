@@ -5197,10 +5197,17 @@ mod tests {
     /// tag happened to name. The O2 PROM does exactly this walk, and the
     /// writeback landed on its own stack and corrupted the saved return
     /// address.
+    ///
+    /// **This has to be an R5000-class model.** `writeback_l1d_line` sends
+    /// dirty data straight to memory only where the L2 is non-inclusive or
+    /// absent, which is the `IS_R5K` branch; on the R4400 the line goes to
+    /// its inclusive L2 instead and memory never changes, so the same test
+    /// written against `R4400Cache` passes whether the bug is present or not.
+    /// It did, until that was noticed. The O2 is an R5000.
     #[test]
     fn index_store_tag_discards_the_line_instead_of_writing_it_back() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache = make_cache(mem.clone());
+        let cache: R5000Cache = make_cache_of::<R5000Cache>(mem.clone());
 
         let phys: u32 = 0x7000;
         let virt = kseg0(phys);
@@ -5208,9 +5215,9 @@ mod tests {
         // Dirty the line in L1D without letting it reach memory.
         let _ = cache.write::<4>(virt, phys as u64, 0x1122_3344_u64);
 
-        let dc_set = (phys as usize >> R4400Cache::DC_LINE_SHIFT as usize)
-            & R4400Cache::DC_NUM_LINES_MASK;
-        let idx_addr = (dc_set << R4400Cache::DC_LINE_SHIFT as usize) as u64;
+        let dc_set = (phys as usize >> R5000Cache::DC_LINE_SHIFT as usize)
+            & R5000Cache::DC_NUM_LINES_MASK;
+        let idx_addr = (dc_set << R5000Cache::DC_LINE_SHIFT as usize) as u64;
 
         // Store an invalid tag over it, the way cache init does.
         cache.cache_op(C_IST | CACH_PD, idx_addr, 0);
