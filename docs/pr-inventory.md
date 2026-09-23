@@ -152,6 +152,45 @@ The code went with the PR, the note never did: `ip7-timer-fix-concept.md`
 `seeq-enet-thread-stops-pumping-under-load.md`, whose code half turned out to
 be upstream already.
 
+## Every test watched failing
+
+A test that ships as a PR's evidence has to be *seen* to fail without its fix.
+Done for all eight features 2026-09-23, by reverting each change and re-running
+its tests.
+
+| feature | tests | fail when reverted | the rest |
+|---|---|---|---|
+| C MTC0 | 3 | 2 | the third guards the unchanged 32-bit path |
+| D XContext | 6 | 3 | the other three pin the existing 40-bit behaviour — the refactor's safety net |
+| E `Index_Store_Tag` | 1 | **0 → fixed → 1** | see below |
+| F `code_bytes_used` | 1 | **missing → restored → 1** | see below |
+| G `apply_env` | 2 | 1 | the other guards unchanged behaviour |
+| A MADD | 6 | 1 | the dedicated rounding test; the broad equivalence test's operands do not reach the precision boundary |
+| A BC1 | 8 | 3 | five are `bc1_fallback_*`, correct to pass under the old classification |
+| B CP0 | 11 | 4 | the negatives (`cause_is_never_admitted`, `unsafe_cop0_still_ends_the_region`) correctly pass |
+
+**Two of the eight were not testing anything.**
+
+**E's test passed with the bug restored.** It built an `R4400Cache`, whose L2
+is inclusive, so the writeback went to L2 and memory never changed. The
+corrupting path is `IS_R5K` — non-inclusive or absent L2, line straight to RAM.
+The O2 is an R5000. Fixed in `1311612`.
+
+**F's test did not exist.** `481c2cd`'s message ends "`code_bytes_used_is_not_page_rounded`
+fails if the rounding comes back" and gives the command to run it. The test was
+written on the `jitv2-packing-stats` branch and lost when that branch came
+through a conflicted merge; the message survived. Restored in `e0cce87`, which
+also had to adapt it: `publish`/`claim` changed signature, and the model is one
+function per page, so three sizes now means three pages rather than three
+publishes into one.
+
+Both would have shipped as a PR's stated evidence.
+
+**Harness caveat:** restoring the file and re-running race each other; a
+"1 failed" on the restore pass turned out to be cargo reading a half-written
+file. Confirm the tree is clean (`git diff` empty) before believing the
+second number.
+
 ## Withdrawn on review
 
 - **`68fd9c8`** (debug-build test aborts) — **not a PR**. Both halves fix
