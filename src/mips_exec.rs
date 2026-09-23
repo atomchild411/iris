@@ -7279,23 +7279,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let rt_val = self.core.read_gpr(d.rt as u32);
         self.ip28_cp0_trace("mtc0", d.rd as u32, rt_val);
         let rd_val = d.rd as u32;
-        let word = rt_val as u32 as u64;
 
-        // MTC0 moves a *word*. Into a 64-bit CP0 register it writes the low
-        // half and leaves the upper half exactly as it was — MIPS64 Vol II
-        // gives the operation as `CPR ← CPR[63:32] || data`. Only a 32-bit
-        // register takes the sign-extended word, and there the extension is an
-        // artifact of storing it in a 64-bit field.
-        //
-        // Sign-extending into the 64-bit registers as well is invisible to a
-        // 32-bit kernel, whose addresses are sign-extended anyway, and fatal
-        // to a 64-bit one. IRIX's standalone code returns from an exception
-        // with `mtc0 ra, EPC` / `mtc0 ra, ErrorEPC` / `eret`, relying on the
-        // exception's own EPC to still be supplying bits 63:32: with `ra` =
-        // 0xa8000000208b9998 and EPC = 0xa8000000208b9924, the word written is
-        // 0x208b9998 and the register has to come out holding `ra`. Sign
-        // extension made that 0x00000000208b9998 and the ERET jumped into
-        // unmapped user space.
         // MTC0 moves the whole register. DMTC0 differs in what the
         // assembler will accept, not in how much data reaches CP0, so a
         // 64-bit CP0 register takes `rt` intact and only a 32-bit one takes
