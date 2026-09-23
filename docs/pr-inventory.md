@@ -29,53 +29,146 @@ file contents will carry both. Build PR branches from *today's file contents*.
 
 ---
 
-## Group 1 — General, and upstream already owns the code
+## The catalogue — by feature, not by commit
 
-The only group being prepared. Decided 2026-09-23: IP32/O2 and R10000/IP28
-are held back as series, except two generic members lifted out of IP28 and one
-out of IP32. **Every PR carries its own `rules/` or `docs/` file** — a fix and
-the note explaining it travel together, and several of ours were orphaned
-before by going out without theirs.
+Reviewed one by one 2026-09-23. A *feature* is the unit that becomes a PR;
+several are more than one commit, and two commits split into more than one
+feature. Each row was cherry-picked onto `upstream/main` and built before it
+earned a verdict.
 
-Each row was cherry-picked onto `upstream/main` and built.
+**The question asked of every row: does upstream have this problem?** Several
+things that looked generic turned out to be ours alone, and several that
+looked local turned out to be upstream bugs sitting in their tree right now.
 
-| # | commits | what | verified | its doc |
-|---|---|---|---|---|
-| 1 | `68fd9c8` | two tests abort the whole binary in a debug build | 1090 rel / full debug suite | — |
-| 2 | `7c67833` + `f812f8e` | **MTC0 moves the whole register into a 64-bit CP0 register** | **974 tests**, +79/-2 | — |
-| 3 | `bf8af6b` + `9d08450` | **XContext's layout follows the CPU's VA width**, derived from the R4000 manual | **978 tests**, +206/-5, **6 tests** | — |
-| 4 | `8f8a1c2` | the JTLB is as big as the CPU model says | **975 tests**, +136/-37 | — |
-| 5 | `d0e984d` | jitv2: gate the ISA level on the CPU model, not a cargo feature — **~20% integer** | needs context | `rules/build/the-three-builds-we-actually-use.md` |
-| 6 | `c75b005` | jitv2: the MIPS IV multiply-add family, RECIP/RSQRT, PREFX — **~3x FP** | standalone | `rules/jitv2/instructions-jitv2-still-interprets.md` |
-| 7 | `97dbcd4` | jitv2: compile BC1 — **~4x** on a BC1-heavy loop | needs context | `rules/jitv2/bc1-is-an-ordinary-branch.md` + `rules/jitv2/bc1/` |
-| 8 | `6de06d1` | jitv2: CP0 instructions stop ending every region — **~13-15%** syscall-bound | needs context | `rules/jitv2/cop0-does-not-have-to-end-a-region.md` |
-| 9 | `481c2cd` | jitv2: stop page-rounding `code_bytes_used`, drop `HOST_PAGE_SIZE` | standalone | — |
-| 10 | `b3c7192` | put the IP28 tracers on devlog; fixes `apply_env` deleting an externally-set `IRIS_DEBUG_LOG` | 1089 tests | `rules/build/tracing-goes-through-devlog.md` |
-| 11 | `a9ea7e6` | seeq: report `intpend` in `seeq status` | standalone | `rules/irix/seeq-enet-thread-stops-pumping-under-load.md` |
-| 12 | `556ac79` | **lifted from IP28**: the low-memory alias has to follow where RAM actually is | standalone; **carries an IP28 alias change that must be split out** | — |
-| 13 | `1c71178` | **lifted from IP28**: allow 256 MB memory banks | standalone | — |
-| 14 | `c52ce8e` | **lifted from IP32**: `Index_Store_Tag` must not write the line back | needs context | — |
+### A. MIPS IV instruction coverage — *one feature, three commits*
 
-Rows 5-8 are the jitv2 performance series and should go as one ordered set:
-they build on each other, they are pure wins on upstream's own hot path, and
-each is measured rather than argued.
+`d0e984d` (gate the ISA level on the CPU model) + `c75b005` (MADD family,
+RECIP/RSQRT, PREFX) + `97dbcd4` (BC1).
 
-### Orphaned `rules/` for fixes already merged upstream
+**Upstream has the underlying bug.** Its CPU is a runtime choice, its
+`CpuModel` carries a `MIPS4` const, its **interpreter checks that const at 17
+sites** — and its **jitv2 checks it at none**, gating 45 sites on a
+`cfg(feature = "mips4")` that is not in the default feature set. A stock
+upstream build with `cpu = "r5000"` interprets MIPS IV correctly and refuses
+to compile it.
 
-The code went with the PR; the note never did. Free to send, and they close a
-documentation gap upstream has right now.
+Worth **~20% integer**, **~3x FP**, **~4x** on FP-branch-heavy code.
 
-| file | its merged PR |
-|---|---|
-| `rules/irix/ip7-timer-fix-concept.md` | #120 |
-| `rules/hal2/netbsd-confirms-clkid-is-a-generator-number.md` | #119 |
-| `rules/irix/netbsd-wd33c93-empty-cdb.md` | #127 |
+**Ordering constraint, verified:** chronologically this is MADD -> BC1 -> gate,
+and `c75b005` *adds* 25 `cfg(feature = "mips4")` sites that `d0e984d` later
+deletes. Cherry-picking in history order leaves the first two PRs inert on a
+default build. Sending the gate first means **rewriting** MADD and BC1 without
+their `cfg` attributes — real work, not a cherry-pick.
 
-### Measurement methodology, to go with rows 5-8
+**Honest gap:** the FMA portability argument (aarch64 `FMADD`, x86-64 FMA3,
+`LibCall.FmaF64` — all round once, so guests get bit-identical results) is
+*reasoned and never tested*. We have only ever run on aarch64. Say so.
 
-`rules/perf/guest-cpu-time-accounting-undercounts.md` (why these must be timed
-by host wall clock — a broken `tms_utime` inflated a Dhrystone figure ~3x) and
-`rules/testing/dhrystone-whetstone-on-an-irix-guest.md`.
+### B. jitv2 region formation — CP0 need not end a region
+
+`6de06d1`. **~13-15% on syscall-bound work.** 677 COP0 sites in `unix.B`,
+concentrated in the paths that run most.
+
+Best-argued and riskiest thing here. The module doc names **exactly two**
+things a region bakes in — FR mode and the pending-interrupt sample — and
+excludes Status (12) and Cause (13) accordingly. That is the right shape of
+argument, but it is an argument that the list is exhaustive, not a proof, and
+unlike BC1 there is no large equivalence test behind it: the evidence is a
+boot plus a live `j2 cop0 on/off` toggle that reverses cleanly. Send last.
+
+### C. CP0 register width — MTC0 moves the whole register
+
+`7c67833` + `f812f8e` (a stale comment that contradicted the code) + `ce0693c`
+(the EntryHi test). **974 tests on upstream.**
+
+Deviates from MIPS64 Vol II's literal wording on purpose; the rebuttal belongs
+at the top of the PR body, not buried. Invisible on upstream's 32-bit guests —
+latent correctness for them, not an observed bug. Say that too.
+
+### D. XContext layout follows the CPU's VA width
+
+`bf8af6b` + `9d08450`. **978 tests, 6 of them new.**
+
+Verified **bit-for-bit identical at 40 bits** — mask `0x000000ffffffe000` is
+`EH_VPN2_64`, ptebase mask and region shift both match. So upstream gets a
+pure refactor plus tests on code that had none. Frame it that way, not as a
+fix.
+
+### E. Cache semantics — `Index_Store_Tag` must not write the line back
+
+The 41 generic lines of `c52ce8e`, which is otherwise 825 lines of `ip32.rs`.
+Isolated and tested: **applies alone, 973 tests, +39/-2, carries its own
+test**, and a PR body already exists in `pr-drafts/`.
+
+The strongest small fix in the inventory: `Index_Store_Tag` writing back sends
+a line to an address derived from the tag being discarded, so a PROM
+initialising the cache corrupts unrelated memory — on the O2 it landed on its
+own stack. **The L2 path in the same `match` already gets this right and says
+so.** Self-evident once seen.
+
+### F. jitv2 memory accounting
+
+`481c2cd`. **Upstream has this bug too**: it still carries
+`HOST_PAGE_SIZE: u64 = 4096` while using the *packing*
+`PagedArenaMemoryProvider`. On a 16 KB-page host — any Apple Silicon Mac —
+three entries of 215, 300 and 48 bytes report as 49152 instead of 563, an
+**87x over-count**, and that inflated number is what a reader consults to
+judge whether the arena is near its flush threshold. Regression test included.
+
+### G. Config precedence — a config file must not delete the caller's env var
+
+The `src/config.rs` half of `b3c7192`. **Upstream has this byte for byte**:
+`apply_env` calls `remove_var` whenever the config carries no `debug_log` key,
+so `IRIS_DEBUG_LOG=l2c ./iris --config foo.toml` silently does nothing — under
+a comment promising "env vars still override if set externally". Two tests, on
+key names unique to them so they cannot race the suite.
+
+**The rest of `b3c7192` does not apply upstream**: the devlog `cp0` mask
+category and the ported tracers exist to serve IP28 traces upstream does not
+have. Those go with IP28.
+
+### H. Physical bus robustness — *three fixes trapped in one IP28 commit*
+
+`556ac79` is four changes. Three are generic, and all three are the emulator
+dying on something the guest is entitled to do:
+
+- a bank mapped outside the lomem/himem windows was never unmapped again;
+- **write only the slots that change** — the old shape did ~8200 non-atomic
+  stores to 16-byte fat pointers on every MEMCFG write, racing the MC thread's
+  own DMA fill. A torn read there is **a segfault in the emulator, and it was
+  happening every few boots**;
+- fill the dispatch table with a real device rather than null pointers whose
+  vtable is live.
+
+The fourth — the low-memory alias following where RAM actually is — is
+IP28-observable only and goes with IP28. **Splitting this commit is the one
+history rewrite the plan needs.**
+
+### I. seeq observability
+
+`9889910` — **one line** (`writeln!(w, "intpend={}", st.intpend)`) plus a
+133-line rules file. Note the commit to use is `9889910`, not its duplicate
+`a9ea7e6`, which carries only the docs. `intpend` already exists upstream;
+this exposes it in `seeq status`.
+
+### J. Orphaned `rules/` for fixes already merged upstream
+
+The code went with the PR, the note never did: `ip7-timer-fix-concept.md`
+(#120), `netbsd-confirms-clkid-is-a-generator-number.md` (#119),
+`netbsd-wd33c93-empty-cdb.md` (#127).
+
+## Withdrawn on review
+
+- **`68fd9c8`** (debug-build test aborts) — **not a PR**. Both halves fix
+  tests that do not exist upstream: `src/ip32.rs` is absent, and the TLB test
+  is introduced by the JTLB commit itself. Folds into whichever of those ships.
+- **`8f8a1c2`** (JTLB size per model) — safe (hot path verified untouched,
+  2632 bytes more on a 520 KB structure) but **zero upstream benefit**: its
+  only consumer is a 64-entry model and upstream has none. Goes with IP28.
+- **`1c71178`** (256 MB banks) — one line, but `VALID_BANK_SIZES` is a single
+  global list checked for *every* machine, and the MC cannot express a 256 MB
+  bank at the IP22/IP24 base shift. As written it lets a user configure a
+  machine that cannot exist. Wants profile-aware validation, or IP28.
 
 ## Group 2 — R10000 / IP28 machine support
 
