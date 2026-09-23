@@ -69,12 +69,51 @@ their `cfg` attributes — real work, not a cherry-pick.
 `6de06d1`. **~13-15% on syscall-bound work.** 677 COP0 sites in `unix.B`,
 concentrated in the paths that run most.
 
-Best-argued and riskiest thing here. The module doc names **exactly two**
-things a region bakes in — FR mode and the pending-interrupt sample — and
-excludes Status (12) and Cause (13) accordingly. That is the right shape of
-argument, but it is an argument that the list is exhaustive, not a proof, and
-unlike BC1 there is no large equivalence test behind it: the evidence is a
-boot plus a live `j2 cop0 on/off` toggle that reverses cleanly. Send last.
+**Verified on upstream 2026-09-23: 980 tests, +588/-6, 7 files.** The three
+cherry-pick conflicts were pure additions, and two of them
+(`pub mod isa;`, the `Bc1` kind) belong to feature A — so B is genuinely
+separable, resolved by taking only the CP0 half.
+
+**Upstream already has interpreter fallback** — 13 mentions in `codegen.rs`,
+26 in `analyzer.rs`. This builds on machinery they maintain rather than
+introducing it.
+
+#### The safety argument, probed
+
+The module doc names **exactly two** things a region bakes in, and the list
+holds up under the sharpest questions available:
+
+- **Cause (13) excluded** because its IP0/IP1 software-interrupt bits are
+  writable only by `MTC0 Cause` and never appear in `hot.interrupts`, which is
+  what the compiled preamble samples. Correct.
+- **Count (9) and Compare (11) admitted** although both touch timer-interrupt
+  state, and `MTC0 Compare` does not only *clear* IP7 — its case 2 (a deadline
+  missed while emulating the instructions between the guest's
+  `read_c0_count()` and its write) **raises** it. Checked: that raise goes
+  through `claim_ip7(..., &self.hot.interrupts, ...)`, and Count's re-anchored
+  deadline reaches the same word via `TimerIrqPtr(&self.hot.interrupts)`. Both
+  put their effects where a region can see them. Consistent.
+- **Status (12) excluded** from the list and gated separately on
+  `has_fpu && writes_cp0_status` in `compile_region_uncommitted`, because it
+  carries `STATUS_FR` and `emit_fr_mode_guard` checks that once per region.
+- **ERET admitted**, and it never falls through. The analyzer treats it as
+  "`Sequential` for reachability — one fall-through edge to offset+1", which
+  looks wrong until you read the fallback head: it captures
+  `expected_next = own_pc + 4` *before* calling the interpreter, then
+  compares. `live_pc != expected_next` returns `EXEC_COMPLETE` and lets the
+  dispatcher re-enter wherever the interpreter went — the comment names
+  `ERET -> EPC` as the case it exists for. The reachability edge is a
+  conservative approximation that may compile an unreachable block: code size,
+  not correctness.
+- **TLB ops excluded** — complex, rare, and a subtle bug there corrupts
+  memory in another address space minutes later.
+
+#### What remains
+
+It is still an *argument* that the two-item list is exhaustive, backed by a
+boot and a reversible `j2 cop0 on/off` toggle rather than a large equivalence
+test — unlike BC1's 128 combinations. Four of its eleven tests fail when the
+policy is reverted; the rest are negatives and correctly pass. Send it last.
 
 ### C. CP0 register width — MTC0 moves the whole register
 
