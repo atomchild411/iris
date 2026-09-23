@@ -4073,6 +4073,43 @@ mod tests {
         assert_eq!(snap[0] & ((1 << 4) | (1 << 5)), (1 << 4) | (1 << 5), "both offsets stay marked");
     }
 
+    /// `code_bytes_used` sums raw `code_size`, with no page rounding.
+    ///
+    /// It used to round every published entry up to a hardcoded 4096, which
+    /// described `ArenaMemoryProvider` — one page-rounded segment per
+    /// function, a type that no longer exists. The live
+    /// `PagedArenaMemoryProvider` packs, so a function costs about its own
+    /// `code_size`.
+    ///
+    /// The constant was also wrong wherever the host page is not 4 KiB, which
+    /// includes every Apple Silicon Mac (16 KiB) and aarch64 Linux kernels
+    /// built for 16 or 64 KiB. That is why nothing here hardcodes a page size
+    /// and the failure message asks `region::page::size()` at runtime: the
+    /// page size is not a property of the target triple.
+    #[test]
+    fn code_bytes_used_is_not_page_rounded() {
+        let counter = AtomicU64::new(0);
+        let sizes = [215u32, 300, 48];
+        // One function per page: `code_bytes_used` sums one `code_size` per
+        // *page*, so three entries means three pages. Publishing three times
+        // into one page just overwrites its `code_size`.
+        let mut jit = Jitv2::new(sizes.len());
+
+        for (i, sz) in sizes.iter().enumerate() {
+            jit.pages[i].claim(i as Pfn + 1, &counter as *const AtomicU64, false);
+            let mut bits = [0u64; BITMAP_WORDS];
+            bits[0] |= 1u64;
+            assert!(jit.pages[i].publish(&bits, 0x1000 as *const (), 0, 1, *sz));
+        }
+
+        let expected: u64 = sizes.iter().map(|s| *s as u64).sum();
+        assert_eq!(
+            jit.code_bytes_used(), expected,
+            "must sum raw code_size; page-rounding would report {} instead",
+            sizes.len() as u64 * region::page::size() as u64,
+        );
+    }
+
     #[test]
     fn snapshot_compile_candidates_unions_requested_and_compiled_masked_by_denied() {
         let counter = AtomicU64::new(0);
