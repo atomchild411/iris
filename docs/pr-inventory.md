@@ -144,18 +144,13 @@ The fourth — the low-memory alias following where RAM actually is — is
 IP28-observable only and goes with IP28. **Splitting this commit is the one
 history rewrite the plan needs.**
 
-### I. seeq observability
-
-`9889910` — **one line** (`writeln!(w, "intpend={}", st.intpend)`) plus a
-133-line rules file. Note the commit to use is `9889910`, not its duplicate
-`a9ea7e6`, which carries only the docs. `intpend` already exists upstream;
-this exposes it in `seeq status`.
-
-### J. Orphaned `rules/` for fixes already merged upstream
+### I. Orphaned `rules/` for fixes already merged upstream
 
 The code went with the PR, the note never did: `ip7-timer-fix-concept.md`
 (#120), `netbsd-confirms-clkid-is-a-generator-number.md` (#119),
-`netbsd-wd33c93-empty-cdb.md` (#127).
+`netbsd-wd33c93-empty-cdb.md` (#127), and
+`seeq-enet-thread-stops-pumping-under-load.md`, whose code half turned out to
+be upstream already.
 
 ## Withdrawn on review
 
@@ -169,6 +164,10 @@ The code went with the PR, the note never did: `ip7-timer-fix-concept.md`
   global list checked for *every* machine, and the MC cannot express a 256 MB
   bank at the IP22/IP24 base shift. As written it lets a user configure a
   machine that cannot exist. Wants profile-aware validation, or IP28.
+- **`9889910`** (seeq `intpend` in `seeq status`) — **upstream already
+  prints it**, and more besides (`rx_delivered`, `rx_refused`,
+  `rx_nothing`). The cherry-pick conflicted because git would not add a
+  duplicate line. Its rules file moves to group I.
 
 ## Group 2 — R10000 / IP28 machine support
 
