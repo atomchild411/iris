@@ -117,7 +117,7 @@ pub mod pcon_regs {
     pub const CLR_S0_RETRACE_N: u8   = 1 << 4; // clear EXP0 slot retrace latch
 }
 
-/// Fullhouse-only `HPC3_EXT_IO_ADDR` bits (`kern/sys/hpc3.h`'s `EXTIO_*`).
+/// Fullhouse-only `HPC3_EXT_IO_ADDR` bits (the `EXTIO_*` set).
 /// All active-low: 0 = interrupt/condition pending, 1 = idle. `IRQ_1` =
 /// graphics (`GIO_INTERRUPT_1`), `IRQ_2` = fifo (`GIO_INTERRUPT_0`), `IRQ_3`
 /// = video vsync (unrelated to the 3 GIO vectors — `VECTOR_VIDEO`).
@@ -160,10 +160,10 @@ pub mod ext_io_regs {
 /// `ip22_newportRetrace` (disassembly, confirmed live at
 /// 0xffffffff882aa5f0) does a read-modify-write on phys 0x1FBD901F
 /// (= HPC3_INT2_BASE index 7) on every vertical retrace. This is
-/// `PORT_CONFIG` (`kern/sys/IP22.h`: `PORT_CONFIG = HPC3_INT2_ADDR +
-/// IP22BOFF(0x1c)`; `IP22BOFF(x) = x|0x3` is the `_MIPSEB` byte-lane
-/// adjustment for byte-wide registers, so the dword index is still
-/// `0x1c>>2 = 7` — MAME's map for this one register is simply incomplete).
+/// `PORT_CONFIG`, at `HPC3_INT2_ADDR + 0x1c` — addressed as `0x1f`, because
+/// byte-wide registers in this block carry `|0x3` as a big-endian byte-lane
+/// adjustment. The dword index is unchanged at `0x1c>>2 = 7`; MAME's map
+/// for this one register is simply incomplete.
 /// PORT_CONFIG is fullhouse-only — no equivalent on guinness, which has no
 /// GIO-slot reset/retrace-clear register at all (see `pcon_regs`).
 /// `Ioc::int2_read8`/`int2_write8` take a *register index* (0-based, one
@@ -219,10 +219,10 @@ pub enum IocInterrupt {
     /// already use), so each of these also sets that shared bit. What makes
     /// them distinct is the 16-bit `HPC3_EXT_IO_ADDR` register (`ext_io_*` in
     /// `IocState`): each variant additionally clears its own active-low
-    /// `EXTIO_*` bit there, which is what `ip22_gio0/1/2_intr`
-    /// (`kern/ml/IP22.c`) reads to decide which slot's ISR to actually call.
-    /// Naming matches IRIX's own SG (GIO_SLOT_GFX) / S0 (GIO_SLOT_0) / S1
-    /// (GIO_SLOT_1) convention from `kern/sys/hpc3.h`'s `EXTIO_*` defines.
+    /// `EXTIO_*` bit there, which is what the guest's `ip22_gio0/1/2_intr`
+    /// fan-out reads to decide which slot's ISR to actually call.
+    /// Naming follows the SG (GIO_SLOT_GFX) / S0 (GIO_SLOT_0) / S1
+    /// (GIO_SLOT_1) convention the `EXTIO_*` bits themselves use.
     GioSgFifo,      // EXTIO_SG_IRQ_2 = 0x0400, sets L0_STAT FIFO_FULL
     GioSgGraphics,  // EXTIO_SG_IRQ_1 = 0x0200, sets L0_STAT GRAPHICS
     GioSgRetrace,   // EXTIO_SG_RETRACE = 0x0100, sets L1_STAT VERTICAL_RETRACE
@@ -270,7 +270,7 @@ pub struct GioSlotWiring {
 /// and `VerticalRetrace` (L1_STAT bit 7) — matching MAME's `gio_int0/2_w`.
 ///
 /// Fullhouse's `VECTOR_GIO2`/`ip22_gio2_intr` fan-out (`L1_STAT` bit 7 +
-/// `HPC3_EXT_IO_ADDR` disambiguation, `kern/ml/IP22.c`) is real and
+/// `HPC3_EXT_IO_ADDR` disambiguation) is real and
 /// implemented (`GioSg/S0/S1Retrace`, `Ioc::read16`/`write16`'s `IOC_EXT_IO`
 /// branch) but is **not what IRIX's fullhouse Newport driver actually uses**:
 /// `ng1_init` never calls `setgiovector(GIO_INTERRUPT_2, ...)` for Newport at
@@ -340,11 +340,11 @@ struct IocState {
     /// as a 32-bit `uint` by IRIX — see `ext_io_regs`). All bits active-low;
     /// idle/no-interrupt state is all-1s. `EXTIO_S1_*` (3rd GIO slot) bits
     /// numerically collide with `EXTIO_SG_STAT_*` in this same word — real
-    /// IRIX (`kern/sys/hpc3.h`: "IP22-006 splits EXTIO into two registers to
-    /// support 3rd gio slot") implies a second physical register for that
-    /// case, but no second address is defined anywhere in IP22.c/IP26.c/
-    /// IP28.c, and it's gated behind a special medical-equipment board
-    /// revision (`kern/ml/IP22.c`'s `SPECIAL_GIO_RESET` comment) that no
+    /// hardware splits EXTIO into two registers on board revision IP22-006
+    /// to support a 3rd GIO slot, implying a second physical register for
+    /// that case — but no second address is documented anywhere for IP22,
+    /// IP26 or IP28, and it is gated behind a special medical-equipment
+    /// board revision (the `SPECIAL_GIO_RESET` path) that no
     /// config IRIS emulates has. IRIS therefore doesn't drive S1 bits from
     /// any callback; they stay permanently deasserted (matching stock
     /// hardware, where `ip22_gio0_intr` et al. explicitly comment "original
@@ -441,8 +441,29 @@ impl Ioc {
         Self::new_inner(guinness, true)
     }
 
+    /// As `new`/`new_ci`, with the machine profile's IP28 flag: an IP28
+    /// baseboard must report a high enough HPC3 board revision.
+    pub fn new_for_profile(guinness: bool, ci_mode: bool, ip28: bool) -> Self {
+        Self::new_inner_profile(guinness, ci_mode, ip28)
+    }
+
     fn new_inner(guinness: bool, ci_mode: bool) -> Self {
-        let sys_id = if guinness { 0x26 } else { 0x11 }; // primarily prom looks at bit 1 to detect full house.
+        Self::new_inner_profile(guinness, ci_mode, false)
+    }
+
+    fn new_inner_profile(guinness: bool, ci_mode: bool, ip28: bool) -> Self {
+        // HPC3 SYS_ID: [7:5] chip rev, [4:1] board rev, [0] 1 = fullhouse.
+        // The PROM looks at bit 0 to tell fullhouse from guinness. IRIX reads
+        // the board revision to tell an IP28 baseboard from an IP26 one and
+        // warns "CPU baseboard downrev (IP26 not IP28)" below 13, so an IP28
+        // has to report at least that.
+        let sys_id: u8 = if guinness {
+            0x26
+        } else if ip28 {
+            0x1B // board rev 13, fullhouse
+        } else {
+            0x11 // board rev 8, fullhouse
+        };
         let state = Arc::new(Mutex::new(IocState {
             sys_id,
             l0_stat: 0,
@@ -949,9 +970,8 @@ impl BusDevice for Ioc {
         let aligned_addr = addr & !3;
         let offset = aligned_addr - IOC_BASE;
         // HPC3_EXT_IO_ADDR: IRIX reads this specific register as a 32-bit
-        // `uint` despite the hardware register being 16 bits wide (comment
-        // in kern/ml/IP22.c: "HPC3_EXT_IO_ADDR is 16 bits wide") — zero-
-        // extend rather than truncate through the generic read8 byte path.
+        // `uint` despite `HPC3_EXT_IO_ADDR` being 16 bits wide in hardware —
+        // zero-extend rather than truncate through the generic read8 path.
         if offset == IOC_EXT_IO {
             let state = self.state.lock();
             return BusRead32::ok(state.ext_io as u32);

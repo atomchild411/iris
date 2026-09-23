@@ -172,6 +172,9 @@ pub mod mips_dis;
 pub mod mips_core;
 pub mod mips_tlb;
 pub mod mips_cache_v2;
+pub mod mips_cache_shadow;
+pub mod arcs;
+pub mod arcs_trace;
 pub mod mips_exec;
 pub mod mips_exec_test;
 pub mod mips_instr_stats;
@@ -185,6 +188,10 @@ pub mod eeprom_93c56;
 pub mod platform;
 pub mod hpc3;
 pub mod ioc;
+/// IP32 (SGI O2) bring-up scaffold — see `docs/ip32-o2-bringup.md`. Not wired
+/// into `Physical`; it drives the CPU against its own bus.
+pub mod aic7880;
+pub mod ip32;
 pub mod physical;
 pub mod ds1x86;
 pub mod z85c30;

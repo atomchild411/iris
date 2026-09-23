@@ -207,6 +207,55 @@ pub const EXC_WATCH: u32 = 23;    // Reference to WatchHi/WatchLo address
 pub const EXC_VCEI: u32 = 14;     // Virtual Coherency Exception (Instruction)
 pub const EXC_VCED: u32 = 31;     // Virtual Coherency Exception (Data)
 
+/// XContext as hardware writes it on a TLB miss, for a CPU implementing
+/// `va_bits` virtual address bits.
+///
+/// `docs/R4000_um2.pdf`, Figure 5-10 and Table 5-8, gives the layout for a
+/// 40-bit CPU:
+///
+/// ```text
+///  63              33 32 31 30            4 3     0
+///        PTEBase         R      BadVPN2         0
+///          31            2         27           4
+/// ```
+///
+/// with the accompanying text: "The 27-bit BadVPN2 field has bits 39:13 of the
+/// virtual address that caused the TLB miss; bit 12 is excluded because a
+/// single TLB entry maps to an even-odd page pair." R is virtual address bits
+/// 63:62, and PTEBase is written by the operating system.
+///
+/// Every field position follows from that one sentence. BadVPN2 is
+/// `VA[va_bits-1:13]`, so it is `va_bits - 13` bits wide — 27 when va_bits is
+/// 40, which is what the figure shows. It starts at bit 4, so it ends at
+/// `va_bits - 10` (30 for 40 bits, per the figure). R is the two bits directly
+/// above it, `[va_bits-8:va_bits-9]` (32:31 — the figure). PTEBase is
+/// everything above that, `[63:va_bits-7]` (63:33 — the figure). The 40-bit
+/// case therefore reproduces the manual exactly, and the general case is the
+/// same arithmetic with the address width left as a parameter, which is how
+/// the manual itself states it.
+///
+/// The R10000 implements 44 virtual address bits rather than 40, so on that
+/// CPU all three fields sit four bits higher. Using the 40-bit layout there
+/// puts R and PTEBase four bits too low: a 64-bit kernel reads XContext in its
+/// TLB refill handler to find the page-table entry for the faulting address,
+/// so the address it computes lands outside the page table it wired, the
+/// nested miss is unrecoverable, and IRIX panics with "Entered tlbmiss with
+/// invalid vaddr". That is the observable difference — the 6.5 IP28 kernel
+/// boots with 44 and panics with 40.
+#[inline]
+pub fn xcontext_on_miss(va_bits: u32, old_xcontext: u64, virt_addr: u64) -> u64 {
+    // Gaps from the field edges down to the address width, read off the
+    // figure: PTEBase starts at 33 = 40 - 7, R at 31 = 40 - 9.
+    const XC_PTEBASE_GAP: u32 = 7;
+    const XC_REGION_GAP: u32 = 9;
+
+    let vpn2_mask: u64 = (((1u64 << (va_bits - 13)) - 1) << 13) & !0xFFFu64;
+    let ptebase = old_xcontext & (!0u64 << (va_bits - XC_PTEBASE_GAP));
+    let badvpn2 = ((virt_addr & vpn2_mask) >> 13) << 4;
+    let region = (virt_addr >> 62) & 0x3;
+    ptebase | (region << (va_bits - XC_REGION_GAP)) | badvpn2
+}
+
 pub const CONFIG_CM: u32 = 31;    // Master checker mode
 pub const CONFIG_EC: u32 = 28;    // 3 bits, clock ratio  0 - 2, 1 - 3...
 pub const CONFIG_EP: u32 = 24;    // 4 bits transmit data pattern for writeback
@@ -282,7 +331,7 @@ struct CpuSnapshot {
     cp0_xcontext: u64,
     cp0_ecc: u32,
     cp0_cacheerr: u32,
-    cp0_taglo: u32,
+    cp0_taglo: u64,
     cp0_taghi: u32,
     cp0_errorepc: u64,
 
@@ -1108,6 +1157,18 @@ impl MipsCpuConfig {
     pub const fn indy() -> Self {
         Self { tlb_entries: 48 }
     }
+
+    /// The JTLB size the CPU model declares.
+    ///
+    /// `core.tlb_entries` is already taken from the model, so sizing the TLB
+    /// itself from anything else leaves the two disagreeing: Random cycles
+    /// over a range the array does not have, and a TLBWI to an index past the
+    /// end is silently dropped. The R10000 has 64 entries where the R4400 has
+    /// 48, and SGI's IP28 diagnostic writes index 48 on its first cache-alias
+    /// test — every one of its reported failures was that write going nowhere.
+    pub fn for_model<C: crate::mips_cache_v2::CpuModel>() -> Self {
+        Self { tlb_entries: C::TLB_ENTRIES }
+    }
 }
 
 /// MIPS Execution Engine - combines CPU core with memory interface and TLB
@@ -1177,6 +1238,14 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     cheritest_dump_hook: bool,
     pub tlb: T,
     pub cache: C,
+    /// ARCS firmware we provide ourselves, when booting with no PROM. `None`
+    /// on a PROM-booted machine, where the real firmware is in ROM.
+    arcs_fw: Option<Box<crate::arcs::Arcs>>,
+    /// ARCS firmware call tracer (`IRIS_ARCS_TRACE`). `None` unless asked for,
+    /// so the disarmed cost is one predictable branch per `jalr` — and only
+    /// `jalr`, because every ARCS call goes through the firmware vector table
+    /// by register. See `src/arcs_trace.rs`.
+    arcs: Option<Box<crate::arcs_trace::ArcsTrace>>,
     #[cfg(feature = "developer")]
     undo_buffer: UndoBuffer,
     #[cfg(feature = "developer")]
@@ -2674,6 +2743,43 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             config |= ss << CONFIG_TR_SS;
         }
 
+        // R10000 lays Config out completely differently from an R4000, and the
+        // PROM sizes its cache diagnostics from it. Fields, per NetBSD's
+        // mips/include/cpuregs.h (MIPS4_CONFIG_*):
+        //   [31:29] IC  primary I-cache size, as 4096 << field
+        //   [28:26] DC  primary D-cache size, likewise
+        //   [18:16] SS  secondary cache size
+        //   [15]    BE  big endian
+        //   [13]    SB  secondary block size, 0 = 64B, 1 = 128B
+        //   [2:0]   K0  kseg0 cacheability, which the PROM sets for itself
+        // Presenting an R4000 Config here told an R10000 PROM that its
+        // secondary cache size field was zero.
+        if C::R10K_CACHE_OPS {
+            let log2 = |n: usize| (n / 4096).trailing_zeros();
+            let mut c = 0u32;
+            c |= log2(32768) << 29;          // 32 KB L1I
+            c |= log2(32768) << 26;          // 32 KB L1D
+            c |= 1 << 15;                    // big endian
+            if C::L2_LINE == 128 { c |= 1 << 13; }
+            // Secondary cache size. The encoding is not in anything to hand,
+            // so it was swept against the PROM rather than guessed.
+            //
+            // 1 is the value to keep: IRIX reports "Secondary unified
+            // instruction/data cache size: 1 Mbyte", which agrees with this
+            // model's own `L2_SIZE`, and the PROM's power-on diagnostics pass
+            // and IRIX boots with it. 4 also passes POST but has IRIX report
+            // 8 MB, contradicting the model — it was only ever the value the
+            // bring-up scripts happened to pass. `IRIS_IP28_SS` still
+            // overrides, for sweeping it again.
+            let ss: u32 = std::env::var("IRIS_IP28_SS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            c |= (ss & 0x7) << 16;
+            c |= 2;                          // K0 = uncached at reset
+            config = c;
+        }
+
         core.cp0_config = config;
         core.tlb_entries = C::TLB_ENTRIES as u32;
         // MipsCore::new already ran reset_registers, so set both the reset value
@@ -2711,6 +2817,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             core,
             sysad,
             cheritest_dump_hook: false,
+            arcs_fw: None,
+            arcs: std::env::var_os("IRIS_ARCS_TRACE")
+                .map(|_| Box::new(crate::arcs_trace::ArcsTrace::new())),
             tlb,
             cache,
             #[cfg(feature = "jitstats")]
@@ -3875,6 +3984,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         step_preamble!(self);
         let pc = self.core.pc;
 
+        // A firmware call, if this PC is one. Checked before the fetch: the
+        // trap window has no memory behind it, so fetching would bus-error.
+        // Checked on arrival rather than at the `jalr`, because the branch
+        // delay slot must run first.
+        if self.arcs_fw.is_some() {
+            if let Some(status) = self.arcs_firmware_call(pc) {
+                return status;
+            }
+        }
+
         let fetch = self.fetch_instr(pc);
         let result = if fetch.status == EXEC_COMPLETE {
             {
@@ -4186,7 +4305,91 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// Handle an exception: update CP0 registers and jump to handler vector.
     /// Takes an ExecStatus with EXEC_IS_EXCEPTION set; extracts code and TLB-refill flag.
+    /// IP28 bring-up: dump everything about the one exception whose BadVAddr
+    /// is `IRIS_IP28_EXC_VADDR`.
+    ///
+    /// A first-N trace is useless for a fault that lands after thousands of
+    /// ordinary TLB misses, and reading the register file from the monitor
+    /// afterwards shows the guest's panic handler, not the fault. Costs one
+    /// relaxed load per exception on the R10000 model and folds away on every
+    /// other; exceptions are not a hot path.
+    #[inline]
+    fn ip28_trace_exception(&self, status: ExecStatus) {
+        if !C::R10K_CACHE_OPS {
+            return;
+        }
+        static WANT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let want = *WANT.get_or_init(|| {
+            std::env::var("IRIS_IP28_EXC_VADDR").ok().and_then(|v| {
+                let v = v.trim();
+                if v.is_empty() { return None; }
+                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()
+            })
+        });
+        let Some(want) = want else { return };
+
+        // Keep the run-up. The exception that panics the guest is the second
+        // one: the first is an ordinary miss, and its handler then faults.
+        // Only the run-up says what the handler was handed, and BadVAddr has
+        // already been overwritten by the time the match fires.
+        static RING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        const KEEP: usize = 12;
+        let line = format!(
+            "code={:<2} pc={:#018x} bd={} badvaddr={:#018x} xcontext={:#018x} \
+             context={:#018x} entryhi={:#018x} ra={:#018x}",
+            (status & CAUSE_EXCCODE_MASK) >> 2,
+            self.core.pc,
+            self.core.in_delay_slot as u8,
+            self.core.cp0_badvaddr,
+            self.core.cp0_xcontext,
+            self.core.cp0_context,
+            self.core.cp0_entryhi,
+            self.core.read_gpr(31),
+        );
+        if let Ok(mut ring) = RING.lock() {
+            if ring.len() == KEEP {
+                ring.remove(0);
+            }
+            ring.push(line);
+            if want == self.core.cp0_badvaddr {
+                eprintln!("ip28exc: --- last {} exceptions, oldest first ---", ring.len());
+                for (i, l) in ring.iter().enumerate() {
+                    eprintln!("ip28exc: [{i}] {l}");
+                }
+            }
+        }
+
+        if want != self.core.cp0_badvaddr {
+            return;
+        }
+        const NAMES: [&str; 32] = [
+            "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+            "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+        ];
+        let code = (status & CAUSE_EXCCODE_MASK) >> 2;
+        eprintln!(
+            "ip28exc: code={code} pc={:#018x} delay_slot={} badvaddr={:#018x} status={:#010x}",
+            self.core.pc, self.core.in_delay_slot, self.core.cp0_badvaddr,
+            self.core.cp0_status,
+        );
+        for i in 0..32u32 {
+            if self.core.read_gpr(i) == self.core.cp0_badvaddr {
+                eprintln!("ip28exc:   {} (${i}) holds the bad address", NAMES[i as usize]);
+            }
+        }
+        for chunk in (0..32u32).collect::<Vec<_>>().chunks(4) {
+            let mut line = String::from("ip28exc: ");
+            for &i in chunk {
+                line.push_str(&format!(" {:>4}={:#018x}", NAMES[i as usize], self.core.read_gpr(i)));
+            }
+            eprintln!("{line}");
+        }
+    }
+
     fn handle_exception(&mut self, status: ExecStatus) -> ExecStatus {
+        self.ip28_trace_exception(status);
         // In developer builds, bus/address error exceptions break into the
         // monitor at the fault site rather than dispatching to the MIPS
         // vector — must be decided before deliver_exception runs, since that
@@ -4804,10 +5007,24 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.cp0_context = ptebase | badvpn2;
 
         // XContext: PTEBase[63:33] preserved, Region[63:62] → bits[32:31], BadVPN2[39:13] → bits[30:4].
-        let xptebase = self.core.cp0_xcontext & 0xFFFF_FFFE_0000_0000;
-        let xbadvpn2 = ((virt_addr & EH_VPN2_64) >> 13) << 4;
-        let region = (virt_addr >> 62) & 0x3;
-        self.core.cp0_xcontext = xptebase | (region << 31) | xbadvpn2;
+        // XContext's fields are laid out around the width of BadVPN2, which is
+        // VA[VA_BITS-1:13] — 27 bits on a 40-bit CPU, 31 on the R10000's
+        // 44-bit one. Region sits directly above it and PTEBase above that, so
+        // all three move together: PTEBase[63:VA_BITS-7],
+        // Region[VA_BITS-8:VA_BITS-9], BadVPN2[VA_BITS-10:4].
+        //
+        // Using the 40-bit layout on an R10000 puts Region and PTEBase four
+        // bits too low. A 64-bit kernel reads XContext in its TLB refill
+        // handler to find the page-table entry for the faulting address, so
+        // the address it computes lands outside the page table it wired, the
+        // nested miss is unrecoverable, and IRIX panics with "Entered tlbmiss
+        // with invalid vaddr".
+        //
+        // EntryHi keeps the 40-bit VPN2 field on every model: a 64-bit kernel
+        // zero-fills those upper bits itself when it builds an EntryHi value,
+        // and widening the mask here breaks it.
+        self.core.cp0_xcontext =
+            xcontext_on_miss(C::VA_BITS, self.core.cp0_xcontext, virt_addr);
     }
 
     // ========== Memory Access Wrapper Methods ==========
@@ -5322,7 +5539,90 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let target = self.core.read_gpr(d.rs as u32);
         let rd_reg = d.rd as u32;
         self.core.write_gpr(rd_reg, self.core.pc + 8);
+        if self.arcs.is_some() {
+            self.note_arcs_call(target);
+        }
         self.branch_delay(target)
+    }
+
+    /// Record a call into the ARCS firmware vector, if this jump is one.
+    ///
+    /// Split out of `exec_jalr` so the armed path's cost stays off the
+    /// instruction stream the common case executes.
+    #[cold]
+    fn note_arcs_call(&mut self, target: u64) {
+        let Some(mut t) = self.arcs.take() else { return };
+        if !t.is_armed() && !t.exhausted() {
+            t.try_arm(self.sysad.as_ref());
+        }
+        if let Some(idx) = t.entry_for(target) {
+            let args = [
+                self.core.read_gpr(4),
+                self.core.read_gpr(5),
+                self.core.read_gpr(6),
+                self.core.read_gpr(7),
+            ];
+            let ra = self.core.read_gpr(31);
+            t.note(idx, args, ra);
+        }
+        self.arcs = Some(t);
+    }
+
+    /// Install firmware for a machine with no PROM: build the SPB, the vector
+    /// table and the firmware-owned structures in guest memory, and start
+    /// answering calls. `ram_base`/`ram_bytes` describe where the machine's
+    /// RAM actually is — see `Arcs::new`.
+    pub fn install_arcs(&mut self, ram_base: u64, ram_bytes: u64) -> &mut crate::arcs::Arcs {
+        let mut fw = Box::new(crate::arcs::Arcs::new(ram_base, ram_bytes));
+        fw.install(self.sysad.as_ref());
+        self.arcs_fw = Some(fw);
+        self.arcs_fw.as_mut().unwrap()
+    }
+
+    /// Service a firmware call if `pc` is a vector entry.
+    ///
+    /// Returns `None` for an ordinary instruction, so the common path costs
+    /// one range check.
+    #[inline]
+    fn arcs_firmware_call(&mut self, pc: u64) -> Option<ExecStatus> {
+        let idx = crate::arcs::Arcs::entry_for_pc(pc)?;
+        let mut fw = self.arcs_fw.take()?;
+        let args = [
+            self.core.read_gpr(4),
+            self.core.read_gpr(5),
+            self.core.read_gpr(6),
+            self.core.read_gpr(7),
+        ];
+        let result = fw.dispatch(idx, args, self.sysad.as_ref());
+        self.arcs_fw = Some(fw);
+
+        let v0 = match result {
+            crate::arcs::CallResult::Value(v) => v,
+            crate::arcs::CallResult::Console(bytes) => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(&bytes);
+                let _ = out.flush();
+                crate::arcs::ESUCCESS
+            }
+            crate::arcs::CallResult::Halt => {
+                eprintln!("arcs: guest asked the firmware to stop the machine");
+                return Some(EXEC_BREAKPOINT);
+            }
+        };
+
+        // Return to the caller. A firmware call is a function call: it leaves
+        // its result in v0 and resumes at ra.
+        self.core.write_gpr(2, v0);
+        let ra = self.core.read_gpr(31);
+        self.core.pc = ra;
+        self.core.in_delay_slot = false;
+        Some(EXEC_COMPLETE)
+    }
+
+    /// Summary of which ARCS entries the guest used. Empty when not tracing.
+    pub fn arcs_report(&self) -> String {
+        self.arcs.as_ref().map(|t| t.report()).unwrap_or_default()
     }
     /// Answer a host call (system calls 3000-3009, see iris-hostcall) if this
     /// `syscall` is one and a service is registered for it. Only from user
@@ -6615,7 +6915,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let op = cache_op & 0x1C;
 
         // Determine if this is a Hit operation that needs address translation
-        let needs_translation = matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV);
+        // On an R10000 the encodings for 5/6/7 are index operations, not the
+        // R4000 hit operations — translating them would fault on an index that
+        // is not a valid virtual address. See C_R10K_ISD in mips_cache_v2.
+        let sel = cache_op & 3;
+        let r10k_index_op = C::R10K_CACHE_OPS
+            && match op {
+                C_R10K_CBARRIER => sel == CACH_PI,
+                C_R10K_ILD => matches!(sel, CACH_PI | CACH_PD | CACH_SD),
+                C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
+                _ => false,
+            };
+        let needs_translation =
+            !r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV);
 
         let phys_addr = if needs_translation {
             // Hit operations need address translation
@@ -6629,19 +6941,73 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         // For Index_Store_Tag, pass TagLo via phys_addr
         let op = cache_op & 0x1C;
-        let phys_addr_or_taglo = if op == C_IST {
-            self.core.cp0_taglo as u64
+        // A cache tag is TagHi:TagLo, not TagLo alone. The IP28 PROM writes
+        // the low 32 bits to $28 and the bits above to $29 — a 36-bit
+        // secondary tag arrives as TagLo=0xffffcdfe, TagHi=0xf — so a model
+        // that reads only TagLo sees a different tag from the one written.
+        // Harmless for R4400/R5000, whose tags fit in 32 bits and who leave
+        // TagHi zero: the shift-in contributes nothing there.
+        let stores_taglo = op == C_IST || (r10k_index_op && op == C_R10K_ISD);
+        let phys_addr_or_taglo = if stores_taglo {
+            ((self.core.cp0_taghi as u64) << 32) | (self.core.cp0_taglo as u32 as u64)
         } else {
             phys_addr
         };
 
+        // On an R10000 the check bits travel with cache data through CP0 ECC.
+        if C::R10K_CACHE_OPS {
+            self.cache.set_cache_ecc(self.core.cp0_ecc);
+        }
+        // IP28 cache-error investigation (`IRIS_IP28_CACHEDIAG=1`). Two kinds
+        // of op are worth seeing: one carrying non-zero check bits, which is a
+        // guest staging a parity error on purpose, and any op from outside the
+        // PROM — i.e. from a loaded diagnostic, which runs out of XKPHYS.
+        //
+        // Both halves of that gate were learned the hard way. Gating on ECC
+        // alone hid every op the IDE issued, because the IDE's ECC reads back
+        // zero: the exact symptom under investigation was also blinding the
+        // instrument to its cause. The cap then has to be generous, because a
+        // cap of 600 silently truncated a run at precisely the boundary and
+        // made a partial picture look like the whole one. It exists only so a
+        // hot loop cannot rewrite the timing it is measuring.
+        if crate::mips_core::cachediag_on() {
+            let from_prom = (self.core.pc >> 32) == 0xFFFF_FFFF;
+            // CBARRIER is pure ordering: it names no line and carries no check
+            // bits, and it outnumbers everything else ~8:1 (83534 of 94322 in
+            // one IDE run). Tracing it swamped the log and slowed the guest
+            // enough that the run no longer reached the loop being studied —
+            // so drop it unless it is carrying staged check bits.
+            let noise = op == C_R10K_CBARRIER && self.core.cp0_ecc == 0;
+            if (self.core.cp0_ecc != 0 || !from_prom) && !noise {
+                const CACHE_TRACE_CAP: u32 = 200_000;
+                static SEEN: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < CACHE_TRACE_CAP {
+                    eprintln!(
+                        "ip28cd: CACHE op={:#04x} sel={} vaddr={:#018x} ECC={:#010x} \
+                         TagHi:Lo={:#010x}:{:#018x} pc={:#018x}",
+                        op, sel, virt_addr, self.core.cp0_ecc,
+                        self.core.cp0_taghi, self.core.cp0_taglo, self.core.pc,
+                    );
+                } else if n == CACHE_TRACE_CAP {
+                    eprintln!("ip28cd: CACHE trace capped at {CACHE_TRACE_CAP} ops \
+                               — output past this point is incomplete");
+                }
+            }
+        }
         // Call unified cache interface
         let result = self.cache.cache_op(cache_op, virt_addr, phys_addr_or_taglo);
+        if C::R10K_CACHE_OPS && op == C_R10K_ILD {
+            self.core.cp0_ecc = self.cache.cache_op_ecc();
+        }
 
         // For Index_Load_Tag, update CP0 TagLo from result
-        if op == C_ILT {
-            self.core.cp0_taglo = result;
-            self.core.cp0_taghi = 0;
+        if op == C_ILT || (r10k_index_op && op == C_R10K_ILD) {
+            // Split back the way it arrived. Zeroing TagHi unconditionally
+            // threw away the top of every tag wider than 32 bits.
+            self.core.cp0_taglo = result & 0xFFFF_FFFF;
+            self.core.cp0_taghi = (result >> 32) as u32;
         }
 
         self.handle_exec_complete()
@@ -6869,6 +7235,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
         let value = self.core.read_cp0(rd_val);
+        self.ip28_cp0_trace("mfc0", rd_val, value);
         // Sign-extend 32-bit value to 64 bits
         self.core.write_gpr(rt_reg, value as u32 as i32 as i64 as u64);
         self.handle_exec_complete()
@@ -6879,23 +7246,90 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
         let value = self.core.read_cp0(rd_val);
+        self.ip28_cp0_trace("dmfc0", rd_val, value);
         self.core.write_gpr(rt_reg, value);
         self.handle_exec_complete()
     }
 
     // MTC0 - Move To CP0
+    /// The CP0 registers that are 64 bits wide.
+    ///
+    /// EntryLo0/1, Context, BadVAddr, EntryHi, EPC, XContext and ErrorEPC are
+    /// 64-bit in MIPS III and stay so in MIPS IV. TagLo is 32-bit on R4x00 but
+    /// 64-bit on the R10000, which is why it is asked of the model rather than
+    /// listed flat.
+    fn cp0_is_64bit(reg: u32) -> bool {
+        matches!(reg, 2 | 3 | 4 | 8 | 10 | 14 | 20 | 30) || (C::R10K_CACHE_OPS && reg == 28)
+    }
+
     fn exec_mtc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
+        self.ip28_cp0_trace("mtc0", d.rd as u32, rt_val);
         let rd_val = d.rd as u32;
-        // Sign-extend from 32 bits
-        self.core.write_cp0(rd_val, rt_val as u32 as i32 as i64 as u64);
+        let word = rt_val as u32 as u64;
+
+        // MTC0 moves a *word*. Into a 64-bit CP0 register it writes the low
+        // half and leaves the upper half exactly as it was — MIPS64 Vol II
+        // gives the operation as `CPR ← CPR[63:32] || data`. Only a 32-bit
+        // register takes the sign-extended word, and there the extension is an
+        // artifact of storing it in a 64-bit field.
+        //
+        // Sign-extending into the 64-bit registers as well is invisible to a
+        // 32-bit kernel, whose addresses are sign-extended anyway, and fatal
+        // to a 64-bit one. IRIX's standalone code returns from an exception
+        // with `mtc0 ra, EPC` / `mtc0 ra, ErrorEPC` / `eret`, relying on the
+        // exception's own EPC to still be supplying bits 63:32: with `ra` =
+        // 0xa8000000208b9998 and EPC = 0xa8000000208b9924, the word written is
+        // 0x208b9998 and the register has to come out holding `ra`. Sign
+        // extension made that 0x00000000208b9998 and the ERET jumped into
+        // unmapped user space.
+        // MTC0 moves the whole register. DMTC0 differs in what the
+        // assembler will accept, not in how much data reaches CP0, so a
+        // 64-bit CP0 register takes `rt` intact and only a 32-bit one takes
+        // the low word (sign-extended, an artifact of holding it in a 64-bit
+        // field here).
+        //
+        // Sign-extending into the 64-bit registers as well was silently fine
+        // for a 32-bit kernel, whose registers are sign-extended anyway, and
+        // fatal to a 64-bit one. IRIX's 64-bit standalone code returns from an
+        // exception with `mtc0 ra, EPC` / `mtc0 ra, ErrorEPC` / `eret`: with
+        // `ra` = 0xa8000000208b9998 the ERET went to 0x00000000208b9998 and
+        // landed in unmapped user space.
+        //
+        // Two other readings were tried against both guests and rejected.
+        // Preserving bits 63:32 of the old value fixes the 64-bit case and
+        // breaks the 32-bit one — EntryHi's upper half carries the TLB Region,
+        // so a stale one files entries under the wrong region and IRIX 6.5.22
+        // dies in sash on a kseg3 address. Doing that only in 64-bit
+        // addressing mode works for both but needs a mode test MTC0 does not
+        // architecturally have. Moving the whole register needs neither, and
+        // both guests are happy with it.
+        let value = if Self::cp0_is_64bit(rd_val) {
+            rt_val
+        } else {
+            rt_val as u32 as i32 as i64 as u64
+        };
+        self.core.write_cp0(rd_val, value);
         self.handle_cp0_side_effects(rd_val);
         self.handle_exec_complete()
     }
 
     // DMTC0 - Doubleword Move To CP0 (MIPS III)
+    /// IP28 bring-up: watch the cache-tag CP0 registers (26 ECC, 28 TagLo,
+    /// 29 TagHi). Only the R10000 model compiles this in.
+    #[inline(always)]
+    fn ip28_cp0_trace(&self, what: &str, reg: u32, val: u64) {
+        if C::R10K_CACHE_OPS
+            && matches!(reg, 26 | 28 | 29)
+            && std::env::var_os("IRIS_IP28_CP0").is_some()
+        {
+            eprintln!("ip28cp0: {what} ${reg} = {val:#018x}");
+        }
+    }
+
     fn exec_dmtc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
+        self.ip28_cp0_trace("dmtc0", d.rd as u32, rt_val);
         let rd_val = d.rd as u32;
         self.core.write_cp0(rd_val, rt_val);
         self.handle_cp0_side_effects(rd_val);
@@ -7061,6 +7495,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // TLBWI - Write Indexed TLB Entry
     // Writes CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask to the TLB entry indexed by CP0.Index
+    /// IP28 bring-up: report every TLB write. `IRIS_IP28_TLBW=1` reports all
+    /// of them; `IRIS_IP28_TLBW=wired` reports only writes below CP0 Wired,
+    /// which is what a kernel uses for mappings that must never be evicted.
+    #[inline]
+    fn ip28_trace_tlb_write(&self, op: &str, index: usize, entry: &crate::mips_tlb::TlbEntry) {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let mode = *MODE.get_or_init(|| match std::env::var("IRIS_IP28_TLBW").as_deref() {
+            Ok("wired") => 2,
+            Ok(v) if !v.is_empty() && v != "0" => 1,
+            _ => 0,
+        });
+        if mode == 0 || (mode == 2 && index >= self.core.cp0_wired as usize) {
+            return;
+        }
+        eprintln!(
+            "ip28tlbw: {op} idx={index:<2} wired={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} \
+             mask={:#x} pc={:#018x}",
+            self.core.cp0_wired, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1],
+            entry.page_mask, self.core.pc,
+        );
+    }
+
     fn exec_tlbwi(&mut self) -> ExecStatus {
         // The slot is Index[5:0]. Masking rather than `%` matters twice:
         //
@@ -7086,7 +7542,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return self.handle_exec_complete();
         }
         let entry = self.create_tlb_entry_from_cp0();
-        //eprintln!("TLBWI idx={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} pc={:#018x}", index, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1], self.core.pc);
+        self.ip28_trace_tlb_write("tlbwi", index, &entry);
         self.tlb.write(index, entry);
         // Flushes the nutlb too — the TLB it caches just changed.
         self.nanotlb_invalidate();
@@ -7110,6 +7566,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.update_random();
         let index = (self.core.cp0_random as usize) % self.tlb.num_entries();
         let entry = self.create_tlb_entry_from_cp0();
+        self.ip28_trace_tlb_write("tlbwr", index, &entry);
         self.tlb.write(index, entry);
         self.nanotlb_invalidate();
 
@@ -7278,6 +7735,18 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // code through the kernel translator. The flush alone cannot cover it: it
         // *guarantees* the next access misses and therefore calls `translate_fn`.
         self.resync_privilege_state();
+
+        // IP28 bring-up: see `IRIS_IP28_EPC`. If the target's top half is
+        // already gone by the time we get here, the guest wrote a truncated
+        // EPC; if it is intact and the next fetch is truncated anyway, the
+        // loss is downstream of this.
+        static ERET_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if C::R10K_CACHE_OPS && *ERET_ON.get_or_init(|| std::env::var_os("IRIS_IP28_EPC").is_some()) {
+            eprintln!(
+                "ip28epc: eret -> {target:#018x} (epc={:#018x} errorepc={:#018x} status={:#010x})",
+                self.core.cp0_epc, self.core.cp0_errorepc, self.core.cp0_status,
+            );
+        }
 
         // ERET jumps immediately without delay slot
         self.core.pc = target;
@@ -10493,6 +10962,59 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         exec.core.pc = elf.entry;
         out.push_str(&format!("  entry {:#018x}\n", elf.entry));
         Ok(out)
+    }
+
+    /// Install ARCS firmware and put the CPU in the state a kernel is entered
+    /// in, for a machine with no PROM.
+    ///
+    /// A kernel is not merely jumped to. SGI firmware enters it as
+    /// `mach_init(argc, argv, magic, bootinfo)`, and at least one kernel reads
+    /// `argv[0]` for its boot path and scans the rest for options. `magic` is
+    /// only meaningful when bootinfo is supplied, which we do not: a kernel
+    /// that finds no bootinfo says so and carries on.
+    ///
+    /// The environment matters more than the arguments. `cpufreq` in
+    /// particular is a hard panic in NetBSD if it is missing — the firmware,
+    /// not the kernel, is what knows how fast the machine is.
+    pub fn boot_arcs(&self, ram_base: u64, ram_bytes: u64, bootpath: &str, kern_lo: u64, kern_hi: u64) -> Result<String, String> {
+        self.check_stopped()?;
+        let mut exec = self.try_lock_executor()?;
+
+        // Clone the bus handle first: `install_arcs` borrows the executor
+        // mutably and the firmware needs the bus to publish into.
+        let bus = exec.sysad.clone();
+        let fw = exec.install_arcs(ram_base, ram_bytes);
+        fw.reserve_loaded_program(kern_lo, kern_hi);
+        // Values a PROM would have derived from NVRAM and the hardware.
+        fw.set_env("cpufreq", "150");
+        fw.set_env("ConsoleOut", "serial(0)");
+        fw.set_env("ConsoleIn", "serial(0)");
+        fw.set_env("console", "d");
+        fw.set_env("dbaud", "9600");
+        fw.set_env("eaddr", "08:00:69:12:34:56");
+        fw.set_env("OSLoadPartition", bootpath);
+        fw.set_env("OSLoadFilename", "netbsd");
+        fw.set_env("OSLoadOptions", "auto");
+        fw.set_env("SystemPartition", bootpath);
+
+        // argv lives in guest memory: an array of 32-bit pointers, each to a
+        // NUL-terminated string.
+        let args = [bootpath.to_string(), "OSLoadOptions=auto".to_string()];
+        let (argc, argv_addr) = fw.publish_argv(bus.as_ref(), &args);
+
+        exec.core.write_gpr(4, argc as u64);
+        exec.core.write_gpr(5, argv_addr as u64);
+        exec.core.write_gpr(6, 0); // magic: no bootinfo
+        exec.core.write_gpr(7, 0); // bootinfo pointer
+        Ok(format!(
+            "  ARCS firmware installed, {} MB at {:#010x}\n  kernel {:#010x}..{:#010x} reserved\n  argc {} argv {:#010x}\n",
+            ram_bytes / (1024 * 1024),
+            ram_base,
+            kern_lo,
+            kern_hi,
+            argc,
+            argv_addr
+        ))
     }
 
     /// Load raw bytes at a virtual address. PC is not touched.
@@ -13921,6 +14443,9 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn core_ptr(&self) -> *const crate::mips_core::MipsCore;
     fn register_locks(&self);
     fn load_elf(&self, path: &str) -> Result<String, String>;
+    /// Install ARCS firmware and set up the kernel entry state, for a
+    /// machine booting with no PROM. See `src/arcs.rs`.
+    fn boot_arcs(&self, ram_base: u64, ram_bytes: u64, bootpath: &str, kern_lo: u64, kern_hi: u64) -> Result<String, String>;
     fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String>;
     fn step_n_inline(&self, n: u64) -> Result<u64, String>;
     #[cfg(feature = "developer")]
@@ -13968,6 +14493,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn core_ptr(&self) -> *const crate::mips_core::MipsCore { MipsCpu::core_ptr(self) }
     fn register_locks(&self) { MipsCpu::register_locks(self) }
     fn load_elf(&self, p: &str) -> Result<String, String> { MipsCpu::load_elf(self, p) }
+    fn boot_arcs(&self, rb: u64, r: u64, b: &str, kl: u64, kh: u64) -> Result<String, String> { MipsCpu::boot_arcs(self, rb, r, b, kl, kh) }
     fn load_elf_bytes(&self, b: &[u8], n: &str) -> Result<String, String> { MipsCpu::load_elf_bytes(self, b, n) }
     fn step_n_inline(&self, n: u64) -> Result<u64, String> { MipsCpu::step_n_inline(self, n) }
     #[cfg(feature = "developer")]
@@ -14053,7 +14579,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         cp0u32!(cp0_status); cp0u32!(cp0_cause);
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
         cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
-        cp0u32!(cp0_taglo); cp0u32!(cp0_taghi);
+        cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
         cp0u64!(cp0_badvaddr); cp0u64!(cp0_epc); cp0u64!(cp0_errorepc);
         cp0u64!(cp0_entrylo0); cp0u64!(cp0_entrylo1); cp0u64!(cp0_context);
         cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext);
@@ -14118,7 +14644,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);
             ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
             ld32!(cp0_config); ld32!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
-            ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld32!(cp0_taglo); ld32!(cp0_taghi);
+            ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
             ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
             ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
             ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
@@ -14539,6 +15065,100 @@ impl<T: Tlb, C: CpuModel> iris_hostcall::PageAccess for HostMemory<'_, T, C> {
     }
 }
 
+
+#[cfg(test)]
+mod xcontext_layout_tests {
+    use super::xcontext_on_miss;
+
+    /// Field edges as `docs/R4000_um2.pdf` Figure 5-10 draws them, for the
+    /// 40-bit CPU the manual describes. These are the numbers in the figure,
+    /// not numbers derived from the code under test.
+    const R4000_PTEBASE_LSB: u32 = 33;
+    const R4000_REGION_LSB: u32 = 31;
+    const R4000_REGION_MSB: u32 = 32;
+    const R4000_BADVPN2_LSB: u32 = 4;
+    const R4000_BADVPN2_MSB: u32 = 30;
+    const R4000_BADVPN2_WIDTH: u32 = 27;
+
+    /// A virtual address with a distinct bit in every VPN2 position, so a
+    /// misplaced field shows up as a shifted result rather than a coincidence.
+    /// Region `11` (kernel), and VA bits 43:13 all set.
+    const VA_ALL_VPN2: u64 = 0xFFFF_FFFF_FFFF_E000;
+
+    #[test]
+    fn forty_bit_layout_matches_the_r4000_manual_figure() {
+        // BadVPN2 is VA[39:13] — the manual's own sentence — landing at
+        // bits [30:4], 27 bits wide.
+        let got = xcontext_on_miss(40, 0, VA_ALL_VPN2);
+        let badvpn2 = (got >> R4000_BADVPN2_LSB) & ((1 << R4000_BADVPN2_WIDTH) - 1);
+        assert_eq!(badvpn2, (1u64 << R4000_BADVPN2_WIDTH) - 1,
+                   "VA[39:13] should fill the 27-bit BadVPN2 field");
+        assert_eq!(got & 0xF, 0, "bits [3:0] are the figure's zero field");
+        // Nothing above BadVPN2's top bit except Region, which is next.
+        assert_eq!((got >> R4000_REGION_LSB) & 0x3, 0x3, "Region = VA[63:62] = 11");
+        assert_eq!(R4000_BADVPN2_MSB + 1, R4000_REGION_LSB,
+                   "Region sits directly above BadVPN2");
+        assert_eq!(R4000_REGION_MSB + 1, R4000_PTEBASE_LSB,
+                   "PTEBase sits directly above Region");
+    }
+
+    #[test]
+    fn forty_bit_ptebase_is_preserved_above_bit_32() {
+        // The OS writes PTEBase; hardware must leave it alone.
+        let ptebase = 0xDEAD_BEEF_0000_0000u64 & (!0u64 << R4000_PTEBASE_LSB);
+        let got = xcontext_on_miss(40, ptebase, VA_ALL_VPN2);
+        assert_eq!(got & (!0u64 << R4000_PTEBASE_LSB), ptebase);
+        // And a stale value below PTEBase must not survive.
+        let stale = xcontext_on_miss(40, !0u64, 0);
+        assert_eq!(stale & !(!0u64 << R4000_PTEBASE_LSB), 0,
+                   "everything below PTEBase is rewritten by hardware");
+    }
+
+    #[test]
+    fn region_carries_virtual_address_bits_63_62() {
+        // Table 5-8: 00 user, 01 supervisor, 11 kernel.
+        for (va_top, want) in [(0u64, 0u64), (1, 1), (3, 3)] {
+            let va = va_top << 62;
+            let got = xcontext_on_miss(40, 0, va);
+            assert_eq!((got >> R4000_REGION_LSB) & 0x3, want);
+        }
+    }
+
+    /// The R10000 implements 44 virtual address bits, so BadVPN2 is
+    /// `44 - 13 = 31` bits and every field above it moves up by four.
+    #[test]
+    fn forty_four_bit_layout_shifts_every_field_up_by_four() {
+        const W: u32 = 44 - 13; // 31
+        let got = xcontext_on_miss(44, 0, VA_ALL_VPN2);
+        assert_eq!((got >> 4) & ((1u64 << W) - 1), (1u64 << W) - 1,
+                   "VA[43:13] should fill the 31-bit BadVPN2 field");
+        assert_eq!((got >> (R4000_REGION_LSB + 4)) & 0x3, 0x3,
+                   "Region moves from [32:31] to [36:35]");
+        let ptebase = 0xABCD_0000_0000_0000u64 & (!0u64 << (R4000_PTEBASE_LSB + 4));
+        let kept = xcontext_on_miss(44, ptebase, VA_ALL_VPN2);
+        assert_eq!(kept & (!0u64 << (R4000_PTEBASE_LSB + 4)), ptebase,
+                   "PTEBase moves from [63:33] to [63:37]");
+    }
+
+    /// The bug this layout fixed: on a 44-bit CPU the 40-bit layout puts
+    /// Region and PTEBase four bits too low, so the two disagree.
+    #[test]
+    fn forty_and_forty_four_bit_layouts_actually_differ() {
+        let va = 0xC000_0FFF_FFFF_E000u64;
+        assert_ne!(xcontext_on_miss(40, 0, va), xcontext_on_miss(44, 0, va));
+    }
+
+    /// VA bits above the implemented width must not reach BadVPN2 — on a
+    /// 40-bit CPU, VA[43:40] is not part of the page number.
+    #[test]
+    fn address_bits_above_the_implemented_width_are_excluded() {
+        let only_high = 0x0000_0F00_0000_0000u64; // VA[43:40]
+        assert_eq!(xcontext_on_miss(40, 0, only_high), 0,
+                   "VA[43:40] is outside a 40-bit CPU's BadVPN2");
+        assert_ne!(xcontext_on_miss(44, 0, only_high), 0,
+                   "but it is inside a 44-bit CPU's");
+    }
+}
 
 #[cfg(test)]
 mod round_to_int_mode_tests {

@@ -24,27 +24,17 @@ is kept only so the discriminants of later variants stay stable —
 
 ## Why only R5000 executes it
 
-IRIX uses `WAIT` **only** on the R4600/R5000 idle path. `kern/ml/R4Kasm.s`:
+The guest executes `WAIT` **only** on the R4600/R5000 idle path. Disassembling
+the idle routine on a running kernel shows the shape of it: interrupts are
+masked via `C0_SR` so the idle flag can be tested atomically, the flag is
+loaded, and if the CPU is to go idle the restore of `C0_SR` is placed
+*immediately* before the `WAIT` — the two adjacent, so an interrupt cannot land
+between re-enabling and sleeping. If the flag says otherwise it restores `SR`
+in the branch delay slot and returns.
 
-```
-#ifdef R4600
-LEAF(wait_for_interrupt)
-	...
-	mfc0	a1, C0_SR
-	mtc0	zero, C0_SR		/* IE=0: test p_nextthread atomically */
-	lbu	t1,0(a0)		/* check idle flag */
-	beqz	t1,1f
-	mtc0	a1, C0_SR		/* (slot) restore, return */
-	j	ra
-1:
-EXPORT(wait_for_interrupt_fix_loc)
-	mtc0	a1,C0_SR		/* must be adjacent to avoid	*/
-	c0	C0_WAIT			/* a race with an interrupt	*/
-```
-
-The R4400 build takes the `#else` arm in `kern/os/machdep.c` — a plain C spin,
-`while (local_idle() && !idler());` — with no `WAIT` at all. **This is the only
-ISA-level difference between the two profiles on an IRIX 6.5 boot**: an
+The R4400 build takes a different arm entirely: a plain C spin of the form
+`while (local_idle() && !idler());`, with no `WAIT` at all. **This is the only
+ISA-level difference between the two profiles on an IRIX 6.5 boot** — an
 `instr_used.txt` diff between them shows `wait` and nothing else.
 
 ## The semantics fix: WAIT completes, then stalls

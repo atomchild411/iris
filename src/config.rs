@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
 /// Valid memory bank sizes in MB.
-pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128];
+pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256];
 
 /// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
 /// `kind = "cdrom"`; either works and they mean the same thing.
@@ -384,27 +384,46 @@ pub enum MachineProfile {
     IndyIp24,
     /// SGI Indigo2 IP22 — fullhouse MC/IOC, Newport XL on GIO gfx slot.
     Indigo2Ip22,
+    /// SGI Indigo2 IMPACT IP28 — an R10000 CPU module in the Indigo2 chassis.
+    ///
+    /// Shares the fullhouse MC/IOC/HPC3 with IP22 and differs in the decodes
+    /// inside them: MEMCFG's base field is shifted by 24 rather than 22 (so
+    /// its size granule is 16 MB, not 4), RAM lives at 0x20000000 with the
+    /// low-memory alias following it there, and both the MC chip revision and
+    /// the HPC3 board revision have to read high enough for the kernel to
+    /// call the board an IP28.
+    ///
+    /// Graphics is IMPACT, which is a register stub — an IP28 kernel carries
+    /// no Newport driver, so REX3 is not an alternative here.
+    Indigo2Ip28,
 }
 
 impl MachineProfile {
     /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
-    pub const ALL: [Self; 2] = [Self::IndyIp24, Self::Indigo2Ip22];
+    pub const ALL: [Self; 3] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::IndyIp24 => "SGI Indy (IP24)",
             Self::Indigo2Ip22 => "SGI Indigo2 (IP22)",
+            Self::Indigo2Ip28 => "SGI Indigo2 IMPACT (IP28)",
         }
     }
 
     pub fn supported(self) -> bool {
-        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22)
+        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22 | Self::Indigo2Ip28)
     }
 
     /// MC/IOC/HPC3 Guinness vs Fullhouse layout. Indy IP24 is Guinness (`true`).
     pub fn guinness(self) -> bool {
         matches!(self, Self::IndyIp24)
+    }
+
+    /// The R10000 Indigo2. Selects the IP28 decodes inside the shared
+    /// fullhouse devices — see the variant's own documentation for the list.
+    pub fn ip28(self) -> bool {
+        matches!(self, Self::Indigo2Ip28)
     }
 }
 
@@ -521,12 +540,19 @@ pub enum CpuModel {
     R4400,
     /// MIPS R5000, 2-way 32K L1s, no secondary cache, MIPS IV.
     R5000,
+    /// MIPS R10000, 2-way 32K L1s, 1 MB secondary cache, MIPS IV. The CPU in
+    /// the Indigo2 IMPACT (IP28). Bring-up only — see docs/ip28-bringup.md.
+    R10000,
 }
 
 impl CpuModel {
-    pub const ALL: [Self; 2] = [Self::R4400, Self::R5000];
+    pub const ALL: [Self; 3] = [Self::R4400, Self::R5000, Self::R10000];
     pub fn label(self) -> &'static str {
-        match self { Self::R4400 => "MIPS R4400", Self::R5000 => "MIPS R5000" }
+        match self {
+            Self::R4400 => "MIPS R4400",
+            Self::R5000 => "MIPS R5000",
+            Self::R10000 => "MIPS R10000",
+        }
     }
 }
 

@@ -28,6 +28,28 @@ pub const STATUS_CU1: u32 = 1 << 29;    // Coprocessor 1 (FPU) Usable
 pub const STATUS_CU2: u32 = 1 << 30;    // Coprocessor 2 Usable
 pub const STATUS_CU3: u32 = 1 << 31;    // Coprocessor 3 Usable
 
+/// IP28 bring-up: `IRIS_IP28_CACHEDIAG=1` traces everything the cache-error
+/// machinery touches — CP0 ECC (26) and CacheErr (27) accesses, Status.DE
+/// transitions, and CACHE ops.
+///
+/// Built to explain why SGI's own IDE field diagnostic reports "Failure
+/// detected on the CPU module" on an otherwise healthy emulated R10000. What
+/// it found: the IDE ends in a bounded 3712-iteration loop reading CacheErr
+/// and ECC, both of which return zero every pass, because nothing in this
+/// emulator ever writes CacheErr — we do not detect or log a cache error at
+/// all. Note it does this with Status.DE *set*: DE suppresses only the trap,
+/// while real hardware still records the error, which is what a poll-based
+/// parity test relies on. (An earlier guess that the IDE wanted a Cache Error
+/// *exception* was refuted by this tracer — DE is never cleared outside the
+/// PROM's own memory sizing.)
+///
+/// One cached bool; unarmed it is a predictable branch.
+#[inline(always)]
+pub fn cachediag_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_IP28_CACHEDIAG").is_some())
+}
+
 // CP0 Cause Register bit definitions
 pub const CAUSE_EXCCODE_MASK: u32 = 0x1F << 2; // Exception Code mask
 pub const CAUSE_EXCCODE_SHIFT: u32 = 2;        // Exception Code shift
@@ -816,7 +838,14 @@ pub struct MipsCore {
     pub cp0_xcontext: u64,    // 20: Extended Context (64-bit)
     pub cp0_ecc: u32,         // 26: ECC Register
     pub cp0_cacheerr: u32,    // 27: Cache Error
-    pub cp0_taglo: u32,       // 28: Cache Tag Low
+    /// 28: Cache Tag Low. 64 bits, not 32.
+    ///
+    /// An R4000's TagLo fits in 32, but an R10000's secondary cache tag does
+    /// not — it carries a 40-bit physical address, and the IP28 PROM's tag
+    /// diagnostic writes and expects back values like 0x0000000f_ffffcdfe.
+    /// Truncating to 32 lost the top nibble and the PROM reported the
+    /// difference.
+    pub cp0_taglo: u64,       // 28: Cache Tag Low
     pub cp0_taghi: u32,       // 29: Cache Tag High
     pub cp0_errorepc: u64,    // 30: Error Exception PC
 
@@ -1466,6 +1495,20 @@ impl MipsCore {
     /// Write a GPR by index. Unconditionally re-zeros gpr[0] to avoid a branch.
     #[inline(always)]
     pub fn write_gpr(&mut self, reg: u32, value: u64) {
+        // IP28 bring-up: `IRIS_IP28_WATCHGPR=<n>` reports every write to that
+        // GPR with the PC that did it. One cached bool and a compare against a
+        // register number already in hand; unarmed it is a predictable branch.
+        #[cfg(debug_assertions)]
+        let _ = ();
+        {
+            static WATCH: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+            let watch = *WATCH.get_or_init(|| {
+                std::env::var("IRIS_IP28_WATCHGPR").ok().and_then(|v| v.trim().parse().ok())
+            });
+            if watch == Some(reg) {
+                eprintln!("ip28gpr: ${reg} = {value:#018x} at pc={:#018x}", self.pc);
+            }
+        }
         unsafe { *self.gpr.get_unchecked_mut(reg as usize) = value; }
         self.gpr[0] = 0;
     }
@@ -1545,9 +1588,21 @@ impl MipsCore {
                 eprintln!("[ip7] MFC0 PerfCnt (reg 25) read -> 0");
                 0
             }
-            26 => self.cp0_ecc as u64,
-            27 => self.cp0_cacheerr as u64,
-            28 => self.cp0_taglo as u64,
+            26 => {
+                if cachediag_on() {
+                    eprintln!("ip28cd: MFC0 ECC -> {:#010x} pc={:#018x}",
+                              self.cp0_ecc, self.pc);
+                }
+                self.cp0_ecc as u64
+            }
+            27 => {
+                if cachediag_on() {
+                    eprintln!("ip28cd: MFC0 CacheErr -> {:#010x} pc={:#018x}",
+                              self.cp0_cacheerr, self.pc);
+                }
+                self.cp0_cacheerr as u64
+            }
+            28 => self.cp0_taglo,
             29 => self.cp0_taghi as u64,
             30 => self.cp0_errorepc,
             _ => 0, // Unimplemented registers read as 0
@@ -1579,7 +1634,7 @@ impl MipsCore {
             20 => self.cp0_xcontext,
             26 => self.cp0_ecc as u64,
             27 => self.cp0_cacheerr as u64,
-            28 => self.cp0_taglo as u64,
+            28 => self.cp0_taglo,
             29 => self.cp0_taghi as u64,
             30 => self.cp0_errorepc,
             _ => 0,
@@ -1913,6 +1968,20 @@ impl MipsCore {
                 self.reanchor_count_and_reschedule();
             }
             10 => { // always use 64bit mask because the entries need to be valid in 64 bit mode even when they were set from 32 bit mode
+                // IP28 bring-up: IRIS_IP28_EHI=1 shows what the guest wrote
+                // against what survives the mask. The mask is R4400's 40-bit
+                // virtual address; the R10000 implements 44.
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *ON.get_or_init(|| std::env::var_os("IRIS_IP28_EHI").is_some())
+                    && (value & !0xC000_00FF_FFFF_E0FF) != 0
+                {
+                    eprintln!(
+                        "ip28ehi: wrote {value:#018x} -> kept {:#018x} (lost {:#018x}) pc={:#018x}",
+                        value & 0xC000_00FF_FFFF_E0FF,
+                        value & !0xC000_00FF_FFFF_E0FF,
+                        self.pc,
+                    );
+                }
                 self.cp0_entryhi = value & 0xC000_00FF_FFFF_E0FF;
             },
             11 => {
@@ -2021,6 +2090,18 @@ impl MipsCore {
             12 => {
                 let old = self.cp0_status;
                 self.cp0_status = value as u32;
+                // Status.DE gates cache error exceptions. A diagnostic that
+                // means to provoke one has to clear it first, so a DE
+                // transition is the guest announcing its intent.
+                if cachediag_on() && (old ^ self.cp0_status) & STATUS_DE != 0 {
+                    eprintln!("ip28cd: Status.DE {} pc={:#018x}",
+                              if self.cp0_status & STATUS_DE != 0 {
+                                  "SET (cache exceptions DISABLED)"
+                              } else {
+                                  "CLEAR (cache exceptions ENABLED)"
+                              },
+                              self.pc);
+                }
                 // Trace every change to the IP7 mask bit (Status.IM7). Linux's
                 // mips_cpu_irq_controller masks IM7 on interrupt entry
                 // (irq_ack) and unmasks on EOI; if the unmask never comes, no
@@ -2048,7 +2129,20 @@ impl MipsCore {
                 let mask = CAUSE_IP0 | CAUSE_IP1;
                 self.cp0_cause = (self.cp0_cause & !mask) | ((value as u32) & mask);
             }
-            14 => self.cp0_epc = value,
+            14 => {
+                // IP28 bring-up: a guest write of a 32-bit value here is where
+                // a 64-bit return address would lose its top half, so the ERET
+                // that follows lands at a truncated PC. Armed with
+                // IRIS_IP28_EPC=1.
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *ON.get_or_init(|| std::env::var_os("IRIS_IP28_EPC").is_some()) {
+                    eprintln!(
+                        "ip28epc: write EPC={value:#018x} (was {:#018x}) from pc={:#018x}",
+                        self.cp0_epc, self.pc,
+                    );
+                }
+                self.cp0_epc = value;
+            }
             15 => { /* PRId is read-only */ }
             16 => {
                 // Bits 5:0 always writable (K0, CU, DB, IB).
@@ -2072,14 +2166,38 @@ impl MipsCore {
             17 => self.cp0_lladdr = value as u32,
             18 => self.cp0_watchlo = value as u32,
             19 => self.cp0_watchhi = value as u32,
-            20 => self.cp0_xcontext = value,
+            20 => {
+                // IP28 bring-up: IRIX's XTLB refill handler builds the page
+                // table base itself and expects XContext's PTEBase to be
+                // zero, so anything landing in bits [63:33] becomes a wild
+                // pointer inside the handler. Armed with IRIS_IP28_XCTX=1.
+                if std::env::var_os("IRIS_IP28_XCTX").is_some() {
+                    eprintln!(
+                        "ip28xctx: write {value:#018x} (ptebase={:#018x}) pc={:#018x}",
+                        value & 0xFFFF_FFFE_0000_0000, self.pc,
+                    );
+                }
+                self.cp0_xcontext = value;
+            }
             25 => {
                 #[cfg(feature = "developer_ip7")]
                 eprintln!("[ip7] MTC0 PerfCnt (reg 25) write {:#018x} (ignored)", value);
             }
-            26 => self.cp0_ecc = value as u32,
-            27 => self.cp0_cacheerr = value as u32,
-            28 => self.cp0_taglo = value as u32,
+            26 => {
+                if cachediag_on() {
+                    eprintln!("ip28cd: MTC0 ECC = {:#010x} (was {:#010x}) pc={:#018x}",
+                              value as u32, self.cp0_ecc, self.pc);
+                }
+                self.cp0_ecc = value as u32;
+            }
+            27 => {
+                if cachediag_on() {
+                    eprintln!("ip28cd: MTC0 CacheErr = {:#010x} (was {:#010x}) pc={:#018x}",
+                              value as u32, self.cp0_cacheerr, self.pc);
+                }
+                self.cp0_cacheerr = value as u32;
+            }
+            28 => self.cp0_taglo = value,
             29 => self.cp0_taghi = value as u32,
             30 => self.cp0_errorepc = value,
             _ => {} // Writes to unimplemented registers are ignored

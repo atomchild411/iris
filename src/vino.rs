@@ -11,7 +11,6 @@
 /// References:
 ///   docs/vino/vino.pdf        — SGI VINO Design Spec 099-8937-001 v2.0
 ///   docs/vino/vino.{h,cpp}   — MAME reference implementation (Ryan Holtz)
-///   irix/stand/arcs/ide/IP22/video/VINO/vinohw.h — IRIX diagnostic headers
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -26,7 +26,8 @@ use crate::mc::MemoryController;
 use crate::mips_tlb::MipsTlb;
 use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
-use crate::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
+use crate::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache, R10000Cache};
+use crate::mips_cache_shadow::R10000ShadowCache;
 use crate::hpc3::Hpc3;
 use crate::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -288,6 +289,7 @@ impl Machine {
         let model_has_l2 = match cfg_cpu_model {
             crate::config::CpuModel::R4400 => <R4400Cache as MipsCache>::L2_SIZE > 0,
             crate::config::CpuModel::R5000 => <R5000Cache as MipsCache>::L2_SIZE > 0,
+            crate::config::CpuModel::R10000 => <R10000ShadowCache as MipsCache>::L2_SIZE > 0,
         };
         if !model_has_l2 {
             eeprom_mc.lock().set_cachsz(0);
@@ -295,7 +297,8 @@ impl Machine {
 
         // 1. Create all devices first
         // Memory Controller
-        let mc = MemoryController::new(eeprom_mc.clone(), guinness, cfg.banks);
+        let mc = MemoryController::new_for_profile(
+            eeprom_mc.clone(), guinness, cfg.banks, cfg.machine.profile.ip28());
 
         // RAM banks sized per config. addr_mask is initialized to mem_size-1;
         // remap_banks() updates it via set_addr_mask() when MEMCFG0/1 are written during POST.
@@ -329,7 +332,7 @@ impl Machine {
 
         // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
         // bindings so multiple `--ci` instances can coexist.
-        let ioc = if ci_enabled { Ioc::new_ci(guinness) } else { Ioc::new(guinness) };
+        let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28());
 
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket
@@ -639,6 +642,7 @@ impl Machine {
             mc.clone(),
             hpc3.clone(),
             prom_port,
+            cfg.machine.profile.ip28(),
         );
 
         // Wrap Physical in Arc
@@ -720,7 +724,7 @@ impl Machine {
         //    arm below monomorphises its own CPU — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         macro_rules! build_cpu { ($cache:ty) => {{
-        let cfg = MipsCpuConfig::indy();
+        let cfg = MipsCpuConfig::for_model::<$cache>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
 
@@ -765,6 +769,10 @@ impl Machine {
         let cpu: Arc<dyn crate::mips_exec::CpuDevice> = match cfg_cpu_model {
             crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
             crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
+            // IP28 uses the shadow cache: out of the data path entirely, with
+            // tag and data arrays that exist only to answer CACHE ops and the
+            // PROM's diagnostics. See mips_cache_shadow.rs.
+            crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
         };
 
         // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
@@ -1173,6 +1181,26 @@ impl Machine {
         // addresses go to UnmappedRam, so map the banks as POST would first.
         let mapped = self.mc.post_map_banks();
         let out = self.cpu.load_elf(path)?;
+        Ok(Self::note_banks(mapped, out))
+    }
+
+    /// Boot a kernel with no PROM: map RAM, load the ELF, install ARCS, and
+    /// put the CPU in the state firmware enters a kernel in.
+    pub fn boot_arcs(&self, path: &str, ram_bytes: u64, bootpath: &str) -> Result<String, String> {
+        // RAM does not start at physical zero on these machines.
+        let ram_base = crate::physical::LOMEM_BASE as u64;
+        let mapped = self.mc.post_map_banks();
+        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let elf = crate::elf::parse(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        // Physical extent of everything the ELF puts in memory, so the
+        // firmware can report it as loaded rather than free.
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        for seg in &elf.segments {
+            lo = lo.min(seg.vaddr & 0x1fff_ffff);
+            hi = hi.max((seg.vaddr & 0x1fff_ffff) + seg.memsz);
+        }
+        let mut out = self.cpu.load_elf_bytes(&bytes, path)?;
+        out.push_str(&self.cpu.boot_arcs(ram_base, ram_bytes, bootpath, lo, hi)?);
         Ok(Self::note_banks(mapped, out))
     }
 

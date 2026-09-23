@@ -27,8 +27,7 @@ word's **ordinary** block. One flag, looks equivalent, and it is not:
 PANIC: tlbmiss: invalid kptbl entry
 ```
 
-(`kern/os/trap.c:3110` — a KSEG2 TLB miss whose page-table entry is invalid, in
-kernel mode.)
+(A KSEG2 TLB miss whose page-table entry is invalid, taken in kernel mode.)
 
 The ordinary block opens by unconditionally storing `in_delay_slot = false`.
 Its own comment says why that is sound:

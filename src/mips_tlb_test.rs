@@ -440,4 +440,40 @@ mod tests {
             .join()
             .expect("thread panicked");
     }
+
+/// The JTLB is as big as the CPU model says, and no bigger.
+///
+/// The R10000 has 64 entries where the R4400 has 48. The count used to be a
+/// compile-time 48 for every model while `core.tlb_entries` was taken from the
+/// model, so on an R10000 the two disagreed: Random cycled over a range the
+/// array did not have, and a TLBWI to index 48..63 went nowhere. SGI's IP28
+/// diagnostic writes index 48 on its first cache-alias test, and every failure
+/// it reported was that write being dropped.
+#[test]
+fn tlb_size_follows_the_cpu_model() {
+    use crate::mips_cache_shadow::R10000ShadowCache;
+    use crate::mips_cache_v2::{R4400Cache, R5000Cache};
+    use crate::mips_exec::MipsCpuConfig;
+
+    assert_eq!(MipsCpuConfig::for_model::<R4400Cache>().tlb_entries, 48);
+    assert_eq!(MipsCpuConfig::for_model::<R5000Cache>().tlb_entries, 48);
+    assert_eq!(MipsCpuConfig::for_model::<R10000ShadowCache>().tlb_entries, 64);
+}
+
+/// An index past the live count is dropped; one inside it is kept.
+#[test]
+fn tlb_write_respects_the_live_entry_count() {
+    let mut entry = TlbEntry::new();
+    entry.entry_hi = 0xC000_0000_0004_0000;
+
+    let mut r4400 = MipsTlb::new(48);
+    r4400.write(48, entry);
+    assert_eq!(r4400.read(48).entry_hi, 0, "48-entry TLB must drop index 48");
+
+    let mut r10000 = MipsTlb::new(64);
+    r10000.write(48, entry);
+    assert_eq!(r10000.read(48).entry_hi, entry.entry_hi, "64-entry TLB must keep it");
+    r10000.write(63, entry);
+    assert_eq!(r10000.read(63).entry_hi, entry.entry_hi, "...and its last slot");
+}
 }

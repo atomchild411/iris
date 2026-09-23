@@ -29,9 +29,10 @@ a coincidence:
 
 - `FirmwareVectorLength` is `0x8c` = 140 = **exactly** 35 four-byte entries,
   which is the ARC firmware vector count. `Write` is entry 27.
-- `DebugBlock` (SPB + 0x10) is 0, which is what the IRIX source quoted in
-  `src/debug.md` tests for — `if (SPB->DebugBlock && ...)` — when symmon is not
-  loaded.
+- The rest of the block matches the ARC System Parameter Block layout as
+  NetBSD declares it in `sys/dev/arcbios/arcbios.h`: `DebugBlock` sits at
+  SPB + 0x10 and reads 0, which is what a machine with no kernel debugger
+  loaded should show.
 
 Every vector entry points into PROM space (`0x9fc.....`), so `arcs_probe()`
 range-checks that before calling: a bad layout would otherwise be a jump into
