@@ -519,10 +519,12 @@ pub fn write_jitv2_html(
 
         let mut rows: Vec<jitv2_html::WordRow> = Vec::new();
         if !entry_words.is_empty() {
+            // Read before the walk: `walked` borrows the analyzer.
+            let mips4 = analyzer.mips4();
             let walked = analyzer.walk_multi_entry(&words, &entry_words, phys_addr, usize::MAX);
             rows = crate::jitv2::analyzer::instrs_linear(walked)
                 .map(|instr| {
-                    let kind = match crate::jitv2::analyzer::classify(instr.raw, instr.word, phys_addr) {
+                    let kind = match crate::jitv2::analyzer::classify(instr.raw, instr.word, phys_addr, mips4) {
                         crate::jitv2::analyzer::Classify::Sequential => "Sequential",
                         crate::jitv2::analyzer::Classify::Branch { .. } => "Branch",
                         crate::jitv2::analyzer::Classify::Jump { .. } => "Jump",

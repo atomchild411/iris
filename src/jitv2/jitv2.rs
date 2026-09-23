@@ -2792,6 +2792,14 @@ pub(crate) fn push_compile_request(
 }
 
 pub struct CompileQueue {
+    /// The ISA level every worker's `Analyzer` walks at — the `CpuModel`'s
+    /// `MIPS4` const, set by `MipsExecutor::new` through [`set_isa`] before
+    /// the pool starts. Defaults to the process-wide value so tools and unit
+    /// tests that never publish one still behave as the build was configured.
+    ///
+    /// [`set_isa`]: CompileQueue::set_isa
+    mips4: bool,
+
     /// The one shared bounded MPMC ring: the CPU thread pushes
     /// (`CompileQueue::send`), every worker thread pops from the same
     /// `Arc` — no producer/consumer handoff needed (unlike the old
@@ -2872,6 +2880,7 @@ impl CompileQueue {
     /// [`Self::start`] to spawn the pool.
     pub fn new() -> Self {
         Self {
+            mips4: crate::jitv2::isa::mips4_enabled(),
             queue: Arc::new(crossbeam_queue::ArrayQueue::new(COMPILE_QUEUE_CAPACITY)),
             running: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
@@ -3060,6 +3069,15 @@ impl CompileQueue {
     /// Spawn the compile-thread pool with one freshly-reserved shared arena
     /// — today's normal entry point (`Machine::new`'s startup path). See
     /// `start_inner`'s own doc comment for the full contract.
+    /// Publish the CPU model's ISA level to the pool. Call before `start`.
+    ///
+    /// This replaces a process-global that jitv2 used to read from deep
+    /// inside `has_emitter`: the level now travels as data, from the model,
+    /// through the worker's `Analyzer`, into `classify`.
+    pub fn set_isa(&mut self, mips4: bool) {
+        self.mips4 = mips4;
+    }
+
     pub fn start(&mut self, bus: Arc<dyn BusDevice>, stats: Arc<JitStats>) {
         let state = Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
         let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
@@ -3112,6 +3130,9 @@ impl CompileQueue {
         if !self.threads.is_empty() {
             return;
         }
+        // Captured before the spawn loop: each worker builds its own
+        // `Analyzer` and needs the level by value, not through `&self`.
+        let worker_mips4 = self.mips4;
         self.running.store(true, Ordering::SeqCst);
         // Publish the arena every worker is about to build its own `Codegen`
         // on into the shared barrier state too — `j2 seal-queue`'s only way
@@ -3145,7 +3166,7 @@ impl CompileQueue {
             self.threads.push(
                 std::thread::Builder::new()
                     .name(format!("jitv2-compile-{i}"))
-                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count))
+                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4))
                     .expect("jitv2-compile spawn"),
             );
         }
@@ -3303,6 +3324,8 @@ impl CompileQueue {
         barrier: Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>,
         quiesce_in_progress: Arc<AtomicBool>,
         thread_count: usize,
+        // The CPU model’s ISA level, for this worker’s `Analyzer`.
+        mips4: bool,
     ) -> crate::jitv2::codegen::Codegen {
         // Pick up the L1-D geometry the CPU published for the inline
         // load/store path. The worker owns `codegen` by value for its whole
@@ -3333,7 +3356,7 @@ impl CompileQueue {
         }
 
 
-        let mut analyzer = crate::jitv2::analyzer::Analyzer::new();
+        let mut analyzer = crate::jitv2::analyzer::Analyzer::with_isa(mips4);
         let mut pending: crate::jitv2::comp::PendingCount = 0;
         // Wall-clock start of the current unbroken stretch of "queue empty
         // AND pending still non-empty after a non-forced publish attempt" —

@@ -132,7 +132,7 @@ pub enum Classify {
 /// resolving on-page-ness against it), until that was found to break
 /// position independence (see `jump_target`'s doc comment) and J/JAL was
 /// moved to the same always-page-leaving treatment as RegJump.
-pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
+pub fn classify(raw: u32, offset_word: u16, page_base: u32, mips4: bool) -> Classify {
     // Test/tooling region-boundary sentinel — checked before opcode decode so
     // no real opcode arm can ever shadow it (see the constant's doc comment).
     if raw == JIT_REGION_BOUNDARY_SENTINEL {
@@ -147,7 +147,7 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
         OP_SPECIAL => match funct {
             FUNCT_JR | FUNCT_JALR => branch_category_gate(raw, Classify::RegJump),
             FUNCT_SYSCALL | FUNCT_BREAK => Classify::Excluded,
-            _ => sequential_or_excluded(raw),
+            _ => sequential_or_excluded(raw, mips4),
         },
         OP_REGIMM => match rt {
             RT_BLTZ | RT_BGEZ | RT_BLTZL | RT_BGEZL | RT_BLTZAL | RT_BGEZAL
@@ -158,7 +158,7 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
             // so whether they're a region boundary is purely a "does codegen
             // have an emitter yet" question, same as everything else routed
             // through sequential_or_excluded.
-            _ => sequential_or_excluded(raw),
+            _ => sequential_or_excluded(raw, mips4),
         },
         OP_J | OP_JAL => branch_category_gate(raw, jump_target()),
         OP_BEQ | OP_BNE | OP_BLEZ | OP_BGTZ
@@ -187,16 +187,16 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
         // `lwxc1 $f0, ($8)` would otherwise be misread as a BC1 branch).
         OP_COP1 => match rs {
             RS_BC1 => branch_category_gate(raw, branch_target(raw, offset_word)),
-            _ => sequential_or_excluded(raw),
+            _ => sequential_or_excluded(raw, mips4),
         },
-        OP_COP1X => sequential_or_excluded(raw),
+        OP_COP1X => sequential_or_excluded(raw, mips4),
         OP_COP2 => Classify::Excluded, // unimplemented coprocessor
         OP_CACHE => Classify::Excluded,
         OP_LL | OP_LLD | OP_SC | OP_SCD => Classify::Excluded,
         // FPU loads/stores are plain memory ops, same as any other load/store.
-        OP_LWC1 | OP_LDC1 | OP_SWC1 | OP_SDC1 => sequential_or_excluded(raw),
+        OP_LWC1 | OP_LDC1 | OP_SWC1 | OP_SDC1 => sequential_or_excluded(raw, mips4),
         OP_LWC2 | OP_LDC2 | OP_SWC2 | OP_SDC2 => Classify::Excluded, // CP2, unimplemented — treat as excluded
-        _ => sequential_or_excluded(raw),
+        _ => sequential_or_excluded(raw, mips4),
     }
 }
 
@@ -249,8 +249,8 @@ pub fn is_fpu_instruction(raw: u32) -> bool {
 /// boundary instead (same as an architecturally-excluded one), and makes
 /// adding a new emitter automatically un-exclude it — no analyzer.rs edit
 /// needed.
-fn sequential_or_excluded(raw: u32) -> Classify {
-    if crate::jitv2::opcode_support::has_emitter(raw) {
+fn sequential_or_excluded(raw: u32, mips4: bool) -> Classify {
+    if crate::jitv2::opcode_support::has_emitter(raw, mips4) {
         Classify::Sequential
     } else {
         Classify::Excluded
@@ -580,12 +580,34 @@ pub struct Analyzer {
     instrs: Box<[CompiledInstr; ENTRIES_PER_PAGE]>,
     has_fpu: bool,
     covered: Vec<WordOffset>,
+    /// The ISA level every walk from this analyzer compiles for.
+    ///
+    /// A property of the CPU, not of the build: an R4400 must raise Reserved
+    /// Instruction on MIPS IV encodings and an R5000/R10000 may execute them,
+    /// and one binary serves both. Production analyzers are built with
+    /// [`Analyzer::with_isa`] from the model's `MIPS4` const.
+    mips4: bool,
 }
 
 impl Analyzer {
     pub fn new() -> Self {
-        Self { instrs: Box::new([CompiledInstr::default(); ENTRIES_PER_PAGE]), has_fpu: false, covered: Vec::new() }
+        Self {
+            mips4: crate::jitv2::isa::mips4_enabled(), instrs: Box::new([CompiledInstr::default(); ENTRIES_PER_PAGE]), has_fpu: false, covered: Vec::new() }
     }
+
+    /// An analyzer for a specific CPU model's ISA level.
+    ///
+    /// This is what production uses. `new()` falls back to the process-wide
+    /// default, which exists for unit tests and the offline tools that have
+    /// no CPU to ask.
+    pub fn with_isa(mips4: bool) -> Self {
+        let mut a = Self::new();
+        a.mips4 = mips4;
+        a
+    }
+
+    /// The ISA level this analyzer walks at.
+    pub fn mips4(&self) -> bool { self.mips4 }
 
     /// Whether the most recent [`Self::walk_multi_entry`] call's merged
     /// region contained any CP1/FPU instruction (`is_fpu_instruction`).
@@ -656,7 +678,7 @@ impl Analyzer {
     /// genuine excluded-instruction boundary.
     pub fn walk_bounded(&mut self, page: &[u32; ENTRIES_PER_PAGE], entry_word: WordOffset, page_base: u32, max_instrs: usize) -> (&[CompiledInstr; ENTRIES_PER_PAGE], bool) {
         self.instrs.fill(CompiledInstr::default());
-        let mut budget = Budget::new(max_instrs, entry_word);
+        let mut budget = Budget::new(max_instrs, entry_word, self.mips4);
         let non_empty = visit(&mut self.instrs, page, page_base, entry_word, &mut budget);
         if non_empty {
             compute_cycles_flush(&mut self.instrs, entry_word, budget.min, budget.max);
@@ -709,7 +731,7 @@ impl Analyzer {
         let mut min_visited = WordOffset::MAX;
         let mut max_visited = 0;
         for &entry_word in entry_words {
-            let mut budget = Budget::new(max_instrs, entry_word);
+            let mut budget = Budget::new(max_instrs, entry_word, self.mips4);
             if visit(&mut self.instrs, page, page_base, entry_word, &mut budget) {
                 // Mark AFTER visit returns, unconditionally — `visit`'s own
                 // already-visited-as-head short-circuit means a word already
@@ -752,11 +774,15 @@ struct Budget {
     remaining: usize,
     min: WordOffset,
     max: WordOffset,
+    /// The ISA level this walk compiles for — the `CpuModel`'s `MIPS4`
+    /// const, carried here because `visit`/`visit_slot` already thread a
+    /// `&mut Budget` through the whole recursive walk and nothing else does.
+    mips4: bool,
 }
 
 impl Budget {
-    fn new(remaining: usize, entry_word: WordOffset) -> Self {
-        Self { remaining, min: entry_word, max: entry_word }
+    fn new(remaining: usize, entry_word: WordOffset, mips4: bool) -> Self {
+        Self { remaining, min: entry_word, max: entry_word, mips4 }
     }
 
     /// Record `offset` as freshly marked visited — call from every site that
@@ -832,7 +858,7 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
         return true;
     }
     let raw = page[offset as usize];
-    let class = classify(raw, offset, page_base);
+    let class = classify(raw, offset, page_base, budget.mips4);
     if class == Classify::Excluded || class == Classify::RegionBoundary {
         // Excluded: an excluded instruction can never be a delay slot (a
         // fallback runs it via the interpreter, which needs it in head
@@ -926,7 +952,7 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     }
 
     let raw = page[offset as usize];
-    let class = classify(raw, offset, page_base);
+    let class = classify(raw, offset, page_base, budget.mips4);
 
     if class == Classify::RegionBoundary {
         // Hard region end (test/tooling sentinel): never visited, never a
@@ -1387,47 +1413,47 @@ mod tests {
 
     #[test]
     fn classify_sequential_nop() {
-        assert_eq!(classify(0, 0, 0), Classify::Sequential);
+        assert_eq!(classify(0, 0, 0, true), Classify::Sequential);
     }
 
     #[test]
     fn classify_jr_is_regjump() {
         let instr = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
-        assert_eq!(classify(instr, 5, 0), Classify::RegJump);
+        assert_eq!(classify(instr, 5, 0, true), Classify::RegJump);
     }
 
     #[test]
     fn classify_excluded_mtc0() {
         let instr = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Excluded);
     }
 
     #[test]
     fn classify_excluded_cache() {
         let instr = i_type(OP_CACHE, 0, 0, 0);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Excluded);
     }
 
     #[test]
     fn classify_plain_fpu_arithmetic_is_sequential() {
         // FADD.D
         let instr = r_type(OP_COP1, RS_D, 3, 4, 5, FUNCT_FADD);
-        assert_eq!(classify(instr, 5, 0), Classify::Sequential);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Sequential);
     }
 
     #[test]
     fn classify_fpu_register_moves_are_sequential() {
         let mfc1 = r_type(OP_COP1, RS_MFC1, 2, 3, 0, 0);
-        assert_eq!(classify(mfc1, 5, 0), Classify::Sequential);
+        assert_eq!(classify(mfc1, 5, 0, true), Classify::Sequential);
         let mtc1 = r_type(OP_COP1, RS_MTC1, 2, 3, 0, 0);
-        assert_eq!(classify(mtc1, 5, 0), Classify::Sequential);
+        assert_eq!(classify(mtc1, 5, 0, true), Classify::Sequential);
     }
 
     #[test]
     fn classify_fpu_compare_is_sequential() {
         // C.EQ.D
         let instr = r_type(OP_COP1, RS_D, 5, 4, 0, FUNCT_FC_EQ);
-        assert_eq!(classify(instr, 5, 0), Classify::Sequential);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Sequential);
     }
 
     #[test]
@@ -1438,8 +1464,8 @@ mod tests {
         // CU1/FR guard's trigger check (has_fpu) still catches them — see
         // codegen::lookup_cp1_semantics's doc comment. sequential_or_excluded
         // correctly reports Sequential now that the emitters exist.
-        assert_eq!(classify(i_type(OP_LWC1, 0, 0, 0), 5, 0), Classify::Sequential);
-        assert_eq!(classify(i_type(OP_SDC1, 0, 0, 0), 5, 0), Classify::Sequential);
+        assert_eq!(classify(i_type(OP_LWC1, 0, 0, 0), 5, 0, true), Classify::Sequential);
+        assert_eq!(classify(i_type(OP_SDC1, 0, 0, 0), 5, 0, true), Classify::Sequential);
     }
 
     #[test]
@@ -1452,12 +1478,12 @@ mod tests {
         let instr = r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S);
         {
             let _isa = crate::jitv2::isa::test_isa(true);
-            assert_eq!(classify(instr, 5, 0), Classify::Sequential,
+            assert_eq!(classify(instr, 5, 0, true), Classify::Sequential,
                        "an R5000/R10000 may execute MADD.S");
         }
         {
             let _isa = crate::jitv2::isa::test_isa(false);
-            assert_eq!(classify(instr, 5, 0), Classify::Excluded,
+            assert_eq!(classify(instr, 5, 0, false), Classify::Excluded,
                        "an R4400 must leave MADD.S to the interpreter, which raises RI");
         }
     }
@@ -1468,7 +1494,7 @@ mod tests {
         // either — no SGI MIPS IV part implements paired-single — so they
         // must stay Excluded even in a `mips4` build.
         let instr = r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_PS);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Excluded);
     }
 
     #[test]
@@ -1484,12 +1510,12 @@ mod tests {
         let instr = r_type(OP_COP1X, RS_BC1, 2, 3, 4, FUNCT_LWXC1);
         {
             let _isa = crate::jitv2::isa::test_isa(true);
-            assert_eq!(classify(instr, 5, 0), Classify::Sequential);
+            assert_eq!(classify(instr, 5, 0, true), Classify::Sequential);
         }
         {
             let _isa = crate::jitv2::isa::test_isa(false);
             // Still Excluded for ISA reasons, never for "it looked like BC1".
-            assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+            assert_eq!(classify(instr, 5, 0, false), Classify::Excluded);
         }
     }
 
@@ -1504,13 +1530,13 @@ mod tests {
         // offset_word 5, immediate 0 => target is the word after the delay
         // slot: 5 + 1 + 0 = 6.
         let instr = r_type(OP_COP1, RS_BC1, 0, 0, 0, 0);
-        assert_eq!(classify(instr, 5, 0), Classify::Branch { target: Some(6) });
+        assert_eq!(classify(instr, 5, 0, true), Classify::Branch { target: Some(6) });
 
         // A non-zero displacement resolves too, and all four tf/nd encodings
         // are branches — nd (bit 1 of rt) only selects annulling.
         for rt in 0..4u32 {
             let instr = (OP_COP1 << 26) | (RS_BC1 << 21) | (rt << 16) | 3;
-            assert_eq!(classify(instr, 5, 0), Classify::Branch { target: Some(9) },
+            assert_eq!(classify(instr, 5, 0, true), Classify::Branch { target: Some(9) },
                        "rt={rt} (tf={}, nd={})", rt & 1, (rt >> 1) & 1);
         }
     }
@@ -1518,7 +1544,7 @@ mod tests {
     #[test]
     fn classify_cop2_is_excluded() {
         let instr = r_type(OP_COP2, 0, 0, 0, 0, 0);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Excluded);
     }
 
     #[test]
@@ -1526,14 +1552,14 @@ mod tests {
         // BEQ at word 10, imm=+2 words -> target word offset = 10 + 1 + 2 = 13
         // (target is relative to the delay slot's address, word 11, not word 12).
         let instr = i_type(OP_BEQ, 1, 2, 2);
-        assert_eq!(classify(instr, 10, 0), Classify::Branch { target: Some(13) });
+        assert_eq!(classify(instr, 10, 0, true), Classify::Branch { target: Some(13) });
     }
 
     #[test]
     fn branch_off_page_low_end() {
         // Backward branch far enough to leave the page (offset 0, big negative imm).
         let instr = i_type(OP_BEQ, 1, 2, 0xFF00u16); // large negative offset
-        assert_eq!(classify(instr, 0, 0), Classify::Branch { target: None });
+        assert_eq!(classify(instr, 0, 0, true), Classify::Branch { target: None });
     }
 
     #[test]

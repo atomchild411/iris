@@ -19,16 +19,22 @@
 //!
 //! ## How it is set
 //!
-//! `MipsExecutor::new` publishes `C::MIPS4` here as the CPU is constructed,
-//! so the flag tracks whatever model the config selected. A process runs one
-//! CPU model, which is what makes a process-global correct; the same shape
-//! upstream already uses for `codegen::mem_helpers_enabled`.
+//! It is not read from here on any path that compiles guest code. The
+//! `CpuModel`'s `MIPS4` const travels as data: `MipsExecutor::new` hands it
+//! to its own inline `Analyzer` and to the compile pool
+//! (`CompileQueue::set_isa`), each worker builds an `Analyzer::with_isa`, and
+//! `Analyzer` passes it through `Budget` into `classify` and
+//! `opcode_support::has_emitter`, the single point that asks the question.
 //!
-//! The `mips4` cargo feature survives only as this flag's **initial value**,
-//! for the window before any CPU exists — which in practice is unit tests
-//! that compile a region without constructing an executor first. It no longer
-//! gates any emitter: every MIPS IV emitter is now compiled into every build
-//! and selected, or not, at runtime.
+//! What remains here is the **default** for the things that have no CPU to
+//! ask: `Analyzer::new()`, `CompileQueue::new()`, and the offline tools that
+//! replay a recorded trace. The `mips4` cargo feature seeds it.
+//!
+//! This replaced a process-global that `MipsExecutor::new` published under
+//! `cfg(not(test))`, so the one line that mattered was compiled out of every
+//! test build and deleting it left the suite green.
+//! `an_executor_walks_at_its_own_models_isa_level` is the test that could not
+//! be written before.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -117,6 +123,45 @@ mod tests {
 
         set_mips4(<PassthroughCache as CpuModel>::MIPS4);
         assert!(!mips4_enabled(), "a MIPS III model must disable it again");
+    }
+
+    /// The wiring test the old design could not have.
+    ///
+    /// jitv2 used to read the ISA level from a process global that
+    /// `MipsExecutor::new` published under `cfg(not(test))` — so the line
+    /// that mattered was compiled out of every test build, and deleting it
+    /// left the suite green. The level now travels as data, which means this
+    /// can assert the thing that actually matters: an executor built for a
+    /// model hands that model's `MIPS4` to the analyzer its compiles walk
+    /// with.
+    #[test]
+    fn an_executor_walks_at_its_own_models_isa_level() {
+        use crate::mips_cache_v2::{CpuModel, PassthroughCache, PassthroughCacheM4};
+        use crate::mips_exec::{MipsCpuConfig, MipsExecutor};
+        use crate::mips_tlb::PassthroughTlb;
+        use crate::mem::Memory;
+        use crate::traits::BusDevice;
+        use std::sync::Arc;
+
+        let cfg = MipsCpuConfig::indy();
+
+        let bus: Arc<dyn BusDevice> = Arc::new(Memory::new(1));
+        let mips3: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &cfg);
+        assert!(!<PassthroughCache as CpuModel>::MIPS4, "fixture must be a MIPS III model");
+        assert!(
+            !mips3.jitv2_inline_analyzer.mips4(),
+            "a MIPS III executor must walk at MIPS III, whatever the build was configured with",
+        );
+
+        let bus: Arc<dyn BusDevice> = Arc::new(Memory::new(1));
+        let mips4: MipsExecutor<PassthroughTlb, PassthroughCacheM4> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &cfg);
+        assert!(<PassthroughCacheM4 as CpuModel>::MIPS4, "fixture must be a MIPS IV model");
+        assert!(
+            mips4.jitv2_inline_analyzer.mips4(),
+            "a MIPS IV executor must walk at MIPS IV",
+        );
     }
 
     /// The guard must restore whatever was there before, or one test's ISA

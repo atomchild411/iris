@@ -2674,41 +2674,6 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     {
         let mut core = MipsCore::new();
 
-        // Publish this model's ISA level to jitv2 before anything can compile.
-        // The interpreter reads `C::MIPS4` directly at every decode; jitv2
-        // runs on a background compile pool with no `C` in scope, so it reads
-        // a process-global instead, and this is where the two are tied
-        // together. Without it jitv2's ISA level came from a cargo feature —
-        // a different axis entirely, which could only agree with the
-        // configured CPU by coincidence (see `jitv2::isa`'s module docs).
-        //
-        // Not under `cfg(test)`, and that is not a dodge: a real run has one
-        // process and one CPU model, which is what makes a global correct
-        // here. The test harness does not — it builds R4400-, R5000- and
-        // R10000-shaped executors concurrently across threads, so publishing
-        // from every construction had them stomping each other, and FPU
-        // equivalence tests failed intermittently with "entry instruction
-        // must not be excluded" when someone else's R4400 landed between
-        // their walk and their compile. Tests drive the level explicitly
-        // through `jitv2::isa::test_isa`, which serialises them.
-        //
-        // **This line is therefore the one line here that no test executes**,
-        // and nothing catches its deletion:
-        // `publishes_the_cpu_models_isa_level_to_jitv2` calls `set_mips4`
-        // directly and would still pass. Retiring the `not(test)` means
-        // retiring the global — threading the level through `classify` into
-        // `opcode_support::has_emitter`, its one production caller. That is
-        // the right shape and it is not done here.
-        //
-        // What makes the global sound meanwhile: `Jitv2` is a field on the
-        // executor, not a process static, so a dropped machine takes its whole
-        // code cache with it and a rebuilt one (iris-gui's Stop/Start, with a
-        // different CPU selected) republishes into an empty cache. There is no
-        // window where code compiled for one ISA level is dispatched under
-        // another.
-        #[cfg(all(feature = "jitv2", not(test)))]
-        crate::jitv2::isa::set_mips4(C::MIPS4);
-
         // Cache geometry comes from the model type C, so Config describes this CPU.
         // `mut` is only used by the Triton L2-enable sync below.
         #[cfg_attr(not(feature = "r5ksc_triton"), allow(unused_mut))]
@@ -2834,7 +2799,16 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // counter — see `jitv2_compile_queue_handle`/`jitv2_stats`'s own
         // doc comments on the struct fields.
         #[cfg(feature = "jitv2")]
-        let jitv2 = crate::jitv2::Jitv2::new(crate::jitv2::JITV2_INITIAL_PAGE_CAPACITY);
+        let mut jitv2 = crate::jitv2::Jitv2::new(crate::jitv2::JITV2_INITIAL_PAGE_CAPACITY);
+        // The ISA level travels as data rather than through a global: the
+        // model's `MIPS4` const goes to the compile pool here and to this
+        // executor's own inline analyzer below, and from there into
+        // `classify`. The interpreter reads `C::MIPS4` at every decode; the
+        // compile workers have no `C` in scope, so they are handed the value
+        // before they exist. An R4400 must raise Reserved Instruction on
+        // MIPS IV encodings where an R5000/R10000 may execute them, and one
+        // binary serves both.
+        jitv2.compile_queue.set_isa(C::MIPS4);
         #[cfg(feature = "jitv2")]
         let jitv2_compile_queue_handle = jitv2.compile_queue.queue_handle();
         #[cfg(feature = "jitv2")]
@@ -2952,7 +2926,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "jitv2")]
             jitv2_inline_compile: cfg!(feature = "jitv2_lockstep"),
             #[cfg(feature = "jitv2")]
-            jitv2_inline_analyzer: crate::jitv2::analyzer::Analyzer::new(),
+            jitv2_inline_analyzer: crate::jitv2::analyzer::Analyzer::with_isa(C::MIPS4),
             #[cfg(feature = "jitv2")]
             jitv2_dispatch_enabled: true,
             #[cfg(feature = "developer")]

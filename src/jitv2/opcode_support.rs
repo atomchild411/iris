@@ -203,7 +203,7 @@ pub fn write_status(w: &mut dyn std::io::Write, filter: Option<InstrCategory>) -
 /// `Jump`/`RegJump`) don't call this — those are handled by construction and
 /// consult [`instr_enabled`] directly instead (there's no per-instruction
 /// emitter-coverage question for them, only the runtime toggle).
-pub fn has_emitter(raw: u32) -> bool {
+pub fn has_emitter(raw: u32, mips4: bool) -> bool {
     let op = ((raw >> 26) & 0x3F) as u8;
     let rs = ((raw >> 21) & 0x1F) as u8;
     let rt = ((raw >> 16) & 0x1F) as u8;
@@ -217,8 +217,12 @@ pub fn has_emitter(raw: u32) -> bool {
     //
     // Deliberately here rather than in `has_jitv2_emitter`: that one seeds
     // `ENABLED` through a `OnceLock`, so anything it consults is frozen at
-    // first touch, which can precede the CPU publishing its model.
-    if kind.is_mips4() && !crate::jitv2::isa::mips4_enabled() {
+    // first touch.
+    //
+    // `mips4` arrives as an argument rather than from a global. It is the
+    // `CpuModel`'s `MIPS4` const, carried down by the `Analyzer` this compile
+    // is walking with — see `analyzer::Analyzer::with_isa`.
+    if kind.is_mips4() && !mips4 {
         return false;
     }
     kind.has_jitv2_emitter() && instr_enabled(kind)
@@ -238,18 +242,18 @@ mod tests {
 
     #[test]
     fn plain_addu_has_emitter() {
-        assert!(has_emitter(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU)));
+        assert!(has_emitter(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU), true));
     }
 
     #[test]
     fn addiu_has_emitter() {
-        assert!(has_emitter(i_type(OP_ADDIU, 1, 2, 5)));
+        assert!(has_emitter(i_type(OP_ADDIU, 1, 2, 5), true));
     }
 
     #[test]
     #[cfg(feature = "mips4")]
     fn movz_has_emitter() {
-        assert!(has_emitter(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVZ)));
+        assert!(has_emitter(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVZ), true));
     }
 
     #[test]
@@ -258,17 +262,17 @@ mod tests {
         // MOVZ is MIPS IV; without the feature it must fall back to the
         // interpreter so Reserved Instruction can be raised (see
         // has_jitv2_emitter's mips4 gate in mips_instr_stats.rs).
-        assert!(!has_emitter(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVZ)));
+        assert!(!has_emitter(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVZ), true));
     }
 
     #[test]
     fn teq_has_emitter() {
-        assert!(has_emitter(r_type(OP_SPECIAL, 1, 2, 0, 0, FUNCT_TEQ)));
+        assert!(has_emitter(r_type(OP_SPECIAL, 1, 2, 0, 0, FUNCT_TEQ), true));
     }
 
     #[test]
     fn tgei_has_emitter() {
-        assert!(has_emitter(i_type(OP_REGIMM, 1, RT_TGEI, 5)));
+        assert!(has_emitter(i_type(OP_REGIMM, 1, RT_TGEI, 5), true));
     }
 
     #[test]
@@ -282,37 +286,37 @@ mod tests {
         // architecturally a hint, so the emitter is deliberately empty and
         // exec_prefx's body is just handle_exec_complete().
         #[cfg(feature = "mips4")]
-        assert!(has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_PREFX)));
+        assert!(has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_PREFX), true));
         #[cfg(not(feature = "mips4"))]
-        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_PREFX)));
+        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_PREFX), true));
     }
 
     #[test]
     fn daddi_has_emitter() {
-        assert!(has_emitter(i_type(OP_DADDI, 1, 2, 5)));
+        assert!(has_emitter(i_type(OP_DADDI, 1, 2, 5), true));
     }
 
     #[test]
     fn daddiu_has_emitter() {
-        assert!(has_emitter(i_type(OP_DADDIU, 1, 2, 5)));
+        assert!(has_emitter(i_type(OP_DADDIU, 1, 2, 5), true));
     }
 
     #[test]
     fn lwl_has_emitter() {
-        assert!(has_emitter(i_type(OP_LWL, 1, 2, 0)));
+        assert!(has_emitter(i_type(OP_LWL, 1, 2, 0), true));
     }
 
     #[test]
     fn swl_has_emitter() {
-        assert!(has_emitter(i_type(OP_SWL, 1, 2, 0)));
+        assert!(has_emitter(i_type(OP_SWL, 1, 2, 0), true));
     }
 
     #[test]
     fn cop1x_madd_emitter_follows_mips4() {
         #[cfg(feature = "mips4")]
-        assert!(has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S)));
+        assert!(has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S), true));
         #[cfg(not(feature = "mips4"))]
-        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S)));
+        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S), true));
     }
 
     #[test]
@@ -320,26 +324,26 @@ mod tests {
         // The *_PS forms have no interpreter handler either — no MIPS IV
         // part SGI shipped implements paired-single — so they must keep
         // falling back even when mips4 is on.
-        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_PS)));
-        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_NMSUB_PS)));
+        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_PS), true));
+        assert!(!has_emitter(r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_NMSUB_PS), true));
     }
 
     #[test]
     fn cp1_add_s_has_emitter() {
-        assert!(has_emitter(r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FADD)));
+        assert!(has_emitter(r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FADD), true));
     }
 
     #[test]
     fn cp1_movz_fmt_has_no_emitter_yet() {
         #[cfg(feature = "mips4")]
-        assert!(has_emitter(r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FMOVZ)));
+        assert!(has_emitter(r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FMOVZ), true));
         #[cfg(not(feature = "mips4"))]
-        assert!(!has_emitter(r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FMOVZ)));
+        assert!(!has_emitter(r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FMOVZ), true));
     }
 
     #[test]
     fn mfc1_has_emitter() {
-        assert!(has_emitter(r_type(OP_COP1, RS_MFC1, 2, 3, 0, 0)));
+        assert!(has_emitter(r_type(OP_COP1, RS_MFC1, 2, 3, 0, 0), true));
     }
 
     #[test]
@@ -348,7 +352,7 @@ mod tests {
         // through has_emitter at all in practice), but has_emitter must
         // still correctly say "no" for it — nothing in either lookup table
         // matches OP_COP0.
-        assert!(!has_emitter(r_type(OP_COP0, RS_MFC0, 2, 3, 0, 0)));
+        assert!(!has_emitter(r_type(OP_COP0, RS_MFC0, 2, 3, 0, 0), true));
     }
 
     #[test]
@@ -359,8 +363,8 @@ mod tests {
         // everything else, so it correctly says "no" for these (codegen's
         // lookup_branch_or_jump/lookup_regjump are the real answer for
         // that different question).
-        assert!(!has_emitter(i_type(OP_BEQ, 1, 2, 0)));
-        assert!(!has_emitter(r_type(OP_SPECIAL, 1, 0, 0, 0, FUNCT_JR)));
+        assert!(!has_emitter(i_type(OP_BEQ, 1, 2, 0), true));
+        assert!(!has_emitter(r_type(OP_SPECIAL, 1, 0, 0, 0, FUNCT_JR), true));
     }
 
     // The tests below mutate the process-global ENABLED table, so they must not run
@@ -411,11 +415,11 @@ mod tests {
     fn disabled_instruction_makes_has_emitter_false() {
         let _lock = TOGGLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let raw = r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU);
-        assert!(has_emitter(raw));
+        assert!(has_emitter(raw, true));
         set_instr_enabled(InstrKind::Addu, false);
-        assert!(!has_emitter(raw));
+        assert!(!has_emitter(raw, true));
         set_instr_enabled(InstrKind::Addu, true);
-        assert!(has_emitter(raw));
+        assert!(has_emitter(raw, true));
     }
 
     #[test]
@@ -428,17 +432,17 @@ mod tests {
         let jr = r_type(OP_SPECIAL, 1, 0, 0, 0, FUNCT_JR);
         let j = i_type(OP_J, 0, 0, 0);
 
-        assert_ne!(crate::jitv2::analyzer::classify(beq, 5, 0), crate::jitv2::analyzer::Classify::Excluded);
-        assert_ne!(crate::jitv2::analyzer::classify(jr, 5, 0), crate::jitv2::analyzer::Classify::Excluded);
-        assert_ne!(crate::jitv2::analyzer::classify(j, 5, 0), crate::jitv2::analyzer::Classify::Excluded);
+        assert_ne!(crate::jitv2::analyzer::classify(beq, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
+        assert_ne!(crate::jitv2::analyzer::classify(jr, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
+        assert_ne!(crate::jitv2::analyzer::classify(j, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
 
         set_category_enabled(InstrCategory::BRANCH, false);
-        assert_eq!(crate::jitv2::analyzer::classify(beq, 5, 0), crate::jitv2::analyzer::Classify::Excluded);
-        assert_eq!(crate::jitv2::analyzer::classify(jr, 5, 0), crate::jitv2::analyzer::Classify::Excluded);
-        assert_eq!(crate::jitv2::analyzer::classify(j, 5, 0), crate::jitv2::analyzer::Classify::Excluded);
+        assert_eq!(crate::jitv2::analyzer::classify(beq, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
+        assert_eq!(crate::jitv2::analyzer::classify(jr, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
+        assert_eq!(crate::jitv2::analyzer::classify(j, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
 
         set_category_enabled(InstrCategory::BRANCH, true);
-        assert_ne!(crate::jitv2::analyzer::classify(beq, 5, 0), crate::jitv2::analyzer::Classify::Excluded);
+        assert_ne!(crate::jitv2::analyzer::classify(beq, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
     }
 
     #[test]
