@@ -31,27 +31,51 @@ file contents will carry both. Build PR branches from *today's file contents*.
 
 ## Group 1 — General, and upstream already owns the code
 
-The lowest-surprise category: fixes and improvements to subsystems upstream
-maintains, touching no file it lacks. **Send these first.**
+The only group being prepared. Decided 2026-09-23: IP32/O2 and R10000/IP28
+are held back as series, except two generic members lifted out of IP28 and one
+out of IP32. **Every PR carries its own `rules/` or `docs/` file** — a fix and
+the note explaining it travel together, and several of ours were orphaned
+before by going out without theirs.
 
-| commit | what | state |
-|---|---|---|
-| `7c67833` | **MTC0 moves the whole register into a 64-bit CP0 register** | **drafted**, builds on upstream, 974 tests pass, +79/-2 |
-| `bf8af6b` | XContext's field layout follows the CPU's virtual address width | builds, 972 tests; **has no test of its own — write one** |
-| `8f8a1c2` | The JTLB is as big as the CPU model says | builds, 975 tests; drop the `ip32.rs` hunk, rehome one test |
-| `481c2cd` | jitv2: stop page-rounding `code_bytes_used`, drop `HOST_PAGE_SIZE` | standalone; ~101 lines, never offered to anyone |
-| `c75b005` | jitv2: compile the MIPS IV multiply-add family, RECIP/RSQRT, PREFX | standalone; **~3x on FP code**, 13 emitters, measured |
-| `97dbcd4` | jitv2: compile BC1 — it was never the unresolvable branch we thought | needs context; **~4x on a BC1-heavy loop** |
-| `d0e984d` | jitv2: gate the ISA level on the CPU model, not a cargo feature | needs context; **~20% integer**, and the feature was never being passed |
-| `6de06d1` | jitv2: stop CP0 instructions ending every compiled region | needs context; **~13-15% syscall-bound** |
-| `68fd9c8` | tests: two that abort the whole test binary in a debug build | **send early** — a reviewer's first `cargo test` aborts without it |
-| `b3c7192` | tracing: put the IP28 tracers on devlog | includes a real config bug: `apply_env` deleted an externally-set `IRIS_DEBUG_LOG` |
-| `a9ea7e6` | seeq: report `intpend` in `seeq status` | small, standalone |
+Each row was cherry-picked onto `upstream/main` and built.
 
-The four jitv2 performance commits are the most valuable thing here and the
-most likely to be *wanted*: they are pure wins on upstream's own hot path,
-measured rather than argued. They need context because they build on each
-other — send them as one series, in the order above.
+| # | commits | what | verified | its doc |
+|---|---|---|---|---|
+| 1 | `68fd9c8` | two tests abort the whole binary in a debug build | 1090 rel / full debug suite | — |
+| 2 | `7c67833` + `f812f8e` | **MTC0 moves the whole register into a 64-bit CP0 register** | **974 tests**, +79/-2 | — |
+| 3 | `bf8af6b` + `9d08450` | **XContext's layout follows the CPU's VA width**, derived from the R4000 manual | **978 tests**, +206/-5, **6 tests** | — |
+| 4 | `8f8a1c2` | the JTLB is as big as the CPU model says | **975 tests**, +136/-37 | — |
+| 5 | `d0e984d` | jitv2: gate the ISA level on the CPU model, not a cargo feature — **~20% integer** | needs context | `rules/build/the-three-builds-we-actually-use.md` |
+| 6 | `c75b005` | jitv2: the MIPS IV multiply-add family, RECIP/RSQRT, PREFX — **~3x FP** | standalone | `rules/jitv2/instructions-jitv2-still-interprets.md` |
+| 7 | `97dbcd4` | jitv2: compile BC1 — **~4x** on a BC1-heavy loop | needs context | `rules/jitv2/bc1-is-an-ordinary-branch.md` + `rules/jitv2/bc1/` |
+| 8 | `6de06d1` | jitv2: CP0 instructions stop ending every region — **~13-15%** syscall-bound | needs context | `rules/jitv2/cop0-does-not-have-to-end-a-region.md` |
+| 9 | `481c2cd` | jitv2: stop page-rounding `code_bytes_used`, drop `HOST_PAGE_SIZE` | standalone | — |
+| 10 | `b3c7192` | put the IP28 tracers on devlog; fixes `apply_env` deleting an externally-set `IRIS_DEBUG_LOG` | 1089 tests | `rules/build/tracing-goes-through-devlog.md` |
+| 11 | `a9ea7e6` | seeq: report `intpend` in `seeq status` | standalone | `rules/irix/seeq-enet-thread-stops-pumping-under-load.md` |
+| 12 | `556ac79` | **lifted from IP28**: the low-memory alias has to follow where RAM actually is | standalone; **carries an IP28 alias change that must be split out** | — |
+| 13 | `1c71178` | **lifted from IP28**: allow 256 MB memory banks | standalone | — |
+| 14 | `c52ce8e` | **lifted from IP32**: `Index_Store_Tag` must not write the line back | needs context | — |
+
+Rows 5-8 are the jitv2 performance series and should go as one ordered set:
+they build on each other, they are pure wins on upstream's own hot path, and
+each is measured rather than argued.
+
+### Orphaned `rules/` for fixes already merged upstream
+
+The code went with the PR; the note never did. Free to send, and they close a
+documentation gap upstream has right now.
+
+| file | its merged PR |
+|---|---|
+| `rules/irix/ip7-timer-fix-concept.md` | #120 |
+| `rules/hal2/netbsd-confirms-clkid-is-a-generator-number.md` | #119 |
+| `rules/irix/netbsd-wd33c93-empty-cdb.md` | #127 |
+
+### Measurement methodology, to go with rows 5-8
+
+`rules/perf/guest-cpu-time-accounting-undercounts.md` (why these must be timed
+by host wall clock — a broken `tms_utime` inflated a Dhrystone figure ~3x) and
+`rules/testing/dhrystone-whetstone-on-an-irix-guest.md`.
 
 ## Group 2 — R10000 / IP28 machine support
 
@@ -85,11 +109,19 @@ it is not O2-specific.
 
 ## Group 4 — ARCS firmware
 
-4 commits (`7dc2544` scope, `8299de6` observe, `fbd19f9` the firmware,
-`d0f122f` executor interception). Our own firmware so a kernel boots with no
-PROM; a NetBSD kernel already finds and calls it. Self-contained and
-genuinely interesting, but it is a *new subsystem* — worth asking upstream
-whether they want it before writing the PR.
+**Not IP28/IP32-specific, despite the motivation.** Checked: `src/arcs.rs`
+mentions neither machine, it is driven by the generic `IRIS_ARCS_BOOT` env
+var, and `mips_exec_test.rs` exercises it on a plain machine. The scoping doc
+says so outright — "the value is general: a working ARCS means direct kernel
+boot on every machine".
+
+The IP28 motivation has since evaporated anyway: that PROM now passes POST
+(`f5a44c1`), so ARCS is no longer needed to boot it.
+
+Still a *new subsystem* rather than a fix, so it is worth asking upstream
+whether they want it before writing the PR. 4 commits: `7dc2544` (scope),
+`8299de6` (observe), `fbd19f9` (the firmware), `d0f122f` (executor
+interception).
 
 ## Group 5 — Documentation and rules
 
