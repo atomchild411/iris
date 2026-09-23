@@ -2690,8 +2690,22 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // equivalence tests failed intermittently with "entry instruction
         // must not be excluded" when someone else's R4400 landed between
         // their walk and their compile. Tests drive the level explicitly
-        // through `jitv2::isa::test_isa`, which serialises them; the publish
-        // itself is covered by `publishes_the_cpu_models_isa_level_to_jitv2`.
+        // through `jitv2::isa::test_isa`, which serialises them.
+        //
+        // **This line is therefore the one line here that no test executes**,
+        // and nothing catches its deletion:
+        // `publishes_the_cpu_models_isa_level_to_jitv2` calls `set_mips4`
+        // directly and would still pass. Retiring the `not(test)` means
+        // retiring the global — threading the level through `classify` into
+        // `opcode_support::has_emitter`, its one production caller. That is
+        // the right shape and it is not done here.
+        //
+        // What makes the global sound meanwhile: `Jitv2` is a field on the
+        // executor, not a process static, so a dropped machine takes its whole
+        // code cache with it and a rebuilt one (iris-gui's Stop/Start, with a
+        // different CPU selected) republishes into an empty cache. There is no
+        // window where code compiled for one ISA level is dispatched under
+        // another.
         #[cfg(all(feature = "jitv2", not(test)))]
         crate::jitv2::isa::set_mips4(C::MIPS4);
 
