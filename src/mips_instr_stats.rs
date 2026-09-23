@@ -349,6 +349,13 @@ impl InstrKind {
             // BC1F/BC1T/BC1FL/BC1TL — an ordinary PC-relative conditional
             // branch whose predicate happens to be an FCSR condition code.
             | Bc1
+            // CP0 reads/writes and ERET have no native emitter and must not
+            // get one — they are kept in a region as interpreter-fallback
+            // heads (`jitv2::cop0`). Listed here purely so the per-instruction
+            // ENABLED table defaults them on, which is what makes
+            // `j2 cop0 off` able to switch the behaviour back off on a live
+            // boot to bisect a divergence.
+            | Mfc0 | Dmfc0 | Mtc0 | Dmtc0 | Eret
         ) || self.has_jitv2_emitter()
     }
 
