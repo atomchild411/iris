@@ -62,8 +62,8 @@ jitv2 read that const **zero** times.
 
 | model | `MIPS4` const | our configs |
 |---|---|---|
-| `R4400Cache` | `false` | `iris-atomchild-hostx.toml.r4400` |
-| `R5000Cache` | `true` | `iris-atomchild-hostx.toml`, `iris-657.toml` |
+| `R4400Cache` | `false` | any config with `cpu = "r4400"` |
+| `R5000Cache` | `true` | any config with `cpu = "r5000"` |
 | `R10000Cache`| `true` | `ip28irix.toml` |
 
 One binary serves all three, so build-time and run-time could only agree by

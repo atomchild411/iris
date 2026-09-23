@@ -46,12 +46,12 @@
 //! `handle_cp0_side_effects`' EntryHi/Config flushes) — and those run here too,
 //! because the real handler runs.
 //!
-//! Ported from the `jit-atomized` work on the `atomchild` branch, which
-//! measured it worth **about 6-7% of boot time**. The Cargo feature and
-//! `IRIS_JIT_ATOMIZED` env policy it carried are deliberately left behind:
-//! they existed to A/B the policy while it was being established, and it has
-//! been. The `j2 cop0 off` monitor toggle still works for bisecting a live
-//! divergence, through the ordinary per-`InstrKind` enable table.
+//! Measured worth **about 6-7% of boot time** when this policy was first
+//! established, and **13-15% on syscall-bound work** here. The Cargo feature
+//! and env-var policy switch it was developed behind are deliberately left
+//! behind: they existed to A/B the policy while it was being settled, and it
+//! has been. The `j2 cop0 off` monitor toggle still works for bisecting a
+//! live divergence, through the ordinary per-`InstrKind` enable table.
 
 use crate::mips_isa::*;
 

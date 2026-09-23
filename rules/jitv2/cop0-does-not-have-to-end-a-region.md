@@ -1,9 +1,8 @@
 # CP0 does not have to end a region
 
-Landed 2026-09-22, ported from the `jit-atomized` work on the `atomchild`
-branch (`c2eb13b`) without its Cargo feature or `IRIS_JIT_ATOMIZED` env
-policy — those existed to A/B the policy while it was being established, and
-it has been.
+Landed 2026-09-22, without the Cargo feature or environment-variable policy
+switch it was developed behind — those existed to A/B the policy while it was
+being established, and it has been.
 
 `OP_COP0` classifies as `Excluded`, and an excluded word used to be a hard
 region boundary: every `mfc0`/`mtc0`/`eret` cut a region in two. A

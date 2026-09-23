@@ -49,11 +49,11 @@ configured and announced. The underrun count is the consequence.
 
 ## What this changes
 
-The CLKID fix (`5e76e78` in atomchild) was rejected for upstreaming with the
-caveat "that assertion is inference from Linux's `hal2.c` and our own trace,
-not a datasheet". That caveat no longer applies: a second, independent driver
-both documents the intent in a comment ("Bresenham clock source") and exhibits
-it at runtime.
+The CLKID fix was first declined with the caveat "that assertion is inference
+from Linux's `hal2.c` and our own trace, not a datasheet". That caveat no
+longer applies: a second, independent driver both documents the intent in a
+comment ("Bresenham clock source") and exhibits it at runtime. The fix landed
+upstream on that basis.
 
 It also gives the fix a **reproduction that does not involve Quake** and does
 not touch the `ALsetparams` wedge: boot GENERIC32_IP2x, read `hal2 status`,
