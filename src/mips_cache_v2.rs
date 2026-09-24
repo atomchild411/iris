@@ -3516,8 +3516,15 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                             };
                             (cs, cs == L1D_CS_DIRTY_EXCLUSIVE as u8)
                         };
-                        // Writeback dirty data before overwriting the tag.
-                        self.writeback_l1d_line(idx, cascade);
+                        // No writeback. Index_Store_Tag installs a tag and
+                        // discards whatever the line held — that is what makes
+                        // it usable to initialise a cache whose tags are
+                        // powerup garbage, which is exactly what PROMs do with
+                        // it. Writing back here sends the line's data to an
+                        // address derived from the *old* tag, corrupting
+                        // unrelated memory. `C_IWBINV` above is the op that
+                        // writes back; the L2 path here already gets this
+                        // right.
                         self.invalidate_l1d_line(idx, true, cascade);
                         self.dc.set_tag(idx, if cs != L1D_CS_INVALID as u8 { L1DTag::valid(ptag_line, cs, dirty) } else { L1DTag::default() });
                     }
@@ -4993,6 +5000,41 @@ mod tests {
         mem_write(&mem, phys, 0x5566_7788);
         let r = cache.read::<4>(virt, phys as u64);
         assert_eq!(r.data as u32, 0x5566_7788, "Hit_WBInv(SD) did not invalidate L2 line");
+    }
+
+    /// Index_Store_Tag must not write the line back. Firmware initialising
+    /// the cache walks every index storing an invalid tag; if that flushed,
+    /// each line's contents would be written to whatever address its
+    /// powerup-garbage tag happened to name.
+    ///
+    /// **This has to be an R5000-class model.** `writeback_l1d_line` sends
+    /// dirty data straight to memory only where the L2 is non-inclusive or
+    /// absent, which is the `IS_R5K` branch; on the R4400 the line goes to
+    /// its inclusive L2 instead and memory never changes, so the same test
+    /// written against `R4400Cache` passes whether the bug is present or not.
+    /// It did, until that was noticed.
+    #[test]
+    fn index_store_tag_discards_the_line_instead_of_writing_it_back() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache: R5000Cache = make_cache_of::<R5000Cache>(mem.clone());
+
+        let phys: u32 = 0x7000;
+        let virt = kseg0(phys);
+        mem_write(&mem, phys, 0xdead_beef);
+        // Dirty the line in L1D without letting it reach memory.
+        let _ = cache.write::<4>(virt, phys as u64, 0x1122_3344_u64);
+
+        let dc_set = (phys as usize >> R5000Cache::DC_LINE_SHIFT as usize)
+            & R5000Cache::DC_NUM_LINES_MASK;
+        let idx_addr = (dc_set << R5000Cache::DC_LINE_SHIFT as usize) as u64;
+
+        // Store an invalid tag over it, the way cache init does.
+        cache.cache_op(C_IST | CACH_PD, idx_addr, 0);
+
+        assert_eq!(
+            mem_read(&mem, phys), 0xdead_beef,
+            "Index_Store_Tag wrote the dirty line back to memory"
+        );
     }
 
     /// Index_LoadTag / Index_StoreTag round-trip: stored tag must read back identically.
