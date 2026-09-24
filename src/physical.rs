@@ -213,6 +213,64 @@ const ALIAS_BASE: u32   = 0x00000000;
 const ALIAS_END: u32    = 0x00080000;
 const ALIAS_OFFSET: u32 = LOMEM_BASE;
 
+/// What one 64 KB `device_map` slot should point at after a MEMCFG write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BankSlot {
+    Unmapped,
+    Bank(usize),
+}
+
+/// Decide every `device_map` slot a MEMCFG write can affect: the lomem and
+/// himem windows, each bank's placement, and wherever a bank sat outside
+/// those windows last time. Returns one entry per slot, in slot order, plus
+/// the slots this placement puts outside the windows, for the next call.
+///
+/// A plan rather than a sequence of stores, for two reasons:
+///
+/// - **Only the differences get written.** Wiping both 256 MB windows and
+///   mapping the banks back over them is about 8200 stores per MEMCFG write,
+///   each a non-atomic 16-byte fat pointer, while the MC's DMA worker may be
+///   dispatching through the table from its own thread. Collapsing to one
+///   entry per slot means a slot that ends up where it started is never
+///   touched, not wiped and rewritten.
+/// - **A bank placed outside the windows is unmapped again when it moves.**
+///   MEMCFG's base field reaches far beyond lomem and himem, and a wipe of
+///   only those two left such a slot pointing at a bank the MC had since
+///   moved or invalidated.
+///
+/// Slots past a bank's `limit` stay `Unmapped`, so reads there return 0.
+fn plan_bank_slots(
+    bank_addrs: &[Option<(u32, u32, u32)>; 4],
+    previously_outside: &[u32],
+) -> (Vec<(u32, BankSlot)>, Vec<u32>) {
+    const WINDOW: u32 = 0x1000_0000;
+    let in_window = |phys: u32| {
+        (LOMEM_BASE..LOMEM_BASE + WINDOW).contains(&phys)
+            || (HIMEM_BASE..HIMEM_BASE + WINDOW).contains(&phys)
+    };
+    let mut plan = std::collections::BTreeMap::new();
+    for base in [LOMEM_BASE, HIMEM_BASE] {
+        for idx in (base >> 16)..((base + WINDOW) >> 16) {
+            plan.insert(idx, BankSlot::Unmapped);
+        }
+    }
+    for &idx in previously_outside {
+        plan.insert(idx, BankSlot::Unmapped);
+    }
+    let mut outside = Vec::new();
+    for (bank, entry) in bank_addrs.iter().enumerate() {
+        let Some((conf_base, _addr_mask, limit)) = *entry else { continue };
+        for slot in 0..(limit >> 16) {
+            let phys = conf_base.wrapping_add(slot << 16);
+            plan.insert(phys >> 16, BankSlot::Bank(bank));
+            if !in_window(phys) {
+                outside.push(phys >> 16);
+            }
+        }
+    }
+    (plan.into_iter().collect(), outside)
+}
+
 // Mystery Black Hole (64KB at 0x02080000)
 const MYSTERY_HOLE_BASE: u32 = 0x02080000;
 const MYSTERY_HOLE_END: u32  = 0x02090000;
@@ -279,6 +337,12 @@ pub struct Physical {
     // Lookup table: 64KB granularity (65536 entries = 512KB on 64-bit)
     // Maps (address >> 16) to device pointer (non-null, always valid)
     device_map: [*const dyn BusDevice; 65536],
+
+    /// 64 KB slots the last `remap_banks` placed a RAM bank in outside the
+    /// lomem and himem windows. MEMCFG's base field reaches well beyond those
+    /// two, and a bank parked out there has to be unmapped again when it
+    /// moves — see `plan_bank_slots`.
+    banks_outside_windows: Vec<u32>,
 
     trace: AtomicBool,
     start_tick: u64,
@@ -357,9 +421,17 @@ impl Physical {
         let vino_gio_alias = AliasBus::new(std::ptr::null::<ErrorBus>(), 0xE1000000u32);
         let black_hole = BlackHoleRegion::new();
 
-        // Initialize lookup table with null - will be filled in init()
-        const NULL_PTR: *const dyn BusDevice = std::ptr::null::<ErrorBus>();
-        let device_map: [*const dyn BusDevice; 65536] = [NULL_PTR; 65536];
+        // The lookup table is filled in init(). Until then it points at a
+        // bus-error device rather than at null, although every slot is
+        // written before the guest runs: the MC's DMA worker dispatches
+        // through this table from its own thread while `remap_banks` rewrites
+        // its 16-byte fat pointers non-atomically from the CPU's, and a torn
+        // read that pairs a null data pointer with a live vtable is a
+        // segfault, not a bus error. A stateless static costs nothing and
+        // takes null out of the table for good.
+        static BOOT_ERR: ErrorBus = ErrorBus { debug: AtomicBool::new(false) };
+        const BOOT_PTR: *const dyn BusDevice = &BOOT_ERR;
+        let device_map: [*const dyn BusDevice; 65536] = [BOOT_PTR; 65536];
 
         // ppmem: reserve the 4GB window over these banks. A failure here is
         // not fatal — the bus path works regardless — so log and carry on
@@ -414,6 +486,7 @@ impl Physical {
             vino_gio_alias,
             black_hole,
             device_map,
+            banks_outside_windows: Vec::new(),
             trace: AtomicBool::new(false),
             start_tick,
             host_freq,
@@ -604,13 +677,6 @@ impl Physical {
             sp.clear_mappings();
         }
 
-        // Wipe lomem (0x08000000..0x18000000) and himem (0x20000000..0x30000000) slots
-        for base in [LOMEM_BASE, HIMEM_BASE] {
-            for i in (base >> 16)..((base + 0x10000000) >> 16) {
-                self.device_map[i as usize] = unmapped_ptr;
-            }
-        }
-
         for (bank_idx, maybe_bank) in bank_addrs.iter().enumerate() {
             let Some((conf_base, addr_mask, limit)) = *maybe_bank else {
                 dlog_dev!(LogModule::Mc, "[MEMCFG] bank {} not mapped", bank_idx);
@@ -622,13 +688,6 @@ impl Physical {
                 addr_mask, limit, limit >> 20, (addr_mask + 1) >> 20);
 
             self.banks[bank_idx].set_addr_mask(addr_mask);
-
-            // Map only the real SIMM range (limit bytes) in 64KB chunks.
-            // Slots beyond limit remain UnmappedRam → reads return 0.
-            for slot in 0..(limit >> 16) {
-                let phys = conf_base + (slot << 16);
-                self.device_map[(phys >> 16) as usize] = bank_ptrs[bank_idx];
-            }
 
             // ppmem: express the same placement as real host mappings. An
             // undersized bank repeats to fill `limit`, which is exactly the
@@ -655,6 +714,23 @@ impl Physical {
                         "ppmem: bank {bank_idx} mirror period {period:#x} does not fit \
                          bank size {bank_bytes:#x}; leaving it to the bus path");
                 }
+            }
+        }
+
+        // Now point the table at the banks, whose masks are set, storing only
+        // the slots whose contents actually change. The DMA worker can be
+        // dispatching through this table right now, and each store is a
+        // non-atomic 16-byte fat pointer; see `plan_bank_slots`.
+        let (plan, outside) = plan_bank_slots(&bank_addrs, &self.banks_outside_windows);
+        self.banks_outside_windows = outside;
+        for (idx, target) in plan {
+            let ptr = match target {
+                BankSlot::Unmapped => unmapped_ptr,
+                BankSlot::Bank(b) => bank_ptrs[b],
+            };
+            let slot = &mut self.device_map[idx as usize];
+            if !std::ptr::addr_eq(*slot, ptr) {
+                *slot = ptr;
             }
         }
 
@@ -1264,5 +1340,88 @@ mod ppmem_tests {
         ] {
             assert!(!claims(addr), "bitmap wrongly claims {name} at {addr:#x}");
         }
+    }
+}
+
+#[cfg(test)]
+mod bank_plan_tests {
+    use super::*;
+
+    const MB: u32 = 1 << 20;
+    const SLOTS_PER_128MB: usize = (128 * MB >> 16) as usize;
+
+    fn bank(base: u32, size: u32) -> Option<(u32, u32, u32)> {
+        Some((base, size - 1, size))
+    }
+
+    /// `device_map` in miniature: apply a plan the way `remap_banks` does and
+    /// count the stores that actually happen.
+    fn apply(map: &mut [BankSlot], plan: &[(u32, BankSlot)]) -> usize {
+        let mut stores = 0;
+        for &(idx, target) in plan {
+            if map[idx as usize] != target {
+                map[idx as usize] = target;
+                stores += 1;
+            }
+        }
+        stores
+    }
+
+    #[test]
+    fn every_slot_is_planned_once() {
+        // One entry per slot means a slot a bank lands in is never stored as
+        // Unmapped first and the bank second, which is the transient a
+        // concurrent DMA dispatch could otherwise catch.
+        let addrs = [bank(LOMEM_BASE, 128 * MB), None, bank(HIMEM_BASE, 128 * MB), None];
+        let (plan, _) = plan_bank_slots(&addrs, &[]);
+        assert!(plan.windows(2).all(|w| w[0].0 < w[1].0), "slots sorted and unique");
+        let lo = (LOMEM_BASE >> 16) as usize;
+        let at = |idx: usize| plan.iter().find(|p| p.0 as usize == idx).unwrap().1;
+        assert_eq!(at(lo), BankSlot::Bank(0));
+        assert_eq!(at(lo + SLOTS_PER_128MB), BankSlot::Unmapped, "past bank 0's limit");
+    }
+
+    #[test]
+    fn a_repeated_memcfg_write_stores_nothing() {
+        let addrs = [bank(LOMEM_BASE, 128 * MB), bank(LOMEM_BASE + 128 * MB, 128 * MB), None, None];
+        let mut map = vec![BankSlot::Unmapped; 65536];
+        let (plan, outside) = plan_bank_slots(&addrs, &[]);
+        assert_eq!(apply(&mut map, &plan), 2 * SLOTS_PER_128MB);
+        let (plan, _) = plan_bank_slots(&addrs, &outside);
+        assert_eq!(apply(&mut map, &plan), 0, "an unchanged MEMCFG write must not touch the table");
+    }
+
+    #[test]
+    fn moving_one_bank_stores_only_that_banks_slots() {
+        let before = [bank(LOMEM_BASE, 128 * MB), bank(LOMEM_BASE + 128 * MB, 128 * MB), None, None];
+        let after = [bank(LOMEM_BASE, 128 * MB), bank(HIMEM_BASE, 128 * MB), None, None];
+        let mut map = vec![BankSlot::Unmapped; 65536];
+        let (plan, outside) = plan_bank_slots(&before, &[]);
+        apply(&mut map, &plan);
+        let (plan, _) = plan_bank_slots(&after, &outside);
+        // Unmapped where it was, mapped where it is: nothing else.
+        assert_eq!(apply(&mut map, &plan), 2 * SLOTS_PER_128MB);
+    }
+
+    #[test]
+    fn a_bank_parked_outside_the_windows_is_unmapped_when_it_moves() {
+        // MEMCFG's base field reaches well past lomem and himem. A bank parked
+        // at 0x60000000 and then moved must not leave those slots pointing at
+        // it: the old wipe covered only the two windows.
+        const PARKED: u32 = 0x6000_0000;
+        let parked = [bank(LOMEM_BASE, 128 * MB), None, None, bank(PARKED, 16 * MB)];
+        let moved = [bank(LOMEM_BASE, 128 * MB), None, None, bank(HIMEM_BASE, 16 * MB)];
+        let mut map = vec![BankSlot::Unmapped; 65536];
+
+        let (plan, outside) = plan_bank_slots(&parked, &[]);
+        apply(&mut map, &plan);
+        assert_eq!(map[(PARKED >> 16) as usize], BankSlot::Bank(3));
+        assert_eq!(outside.len(), (16 * MB >> 16) as usize);
+
+        let (plan, outside) = plan_bank_slots(&moved, &outside);
+        apply(&mut map, &plan);
+        assert_eq!(map[(PARKED >> 16) as usize], BankSlot::Unmapped,
+                   "a slot outside the windows kept pointing at a bank that moved");
+        assert!(outside.is_empty());
     }
 }
