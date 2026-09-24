@@ -2538,24 +2538,25 @@ impl Jitv2 {
         self.capacity
     }
 
-    /// Sum, across every pooled page with a published function, of the
-    /// page's `code_size` **rounded up to `Codegen::HOST_PAGE_SIZE`** —
-    /// dev-only diagnostic (`j2 stats`), the best available proxy for the
-    /// shared `Codegen`'s actual Cranelift memory-arena usage. Rounding
-    /// matters: `code_size` is raw compiled-machine-code bytes, but
-    /// `ArenaMemoryProvider` gives every function its own segment, always
-    /// rounded up to a full host page regardless of actual size — summing
-    /// raw `code_size` alone would under-report real arena consumption.
-    /// §13: page-granular now (one function per page), not per-offset — see
-    /// `PhysicalCodePage::code_size`'s own field doc.
+    /// Sum, across every pooled page with a published function, of that
+    /// page's `code_size` — diagnostic for `j2 status`.
+    ///
+    /// **Not rounded.** The page-rounding this used to do modelled
+    /// `ArenaMemoryProvider`, which gave every function its own
+    /// page-rounded segment; that provider no longer exists. The live
+    /// `PagedArenaMemoryProvider` packs allocations back to back, so a
+    /// function costs about its own `code_size`, and on a 16 KiB-page host
+    /// the old rounding over-reported a ~215-byte function by about 76x.
+    ///
+    /// NOT `#[cfg(feature = "developer")]`, though the commit this came
+    /// from added that: `j2 status` is read on `lightning` builds, and
+    /// gating a statistic to `developer` is how `last_code_size` came to
+    /// report 0 bytes in the only build worth measuring (see
+    /// rules/build/the-three-builds-we-actually-use.md).
     pub fn code_bytes_used(&self) -> u64 {
-        let page_size = crate::jitv2::codegen::Codegen::HOST_PAGE_SIZE;
         self.pages.iter()
             .filter(|page| !page.func().is_null())
-            .map(|page| {
-                let raw = page.code_size.load(Ordering::Relaxed) as u64;
-                raw.div_ceil(page_size) * page_size
-            })
+            .map(|page| page.code_size.load(Ordering::Relaxed) as u64)
             .sum()
     }
 
@@ -4070,6 +4071,43 @@ mod tests {
         page.mark_requested(5);
         let snap = page.snapshot_requested();
         assert_eq!(snap[0] & ((1 << 4) | (1 << 5)), (1 << 4) | (1 << 5), "both offsets stay marked");
+    }
+
+    /// `code_bytes_used` sums raw `code_size`, with no page rounding.
+    ///
+    /// It used to round every published entry up to a hardcoded 4096, which
+    /// described `ArenaMemoryProvider` — one page-rounded segment per
+    /// function, a type that no longer exists. The live
+    /// `PagedArenaMemoryProvider` packs, so a function costs about its own
+    /// `code_size`.
+    ///
+    /// The constant was also wrong wherever the host page is not 4 KiB, which
+    /// includes every Apple Silicon Mac (16 KiB) and aarch64 Linux kernels
+    /// built for 16 or 64 KiB. That is why nothing here hardcodes a page size
+    /// and the failure message asks `region::page::size()` at runtime: the
+    /// page size is not a property of the target triple.
+    #[test]
+    fn code_bytes_used_is_not_page_rounded() {
+        let counter = AtomicU64::new(0);
+        let sizes = [215u32, 300, 48];
+        // One function per page: `code_bytes_used` sums one `code_size` per
+        // *page*, so three entries means three pages. Publishing three times
+        // into one page just overwrites its `code_size`.
+        let mut jit = Jitv2::new(sizes.len());
+
+        for (i, sz) in sizes.iter().enumerate() {
+            jit.pages[i].claim(i as Pfn + 1, &counter as *const AtomicU64, false);
+            let mut bits = [0u64; BITMAP_WORDS];
+            bits[0] |= 1u64;
+            assert!(jit.pages[i].publish(&bits, 0x1000 as *const (), 0, 1, *sz));
+        }
+
+        let expected: u64 = sizes.iter().map(|s| *s as u64).sum();
+        assert_eq!(
+            jit.code_bytes_used(), expected,
+            "must sum raw code_size; page-rounding would report {} instead",
+            sizes.len() as u64 * region::page::size() as u64,
+        );
     }
 
     #[test]
