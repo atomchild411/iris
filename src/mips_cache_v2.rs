@@ -422,6 +422,13 @@ pub trait CpuModel: MipsCache {
     const FIR: u32;
     /// JTLB entries.
     const TLB_ENTRIES: usize;
+    /// Implemented virtual address bits.
+    ///
+    /// 40 on the R4x00/R5000, **44 on the R10000**. This is not cosmetic: it
+    /// sets the width of XContext's BadVPN2 field and therefore where its
+    /// Region and PTEBase fields sit, which is how a 64-bit kernel finds the
+    /// page-table entry for a faulting address.
+    const VA_BITS: u32 = 40;
     /// Name as the guest and the benchmark report see it.
     const NAME: &'static str;
 }
