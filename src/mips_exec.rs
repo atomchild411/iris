@@ -2808,6 +2808,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // before they exist. An R4400 must raise Reserved Instruction on
         // MIPS IV encodings where an R5000/R10000 may execute them, and one
         // binary serves both.
+        #[cfg(feature = "jitv2")]
         jitv2.compile_queue.set_isa(C::MIPS4);
         #[cfg(feature = "jitv2")]
         let jitv2_compile_queue_handle = jitv2.compile_queue.queue_handle();
