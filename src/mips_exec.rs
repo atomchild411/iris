@@ -6798,11 +6798,45 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     // MTC0 - Move To CP0
+    /// The CP0 registers that are 64 bits wide.
+    ///
+    /// EntryLo0/1, Context, BadVAddr, EntryHi, EPC, XContext and ErrorEPC are
+    /// 64-bit in MIPS III and stay so in MIPS IV.
+    fn cp0_is_64bit(reg: u32) -> bool {
+        matches!(reg, 2 | 3 | 4 | 8 | 10 | 14 | 20 | 30)
+    }
+
     fn exec_mtc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_val = d.rd as u32;
-        // Sign-extend from 32 bits
-        self.core.write_cp0(rd_val, rt_val as u32 as i32 as i64 as u64);
+
+        // MTC0 moves the whole register. DMTC0 differs in what the
+        // assembler will accept, not in how much data reaches CP0, so a
+        // 64-bit CP0 register takes `rt` intact and only a 32-bit one takes
+        // the low word (sign-extended, an artifact of holding it in a 64-bit
+        // field here).
+        //
+        // Sign-extending into the 64-bit registers as well was silently fine
+        // for a 32-bit kernel, whose registers are sign-extended anyway, and
+        // fatal to a 64-bit one. IRIX's 64-bit standalone code returns from an
+        // exception with `mtc0 ra, EPC` / `mtc0 ra, ErrorEPC` / `eret`: with
+        // `ra` = 0xa8000000208b9998 the ERET went to 0x00000000208b9998 and
+        // landed in unmapped user space.
+        //
+        // Two other readings were tried against both guests and rejected.
+        // Preserving bits 63:32 of the old value fixes the 64-bit case and
+        // breaks the 32-bit one — EntryHi's upper half carries the TLB Region,
+        // so a stale one files entries under the wrong region and IRIX 6.5.22
+        // dies in sash on a kseg3 address. Doing that only in 64-bit
+        // addressing mode works for both but needs a mode test MTC0 does not
+        // architecturally have. Moving the whole register needs neither, and
+        // both guests are happy with it.
+        let value = if Self::cp0_is_64bit(rd_val) {
+            rt_val
+        } else {
+            rt_val as u32 as i32 as i64 as u64
+        };
+        self.core.write_cp0(rd_val, value);
         self.handle_cp0_side_effects(rd_val);
         self.handle_exec_complete()
     }
@@ -7192,6 +7226,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // code through the kernel translator. The flush alone cannot cover it: it
         // *guarantees* the next access misses and therefore calls `translate_fn`.
         self.resync_privilege_state();
+
 
         // ERET jumps immediately without delay slot
         self.core.pc = target;

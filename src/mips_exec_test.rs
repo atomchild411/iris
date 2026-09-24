@@ -681,6 +681,77 @@ mod tests {
         assert_eq!(exec.core.pc, xkphys_addr + 4);
     }
 
+    /// MTC0 moves the whole register into a 64-bit CP0 register.
+    ///
+    /// IRIX's 64-bit standalone code returns from an exception with
+    /// `mtc0 ra, EPC` / `mtc0 ra, ErrorEPC` / `eret`, so if MTC0 keeps only
+    /// the low word the ERET goes to a truncated address. Sign-extending
+    /// instead was invisible on a 32-bit guest, whose registers are
+    /// sign-extended already, and fatal on a 64-bit one.
+    #[test]
+    fn mtc0_moves_the_whole_register_into_a_64bit_cp0_register() {
+        let (mut exec, mem) = create_executor();
+        let ra = 0xa800_0000_208b_9998u64;
+
+        // MTC0 ra($31), EPC($14)  ->  0x409f7000
+        mem.set_word(0x00000000, 0x409f_7000);
+        exec.core.pc = 0xFFFFFFFF_80000000u64;
+        exec.core.write_gpr(31, ra);
+        exec.core.cp0_epc = 0xa800_0000_208b_9924;
+
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(
+            exec.core.cp0_epc, ra,
+            "EPC must hold the whole register, not its low word"
+        );
+    }
+
+    /// EntryHi is the register the whole argument turned on.
+    ///
+    /// Its bits 63:62 are the TLB Region. The rejected reading — preserve
+    /// bits 63:32 of the *old* value, which is how MIPS64 Vol II words it —
+    /// leaves a stale Region behind, so entries get filed under the wrong
+    /// one and IRIX 6.5.22 dies in sash on a kseg3 address. Sign-extending
+    /// loses the Region outright. Only moving the whole register keeps it.
+    ///
+    /// Without this, a later "fix" back toward the manual's wording would
+    /// pass the other two tests and break real guests.
+    #[test]
+    fn mtc0_into_entryhi_keeps_the_tlb_region() {
+        let (mut exec, mem) = create_executor();
+
+        // MTC0 t0($8), EntryHi($10)  ->  0x40885000
+        mem.set_word(0x00000000, 0x4088_5000);
+        exec.core.pc = 0xFFFFFFFF_80000000u64;
+        // Region 3 (xkseg), and a VPN2 the register's own mask keeps.
+        exec.core.write_gpr(8, 0xC000_0000_1234_5000);
+
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(
+            exec.core.cp0_entryhi, 0xC000_0000_1234_4000,
+            "EntryHi must keep the TLB Region the guest wrote; sign-extending \
+             the low word drops it to region 0"
+        );
+    }
+
+    /// ...and only the low word, sign-extended, into a 32-bit one.
+    #[test]
+    fn mtc0_truncates_into_a_32bit_cp0_register() {
+        let (mut exec, mem) = create_executor();
+
+        // MTC0 t0($8), Compare($11)  ->  0x40885800
+        mem.set_word(0x00000000, 0x4088_5800);
+        exec.core.pc = 0xFFFFFFFF_80000000u64;
+        exec.core.write_gpr(8, 0x1234_5678_9abc_def0);
+
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(
+            exec.core.read_cp0_debug(11) as u32,
+            0x9abc_def0,
+            "a 32-bit CP0 register takes the low word"
+        );
+    }
+
     #[test]
     fn test_lui_ori_sequence() {
         let (mut exec, _) = create_executor();
