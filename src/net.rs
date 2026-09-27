@@ -156,6 +156,61 @@ struct NatTcpEntry {
     fin_wait:         bool,  // IRIX sent FIN; waiting for server to close before we send FIN back
     server_fin:       bool,  // server closed its end; need to send FIN+ACK to IRIX when ring has space
     retransmit:       VecDeque<RetransmitEntry>,
+    // Bytes IRIX sent that we have ACKed but the host socket has not taken yet
+    // (it is non-blocking and fills up when the host reads slowly). This is our
+    // receive buffer: what we ACK is what is in here or already written, and
+    // the window we advertise is the room left in it.
+    to_host:          VecDeque<u8>,
+    adv_win:          u32,   // the window we last advertised to IRIX
+    shut_pending:     bool,  // IRIX's FIN arrived; shut the host write side once to_host drains
+    fin_sent:         bool,  // we sent IRIX our FIN (the host closed); IRIX may still send until its FIN
+}
+
+/// Our receive buffer toward the host socket, and so the largest window we
+/// advertise to IRIX (no window scaling: at most 65535).
+const TO_HOST_CAP: usize = 65535;
+
+impl NatTcpEntry {
+    fn new(stream: TcpStream, client_mac: [u8; 6], client_ip: Ipv4Addr, client_port: u16,
+           server_ip: Ipv4Addr, server_seq: u32, client_win: u32, client_seq: u32) -> Self {
+        NatTcpEntry {
+            stream, client_mac, client_ip, client_port, server_ip,
+            server_seq, server_seq_acked: server_seq, client_win, client_seq,
+            last_use: Instant::now(), fin_wait: false, server_fin: false,
+            retransmit: VecDeque::new(),
+            to_host: VecDeque::new(), adv_win: TO_HOST_CAP as u32, shut_pending: false,
+            fin_sent: false,
+        }
+    }
+
+    /// The receive window to advertise now: the room left in `to_host`.
+    fn rcv_win(&self) -> u16 {
+        TO_HOST_CAP.saturating_sub(self.to_host.len()) as u16
+    }
+
+    /// Write as much of `to_host` to the host socket as it takes without
+    /// blocking. Returns true if anything was written. A hard error means the
+    /// host end is gone; the buffered bytes are dropped with it.
+    fn flush_to_host(&mut self) -> bool {
+        use std::io::Write as _;
+        let mut wrote = false;
+        while !self.to_host.is_empty() {
+            let (head, _) = self.to_host.as_slices();
+            match self.stream.write(head) {
+                Ok(0) => break,
+                Ok(n) => { self.to_host.drain(..n); wrote = true; }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => { self.to_host.clear(); break; }
+            }
+        }
+        if wrote { self.last_use = Instant::now(); }
+        if self.shut_pending && self.to_host.is_empty() {
+            let _ = self.stream.shutdown(std::net::Shutdown::Write);
+            self.shut_pending = false;
+        }
+        wrote
+    }
 }
 
 // ── Packet helpers ────────────────────────────────────────────────────────────
@@ -294,12 +349,21 @@ fn tcp_segment(src_ip: Ipv4Addr, dst_ip: Ipv4Addr,
                sport: u16, dport: u16,
                seq: u32, ack: u32, flags: u8,
                payload: &[u8]) -> Vec<u8> {
+    tcp_segment_win(src_ip, dst_ip, sport, dport, seq, ack, flags, 65535, payload)
+}
+
+/// A TCP segment advertising receive window `win` (NAT connections advertise
+/// the room left in their `to_host` buffer).
+fn tcp_segment_win(src_ip: Ipv4Addr, dst_ip: Ipv4Addr,
+                   sport: u16, dport: u16,
+                   seq: u32, ack: u32, flags: u8, win: u16,
+                   payload: &[u8]) -> Vec<u8> {
     let mut seg = vec![0u8; 20 + payload.len()];
     w16(&mut seg, 0, sport); w16(&mut seg, 2, dport);
     w32(&mut seg, 4, seq);   w32(&mut seg, 8, ack);
     seg[12] = 0x50;
     seg[13] = flags;
-    w16(&mut seg, 14, 65535);
+    w16(&mut seg, 14, win);
     if !payload.is_empty() { seg[20..].copy_from_slice(payload); }
     let c = tcp_checksum(src_ip, dst_ip, &seg); w16(&mut seg, 16, c);
     seg
@@ -954,6 +1018,83 @@ mod ftp_alg_tests {
         // Malformed tuple (not six bytes) is rejected.
         assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
         assert!(ftp_pasv_rewrite(b"227 (1,2,3,4,5,999)\r\n", Ipv4Addr::LOCALHOST, 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tcp_to_host_tests {
+    use super::*;
+    use std::io::Read as _;
+
+    // A host socket that stops reading must not lose what IRIX sent: the
+    // bytes wait in to_host, the advertised window shrinks by what waits, and
+    // everything arrives, in order, once the host reads again.
+    #[test]
+    fn slow_host_reader_loses_nothing() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut host, _) = listener.accept().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let mut e = NatTcpEntry::new(ours, [0; 6], Ipv4Addr::new(192, 168, 0, 2), 1234,
+                                     Ipv4Addr::new(192, 168, 0, 1), 1, 65535, 1);
+        assert_eq!(e.rcv_win(), TO_HOST_CAP as u16);
+
+        // Feed far more than the socket buffers hold, TO_HOST_CAP at a time,
+        // as handle_tcp would, until the socket stops taking data.
+        let pattern: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        let mut fed = 0;
+        while fed < pattern.len() {
+            let take = (pattern.len() - fed).min(TO_HOST_CAP - e.to_host.len());
+            if take == 0 { break; }
+            e.to_host.extend(&pattern[fed..fed + take]);
+            fed += take;
+            e.flush_to_host();
+        }
+        assert!(fed < pattern.len(), "the socket never pushed back");
+        assert!(!e.to_host.is_empty(), "back-pressure should leave bytes waiting");
+        assert_eq!(e.rcv_win() as usize, TO_HOST_CAP - e.to_host.len());
+
+        // The host reads everything; we keep flushing and feeding.
+        host.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        while got.len() < pattern.len() {
+            e.flush_to_host();
+            while fed < pattern.len() && e.to_host.len() < TO_HOST_CAP {
+                let take = (pattern.len() - fed).min(TO_HOST_CAP - e.to_host.len());
+                e.to_host.extend(&pattern[fed..fed + take]);
+                fed += take;
+                e.flush_to_host();
+            }
+            match host.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(_) => {}
+            }
+        }
+        assert_eq!(got.len(), pattern.len());
+        assert!(got == pattern, "bytes arrived out of order or altered");
+        assert!(e.to_host.is_empty());
+        assert_eq!(e.rcv_win(), TO_HOST_CAP as u16);
+    }
+
+    // IRIX's FIN shuts the host write side only after what came before it
+    // has been written.
+    #[test]
+    fn fin_waits_for_buffered_data() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut host, _) = listener.accept().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let mut e = NatTcpEntry::new(ours, [0; 6], Ipv4Addr::new(192, 168, 0, 2), 1234,
+                                     Ipv4Addr::new(192, 168, 0, 1), 1, 65535, 1);
+        e.to_host.extend(b"hello, host");
+        e.shut_pending = true;
+        e.flush_to_host();
+        assert!(!e.shut_pending);
+        let mut all = Vec::new();
+        host.read_to_end(&mut all).unwrap();   // ends only because we shut after the data
+        assert_eq!(all, b"hello, host");
     }
 }
 
@@ -2234,21 +2375,9 @@ impl NatEngine {
                 // Our SYN consumed client_isn, so our first data byte is client_isn+1.
                 // ack_seq (= guest ISN+1) is what IRIX expects us to ACK — that goes into client_seq.
                 let our_send_seq = pending.client_isn.wrapping_add(1);
-                self.tcp_nat.insert(nat_key, NatTcpEntry {
-                    stream:           pending.stream,
-                    client_mac:       *client_mac,
-                    client_ip:        src_ip,
-                    client_port:      sport,
-                    server_ip:        self.config.gateway_ip,
-                    server_seq:       our_send_seq,
-                    server_seq_acked: our_send_seq,
-                    client_win:       r16(tcp, 14) as u32,
-                    client_seq:       ack_seq,
-                    last_use:         Instant::now(),
-                    fin_wait:         false,
-                    server_fin:       false,
-                    retransmit:       VecDeque::new(),
-                });
+                self.tcp_nat.insert(nat_key, NatTcpEntry::new(
+                    pending.stream, *client_mac, src_ip, sport, self.config.gateway_ip,
+                    our_send_seq, r16(tcp, 14) as u32, ack_seq));
                 return;
             }
         }
@@ -2304,18 +2433,9 @@ impl NatEngine {
                     let _ = stream.set_nonblocking(true);
                     let server_seq = 0x4000_0000u32;
                     dlog_dev!(LogModule::Net, "NAT TCP connected {}:{} → {}:{}", src_ip, sport, dst_ip, dport);
-                    self.tcp_nat.insert(key, NatTcpEntry {
-                        stream, client_mac: *client_mac, client_ip: src_ip,
-                        client_port: sport, server_ip: visible_ip,
-                        server_seq: server_seq.wrapping_add(1),
-                        server_seq_acked: server_seq.wrapping_add(1),
-                        client_win: r16(tcp, 14) as u32,
-                        client_seq: seq.wrapping_add(1),
-                        last_use: Instant::now(),
-                        fin_wait: false,
-                        server_fin: false,
-                        retransmit: VecDeque::new(),
-                    });
+                    self.tcp_nat.insert(key, NatTcpEntry::new(
+                        stream, *client_mac, src_ip, sport, visible_ip,
+                        server_seq.wrapping_add(1), r16(tcp, 14) as u32, seq.wrapping_add(1)));
                     let seg = tcp_segment(visible_ip, src_ip, dport, sport,
                                          server_seq, seq.wrapping_add(1), 0x12, &[]);
                     let frame = ip_frame(client_mac, &self.config.gateway_mac,
@@ -2389,20 +2509,37 @@ impl NatEngine {
             }
         }
 
+        // Data from IRIX. Take only the bytes that continue the stream exactly
+        // where client_seq says it is, and only as many as fit in to_host: a
+        // segment beyond a gap, or the part of one that does not fit, is left
+        // for IRIX to retransmit. What we take is ACKed and reaches the host
+        // socket as fast as that socket accepts it (flush_to_host, and again
+        // from poll_tcp). Writing straight to the non-blocking socket and
+        // ACKing regardless, as before, lost whatever the socket refused
+        // whenever the host read more slowly than IRIX sent.
         if !payload.is_empty() {
-            // Detect retransmit: if seq is already ACKed, just re-ACK, don't write again.
-            let already_acked = entry.client_seq.wrapping_sub(seq) <= 0x8000_0000
-                                && seq != entry.client_seq;
-            if !already_acked {
-                use std::io::Write as _;
+            // How far this segment starts before client_seq (0 = exactly in order;
+            // "negative", i.e. >= 2^31, = beyond a gap).
+            let behind = entry.client_seq.wrapping_sub(seq);
+            let new_data: &[u8] = if behind < 0x8000_0000 && (behind as usize) < payload.len() {
+                &payload[behind as usize..]      // in order, or overlapping what we have
+            } else {
+                &[]                              // all old (a retransmit), or ahead of a gap
+            };
+            let room = TO_HOST_CAP.saturating_sub(entry.to_host.len());
+            let take = new_data.len().min(room);
+            if take > 0 {
                 // FTP ALG: on an inbound port-forward to the guest's ftpd
                 // (server = gateway, guest control port 21), rewrite a passive
                 // 227 reply so the host client reaches the data connection via a
                 // freshly-bound host forward. client_seq still advances by the
                 // *original* length (that's what the guest sent and we ACK).
+                // Only a reply that arrives whole is rewritten.
                 let is_ftp_ctrl = entry.server_ip == gateway_ip && entry.client_port == 21;
                 let mut handled = false;
-                if is_ftp_ctrl && ftp_pasv_rewrite(payload, Ipv4Addr::LOCALHOST, 0).is_some() {
+                if is_ftp_ctrl && behind == 0 && take == payload.len()
+                    && ftp_pasv_rewrite(payload, Ipv4Addr::LOCALHOST, 0).is_some()
+                {
                     if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
                         if let Ok(addr) = listener.local_addr() {
                             let host_port = addr.port();
@@ -2413,7 +2550,7 @@ impl NatEngine {
                                 dlog_dev!(LogModule::Net,
                                     "NAT FTP ALG: PASV guest data port {} -> host 127.0.0.1:{}",
                                     data_port, host_port);
-                                let _ = entry.stream.write_all(&rewritten);
+                                entry.to_host.extend(&rewritten);
                                 new_data_fwd = Some((listener, data_port));
                                 handled = true;
                             }
@@ -2421,14 +2558,20 @@ impl NatEngine {
                     }
                 }
                 if !handled {
-                    let _ = entry.stream.write_all(payload);
+                    entry.to_host.extend(&new_data[..take]);
                 }
-                entry.client_seq = seq.wrapping_add(payload.len() as u32);
+                entry.client_seq = entry.client_seq.wrapping_add(take as u32);
+                entry.flush_to_host();
+            } else if !new_data.is_empty() || behind >= 0x8000_0000 {
+                dlog_dev!(LogModule::Net, "NAT TCP hold {}:{} seq={:#010x} want={:#010x} len={} buffered={}",
+                          src_ip, sport, seq, entry.client_seq, payload.len(), entry.to_host.len());
             }
+            let win = entry.rcv_win();
+            entry.adv_win = win as u32;
             let sip  = entry.server_ip;
-            let seg = tcp_segment(sip, entry.client_ip,
-                                  dport, entry.client_port,
-                                  entry.server_seq, entry.client_seq, 0x10, &[]);
+            let seg = tcp_segment_win(sip, entry.client_ip,
+                                      dport, entry.client_port,
+                                      entry.server_seq, entry.client_seq, 0x10, win, &[]);
             let cmac = entry.client_mac;
             let cip  = entry.client_ip;
             let frame = ip_frame(&cmac, &self.config.gateway_mac,
@@ -2439,23 +2582,34 @@ impl NatEngine {
         if fin {
             let frame = {
                 let entry = self.tcp_nat.get_mut(&key).unwrap();
-                dlog_dev!(LogModule::Net, "NAT TCP FIN {}:{} → {}:{}", src_ip, sport, entry.server_ip, dport);
-                entry.client_seq = entry.client_seq.wrapping_add(1);
-                // ACK IRIX's FIN so it stops retransmitting.
+                let fin_seq = seq.wrapping_add(payload.len() as u32);
+                if fin_seq == entry.client_seq {
+                    // Every byte before the FIN is ours: accept it.
+                    dlog_dev!(LogModule::Net, "NAT TCP FIN {}:{} → {}:{}", src_ip, sport, entry.server_ip, dport);
+                    entry.client_seq = entry.client_seq.wrapping_add(1);
+                    // Shut our write side so the server sees EOF -- once what IRIX
+                    // sent before the FIN has reached it -- then wait for its FIN.
+                    entry.shut_pending = true;
+                    entry.flush_to_host();
+                    entry.fin_wait = true;
+                } else if fin_seq.wrapping_add(1) != entry.client_seq {
+                    // Data before this FIN is still missing (or did not fit):
+                    // don't take the FIN yet; IRIX retransmits it.
+                    dlog_dev!(LogModule::Net, "NAT TCP FIN held {}:{} fin_seq={:#010x} want={:#010x}",
+                              src_ip, sport, fin_seq, entry.client_seq);
+                }
+                // ACK (again, for a retransmitted FIN) so IRIX stops retransmitting.
+                let win = entry.rcv_win();
+                entry.adv_win = win as u32;
                 let sip  = entry.server_ip;
-                let seg = tcp_segment(sip, entry.client_ip,
-                                      dport, entry.client_port,
-                                      entry.server_seq, entry.client_seq, 0x10, &[]);
+                let seg = tcp_segment_win(sip, entry.client_ip,
+                                          dport, entry.client_port,
+                                          entry.server_seq, entry.client_seq, 0x10, win, &[]);
                 let cmac = entry.client_mac;
                 let cip  = entry.client_ip;
                 ip_frame(&cmac, &self.config.gateway_mac, sip, cip, IP_PROTO_TCP, &seg)
             };
             self.enqueue_rx(frame);
-            // Shut down our write side so the server sees EOF, then wait for server's FIN.
-            let entry = self.tcp_nat.get_mut(&key).unwrap();
-            use std::net::Shutdown;
-            let _ = entry.stream.shutdown(Shutdown::Write);
-            entry.fin_wait = true;
         }
 
         // Register the FTP-ALG data forward now that the `entry` borrow is gone.
@@ -2476,7 +2630,9 @@ impl NatEngine {
         let mut expired  = Vec::new();   // timed out — just remove
 
         for (&key, entry) in &mut self.tcp_nat {
-            let timeout = if entry.fin_wait { Duration::from_secs(10) } else { Duration::from_secs(300) };
+            let timeout = if entry.fin_wait { Duration::from_secs(10) }
+                          else if entry.fin_sent { Duration::from_secs(60) }
+                          else { Duration::from_secs(300) };
             if entry.last_use.elapsed() > timeout {
                 dlog_dev!(LogModule::Net, "NAT TCP timeout {}:{} → {}:{}", entry.client_ip, key.2, Ipv4Addr::from(key.0), key.1);
                 expired.push(key); continue;
@@ -2484,14 +2640,34 @@ impl NatEngine {
             let (_, dport, sport) = key;
             let sip = entry.server_ip;
 
+            // ── Drain IRIX's data into the host socket; reopen the window ─────
+            // When the host catches up, tell IRIX (a window update) once the
+            // window has grown by a full segment, or opened completely.
+            entry.flush_to_host();
+            let win = entry.rcv_win() as u32;
+            if (win >= entry.adv_win.saturating_add(1460) || (win == TO_HOST_CAP as u32 && entry.adv_win < win))
+                && self.rx_prod.slots() >= 5
+            {
+                dlog_dev!(LogModule::Net, "NAT TCP window update {}:{} → {}:{} win {} -> {}",
+                          sip, dport, entry.client_ip, sport, entry.adv_win, win);
+                let seg = tcp_segment_win(sip, entry.client_ip, dport, sport,
+                                          entry.server_seq, entry.client_seq, 0x10, win as u16, &[]);
+                let frame = ip_frame(&entry.client_mac, &self.config.gateway_mac,
+                                     sip, entry.client_ip, IP_PROTO_TCP, &seg);
+                let _ = self.rx_prod.push(frame);
+                self.rx_wake.1.notify_one();
+                entry.adv_win = win;
+            }
+
             // ── Retransmit timed-out segments ────────────────────────────────
+            let rt_win = entry.rcv_win();
             for rt in &mut entry.retransmit {
                 if rt.sent_at.elapsed() < RTO { break; }  // queue is ordered; stop at first fresh entry
                 if self.rx_prod.slots() < 5 { break; }
                 dlog_dev!(LogModule::Net, "NAT TCP RETRANSMIT {}:{} → {}:{} seq={} len={}",
                           sip, dport, entry.client_ip, sport, rt.seq, rt.data.len());
-                let seg = tcp_segment(sip, entry.client_ip, dport, sport,
-                                      rt.seq, entry.client_seq, 0x18, &rt.data);
+                let seg = tcp_segment_win(sip, entry.client_ip, dport, sport,
+                                          rt.seq, entry.client_seq, 0x18, rt_win, &rt.data);
                 let frame = ip_frame(&entry.client_mac, &self.config.gateway_mac,
                                      sip, entry.client_ip, IP_PROTO_TCP, &seg);
                 let _ = self.rx_prod.push(frame);
@@ -2523,8 +2699,8 @@ impl NatEngine {
                         dlog_dev!(LogModule::Net, "NAT TCP poll_tcp PUSH {}:{} → {}:{} seq={} ack={} len={} win_rem={}",
                                   sip, dport, entry.client_ip, sport, seq, entry.client_seq, n, window_remaining);
                         let data = buf[..n].to_vec();
-                        let seg = tcp_segment(sip, entry.client_ip, dport, sport,
-                                              seq, entry.client_seq, 0x18, &data);
+                        let seg = tcp_segment_win(sip, entry.client_ip, dport, sport,
+                                                  seq, entry.client_seq, 0x18, entry.rcv_win(), &data);
                         let frame = ip_frame(&entry.client_mac, &self.config.gateway_mac,
                                              sip, entry.client_ip, IP_PROTO_TCP, &seg);
                         let _ = self.rx_prod.push(frame);
@@ -2538,27 +2714,35 @@ impl NatEngine {
         for k in expired { self.tcp_nat.remove(&k); }
         // Expire old TIME_WAIT entries (4 seconds is plenty for a LAN).
         self.tcp_tw.retain(|_, t| t.elapsed() < Duration::from_secs(4));
-        // Send FIN+ACK to IRIX for connections where the server closed.
+        // Send our FIN to IRIX for connections where the server closed.
         // If the ring is full, leave server_fin set and retry next poll cycle.
-        let mut fin_sent = Vec::new();
+        // The host closing is only a half-close: IRIX may go on sending (an
+        // echo, the rest of a reply), so the entry stays until IRIX's own FIN
+        // has come and what it sent has reached the host.
+        let mut closed = Vec::new();
         for (&k, entry) in &mut self.tcp_nat {
-            if !entry.server_fin { continue; }
-            // Wait until IRIX has ACKed all data before sending FIN — otherwise IRIX
-            // may discard buffered data when it receives FIN and closes the connection.
-            let in_flight = entry.server_seq.wrapping_sub(entry.server_seq_acked);
-            if in_flight > 0 { continue; }
-            if self.rx_prod.slots() < 1 { continue; }
-            let sip = entry.server_ip;
-            let seg = tcp_segment(sip, entry.client_ip,
-                                  k.1, entry.client_port,
-                                  entry.server_seq, entry.client_seq, 0x11, &[]);
-            let frame = ip_frame(&entry.client_mac, &self.config.gateway_mac,
-                                 sip, entry.client_ip, IP_PROTO_TCP, &seg);
-            let _ = self.rx_prod.push(frame);
-            self.rx_wake.1.notify_one();
-            fin_sent.push(k);
+            if entry.server_fin && !entry.fin_sent {
+                // Wait until IRIX has ACKed all data before sending FIN — otherwise IRIX
+                // may discard buffered data when it receives FIN and closes the connection.
+                let in_flight = entry.server_seq.wrapping_sub(entry.server_seq_acked);
+                if in_flight > 0 { continue; }
+                if self.rx_prod.slots() < 1 { continue; }
+                let sip = entry.server_ip;
+                let seg = tcp_segment_win(sip, entry.client_ip,
+                                          k.1, entry.client_port,
+                                          entry.server_seq, entry.client_seq, 0x11, entry.rcv_win(), &[]);
+                let frame = ip_frame(&entry.client_mac, &self.config.gateway_mac,
+                                     sip, entry.client_ip, IP_PROTO_TCP, &seg);
+                let _ = self.rx_prod.push(frame);
+                self.rx_wake.1.notify_one();
+                entry.server_seq = entry.server_seq.wrapping_add(1);   // the FIN's sequence number
+                entry.fin_sent = true;
+            }
+            if entry.fin_sent && entry.fin_wait && entry.to_host.is_empty() {
+                closed.push(k);
+            }
         }
-        for k in fin_sent {
+        for k in closed {
             self.tcp_nat.remove(&k);
             self.tcp_tw.insert(k, Instant::now());
         }
