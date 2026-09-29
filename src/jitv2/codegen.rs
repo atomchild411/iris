@@ -79,6 +79,11 @@ pub struct Codegen {
     /// one `u32` written once per compile off the hot path, so gating it
     /// bought nothing to begin with.
     last_code_size: u32,
+    /// Machine code and alignment of the most recent successful compile, for
+    /// the persistent cache (`pcache`). Captured only while the cache is on,
+    /// and only when the code is relocation-free, so it can be loaded
+    /// anywhere; `None` otherwise.
+    last_blob: Option<(Vec<u8>, u32)>,
     /// Set right before `compile_region` returns `None` iff that failure
     /// was `ModuleError::Allocation` — the `ArenaMemoryProvider` running out
     /// of its `ARENA_RESERVE_SIZE` reservation (real message observed live:
@@ -495,24 +500,6 @@ impl Codegen {
         CODEGEN_INTERRUPT_RUN.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Host mmap page granularity `ArenaMemoryProvider` rounds every
-    /// function's segment up to (`memory/arena.rs`'s own `align_up(size,
-    /// page::size())`, via the `region` crate — a transitive dependency of
-    /// `cranelift-jit`, not depended on directly here, so this is a named
-    /// assumption rather than a call to `region::page::size()`). 4KiB is
-    /// correct for every platform this project actually targets
-    /// (`target-cpu=native` x86-64/aarch64 Linux and macOS) — if that ever
-    /// changes, this is the one place to update, not a magic number buried
-    /// in `code_bytes_used`'s arithmetic.
-    ///
-    /// `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s own doc comment already derived
-    /// this fact independently (confirmed live: the arena exhausts at
-    /// *exactly* `ARENA_RESERVE_SIZE / HOST_PAGE_SIZE` functions, not a
-    /// byte-size estimate) — this constant makes that same fact available
-    /// to `Jitv2::code_bytes_used`'s per-entry accounting instead of just
-    /// the flush-threshold math.
-    pub const HOST_PAGE_SIZE: u64 = 4096;
-
     /// `cranelift_jit`'s default `SystemMemoryProvider` mmaps (or
     /// `alloc::alloc`s, which on Linux still routes through mmap for
     /// large/page-sized allocations) a fresh chunk sized to fit exactly
@@ -625,6 +612,7 @@ impl Codegen {
             // constructing here would always no-op).
             mem_helpers: [None; MEM_HELPER_COUNT],
             last_code_size: 0,
+            last_blob: None,
             last_compile_ran_out_of_memory: false,
             #[cfg(feature = "developer")]
             last_decline_was_verifier_error: false,
@@ -714,6 +702,18 @@ impl Codegen {
         unsafe { self.reset_inner(Self::new_module(None, None)) }
     }
 
+    /// Reclaim this `Codegen`'s executable memory, as `reset` does, without
+    /// building a replacement: for a `Codegen` being retired for good (the
+    /// compile pool's workers, which `CompileQueue::stop` hands back when
+    /// `Jitv2::flush_from_cpu_thread` starts a new pool on a new arena).
+    /// Several retired `Codegen`s can share one arena; it is released once.
+    ///
+    /// # Safety
+    /// Same as `reset`.
+    pub unsafe fn release(self) {
+        unsafe { self.module.free_memory() }
+    }
+
     /// Same contract as `reset()`, but rebuilds on top of an
     /// already-reserved shared arena instead of freeing the old one and
     /// reserving a fresh one — the compile-pool flush-leader path (a fresh
@@ -758,6 +758,7 @@ impl Codegen {
         self.func_id_counter = 0;
         self.func_ranges.clear();
         self.last_code_size = 0;
+        self.last_blob = None;
         self.last_compile_ran_out_of_memory = false;
         // Old helper addresses point into the arena that was just freed.
         // Dropped here, but NOT rebuilt: a forced seal mprotects a whole host
@@ -785,6 +786,90 @@ impl Codegen {
     /// `compile_region` call — see `last_code_size`'s own field doc comment.
     pub fn last_code_size(&self) -> u32 {
         self.last_code_size
+    }
+
+    /// The most recent compile's machine code and alignment, if the
+    /// persistent cache is on and the code can be stored — see `last_blob`.
+    pub fn take_last_blob(&mut self) -> Option<(Vec<u8>, u32)> {
+        self.last_blob.take()
+    }
+
+    /// Everything besides the page words and entry set that shapes what
+    /// `compile_region_uncommitted` emits, hashed; the persistent cache keys
+    /// on it. `None` when this `Codegen` bakes host addresses into its code
+    /// (baked hook pointers, shared memory helpers), which would not be valid
+    /// in another process.
+    ///
+    /// Whatever is left out here is served across a change to it, so when in
+    /// doubt, add it. The build itself (features, codegen source, Cranelift
+    /// version) is covered separately by the cache's build id.
+    pub fn cache_fingerprint(&self, skip_entry_preamble: bool) -> Option<crate::jitv2::pcache::Fingerprint> {
+        if (bake_hooks_enabled() && self.jit_consts.core.is_some()) || self.mem_helpers.iter().any(|h| h.is_some()) {
+            return None;
+        }
+        let isa = self.module.isa();
+        let mut s = String::new();
+        use std::fmt::Write as _;
+        let _ = write!(
+            s,
+            "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} triple={} flags={}",
+            crate::jitv2::comp::max_instrs_per_compile(),
+            crate::jitv2::comp::min_instrs_to_compile(),
+            Self::opt_level_speed(),
+            Self::interrupt_run(),
+            inline_mem_enabled(),
+            mem_helpers_enabled(),
+            crate::jitv2::analyzer::fallback_enabled(),
+            crate::jitv2::entry_preamble_forced(),
+            skip_entry_preamble,
+            crate::jitv2::isa::mips4_enabled(),
+            self.dc_geometry,
+            isa.triple(),
+            isa.flags(),
+        );
+        for v in isa.isa_flags() {
+            let _ = write!(s, " {v}");
+        }
+        s.push_str(" ops=");
+        s.extend(crate::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
+        Some(blake3::hash(s.as_bytes()).as_bytes()[..16].try_into().unwrap())
+    }
+
+    /// Install machine code the persistent cache kept from an earlier
+    /// compile of the same page, in place of compiling it: the counterpart of
+    /// `compile_region_uncommitted`, with the same contract afterwards (a
+    /// `FuncId` to hand to `finalize_batch_nonforced`, its seal-queue slot
+    /// already reserved). The bytes go through Cranelift's own
+    /// `define_function_bytes`, so they land in the same arena and are sealed
+    /// and published exactly like freshly compiled code.
+    ///
+    /// `code` must be relocation-free (`last_blob` only ever captures such
+    /// code). `None` on an allocation failure, with
+    /// `last_compile_ran_out_of_memory` set just as a compile would.
+    pub fn load_region_uncommitted(
+        &mut self,
+        code: &[u8],
+        align: u32,
+        page: *mut crate::jitv2::PhysicalCodePage,
+    ) -> Option<cranelift_module::FuncId> {
+        let sig = self.jit_fn_signature();
+        let func_id = self.module
+            .declare_anonymous_function(&sig)
+            .expect("declare_anonymous_function");
+        if let Err(e) = self.module.define_function_bytes(func_id, align as u64, code, &[]) {
+            self.last_compile_ran_out_of_memory = matches!(e, cranelift_module::ModuleError::Allocation { .. });
+            eprintln!("jitcache: could not install a cached region: {e}");
+            return None;
+        }
+        self.last_compile_ran_out_of_memory = false;
+        let range = self.seal_handle.take_last_allocation()
+            .expect("define_function_bytes must have allocated real memory");
+        self.func_ranges.insert(func_id, range);
+        self.seal_handle.push_placeholder(range.0, range.1, page);
+        self.last_code_size = code.len() as u32;
+        self.last_blob = None;
+        self.func_id_counter += 1;
+        Some(func_id)
     }
 
     /// Whether the most recent `compile_region` call returned `None`
@@ -1301,6 +1386,27 @@ impl Codegen {
             // (emit_interp_fallback_head), so it's exempt from the
             // must-have-an-emitter rule below.
             if instr.is_fallback {
+                // The gate that makes admitting `MTC0 Status` safe, and the
+                // structural backstop for `emit_fr_mode_guard`'s region-wide
+                // STATUS_FR check: that check runs ONCE, in entry_block, on
+                // behalf of every FPR access in this region, which is only
+                // legitimate while nothing in the region can change FR
+                // mid-flight. A region with no CP1 instruction has no
+                // FPR-access emitter and no guard at all, so a Status write
+                // there has nothing to invalidate — and that is exactly the
+                // shape of the kernel exception and timer paths this exists
+                // for. When the two DO meet, decline: the interpreter runs
+                // the region instead, which costs compilation and cannot
+                // cost correctness.
+                //
+                // Not conditional on anything, deliberately: the blanket
+                // `j2 fallback on` toggle admits `MTC0 Status` as a fallback
+                // head too, and has done since interpreter fallback landed,
+                // so without this the same stale-FR hazard already existed on
+                // that path. One comparison closes it for both.
+                if has_fpu && crate::jitv2::cop0::writes_cp0_status(instr.raw) {
+                    return None;
+                }
                 continue;
             }
             if lookup_semantics(instr.raw).is_none()
@@ -2257,6 +2363,16 @@ impl Codegen {
         self.last_code_size = self.ctx.compiled_code()
             .map(|cc| cc.code_buffer().len() as u32)
             .unwrap_or(0);
+        // For the persistent cache: code with a relocation (a libcall, say)
+        // is only valid where it was linked, so it is not kept.
+        self.last_blob = None;
+        if crate::jitv2::pcache::enabled() {
+            if let Some(cc) = self.ctx.compiled_code() {
+                if cc.buffer.relocs().is_empty() {
+                    self.last_blob = Some((cc.code_buffer().to_vec(), cc.buffer.alignment));
+                }
+            }
+        }
         self.module.clear_context(&mut self.ctx);
         self.func_id_counter += 1;
         // Heartbeat: cranelift-jit exposes no arena-size/mmap-count API of
@@ -2517,10 +2633,20 @@ fn emit_pending_interrupt_preamble(ctx: &mut EmitCtx, exit_block: Block, word_of
 
 /// Region-wide FR-mode guard: emitted once, in `entry_block`, only when the
 /// region being compiled contains at least one CP1 instruction — legitimate
-/// as a region-wide check because `STATUS_FR` cannot change mid-region (the
-/// only instructions that touch CP0.Status, MTC0/ERET, are `Excluded` and
-/// end the region on contact, §4.4), so the very first entry checks it once
-/// on behalf of everything the rest of the region will FPR-access-emit.
+/// as a region-wide check because `STATUS_FR` cannot change mid-region, so
+/// the very first entry checks it once on behalf of everything the rest of
+/// the region will FPR-access-emit.
+///
+/// That invariant used to rest on "all of CP0 is `Excluded` and ends the
+/// region on contact" (§4.4), which stopped being the whole story once
+/// interpreter-fallback heads could keep an `Excluded` word *in* a region
+/// (`j2 fallback on`, and `jitv2::cop0`'s narrower COP0 subset). It now rests
+/// on an enforced condition instead: **this guard is only ever emitted for a
+/// region with a CP1 instruction in it, and `compile_region_uncommitted`
+/// declines any region that combines `has_fpu` with a Status-writing fallback
+/// head** (`cop0::writes_cp0_status`). So wherever this check exists, nothing
+/// between here and the region's exits can move FR. ERET is admitted and needs
+/// no gate — it clears EXL/ERL and restores PC without touching FR.
 ///
 /// **Does NOT check CU1** — see `emit_cp1_cu1_guard`'s own doc comment for
 /// why that must be a per-CP1-instruction check, not a region/entry-wide
@@ -5348,9 +5474,59 @@ fn emit_fpu_arith_flags_snan_only_d(ctx: &mut EmitCtx, fs_bits: Value, ft_bits: 
     ctx.builder.ins().ishl_imm_s(any_snan, FCSR_FV_I64.trailing_zeros() as i64)
 }
 
-/// DIV (S or D — the only JIT caller today; RECIP has no JIT codegen):
-/// Invalid takes priority over divide-by-zero, else Z when the divisor is
-/// zero — mirrors `fpu_arith_flags_div_s/d`.
+/// RSQRT (S or D): the SQRT Invalid rule first (sNaN or a negative non-zero
+/// operand), and only if that is clear, divide-by-zero for a zero operand —
+/// mirrors the inline `flags` block in `exec_frsqrt_s/d`. Note the precedence:
+/// FV wins over FZ, exactly as in DIV.
+fn emit_fpu_arith_flags_rsqrt_s(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
+    let sqrt_flags = emit_fpu_arith_flags_sqrt_s(ctx, fs_bits);
+    let fs_zero = {
+        let masked = ctx.builder.ins().band_imm_s(fs_bits, 0x7FFF_FFFFu32 as i64);
+        ctx.builder.ins().icmp_imm_s(IntCC::Equal, masked, 0)
+    };
+    let z_flag = ctx.builder.ins().uextend(ir::types::I32, fs_zero);
+    let z_flag = ctx.builder.ins().ishl_imm_s(z_flag, FCSR_FZ_I64.trailing_zeros() as i64);
+    let sqrt_is_zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, sqrt_flags, 0);
+    ctx.builder.ins().select(sqrt_is_zero, z_flag, sqrt_flags)
+}
+fn emit_fpu_arith_flags_rsqrt_d(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
+    let sqrt_flags = emit_fpu_arith_flags_sqrt_d(ctx, fs_bits);
+    let fs_zero = {
+        let masked = ctx.builder.ins().band_imm_s(fs_bits, 0x7FFF_FFFF_FFFF_FFFFu64 as i64);
+        ctx.builder.ins().icmp_imm_s(IntCC::Equal, masked, 0)
+    };
+    let z_flag = ctx.builder.ins().uextend(ir::types::I32, fs_zero);
+    let z_flag = ctx.builder.ins().ishl_imm_s(z_flag, FCSR_FZ_I64.trailing_zeros() as i64);
+    let sqrt_is_zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, sqrt_flags, 0);
+    ctx.builder.ins().select(sqrt_is_zero, z_flag, sqrt_flags)
+}
+
+/// MADD/MSUB/NMADD/NMSUB (S or D): Invalid if *any of the three* sources is
+/// a signalling NaN, else 0 — mirrors `fpu_arith_flags_snan_only3_s/d`.
+/// Separate from the two-operand form above because the multiply-add family
+/// reads `fr` as well as `fs`/`ft`.
+fn emit_fpu_arith_flags_snan_only3_s(ctx: &mut EmitCtx, fr_bits: Value, ft_bits: Value, fs_bits: Value) -> Value {
+    let fr_snan = emit_is_snan_s(ctx, fr_bits);
+    let ft_snan = emit_is_snan_s(ctx, ft_bits);
+    let fs_snan = emit_is_snan_s(ctx, fs_bits);
+    let any_snan = ctx.builder.ins().bor(fr_snan, ft_snan);
+    let any_snan = ctx.builder.ins().bor(any_snan, fs_snan);
+    let any_snan = ctx.builder.ins().uextend(ir::types::I32, any_snan);
+    ctx.builder.ins().ishl_imm_s(any_snan, FCSR_FV_I64.trailing_zeros() as i64)
+}
+fn emit_fpu_arith_flags_snan_only3_d(ctx: &mut EmitCtx, fr_bits: Value, ft_bits: Value, fs_bits: Value) -> Value {
+    let fr_snan = emit_is_snan_d(ctx, fr_bits);
+    let ft_snan = emit_is_snan_d(ctx, ft_bits);
+    let fs_snan = emit_is_snan_d(ctx, fs_bits);
+    let any_snan = ctx.builder.ins().bor(fr_snan, ft_snan);
+    let any_snan = ctx.builder.ins().bor(any_snan, fs_snan);
+    let any_snan = ctx.builder.ins().uextend(ir::types::I32, any_snan);
+    ctx.builder.ins().ishl_imm_s(any_snan, FCSR_FV_I64.trailing_zeros() as i64)
+}
+
+/// DIV (S or D), and RECIP/RSQRT, which pass a constant `1.0` as the
+/// dividend — mirrors `fpu_arith_flags_div_s/d`. Invalid takes priority over
+/// divide-by-zero, else Z when the divisor is zero.
 fn emit_fpu_arith_flags_div_s(ctx: &mut EmitCtx, fs_bits: Value, ft_bits: Value) -> Value {
     let snan = emit_fpu_arith_flags_snan_only_s(ctx, fs_bits, ft_bits);
     let ft_zero = {
@@ -5878,6 +6054,11 @@ enum BranchCond {
     GtZero, // BGTZ: rs as i64 > 0
     LtZero, // BLTZ (REGIMM rt=0): rs as i64 < 0
     GeZero, // BGEZ (REGIMM rt=1): rs as i64 >= 0
+    /// BC1F/BC1T/BC1FL/BC1TL: FCSR condition code `cc` (raw[20:18]) equals
+    /// `tf` (raw[16]). The only `BranchCond` whose predicate comes from the
+    /// FPU rather than a GPR — and the only one that can raise an exception
+    /// while evaluating it (CU1), which `emit_cond` handles.
+    Fcc,
 }
 
 /// A branch or jump instruction's shape, as far as codegen cares: how the
@@ -5929,6 +6110,13 @@ fn lookup_branch_or_jump(raw: u32) -> Option<BranchOrJump> {
         },
         OP_J => Some(BranchOrJump { cond: BranchCond::Always, link: false, annul: false }),
         OP_JAL => Some(BranchOrJump { cond: BranchCond::Always, link: true, annul: false }),
+        // BC1F/BC1T/BC1FL/BC1TL. `rt` is not a register here: bit 0 is `tf`
+        // (consumed by emit_fcc_taken via the raw word) and bit 1 is `nd`,
+        // the nullify/"likely" flag, which is this table's `annul` exactly as
+        // for BEQL/BNEL. Only OP_COP1 — for OP_COP1X the same `rs` position
+        // is an indexed load/store's base register, never a branch selector.
+        OP_COP1 if ((raw >> 21) & 0x1F) == RS_BC1 =>
+            Some(BranchOrJump { cond: BranchCond::Fcc, link: false, annul: (rt & 2) != 0 }),
         _ => None,
     }
 }
@@ -7174,28 +7362,50 @@ fn emit_nested_regjump_slot(
 /// compare `rs`/`rt` directly with no sign interpretation needed since
 /// equality doesn't care).
 fn emit_cond(ctx: &mut EmitCtx, raw: u32, cond: BranchCond) -> Value {
-    let rs_val = emit_read_gpr(ctx, field_rs(raw));
+    // `rs` is read lazily rather than up front: for `Fcc` the `rs` field is
+    // the COP1 format selector (RS_BC1 = 0x08), not a register number, and
+    // loading GPR 8 there would be dead IR at best and misleading at worst.
     match cond {
         BranchCond::Always => unreachable!("Always has no condition to evaluate"),
         BranchCond::Eq => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             let rt_val = emit_read_gpr(ctx, field_rt(raw));
             ctx.builder.ins().icmp(IntCC::Equal, rs_val, rt_val)
         }
         BranchCond::Ne => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             let rt_val = emit_read_gpr(ctx, field_rt(raw));
             ctx.builder.ins().icmp(IntCC::NotEqual, rs_val, rt_val)
         }
         BranchCond::LeZero => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, rs_val, 0)
         }
         BranchCond::GtZero => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             ctx.builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, rs_val, 0)
         }
         BranchCond::LtZero => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, rs_val, 0)
         }
         BranchCond::GeZero => {
+            let rs_val = emit_read_gpr(ctx, field_rs(raw));
             ctx.builder.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, rs_val, 0)
+        }
+        // BC1's predicate is an FPU read, so unlike every other branch it can
+        // fault: `exec_bc1` checks STATUS_CU1 first and raises Coprocessor
+        // Unusable when it is clear. Branches reach codegen through
+        // `lookup_branch_or_jump`, which — unlike `lookup_cp1_semantics` —
+        // gets no automatic `emit_cp1_cu1_guard`, so it is emitted here.
+        //
+        // Position matters: every `emit_cond` call site evaluates the
+        // condition *before* `emit_slot` inlines the delay slot, which is
+        // the interpreter's order too (the CU1 exception is raised before
+        // the delay-slot instruction runs). Do not sink this past the slot.
+        BranchCond::Fcc => {
+            emit_cp1_cu1_guard(ctx);
+            emit_fcc_taken(ctx, raw)
         }
     }
 }
@@ -7462,8 +7672,20 @@ fn emit_fmov_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 /// returns the `taken` boolean `Value`. Mirrors `emit_movci`'s identical
 /// FCSR bit extraction (cc0 at bit 23, cc1..cc7 at bits 24..30).
 fn emit_fmovcf_taken(ctx: &mut EmitCtx) -> Value {
-    let cc = (ctx.raw >> 18) & 0x7;
-    let tf = ((ctx.raw >> 16) & 0x1) != 0;
+    let raw = ctx.raw;
+    emit_fcc_taken(ctx, raw)
+}
+
+/// `FCSR[cc] == tf`, for any instruction using the MIPS `cc`/`tf` encoding —
+/// MOVCF.s/d, MOVF/MOVT, and BC1F/BC1T/BC1FL/BC1TL, which all place `cc` at
+/// raw[20:18] and `tf` at raw[16]. Mirrors `MipsCore::get_fpu_cc`'s bit
+/// layout: cc0 lives at FCSR bit 23, cc1..cc7 at bits 25..31 (`24 + cc`).
+///
+/// Takes `raw` explicitly rather than reading `ctx.raw` because the branch
+/// path calls it while `ctx.raw` may have been swapped to a delay-slot word.
+fn emit_fcc_taken(ctx: &mut EmitCtx, raw: u32) -> Value {
+    let cc = (raw >> 18) & 0x7;
+    let tf = ((raw >> 16) & 0x1) != 0;
     let bit = if cc == 0 { 23 } else { 24 + cc };
 
     let mem = MemFlagsData::trusted();
@@ -7523,7 +7745,6 @@ fn emit_fmovcf_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     ctx.builder.seal_block(merge_block);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_fmovz_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -7544,7 +7765,6 @@ fn emit_fmovz_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     ctx.builder.seal_block(merge_block);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_fmovn_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -7565,7 +7785,6 @@ fn emit_fmovn_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     ctx.builder.seal_block(merge_block);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_fmovz_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -7586,7 +7805,6 @@ fn emit_fmovz_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     ctx.builder.seal_block(merge_block);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_fmovn_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -8191,7 +8409,6 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
         OP_LDC1 => return Some(emit_ldc1),
         OP_SWC1 => return Some(emit_swc1),
         OP_SDC1 => return Some(emit_sdc1),
-        #[cfg(feature = "mips4")]
         OP_COP1X => {
             let funct = raw & 0x3F;
             return match funct {
@@ -8199,6 +8416,18 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
                 FUNCT_LDXC1 => Some(emit_ldxc1),
                 FUNCT_SWXC1 => Some(emit_swxc1),
                 FUNCT_SDXC1 => Some(emit_sdxc1),
+                FUNCT_PREFX => Some(emit_prefx),
+                FUNCT_MADD_S => Some(emit_madd_s),
+                FUNCT_MADD_D => Some(emit_madd_d),
+                FUNCT_MSUB_S => Some(emit_msub_s),
+                FUNCT_MSUB_D => Some(emit_msub_d),
+                FUNCT_NMADD_S => Some(emit_nmadd_s),
+                FUNCT_NMADD_D => Some(emit_nmadd_d),
+                FUNCT_NMSUB_S => Some(emit_nmsub_s),
+                FUNCT_NMSUB_D => Some(emit_nmsub_d),
+                // The *_PS (paired-single) forms are deliberately absent:
+                // the interpreter has no handlers for them either, and no
+                // MIPS IV part SGI shipped implements paired-single.
                 _ => None,
             };
         }
@@ -8216,22 +8445,15 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FMUL => Some(emit_fmul_s),
             FUNCT_FDIV => Some(emit_fdiv_s),
             FUNCT_FSQRT => Some(emit_fsqrt_s),
+            FUNCT_FRECIP => Some(emit_frecip_s),
+            FUNCT_FRSQRT => Some(emit_frsqrt_s),
             FUNCT_FABS => Some(emit_fabs_s),
             FUNCT_FNEG => Some(emit_fneg_s),
             FUNCT_FMOV => Some(emit_fmov_s),
             // MOVF.fmt/MOVT.fmt is MIPS IV; gate like MOVZ/MOVN/MOVCI above.
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVCF => Some(emit_fmovcf_s),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVCF => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVZ => Some(emit_fmovz_s),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVZ => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVN => Some(emit_fmovn_s),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVN => None,
             FUNCT_FCVT_D => Some(emit_fcvt_d_s),
             FUNCT_FCVT_W => Some(emit_fcvt_w_s),
             FUNCT_FCVT_L => Some(emit_fcvt_l_s),
@@ -8252,21 +8474,14 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FMUL => Some(emit_fmul_d),
             FUNCT_FDIV => Some(emit_fdiv_d),
             FUNCT_FSQRT => Some(emit_fsqrt_d),
+            FUNCT_FRECIP => Some(emit_frecip_d),
+            FUNCT_FRSQRT => Some(emit_frsqrt_d),
             FUNCT_FABS => Some(emit_fabs_d),
             FUNCT_FNEG => Some(emit_fneg_d),
             FUNCT_FMOV => Some(emit_fmov_d),
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVCF => Some(emit_fmovcf_d),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVCF => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVZ => Some(emit_fmovz_d),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVZ => None,
-            #[cfg(feature = "mips4")]
             FUNCT_FMOVN => Some(emit_fmovn_d),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_FMOVN => None,
             FUNCT_FCVT_S => Some(emit_fcvt_s_d),
             FUNCT_FCVT_W => Some(emit_fcvt_w_d),
             FUNCT_FCVT_L => Some(emit_fcvt_l_d),
@@ -9475,7 +9690,6 @@ fn emit_sdc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_mem_write(ctx, vaddr, value_64, MemSize::B8);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_lwxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let index = emit_read_gpr(ctx, field_rt(ctx.raw));
@@ -9486,7 +9700,6 @@ fn emit_lwxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_write_fpr_w(ctx, field_sa(ctx.raw), value_32, fr_mode);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_ldxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let index = emit_read_gpr(ctx, field_rt(ctx.raw));
@@ -9506,7 +9719,6 @@ fn emit_ldxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_write_fpr_l(ctx, fd, loaded, fr_mode);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_swxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let index = emit_read_gpr(ctx, field_rt(ctx.raw));
@@ -9524,7 +9736,6 @@ fn emit_swxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_mem_write(ctx, vaddr, value_64, MemSize::B4);
 }
 
-#[cfg(feature = "mips4")]
 fn emit_sdxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let index = emit_read_gpr(ctx, field_rt(ctx.raw));
@@ -9540,6 +9751,179 @@ fn emit_sdxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
 
     emit_mem_write(ctx, vaddr, value_64, MemSize::B8);
 }
+
+/// MADD/MSUB/NMADD/NMSUB.S/D — COP1X multiply-add, `fd = ±(fs*ft ± fr)`.
+///
+/// Three things here are deliberately *unlike* `emit_fbinop_s/d`, because
+/// they are unlike the interpreter's `exec_madd_*` too, and lockstep compares
+/// against the interpreter rather than against the other emitters:
+///
+/// - **No `emit_check_denorm_operand`.** The binop handlers call
+///   `fpu_check_denorm_operand_*` on each operand and can trap before
+///   computing; `exec_madd_d` does not.
+/// - **No flush-to-zero on a denormal result.** The binops route through
+///   `fpu_update_fcsr_full` with a `Some(is_negative)` denorm argument;
+///   `exec_madd_d` uses plain `fpu_update_fcsr`, i.e. `denorm = None`, so the
+///   result is written as computed.
+/// - **Invalid is computed over all three sources**, not two.
+///
+/// (Whether the interpreter *should* do the denormal handling for this family
+/// as it does for ADD/SUB/MUL is a real question, but it is a question about
+/// the interpreter. Diverging here would only break lockstep while leaving
+/// the behaviour just as wrong.)
+///
+/// Not fused: MIPS IV rounds the product to the format and then adds,
+/// rounding again — on the R10000, one pass through the multiplier and a
+/// second through the adder — and so does the interpreter (see
+/// `exec_madd_s`). So `fmul` then `fadd`/`fsub`, never Cranelift's `fma`,
+/// which rounds once and would differ in the last bit on many inputs.
+/// Cranelift does not fuse the two on its own, and every host rounds them
+/// identically, so a guest gets bit-identical results whichever host it runs
+/// on — which is what lockstep, and any snapshot taken on one machine and
+/// resumed on another, depend on.
+///
+/// Register fields are the COP1X layout, which is not the COP1 one:
+/// `fr = rs`, `ft = rt`, `fs = rd`, `fd = sa`.
+fn emit_fternop_s(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_result: bool) {
+    let raw = ctx.raw;
+    let fr = field_rs(raw);
+    let ft = field_rt(raw);
+    let fs = field_rd(raw);
+    let fd = field_sa(raw);
+
+    let fr_bits = emit_read_fpr_w(ctx, fr, fr_mode);
+    let ft_bits = emit_read_fpr_w(ctx, ft, fr_mode);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let flags = emit_fpu_arith_flags_snan_only3_s(ctx, fr_bits, ft_bits, fs_bits);
+
+    let fr_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fr_bits);
+    let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+
+    let product = ctx.builder.ins().fmul(fs_val, ft_val);
+    let sum = if negate_fr {
+        ctx.builder.ins().fsub(product, fr_val)
+    } else {
+        ctx.builder.ins().fadd(product, fr_val)
+    };
+    let result = if negate_result { ctx.builder.ins().fneg(sum) } else { sum };
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+}
+
+fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_result: bool) {
+    let raw = ctx.raw;
+    let fr = field_rs(raw);
+    let ft = field_rt(raw);
+    let fs = field_rd(raw);
+    let fd = field_sa(raw);
+
+    let fr_bits = emit_read_fpr_l(ctx, fr, fr_mode);
+    let ft_bits = emit_read_fpr_l(ctx, ft, fr_mode);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let flags = emit_fpu_arith_flags_snan_only3_d(ctx, fr_bits, ft_bits, fs_bits);
+
+    let fr_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fr_bits);
+    let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+
+    let product = ctx.builder.ins().fmul(fs_val, ft_val);
+    let sum = if negate_fr {
+        ctx.builder.ins().fsub(product, fr_val)
+    } else {
+        ctx.builder.ins().fadd(product, fr_val)
+    };
+    let result = if negate_result { ctx.builder.ins().fneg(sum) } else { sum };
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+}
+
+// fd = fs*ft + fr
+fn emit_madd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, false, false); }
+fn emit_madd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, false, false); }
+// fd = fs*ft - fr
+fn emit_msub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, true, false); }
+fn emit_msub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, true, false); }
+// fd = -(fs*ft + fr)
+fn emit_nmadd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, false, true); }
+fn emit_nmadd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, false, true); }
+// fd = -(fs*ft - fr)
+fn emit_nmsub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_s(ctx, fr_mode, true, true); }
+fn emit_nmsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mode, true, true); }
+
+/// RECIP.S/D and RSQRT.S/D fd, fs — MIPS IV, `1/fs` and `1/sqrt(fs)`.
+///
+/// Mirrors `exec_frecip_*`/`exec_frsqrt_*`: the flags come from the DIV rule
+/// with a constant `1.0` as the dividend (so a zero operand raises
+/// divide-by-zero), and the FCSR tail is plain `fpu_update_fcsr` — no denorm
+/// operand check and no flush-to-zero, same as the multiply-add family above
+/// and unlike `emit_fbinop_*`.
+///
+/// Computed as a real divide (and `1/sqrt` as divide-of-sqrt) rather than any
+/// reciprocal-estimate instruction: the interpreter computes `1.0 / fs` at
+/// full precision, and MIPS IV permits RECIP to be less accurate than divide
+/// but does not require it. Matching the interpreter is what lockstep needs.
+fn emit_frecip_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let one = ctx.builder.ins().f32const(1.0);
+    let one_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), one);
+    let flags = emit_fpu_arith_flags_div_s(ctx, one_bits, fs_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().fdiv(one, fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+}
+fn emit_frecip_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let one = ctx.builder.ins().f64const(1.0);
+    let one_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), one);
+    let flags = emit_fpu_arith_flags_div_d(ctx, one_bits, fs_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().fdiv(one, fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+}
+fn emit_frsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    let one = ctx.builder.ins().f32const(1.0);
+    let flags = emit_fpu_arith_flags_rsqrt_s(ctx, fs_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let root = ctx.builder.ins().sqrt(fs_val);
+    let result = ctx.builder.ins().fdiv(one, root);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+}
+fn emit_frsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    let one = ctx.builder.ins().f64const(1.0);
+    let flags = emit_fpu_arith_flags_rsqrt_d(ctx, fs_bits);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let root = ctx.builder.ins().sqrt(fs_val);
+    let result = ctx.builder.ins().fdiv(one, root);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+}
+
+/// PREFX — indexed prefetch. A prefetch is architecturally a hint with no
+/// effect on program state, and `exec_prefx` does nothing beyond the CU1
+/// check that every CP1-table entry already gets from
+/// `emit_cp1_cu1_guard`. So the emitter is empty *on purpose*: the point is
+/// that the instruction stops being a fallback and no longer interrupts the
+/// compiled run, not that it does any work.
+///
+/// Note it does NOT compute or validate the address: an unmapped prefetch
+/// address must not fault, so there is deliberately no `emit_mem_read` here.
+fn emit_prefx(_ctx: &mut EmitCtx, _fr_mode: FrMode) {}
 
 /// MOVZ rd, rs, rt: rd = rs if rt == 0 (no-op otherwise). Mirrors
 /// `MipsExecutor::exec_movz` exactly, including that `rd` isn't touched at
@@ -9771,14 +10155,9 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
             // MOVZ/MOVN/MOVCI are MIPS IV; without the feature they must not
             // be compiled here so the analyzer/interpreter fallback can
             // raise Reserved Instruction (mirrors mips_exec.rs's decode gate).
-            #[cfg(feature = "mips4")]
             FUNCT_MOVZ => Some(emit_movz),
-            #[cfg(feature = "mips4")]
             FUNCT_MOVN => Some(emit_movn),
-            #[cfg(feature = "mips4")]
             FUNCT_MOVCI => Some(emit_movci),
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_MOVZ | FUNCT_MOVN | FUNCT_MOVCI => None,
             FUNCT_TGE => Some(emit_tge),
             FUNCT_TGEU => Some(emit_tgeu),
             FUNCT_TLT => Some(emit_tlt),
@@ -9799,10 +10178,7 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
         },
         // PREF is MIPS IV; without the feature it must not be compiled here
         // so the interpreter fallback can raise Reserved Instruction.
-        #[cfg(feature = "mips4")]
         OP_PREF => Some(emit_nop),
-        #[cfg(not(feature = "mips4"))]
-        OP_PREF => None,
         OP_ADDI => Some(emit_addi),
         OP_ADDIU => Some(emit_addiu),
         OP_DADDI => Some(emit_daddi),

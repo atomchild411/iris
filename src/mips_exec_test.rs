@@ -4004,7 +4004,7 @@ mod tests {
         assert_eq!(exec.core.read_fpr_d(8), 10.0); // 3*4 - 2 = 10
     }
 
-    // Covers the remaining MIPS IV COP1X fused ops not exercised by test_cop1x_madd
+    // Covers the remaining MIPS IV COP1X multiply-add ops not exercised by test_cop1x_madd
     // (MADD.D, MSUB.S, NMADD.S/D, NMSUB.S/D) — fd = fs*ft +/- fr, negated for NMADD/NMSUB.
     #[test]
     fn test_cop1x_madd_remaining_variants() {
@@ -4059,6 +4059,39 @@ mod tests {
         let nmsub_d = make_cop1x(21, 23, 22, 24, FUNCT_NMSUB_D);
         assert_eq!(exec.exec(nmsub_d), EXEC_COMPLETE);
         assert_eq!(exec.core.read_fpr_d(24), -10.0); // -(3*4 - 2) = -10
+    }
+
+    // MIPS IV's multiply-add is not fused: the product is rounded to the
+    // format before fr is added. With fs*ft = 1 - 2^-60 exactly (2^-26 in
+    // single), the rounded product is 1.0, so fs*ft - 1 is exactly 0; a fused
+    // multiply-add would give -2^-60 (-2^-26).
+    #[test]
+    fn test_cop1x_madd_rounds_the_product() {
+        let (mut exec, _) = create_executor_m4();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        exec.core.write_fpr_d(1, -1.0); // fr
+        exec.core.write_fpr_d(2, 1.0 + f64::powi(2.0, -30)); // fs
+        exec.core.write_fpr_d(3, 1.0 - f64::powi(2.0, -30)); // ft
+        assert_eq!(exec.exec(make_cop1x(1, 3, 2, 4, FUNCT_MADD_D)), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_d(4).to_bits(), 0.0f64.to_bits());
+        // NMADD.D: -(+0.0) is -0.0.
+        assert_eq!(exec.exec(make_cop1x(1, 3, 2, 5, FUNCT_NMADD_D)), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_d(5).to_bits(), (-0.0f64).to_bits());
+        // MSUB.D with fr = +1: fs*ft - 1.
+        exec.core.write_fpr_d(6, 1.0);
+        assert_eq!(exec.exec(make_cop1x(6, 3, 2, 7, FUNCT_MSUB_D)), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_d(7).to_bits(), 0.0f64.to_bits());
+
+        exec.core.write_fpr_s(8, -1.0); // fr
+        exec.core.write_fpr_s(9, 1.0 + f32::powi(2.0, -13)); // fs
+        exec.core.write_fpr_s(10, 1.0 - f32::powi(2.0, -13)); // ft
+        assert_eq!(exec.exec(make_cop1x(8, 10, 9, 11, FUNCT_MADD_S)), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_s(11).to_bits(), 0.0f32.to_bits());
+        exec.core.write_fpr_s(12, 1.0);
+        assert_eq!(exec.exec(make_cop1x(12, 10, 9, 13, FUNCT_NMSUB_S)), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_s(13).to_bits(), (-0.0f32).to_bits());
     }
 
     // Covers SDXC1 (missing from test_cop1x_load_store, which only checks LWXC1/SWXC1/LDXC1)

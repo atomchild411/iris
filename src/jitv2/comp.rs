@@ -144,6 +144,9 @@ struct CompileInputs {
     /// One bit per word the walk decoded, delay slots included — the only
     /// words whose value could change what a recompile would emit.
     used: [u64; crate::jitv2::BITMAP_WORDS],
+    /// Content hash of `words`, when the persistent cache is in play for
+    /// this compile (`prepare_multi_entry_compile`'s `cache_fp`).
+    page_hash: Option<crate::jitv2::pcache::PageHash>,
 }
 
 /// §13.3 steps 1-5, shared front half of `handle_request`/
@@ -159,6 +162,7 @@ fn prepare_multi_entry_compile(
     req: &CompileRequest,
     bus: &Arc<dyn BusDevice>,
     analyzer: &mut Analyzer,
+    cache_fp: Option<&crate::jitv2::pcache::Fingerprint>,
     #[cfg(feature = "developer")] stats: &crate::jitv2::JitStats,
 ) -> PrepareOutcome {
     let page = unsafe { &*req.page };
@@ -310,7 +314,8 @@ fn prepare_multi_entry_compile(
     // `candidate_bits` is exactly the entry-point set this compile would
     // publish, so it is the honest thing to test coverage against, and it
     // already has `denied` and the gen guard folded in.
-    if page.has_compile_snapshot() {
+    let had_snapshot = page.has_compile_snapshot();
+    if had_snapshot {
         if page.try_skip_redundant_compile(&words, &candidate_bits, gen_snap, req.compiled_for_fr1) {
             // Covered offsets are no longer outstanding asks — the installed
             // `func` serves them again as of the gen just written. Mirrors
@@ -320,6 +325,34 @@ fn prepare_multi_entry_compile(
             return PrepareOutcome::Done(false);
         }
         page.mark_redundant_compile_rejected();
+    }
+
+    // Persistent cache, union-on-miss: walk every entry any stored compile
+    // of these exact bytes had, as well as this round's. If a stored variant
+    // already covers the result, the caller loads it instead of compiling;
+    // if not, the new compile covers all of them and replaces the variants
+    // it subsumes, so a page's stored code converges on every entry it has
+    // ever needed instead of accumulating near-duplicates. Denied offsets
+    // stay out, exactly as for `candidate_bits`.
+    let page_hash = cache_fp.map(|_| crate::jitv2::pcache::page_hash(&words));
+    if let (Some(fp), Some(ph)) = (cache_fp, &page_hash) {
+        let known = crate::jitv2::pcache::known_entries(fp, ph, req.compiled_for_fr1);
+        let denied = page.snapshot_denied_raw();
+        let mut added = 0u32;
+        for i in 0..crate::jitv2::BITMAP_WORDS {
+            let extra = known[i] & denied[i] & !candidate_bits[i];
+            if extra == 0 { continue; }
+            added += extra.count_ones();
+            for bit in 0..64 {
+                if extra & (1u64 << bit) != 0 {
+                    candidates.push((i * 64 + bit) as u16);
+                }
+            }
+        }
+        if added > 0 {
+            candidates.sort_unstable();
+            crate::jitv2::pcache::note_union_added(added);
+        }
     }
 
     // instr_count computed immediately, right after the walk: `instrs`
@@ -361,7 +394,7 @@ fn prepare_multi_entry_compile(
     for &offset in &candidates {
         if !analyzer.covered().contains(&offset) {
             page.denylist(offset as usize);
-            page.kill(offset as usize);
+            page.kill_denylisted(offset as usize);
             page.mark_analyze_rejected();
             #[cfg(feature = "developer")]
             stats.record_reject(crate::jitv2::RejectReason::EntryExcluded);
@@ -381,7 +414,7 @@ fn prepare_multi_entry_compile(
         // previously-`compiled` offsets whose stale bit must not survive.
         for &offset in analyzer.covered() {
             page.denylist(offset as usize);
-            page.kill(offset as usize);
+            page.kill_denylisted(offset as usize);
         }
         page.mark_analyze_rejected();
         #[cfg(feature = "developer")]
@@ -413,7 +446,16 @@ fn prepare_multi_entry_compile(
         used[i] |= !*w; // `denied` is inverted: 0 = denied, so complement it
     }
 
-    PrepareOutcome::Ready { gen_snap, instr_count, snapshot: Box::new(CompileInputs { words, used }) }
+    if crate::jitv2::hashstats::enabled() {
+        let mut entries = [0u64; crate::jitv2::BITMAP_WORDS];
+        for &o in analyzer.covered() {
+            entries[o as usize >> 6] |= 1u64 << (o % 64);
+        }
+        crate::jitv2::hashstats::record(page.pfn, &words, &used, &entries, req.compiled_for_fr1, instr_count, had_snapshot,
+            page.last_skip_reject.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    PrepareOutcome::Ready { gen_snap, instr_count, snapshot: Box::new(CompileInputs { words, used, page_hash }) }
 }
 
 /// §13.3 compile-from-snapshot protocol, multi-entry (§13.10 build-order
@@ -455,9 +497,9 @@ pub fn handle_request(
     let _clear_scheduled = ClearScheduledOnDrop { page };
 
     #[cfg(feature = "developer")]
-    let outcome = prepare_multi_entry_compile(req, bus, analyzer, stats);
+    let outcome = prepare_multi_entry_compile(req, bus, analyzer, None, stats);
     #[cfg(not(feature = "developer"))]
-    let outcome = prepare_multi_entry_compile(req, bus, analyzer);
+    let outcome = prepare_multi_entry_compile(req, bus, analyzer, None);
     let (gen_snap, instr_count, inputs) = match outcome {
         PrepareOutcome::Done(early) => return early,
         PrepareOutcome::Ready { gen_snap, instr_count, snapshot } => (gen_snap, instr_count, snapshot),
@@ -515,9 +557,9 @@ pub fn handle_request(
             // `func` currently installed, and `publish`'s two early-outs
             // (stale gen, subsumed) leave someone else's code in place.
             page.stage_compile_snapshot(&inputs.words, &inputs.used, &new_entries, gen_snap, req.compiled_for_fr1);
-            if page.publish(&new_entries, jit_fn as *const (), gen_snap, instr_count, code_size) {
+            if page.publish(&new_entries, jit_fn as *const (), gen_snap, instr_count, code_size, req.compiled_for_fr1) {
                 page.clear_requested_bits(&new_entries);
-                page.commit_compile_snapshot(gen_snap, &new_entries);
+                page.commit_compile_snapshot(gen_snap, &new_entries, req.compiled_for_fr1);
             }
             #[cfg(feature = "developer")]
             {
@@ -643,11 +685,15 @@ pub fn handle_request_deferred(
     }
     let _clear_scheduled = ClearScheduledOnDrop { page };
 
+    // Persistent cache: only for a `Codegen` whose output can be stored
+    // (see `Codegen::cache_fingerprint`). `true` matches the
+    // `skip_entry_preamble` this path compiles with below.
+    let cache_fp = if crate::jitv2::pcache::enabled() { codegen.cache_fingerprint(true) } else { None };
     #[cfg(feature = "developer")]
-    let outcome = prepare_multi_entry_compile(req, bus, analyzer, stats);
+    let outcome = prepare_multi_entry_compile(req, bus, analyzer, cache_fp.as_ref(), stats);
     #[cfg(not(feature = "developer"))]
-    let outcome = prepare_multi_entry_compile(req, bus, analyzer);
-    let (gen_snap, instr_count, inputs) = match outcome {
+    let outcome = prepare_multi_entry_compile(req, bus, analyzer, cache_fp.as_ref());
+    let (gen_snap, mut instr_count, mut inputs) = match outcome {
         PrepareOutcome::Done(early) => return early,
         PrepareOutcome::Ready { gen_snap, instr_count, snapshot } => (gen_snap, instr_count, snapshot),
     };
@@ -658,7 +704,53 @@ pub fn handle_request_deferred(
     }
 
     let mut instrs_owned = analyzer.instrs_snapshot();
-    let func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, analyzer.has_fpu(), req.page);
+    let cache_key = cache_fp.zip(inputs.page_hash);
+    let cached = cache_key.as_ref().and_then(|(fp, ph)| {
+        crate::jitv2::pcache::lookup(fp, ph, req.compiled_for_fr1, &inputs.words, &new_entries)
+    });
+    let mut func_id = None;
+    let mut loaded = false;
+    let mut load_oom = false;
+    if let Some(blob) = cached {
+        // A hit: the stored code is a compile of these exact bytes (the
+        // lookup compared all 1024 words) for a superset of this walk's
+        // entries, under the same codegen configuration. Publish every entry
+        // it has a case for that isn't denied here, and stage the snapshot
+        // over every word either compile decoded.
+        let t_load = std::time::Instant::now();
+        func_id = codegen.load_region_uncommitted(&blob.code, blob.align, req.page);
+        if func_id.is_some() {
+            let denied = page.snapshot_denied_raw(); // inverted: 1 = allowed
+            for i in 0..crate::jitv2::BITMAP_WORDS {
+                new_entries[i] = blob.entries[i] & denied[i];
+                inputs.used[i] |= blob.used[i];
+            }
+            instr_count = blob.instr_count as usize;
+            loaded = true;
+            crate::jitv2::pcache::note_load_time(t_load.elapsed());
+        } else {
+            // Out of arena: the OOM arm below flushes, as for a compile.
+            load_oom = codegen.last_compile_ran_out_of_memory();
+        }
+    }
+    if !loaded && !load_oom {
+        let t_compile = std::time::Instant::now();
+        func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, analyzer.has_fpu(), req.page);
+        crate::jitv2::hashstats::note_compile_time(t_compile.elapsed());
+        if let (Some(_), Some((fp, ph))) = (func_id, cache_key) {
+            match codegen.take_last_blob() {
+                Some((code, align)) => crate::jitv2::pcache::store(fp, ph, req.compiled_for_fr1, crate::jitv2::pcache::Blob {
+                    entries: new_entries,
+                    used: inputs.used,
+                    instr_count: instr_count as u32,
+                    align,
+                    words: Box::new(inputs.words),
+                    code,
+                }),
+                None => crate::jitv2::pcache::note_refused(),
+            }
+        }
+    }
     match func_id {
         Some(func_id) => {
             // Not `developer`-gated: `last_code_size()` is unconditional, and
@@ -774,14 +866,14 @@ fn publish_all(sealed: &[crate::jitv2::paged_memory::PublishInfo]) {
         if crate::jitv2::jit_page_has_dirty_lines((page.pfn * PAGE_SIZE) as u64) {
             continue;
         }
-        if page.publish(&entry.new_entries, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size) {
+        if page.publish(&entry.new_entries, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size, entry.compiled_for_fr1) {
             page.clear_requested_bits(&entry.new_entries);
             // Vouch for the record `handle_request_deferred` staged for this
             // compile — matched by `gen_snap`+`new_entries`, so a record
             // some other compile of the same page overwrote in the meantime
             // is dropped rather than wrongly validated. See
             // `PhysicalCodePage::commit_compile_snapshot`.
-            page.commit_compile_snapshot(entry.gen_snap, &entry.new_entries);
+            page.commit_compile_snapshot(entry.gen_snap, &entry.new_entries, entry.compiled_for_fr1);
         }
     }
 }

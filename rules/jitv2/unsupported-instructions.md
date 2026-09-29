@@ -99,10 +99,10 @@ No `lookup_cp1_semantics` arm exists for `op == OP_COP1X` at all (only
 | `LDXC1` | 0x01 | indexed FP load double |
 | `SWXC1` | 0x08 | indexed FP store word |
 | `SDXC1` | 0x09 | indexed FP store double |
-| `MADD_S` / `MADD_D` / `MADD_PS` | 0x20 / 0x21 / 0x26 | fused multiply-add |
-| `MSUB_S` / `MSUB_D` / `MSUB_PS` | 0x28 / 0x29 / 0x2E | fused multiply-subtract |
-| `NMADD_S` / `NMADD_D` / `NMADD_PS` | 0x30 / 0x31 / 0x36 | negated fused multiply-add |
-| `NMSUB_S` / `NMSUB_D` / `NMSUB_PS` | 0x38 / 0x39 / 0x3E | negated fused multiply-subtract |
+| `MADD_S` / `MADD_D` / `MADD_PS` | 0x20 / 0x21 / 0x26 | multiply-add (product rounded, not fused) |
+| `MSUB_S` / `MSUB_D` / `MSUB_PS` | 0x28 / 0x29 / 0x2E | multiply-subtract (not fused) |
+| `NMADD_S` / `NMADD_D` / `NMADD_PS` | 0x30 / 0x31 / 0x36 | negated multiply-add (not fused) |
+| `NMSUB_S` / `NMSUB_D` / `NMSUB_PS` | 0x38 / 0x39 / 0x3E | negated multiply-subtract (not fused) |
 
 `*_PS` (paired-single) variants are R5000/MIPS IV-only and likely out of
 scope for an R4400 target regardless — but the scalar S/D forms

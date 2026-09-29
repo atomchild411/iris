@@ -132,7 +132,7 @@ pub enum Classify {
 /// resolving on-page-ness against it), until that was found to break
 /// position independence (see `jump_target`'s doc comment) and J/JAL was
 /// moved to the same always-page-leaving treatment as RegJump.
-pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
+pub fn classify(raw: u32, offset_word: u16, page_base: u32, mips4: bool) -> Classify {
     // Test/tooling region-boundary sentinel — checked before opcode decode so
     // no real opcode arm can ever shadow it (see the constant's doc comment).
     if raw == JIT_REGION_BOUNDARY_SENTINEL {
@@ -147,7 +147,7 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
         OP_SPECIAL => match funct {
             FUNCT_JR | FUNCT_JALR => branch_category_gate(raw, Classify::RegJump),
             FUNCT_SYSCALL | FUNCT_BREAK => Classify::Excluded,
-            _ => sequential_or_excluded(raw),
+            _ => sequential_or_excluded(raw, mips4),
         },
         OP_REGIMM => match rt {
             RT_BLTZ | RT_BGEZ | RT_BLTZL | RT_BGEZL | RT_BLTZAL | RT_BGEZAL
@@ -158,7 +158,7 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
             // so whether they're a region boundary is purely a "does codegen
             // have an emitter yet" question, same as everything else routed
             // through sequential_or_excluded.
-            _ => sequential_or_excluded(raw),
+            _ => sequential_or_excluded(raw, mips4),
         },
         OP_J | OP_JAL => branch_category_gate(raw, jump_target()),
         OP_BEQ | OP_BNE | OP_BLEZ | OP_BGTZ
@@ -171,26 +171,32 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32) -> Classify {
         // not just a subset, and is a codegen concern (materialize state
         // before the op so a raised CP1 exception can be delivered
         // correctly), not a reachability one — see the design doc's Phase 3
-        // note. RS_BC1 is the one real exception: it's a CP1-conditional
-        // branch, and the walker doesn't resolve condition-code-dependent
-        // targets, so it stays a region boundary. `rs == RS_BC1` (0x08) is
-        // only meaningful as a format selector for OP_COP1 — for OP_COP1X
-        // the same bit position is the *base register* for indexed loads/
-        // stores (LWXC1/SWXC1/etc.), not a branch selector, so OP_COP1X
-        // must never share this arm (a legitimate `lwxc1 $f0, ($8)` would
-        // otherwise be misread as a BC1 branch and wrongly excluded).
+        // note. RS_BC1 is a CP1-*conditional branch* and is classified as one:
+        // its target is PC-relative and statically resolvable from the
+        // instruction word, exactly like BEQ's. Only the predicate differs —
+        // an FCSR condition-code bit instead of a GPR comparison — and BEQ's
+        // predicate is equally a runtime value. (This used to be `Excluded`,
+        // described as having a "condition-code-dependent target"; that
+        // conflated the condition with the target. The target never depended
+        // on the condition code. See rules/jitv2/bc1-is-an-ordinary-branch.md.)
+        //
+        // `rs == RS_BC1` (0x08) is only meaningful as a format selector for
+        // OP_COP1 — for OP_COP1X the same bit position is the *base register*
+        // for indexed loads/stores (LWXC1/SWXC1/etc.), not a branch selector,
+        // so OP_COP1X must never share this arm (a legitimate
+        // `lwxc1 $f0, ($8)` would otherwise be misread as a BC1 branch).
         OP_COP1 => match rs {
-            RS_BC1 => Classify::Excluded,
-            _ => sequential_or_excluded(raw),
+            RS_BC1 => branch_category_gate(raw, branch_target(raw, offset_word)),
+            _ => sequential_or_excluded(raw, mips4),
         },
-        OP_COP1X => sequential_or_excluded(raw),
+        OP_COP1X => sequential_or_excluded(raw, mips4),
         OP_COP2 => Classify::Excluded, // unimplemented coprocessor
         OP_CACHE => Classify::Excluded,
         OP_LL | OP_LLD | OP_SC | OP_SCD => Classify::Excluded,
         // FPU loads/stores are plain memory ops, same as any other load/store.
-        OP_LWC1 | OP_LDC1 | OP_SWC1 | OP_SDC1 => sequential_or_excluded(raw),
+        OP_LWC1 | OP_LDC1 | OP_SWC1 | OP_SDC1 => sequential_or_excluded(raw, mips4),
         OP_LWC2 | OP_LDC2 | OP_SWC2 | OP_SDC2 => Classify::Excluded, // CP2, unimplemented — treat as excluded
-        _ => sequential_or_excluded(raw),
+        _ => sequential_or_excluded(raw, mips4),
     }
 }
 
@@ -243,8 +249,8 @@ pub fn is_fpu_instruction(raw: u32) -> bool {
 /// boundary instead (same as an architecturally-excluded one), and makes
 /// adding a new emitter automatically un-exclude it — no analyzer.rs edit
 /// needed.
-fn sequential_or_excluded(raw: u32) -> Classify {
-    if crate::jitv2::opcode_support::has_emitter(raw) {
+fn sequential_or_excluded(raw: u32, mips4: bool) -> Classify {
+    if crate::jitv2::opcode_support::has_emitter(raw, mips4) {
         Classify::Sequential
     } else {
         Classify::Excluded
@@ -574,12 +580,34 @@ pub struct Analyzer {
     instrs: Box<[CompiledInstr; ENTRIES_PER_PAGE]>,
     has_fpu: bool,
     covered: Vec<WordOffset>,
+    /// The ISA level every walk from this analyzer compiles for.
+    ///
+    /// A property of the CPU, not of the build: an R4400 must raise Reserved
+    /// Instruction on MIPS IV encodings and an R5000/R10000 may execute them,
+    /// and one binary serves both. Production analyzers are built with
+    /// [`Analyzer::with_isa`] from the model's `MIPS4` const.
+    mips4: bool,
 }
 
 impl Analyzer {
     pub fn new() -> Self {
-        Self { instrs: Box::new([CompiledInstr::default(); ENTRIES_PER_PAGE]), has_fpu: false, covered: Vec::new() }
+        Self {
+            mips4: crate::jitv2::isa::mips4_enabled(), instrs: Box::new([CompiledInstr::default(); ENTRIES_PER_PAGE]), has_fpu: false, covered: Vec::new() }
     }
+
+    /// An analyzer for a specific CPU model's ISA level.
+    ///
+    /// This is what production uses. `new()` falls back to the process-wide
+    /// default, which exists for unit tests and the offline tools that have
+    /// no CPU to ask.
+    pub fn with_isa(mips4: bool) -> Self {
+        let mut a = Self::new();
+        a.mips4 = mips4;
+        a
+    }
+
+    /// The ISA level this analyzer walks at.
+    pub fn mips4(&self) -> bool { self.mips4 }
 
     /// Whether the most recent [`Self::walk_multi_entry`] call's merged
     /// region contained any CP1/FPU instruction (`is_fpu_instruction`).
@@ -650,7 +678,7 @@ impl Analyzer {
     /// genuine excluded-instruction boundary.
     pub fn walk_bounded(&mut self, page: &[u32; ENTRIES_PER_PAGE], entry_word: WordOffset, page_base: u32, max_instrs: usize) -> (&[CompiledInstr; ENTRIES_PER_PAGE], bool) {
         self.instrs.fill(CompiledInstr::default());
-        let mut budget = Budget::new(max_instrs, entry_word);
+        let mut budget = Budget::new(max_instrs, entry_word, self.mips4);
         let non_empty = visit(&mut self.instrs, page, page_base, entry_word, &mut budget);
         if non_empty {
             compute_cycles_flush(&mut self.instrs, entry_word, budget.min, budget.max);
@@ -697,13 +725,41 @@ impl Analyzer {
         page_base: u32,
         max_instrs: usize,
     ) -> &[CompiledInstr; ENTRIES_PER_PAGE] {
+        self.walk_multi_entry_once(page, entry_words, page_base, max_instrs, false);
+        // Codegen declines any region that keeps a Status write as a fallback
+        // head alongside CP1 code (`emit_fr_mode_guard` checks FR once per
+        // entry, which a Status write mid-region could invalidate), and a
+        // declined compile leaves every entry on the page interpreted. The
+        // kernel's FP context paths mix the two on the same page, so on a
+        // 32-bit IRIX 6.5.22 Indy that cost 40% of boot time. Walk such a page
+        // again with the Status writes ending the region instead: the page
+        // compiles in pieces around them, as before CP0 heads existed, and
+        // pages without CP1 code keep them.
+        if self.has_fpu
+            && instrs_linear(&self.instrs)
+                .any(|i| i.is_fallback && crate::jitv2::cop0::writes_cp0_status(i.raw))
+        {
+            self.walk_multi_entry_once(page, entry_words, page_base, max_instrs, true);
+        }
+        &self.instrs
+    }
+
+    fn walk_multi_entry_once(
+        &mut self,
+        page: &[u32; ENTRIES_PER_PAGE],
+        entry_words: &[WordOffset],
+        page_base: u32,
+        max_instrs: usize,
+        status_ends_region: bool,
+    ) {
         self.instrs.fill(CompiledInstr::default());
         self.covered.clear();
         let mut any_covered = false;
         let mut min_visited = WordOffset::MAX;
         let mut max_visited = 0;
         for &entry_word in entry_words {
-            let mut budget = Budget::new(max_instrs, entry_word);
+            let mut budget = Budget::new(max_instrs, entry_word, self.mips4);
+            budget.status_ends_region = status_ends_region;
             if visit(&mut self.instrs, page, page_base, entry_word, &mut budget) {
                 // Mark AFTER visit returns, unconditionally — `visit`'s own
                 // already-visited-as-head short-circuit means a word already
@@ -730,7 +786,6 @@ impl Analyzer {
             compute_cycles_flush(&mut self.instrs, self.covered[0], min_visited, max_visited);
         }
         self.has_fpu = instrs_linear(&self.instrs).any(|i| is_fpu_instruction(i.raw));
-        &self.instrs
     }
 }
 
@@ -746,11 +801,19 @@ struct Budget {
     remaining: usize,
     min: WordOffset,
     max: WordOffset,
+    /// The ISA level this walk compiles for — the `CpuModel`'s `MIPS4`
+    /// const, carried here because `visit`/`visit_slot` already thread a
+    /// `&mut Budget` through the whole recursive walk and nothing else does.
+    mips4: bool,
+    /// End the region on a CP0 Status write instead of keeping it as a
+    /// fallback head. Set only for the second walk `walk_multi_entry` makes of
+    /// a page whose first walk combined a Status write with CP1 code.
+    status_ends_region: bool,
 }
 
 impl Budget {
-    fn new(remaining: usize, entry_word: WordOffset) -> Self {
-        Self { remaining, min: entry_word, max: entry_word }
+    fn new(remaining: usize, entry_word: WordOffset, mips4: bool) -> Self {
+        Self { remaining, min: entry_word, max: entry_word, mips4, status_ends_region: false }
     }
 
     /// Record `offset` as freshly marked visited — call from every site that
@@ -826,7 +889,7 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
         return true;
     }
     let raw = page[offset as usize];
-    let class = classify(raw, offset, page_base);
+    let class = classify(raw, offset, page_base, budget.mips4);
     if class == Classify::Excluded || class == Classify::RegionBoundary {
         // Excluded: an excluded instruction can never be a delay slot (a
         // fallback runs it via the interpreter, which needs it in head
@@ -920,7 +983,7 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     }
 
     let raw = page[offset as usize];
-    let class = classify(raw, offset, page_base);
+    let class = classify(raw, offset, page_base, budget.mips4);
 
     if class == Classify::RegionBoundary {
         // Hard region end (test/tooling sentinel): never visited, never a
@@ -929,10 +992,29 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
         return false;
     }
 
-    if class == Classify::Excluded && !fallback_enabled() {
+    if class == Classify::Excluded && budget.status_ends_region
+        && crate::jitv2::cop0::writes_cp0_status(raw)
+    {
+        // The second walk of a page that mixes CP1 code with a Status write:
+        // the write ends the region, as every CP0 word did before CP0 heads,
+        // so the page still compiles (see `Analyzer::walk_multi_entry`).
+        return false;
+    }
+
+    if class == Classify::Excluded && !fallback_enabled()
+        && !crate::jitv2::cop0::stays_in_region(raw)
+        && !crate::jitv2::atomics::stays_in_region(raw)
+    {
         // Fallback disabled (the default): an excluded instruction ends the
         // region here, exactly as it always did — never visited, the caller
         // records StopReason::Excluded on its own edge.
+        //
+        // The CP0 exception: `OP_COP0` stays `Excluded` (there is no native
+        // emitter and there must not be one), but the safe subset is kept
+        // *in* the region as an interpreter-fallback head rather than ending
+        // it, because ending on every mfc0/mtc0/eret is a large part of why
+        // the kernel interprets so much — 677 COP0 sites in `unix.B`. See
+        // `jitv2::cop0` for which words qualify and why the rest do not.
         return false;
     }
 
@@ -1233,7 +1315,14 @@ fn compute_cycles_flush(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], entry_wo
         if !instrs[word as usize].visited {
             continue;
         }
-        let mut flush = instrs[word as usize].is_region_exit();
+        // A fallback head flushes too. `emit_account_for_cycles` runs
+        // before the word's own semantics, so `hot.cycles` ends up
+        // including this instruction — the same convention as the
+        // interpreter's `step_preamble!`, which bumps cycles before
+        // dispatching. Flushing *on* the fallback word rather than on its
+        // predecessor is what makes the count come out exactly right.
+        let mut flush = instrs[word as usize].is_region_exit()
+            || instrs[word as usize].is_fallback;
         if let Some(t) = instrs[word as usize].continues_to_fallthrough {
             flush |= instrs[t as usize].is_branch_target || instrs[t as usize].is_entry_point || t == entry_word;
         }
@@ -1273,6 +1362,132 @@ mod tests {
         super::test_fallback_guard()
     }
 
+    // --- COP0 kept in-region as a fallback head (jitv2::cop0) --------------
+    //
+    // The analyzer half only: does the region continue past the COP0 word, or
+    // stop on it as it always did. That the admitted instructions produce the
+    // same architectural result is the interpreter's job — they run through
+    // `exec_cop0` unchanged, which is the whole point of admitting them as
+    // fallback heads rather than writing a second CP0 implementation.
+
+    /// A COP0 word, then real work, then an exit. If the COP0 word ends the
+    /// region, word 1 is never walked.
+    fn cop0_then_work_page(cop0_word: u32) -> [u32; ENTRIES_PER_PAGE] {
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = cop0_word;
+        page[1] = i_type(OP_ADDIU, 0, 9, 0x55);
+        page[2] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        page[3] = 0; // jr's delay slot
+        page
+    }
+
+    #[test]
+    fn admitted_cop0_stays_in_the_region_as_a_fallback_head() {
+        let _lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (what, word) in [
+            ("mfc0 t1, Count",    r_type(OP_COP0, RS_MFC0, 9, 9, 0, 0)),
+            ("dmfc0 t1, Status",  r_type(OP_COP0, RS_DMFC0, 9, 12, 0, 0)),
+            ("mtc0 t1, Compare",  r_type(OP_COP0, RS_MTC0, 9, 11, 0, 0)),
+            ("mtc0 t1, Status",   r_type(OP_COP0, RS_MTC0, 9, 12, 0, 0)),
+            ("eret",              (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_ERET),
+        ] {
+            let page = cop0_then_work_page(word);
+            let mut a = Analyzer::new();
+            let (result, non_empty) = a.walk_bounded(&page, 0, 0, 8);
+            assert!(non_empty, "{what}: must form a region");
+            assert!(result[0].visited, "{what}: the COP0 word itself must be visited");
+            assert!(result[0].is_fallback, "{what}: it must be a fallback head, never a native emitter");
+            // ERET is a control transfer, so nothing follows it in-region;
+            // the others must let the walk continue to real work.
+            if word & 0x3F != FUNCT_ERET {
+                assert!(result[1].visited, "{what}: the walk must continue past it");
+            }
+        }
+    }
+
+    #[test]
+    fn unsafe_cop0_still_ends_the_region() {
+        let _lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (what, word) in [
+            // Cause: its IP0/IP1 software-interrupt bits are invisible to the
+            // compiled preamble's `hot.interrupts` sample.
+            ("mtc0 t1, Cause", r_type(OP_COP0, RS_MTC0, 9, 13, 0, 0)),
+            ("tlbwi",  (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBWI),
+            ("tlbwr",  (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBWR),
+            ("tlbp",   (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP),
+        ] {
+            let page = cop0_then_work_page(word);
+            let mut a = Analyzer::new();
+            let (result, non_empty) = a.walk_bounded(&page, 0, 0, 8);
+            assert!(!non_empty, "{what}: an excluded entry must not form a region");
+            assert!(!result[1].visited, "{what}: nothing past it may be walked");
+        }
+    }
+
+    #[test]
+    fn j2_cop0_off_switches_the_behaviour_back_off() {
+        // The monitor half: a divergence found on a live boot must be
+        // bisectable without relaunching.
+        let _lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::mips_instr_stats::InstrKind;
+        use crate::jitv2::opcode_support::{instr_enabled, set_instr_enabled};
+
+        let word = r_type(OP_COP0, RS_MFC0, 9, 9, 0, 0);
+        let page = cop0_then_work_page(word);
+
+        let before = instr_enabled(InstrKind::Mfc0);
+        set_instr_enabled(InstrKind::Mfc0, false);
+        let mut a = Analyzer::new();
+        let (result, non_empty) = a.walk_bounded(&page, 0, 0, 8);
+        set_instr_enabled(InstrKind::Mfc0, before);
+
+        assert!(!non_empty, "with Mfc0 disabled the COP0 word must end the region again");
+        assert!(!result[1].visited);
+    }
+
+    /// `mtc0 t1, Status` at word 0 and `jr ra` at word 2, with `second` at
+    /// word 1 — the shape of a kernel path that sets Status.CU1 and then
+    /// saves an FPR.
+    fn status_write_then(second: u32) -> [u32; ENTRIES_PER_PAGE] {
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = r_type(OP_COP0, RS_MTC0, 9, 12, 0, 0);
+        page[1] = second;
+        page[2] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        page[3] = 0; // jr's delay slot
+        page
+    }
+
+    #[test]
+    fn a_status_write_beside_cp1_code_ends_the_region_instead_of_sinking_the_page() {
+        // Codegen declines a region holding both (the FR guard runs once per
+        // entry), and a declined compile leaves the whole page interpreted.
+        // The page must compile around the write instead.
+        let _lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let page = status_write_then(i_type(OP_SDC1, 4, 0, 0)); // sdc1 $f0, 0(a0)
+        let mut a = Analyzer::new();
+        let result = *a.walk_multi_entry(&page, &[0, 1], 0, usize::MAX);
+        assert!(!result[0].visited, "the Status write must end the region, not be a head");
+        assert!(result[1].visited && !result[1].is_fallback, "the CP1 store still compiles");
+        assert_eq!(a.covered(), &[1], "only the entry past the write forms a region");
+        assert!(a.has_fpu());
+        assert!(
+            !instrs_linear(&result).any(|i| i.is_fallback && crate::jitv2::cop0::writes_cp0_status(i.raw)),
+            "nothing codegen would decline may be left in the walk"
+        );
+    }
+
+    #[test]
+    fn a_status_write_without_cp1_code_stays_a_fallback_head() {
+        let _lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let page = status_write_then(i_type(OP_ADDIU, 0, 9, 0x55));
+        let mut a = Analyzer::new();
+        let result = *a.walk_multi_entry(&page, &[0], 0, usize::MAX);
+        assert!(result[0].visited && result[0].is_fallback, "no CP1 code: the write stays in the region");
+        assert!(result[1].visited);
+        assert_eq!(a.covered(), &[0]);
+        assert!(!a.has_fpu());
+    }
+
     fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
     }
@@ -1282,47 +1497,47 @@ mod tests {
 
     #[test]
     fn classify_sequential_nop() {
-        assert_eq!(classify(0, 0, 0), Classify::Sequential);
+        assert_eq!(classify(0, 0, 0, true), Classify::Sequential);
     }
 
     #[test]
     fn classify_jr_is_regjump() {
         let instr = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
-        assert_eq!(classify(instr, 5, 0), Classify::RegJump);
+        assert_eq!(classify(instr, 5, 0, true), Classify::RegJump);
     }
 
     #[test]
     fn classify_excluded_mtc0() {
         let instr = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Excluded);
     }
 
     #[test]
     fn classify_excluded_cache() {
         let instr = i_type(OP_CACHE, 0, 0, 0);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Excluded);
     }
 
     #[test]
     fn classify_plain_fpu_arithmetic_is_sequential() {
         // FADD.D
         let instr = r_type(OP_COP1, RS_D, 3, 4, 5, FUNCT_FADD);
-        assert_eq!(classify(instr, 5, 0), Classify::Sequential);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Sequential);
     }
 
     #[test]
     fn classify_fpu_register_moves_are_sequential() {
         let mfc1 = r_type(OP_COP1, RS_MFC1, 2, 3, 0, 0);
-        assert_eq!(classify(mfc1, 5, 0), Classify::Sequential);
+        assert_eq!(classify(mfc1, 5, 0, true), Classify::Sequential);
         let mtc1 = r_type(OP_COP1, RS_MTC1, 2, 3, 0, 0);
-        assert_eq!(classify(mtc1, 5, 0), Classify::Sequential);
+        assert_eq!(classify(mtc1, 5, 0, true), Classify::Sequential);
     }
 
     #[test]
     fn classify_fpu_compare_is_sequential() {
         // C.EQ.D
         let instr = r_type(OP_COP1, RS_D, 5, 4, 0, FUNCT_FC_EQ);
-        assert_eq!(classify(instr, 5, 0), Classify::Sequential);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Sequential);
     }
 
     #[test]
@@ -1333,17 +1548,37 @@ mod tests {
         // CU1/FR guard's trigger check (has_fpu) still catches them — see
         // codegen::lookup_cp1_semantics's doc comment. sequential_or_excluded
         // correctly reports Sequential now that the emitters exist.
-        assert_eq!(classify(i_type(OP_LWC1, 0, 0, 0), 5, 0), Classify::Sequential);
-        assert_eq!(classify(i_type(OP_SDC1, 0, 0, 0), 5, 0), Classify::Sequential);
+        assert_eq!(classify(i_type(OP_LWC1, 0, 0, 0), 5, 0, true), Classify::Sequential);
+        assert_eq!(classify(i_type(OP_SDC1, 0, 0, 0), 5, 0, true), Classify::Sequential);
     }
 
     #[test]
-    fn classify_cop1x_madd_is_excluded_until_an_emitter_exists() {
-        // OP_COP1X has no emitters at all yet (lookup_cp1_semantics only
-        // matches op == OP_COP1) — sequential_or_excluded correctly reports
-        // Excluded here too, not Sequential.
+    fn classify_cop1x_madd_follows_emitter_coverage() {
+        // OP_COP1X is architecturally sequential — no unresolved control
+        // flow — so classify tracks emitter coverage, which for the whole
+        // MIPS IV COP1X set follows the *running CPU model*'s ISA level, so
+        // this asserts both directions in one build rather than whichever the
+        // cargo features happened to select.
         let instr = r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        {
+            let _isa = crate::jitv2::isa::test_isa(true);
+            assert_eq!(classify(instr, 5, 0, true), Classify::Sequential,
+                       "an R5000/R10000 may execute MADD.S");
+        }
+        {
+            let _isa = crate::jitv2::isa::test_isa(false);
+            assert_eq!(classify(instr, 5, 0, false), Classify::Excluded,
+                       "an R4400 must leave MADD.S to the interpreter, which raises RI");
+        }
+    }
+
+    #[test]
+    fn classify_cop1x_paired_single_stays_excluded() {
+        // MADD.PS and friends have no emitter and no interpreter handler
+        // either — no SGI MIPS IV part implements paired-single — so they
+        // must stay Excluded even in a `mips4` build.
+        let instr = r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_PS);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Excluded);
     }
 
     #[test]
@@ -1357,23 +1592,43 @@ mod tests {
         // lands this must become Sequential, never get stuck as a phantom
         // branch exclusion.
         let instr = r_type(OP_COP1X, RS_BC1, 2, 3, 4, FUNCT_LWXC1);
-        #[cfg(feature = "mips4")]
-        assert_eq!(classify(instr, 5, 0), Classify::Sequential);
-        #[cfg(not(feature = "mips4"))]
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        {
+            let _isa = crate::jitv2::isa::test_isa(true);
+            assert_eq!(classify(instr, 5, 0, true), Classify::Sequential);
+        }
+        {
+            let _isa = crate::jitv2::isa::test_isa(false);
+            // Still Excluded for ISA reasons, never for "it looked like BC1".
+            assert_eq!(classify(instr, 5, 0, false), Classify::Excluded);
+        }
     }
 
     #[test]
-    fn classify_bc1_is_excluded() {
-        // BC1F/BC1T — CP1 conditional branch, condition-code-dependent target.
+    fn classify_bc1_is_an_ordinary_pc_relative_branch() {
+        // BC1F/BC1T/BC1FL/BC1TL. The predicate is an FCSR condition code, but
+        // the *target* is the same PC-relative 16-bit offset every other
+        // conditional branch uses, so it classifies as a Branch and the walker
+        // resolves the target statically. (This asserted Excluded until
+        // 2026-09-22 — see the comment in `classify`.)
+        //
+        // offset_word 5, immediate 0 => target is the word after the delay
+        // slot: 5 + 1 + 0 = 6.
         let instr = r_type(OP_COP1, RS_BC1, 0, 0, 0, 0);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Branch { target: Some(6) });
+
+        // A non-zero displacement resolves too, and all four tf/nd encodings
+        // are branches — nd (bit 1 of rt) only selects annulling.
+        for rt in 0..4u32 {
+            let instr = (OP_COP1 << 26) | (RS_BC1 << 21) | (rt << 16) | 3;
+            assert_eq!(classify(instr, 5, 0, true), Classify::Branch { target: Some(9) },
+                       "rt={rt} (tf={}, nd={})", rt & 1, (rt >> 1) & 1);
+        }
     }
 
     #[test]
     fn classify_cop2_is_excluded() {
         let instr = r_type(OP_COP2, 0, 0, 0, 0, 0);
-        assert_eq!(classify(instr, 5, 0), Classify::Excluded);
+        assert_eq!(classify(instr, 5, 0, true), Classify::Excluded);
     }
 
     #[test]
@@ -1381,14 +1636,14 @@ mod tests {
         // BEQ at word 10, imm=+2 words -> target word offset = 10 + 1 + 2 = 13
         // (target is relative to the delay slot's address, word 11, not word 12).
         let instr = i_type(OP_BEQ, 1, 2, 2);
-        assert_eq!(classify(instr, 10, 0), Classify::Branch { target: Some(13) });
+        assert_eq!(classify(instr, 10, 0, true), Classify::Branch { target: Some(13) });
     }
 
     #[test]
     fn branch_off_page_low_end() {
         // Backward branch far enough to leave the page (offset 0, big negative imm).
         let instr = i_type(OP_BEQ, 1, 2, 0xFF00u16); // large negative offset
-        assert_eq!(classify(instr, 0, 0), Classify::Branch { target: None });
+        assert_eq!(classify(instr, 0, 0, true), Classify::Branch { target: None });
     }
 
     #[test]

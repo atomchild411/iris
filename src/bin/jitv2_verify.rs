@@ -48,6 +48,15 @@ use iris::jitv2::{JitFn, ENTRIES_PER_PAGE};
 use iris::mips_core::MipsCore;
 use iris::trace::{CoreState, TraceReader, TraceRecord};
 
+/// The ISA level this offline tool analyses at.
+///
+/// It has no CPU to ask — it replays a recorded trace — so it takes the
+/// process-wide default, which the `mips4` cargo feature seeds. A trace from
+/// a MIPS IV guest should be verified with a `mips4` build.
+fn isa_mips4() -> bool {
+    iris::jitv2::isa::mips4_enabled()
+}
+
 /// `MipsCore`'s FPU rounding-mode hook (`fpu_set_mode_fn`) is a pure
 /// host-arch function with no executor dependency (see `mips_exec.rs`'s own
 /// `jit_fpu_set_mode` trampoline, which this mirrors exactly) — safe to wire
@@ -333,7 +342,7 @@ fn run(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbose: boo
 
         let word = ((rec.pc & 0xFFF) / 4) as u16;
         let page_base = (rec.pc & !0xFFFu64) as u32;
-        let class = classify(rec.raw, word, page_base);
+        let class = classify(rec.raw, word, page_base, isa_mips4());
         // RegJump (JR/JALR) has the same "mandatory inline delay slot, one
         // compiled unit covering both records" shape as Branch/Jump (its
         // target just isn't statically known — emit_regjump still always
@@ -572,7 +581,7 @@ fn run_chain(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbos
 
             let word = ((rec.pc & 0xFFF) / 4) as u16;
             let page_base = (rec.pc & !0xFFFu64) as u32;
-            let class = classify(rec.raw, word, page_base);
+            let class = classify(rec.raw, word, page_base, isa_mips4());
             let is_bj = matches!(class, Classify::Branch { .. } | Classify::Jump { .. } | Classify::RegJump);
 
             if touches_memory(rec.raw) || class == Classify::Excluded {
@@ -666,7 +675,7 @@ fn run_chain(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbos
             if !last_is_bj { break; } // only a branch/jump/regjump has an extension point to resolve
             let last_word = ((last_rec.pc & 0xFFF) / 4) as u16;
             let last_page_base = (last_rec.pc & !0xFFFu64) as u32;
-            let last_class = classify(last_rec.raw, last_word, last_page_base);
+            let last_class = classify(last_rec.raw, last_word, last_page_base, isa_mips4());
             if matches!(last_class, Classify::RegJump) { break; }
 
             fill(&mut buf, &mut reader, consumed + 1)?;
@@ -679,7 +688,7 @@ fn run_chain(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbos
             }
             let next_word = ((next_head.pc & 0xFFF) / 4) as u16;
             let next_page_base = (next_head.pc & !0xFFFu64) as u32;
-            let next_class = classify(next_head.raw, next_word, next_page_base);
+            let next_class = classify(next_head.raw, next_word, next_page_base, isa_mips4());
             if touches_memory(next_head.raw) || next_class == Classify::Excluded {
                 // Same rule as the initial build loop above: an Excluded
                 // word can never actually be a head in the real compiled
@@ -872,7 +881,7 @@ fn build_chain_page_words(heads: &[(TraceRecord, bool, Option<TraceRecord>)], pa
         let (rec, is_bj, _) = heads[i];
         if !is_bj { continue; }
         let word = ((rec.pc & 0xFFF) / 4) as u16;
-        let class = classify(rec.raw, word, page_base);
+        let class = classify(rec.raw, word, page_base, isa_mips4());
         let taken_word = branch_or_jump_taken_word(class, rec.raw, word);
         let not_taken_word = word + 2; // past the slot, same for Branch and Jump/regjump-shaped entries
         let actual_next_word = ((heads[i + 1].0.pc & 0xFFF) / 4) as u16;

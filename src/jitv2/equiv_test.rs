@@ -1082,6 +1082,160 @@ mod tests {
         assert_eq!(jit, interp, "JIT and interpreter diverged for page={:x?} entry_word={} pc=0x{:x}", page, entry_word, pc);
     }
 
+    // ---- BC1 (CP1 conditional branch) page harness ------
+    //
+    // BC1 needs what neither existing harness provides on its own: a
+    // multi-word page (branch + delay slot, like the integer branch tests)
+    // AND CP1 state (CU1 set, a seeded FCSR condition code, like the FPU
+    // tests). Rather than widen the shared page harness — every non-FPU test
+    // depends on CU1 being irrelevant there — these mirror
+    // `run_interpreter_page`/`run_jit_page` with the CP1 seeding added.
+
+    /// Seed one FPU condition code through `set_fpu_cc` rather than writing
+    /// `fpu_fcsr` directly, so the derived `fpu_fccr` stays consistent — a
+    /// hand-written FCSR would leave `fccr` stale and `CoreSnapshot` compares
+    /// both.
+    fn run_interpreter_page_bc1(page: &[(u16, u32)], gpr: [u64; 32], cc: u32, cc_val: bool,
+                                pc: u64, steps: usize, cu1: bool, fr1: bool) -> CoreSnapshot {
+        let (mut exec, mem) = seeded_executor_over(MockMemory::new_not_compilable(), gpr, pc);
+        exec.set_cp0_status(
+            (if cu1 { crate::mips_core::STATUS_CU1 } else { 0 })
+            | (if fr1 { crate::mips_core::STATUS_FR } else { 0 }));
+        exec.core.set_fpu_cc(cc, cc_val);
+        let page_base = pc & !(PAGE_SIZE as u64 - 1);
+        for &(word, raw) in page {
+            mem.set_word(page_base + (word as u64) * 4, raw);
+        }
+        for _ in 0..steps {
+            let fetch_pc = exec.core.pc;
+            let instr = mem.get_word(fetch_pc & !3);
+            exec.exec(instr);
+        }
+        CoreSnapshot::capture(&exec.core)
+    }
+
+    fn run_jit_page_bc1(page: &[(u16, u32)], gpr: [u64; 32], cc: u32, cc_val: bool,
+                        pc: u64, entry_word: u16, max_instrs: usize, cu1: bool, fr1: bool) -> Option<CoreSnapshot> {
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(word, raw) in page {
+            page_words[word as usize] = raw;
+        }
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, entry_word, page_base, max_instrs);
+        assert!(non_empty, "entry instruction must not be excluded — check the test's encoding");
+        let mut instrs_owned = *walked;
+
+        let mut codegen = Codegen::new();
+        // The FR mode the code is pinned to MUST match the mode the core is
+        // actually in, or emit_fr_mode_guard fires at entry and calls
+        // jit_kill_entry — which this harness has no tracked
+        // PhysicalCodePage for, so it aborts rather than recompiling. Any
+        // region containing a CP1 instruction gets that guard, and BC1 is
+        // one, so unlike the integer page harness this cannot hardcode
+        // `true`.
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, entry_word, fr1, false)?;
+
+        let (exec, mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.set_cp0_status(
+            (if cu1 { crate::mips_core::STATUS_CU1 } else { 0 })
+            | (if fr1 { crate::mips_core::STATUS_FR } else { 0 }));
+        exec.core.set_fpu_cc(cc, cc_val);
+        let phys_base = (page_base & 0x1FFF_FFFF) as u64;
+        for &(word, raw) in page {
+            mem.set_word(page_base as u64 + (word as u64) * 4, raw);
+            mem.set_word(phys_base + (word as u64) * 4, raw);
+        }
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        Some(CoreSnapshot::capture(&exec.core))
+    }
+
+    fn assert_bc1_matches_interpreter(page: &[(u16, u32)], gpr: [u64; 32], cc: u32, cc_val: bool,
+                                      steps: usize, max_instrs: usize, cu1: bool, fr1: bool) {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let interp = run_interpreter_page_bc1(page, gpr, cc, cc_val, pc, steps, cu1, fr1);
+        let jit = run_jit_page_bc1(page, gpr, cc, cc_val, pc, 0, max_instrs, cu1, fr1)
+            .expect("BC1 region must be compilable for this test to be meaningful");
+        assert_eq!(jit, interp,
+            "JIT and interpreter diverged for BC1 page={page:x?} cc={cc} cc_val={cc_val} cu1={cu1} fr1={fr1}");
+    }
+
+    /// `BC1F`/`BC1T`/`BC1FL`/`BC1TL`. `rt` is not a register: bits are
+    /// `cc<<2 | nd<<1 | tf`, sitting at raw[20:16].
+    fn make_bc1(cc: u32, tf: bool, nd: bool, imm: u16) -> u32 {
+        let rt = (cc << 2) | ((nd as u32) << 1) | (tf as u32);
+        (crate::mips_isa::OP_COP1 << 26) | (crate::mips_isa::RS_BC1 << 21) | (rt << 16) | (imm as u32)
+    }
+
+    fn bc1_layout(cc: u32, tf: bool, nd: bool) -> Vec<(u16, u32)> {
+        vec![
+            (0, make_bc1(cc, tf, nd, BRANCH_IMM)),
+            // r5 = 1 marks that the delay slot ran (annulled on a not-taken
+            // "likely", exactly as for BEQL).
+            (1, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+        ]
+    }
+
+    /// Every combination that changes BC1's behaviour: all 8 condition codes,
+    /// both `tf` polarities, both `nd` (likely) settings, and the condition
+    /// both set and clear — so taken, not-taken, and annulled-not-taken are
+    /// all covered for each.
+    #[test]
+    fn bc1_all_conditions_match_interpreter() {
+        for cc in 0..8u32 {
+            for tf in [false, true] {
+                for nd in [false, true] {
+                    for cc_val in [false, true] {
+                        for fr1 in [false, true] {
+                            let page = bc1_layout(cc, tf, nd);
+                            let taken = cc_val == tf;
+                            // A not-taken "likely" annuls its slot, so only
+                            // one instruction retires; everything else two.
+                            let steps = if !taken && nd { 1 } else { 2 };
+                            assert_bc1_matches_interpreter(&page, [0u64; 32], cc, cc_val, steps, 1, true, fr1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The delay slot must actually be annulled on the not-taken path of
+    /// BC1FL/BC1TL — asserted directly, not just via agreement with the
+    /// interpreter, so a harness that ran neither side's slot couldn't pass.
+    #[test]
+    fn bc1_likely_not_taken_annuls_its_delay_slot() {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        // BC1TL with cc0 clear: not taken, so the slot is annulled.
+        let page = bc1_layout(0, true, true);
+        let jit = run_jit_page_bc1(&page, [0u64; 32], 0, false, pc, 0, 1, true, true)
+            .expect("compilable");
+        assert_eq!(jit.gpr[5], 0, "annulled delay slot must not execute");
+
+        // Same encoding, condition set: taken, so the slot DOES run. Without
+        // this the assertion above would also pass on a broken emitter that
+        // simply never ran the slot.
+        let jit = run_jit_page_bc1(&page, [0u64; 32], 0, true, pc, 0, 1, true, true)
+            .expect("compilable");
+        assert_eq!(jit.gpr[5], 1, "taken branch must still execute its delay slot");
+    }
+
+    /// BC1 reads the FPU, so unlike every other branch it faults when CU1 is
+    /// clear (`exec_bc1`'s first line). Branches do not go through
+    /// `lookup_cp1_semantics`, so they get no automatic CU1 guard — codegen
+    /// emits one in `emit_cond`'s `Fcc` arm, and this is what proves it.
+    #[test]
+    fn bc1_without_cu1_raises_coprocessor_unusable_like_the_interpreter() {
+        let page = bc1_layout(0, true, false);
+        // cc set, so it would be TAKEN if CU1 were on — the exception must
+        // win over the branch. One step: the exception is the only thing
+        // that retires.
+        assert_bc1_matches_interpreter(&page, [0u64; 32], 0, true, 1, 1, false, true);
+    }
+
     // ---- FPU (CP1) test harness ------
     //
     // Separate from the integer harness above: FPU tests need FPR contents
@@ -1349,28 +1503,33 @@ mod tests {
     #[test]
     fn analyzer_admits_unimplemented_instruction_as_a_fallback_entry() {
         let _fb = fallback_on_guard();
-        // PREFX has no emitter (opcode_support::has_emitter) and, unlike most
-        // other gaps closed in this file's history, never will: exec_prefx
-        // checks STATUS_CU1 and raises cpu_unusable when it's clear, a genuine
-        // COP0-adjacent side effect this codebase's hard no on privilege/
-        // COP0-touching instructions excludes from *native* jitv2 codegen
-        // permanently.
+        // MADD.PS has no emitter (opcode_support::has_emitter) and no
+        // interpreter handler either — no MIPS IV part SGI shipped implements
+        // paired-single — so it stays uncompiled in every build, `mips4`
+        // included. That makes it the stable example for this test.
+        //
+        // (This used to use PREFX, which was described as permanently
+        // excluded because exec_prefx raises cpu_unusable when CU1 is clear.
+        // That reasoning was wrong: COP1X is routed through
+        // lookup_cp1_semantics, and codegen emits emit_cp1_cu1_guard before
+        // every emitter from that table, so the CU1 exception is delivered
+        // identically by native code. PREFX now has a — deliberately empty —
+        // emitter under `mips4`.)
         //
         // With interpreter-fallback, "no native emitter" no longer means "not
         // in a region": the analyzer admits an Excluded instruction as a
         // fallback head (is_fallback), and codegen runs it through the real
-        // interpreter (emit_interp_fallback_head), which delivers the
-        // cpu_unusable exception correctly. So a lone PREFX entry is now a
+        // interpreter (emit_interp_fallback_head). So a lone entry here is a
         // one-instruction fallback region, not an empty one. (Pre-fallback this
         // asserted non_empty == false — see git history / the analyzer's own
         // walk_excluded_entry_* tests, updated in the same change.)
-        let instr = make_r(crate::mips_isa::OP_COP1X, 1, 2, 3, 4, crate::mips_isa::FUNCT_PREFX);
+        let instr = make_r(crate::mips_isa::OP_COP1X, 1, 2, 3, 4, crate::mips_isa::FUNCT_MADD_PS);
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = instr;
         let mut analyzer = Analyzer::new();
         let (result, non_empty) = analyzer.walk(&page, 0, 0);
-        assert!(non_empty, "PREFX has no native emitter but is now a compilable fallback region");
-        assert!(result[0].visited && result[0].is_fallback, "PREFX entry must be a fallback head");
+        assert!(non_empty, "MADD.PS has no native emitter but is still a compilable fallback region");
+        assert!(result[0].visited && result[0].is_fallback, "MADD.PS entry must be a fallback head");
     }
 
     fn make_i(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
@@ -5689,6 +5848,127 @@ mod tests {
             }
         }
     }
+
+    /// The multiply-add family, S and D, in both FR modes.
+    ///
+    /// COP1X field layout is not COP1's: fr=rs, ft=rt, fs=rd, fd=sa, and the
+    /// result is fd = ±(fs*ft ± fr).
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn madd_family_matches_interpreter_fr0_and_fr1() {
+        use crate::mips_isa::{OP_COP1X, FUNCT_MADD_S, FUNCT_MADD_D, FUNCT_MSUB_S,
+                              FUNCT_MSUB_D, FUNCT_NMADD_S, FUNCT_NMADD_D,
+                              FUNCT_NMSUB_S, FUNCT_NMSUB_D};
+        // Even registers throughout so the FR=0 pairing rules are satisfied
+        // for the .D forms: fr=2, ft=4, fs=6, fd=8.
+        for fr1 in [false, true] {
+            for (fr_v, ft_v, fs_v) in [
+                (1.25f64, 2.5f64, 3.0f64),
+                (-0.5f64, 4.0f64, 0.25f64),
+                (0.0f64, 0.0f64, 0.0f64),
+                (-0.0f64, 1.0f64, -0.0f64),
+                (f64::INFINITY, 2.0f64, 1.0f64),
+                (1.0f64, f64::INFINITY, 0.0f64),
+                (f64::NAN, 1.0f64, 1.0f64),
+            ] {
+                let mut fpr = [0u64; 32];
+                fpr[2] = fr_v.to_bits();
+                fpr[4] = ft_v.to_bits();
+                fpr[6] = fs_v.to_bits();
+                fpr[8] = 0xDEAD_BEEF_DEAD_BEEF; // pre-existing fd
+                for funct in [FUNCT_MADD_D, FUNCT_MSUB_D, FUNCT_NMADD_D, FUNCT_NMSUB_D] {
+                    let instr = make_r(OP_COP1X, 2, 4, 6, 8, funct);
+                    assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, fr1);
+                }
+
+                let mut fpr_s = [0u64; 32];
+                fpr_s[2] = (fr_v as f32).to_bits() as u64;
+                fpr_s[4] = (ft_v as f32).to_bits() as u64;
+                fpr_s[6] = (fs_v as f32).to_bits() as u64;
+                fpr_s[8] = 0xDEAD_BEEF_DEAD_BEEF;
+                for funct in [FUNCT_MADD_S, FUNCT_MSUB_S, FUNCT_NMADD_S, FUNCT_NMSUB_S] {
+                    let instr = make_r(OP_COP1X, 2, 4, 6, 8, funct);
+                    assert_fpu_matches_interpreter(instr, [0u64; 32], fpr_s, fr1);
+                }
+            }
+        }
+    }
+
+    /// The multiply-add must round TWICE: MIPS IV rounds the product to the
+    /// format before adding fr (the R10000 makes one pass through its
+    /// multiplier and a second through its adder), so a fused multiply-add is
+    /// the mistake to catch here, and no amount of ordinary test values would.
+    ///
+    /// `0.1f64` is slightly greater than one tenth, so the exact product
+    /// `0.1 * 10.0` is `1.0000000000000000555...`. Rounded to a double that
+    /// is exactly `1.0`, so multiplying and then adding `-1.0` yields `0.0`,
+    /// which is MIPS IV's answer. A single-rounding FMA keeps the residual and
+    /// yields `5.551115123125783e-17`.
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn madd_d_rounds_the_product_first() {
+        use crate::mips_isa::{OP_COP1X, FUNCT_MADD_D};
+        let mut fpr = [0u64; 32];
+        fpr[2] = (-1.0f64).to_bits();  // fr
+        fpr[4] = (10.0f64).to_bits();  // ft
+        fpr[6] = (0.1f64).to_bits();   // fs
+        let instr = make_r(OP_COP1X, 2, 4, 6, 8, FUNCT_MADD_D);
+        assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
+
+        // And state plainly what separates the answers, so a future change to
+        // the interpreter cannot quietly make both sides wrong together (the
+        // interpreter's own test_cop1x_madd_rounds_the_product pins its
+        // result).
+        assert_eq!(0.1f64 * 10.0f64 - 1.0f64, 0.0, "test premise broken: two-rounding path changed");
+        assert_eq!((0.1f64).mul_add(10.0f64, -1.0f64), 5.551115123125783e-17,
+                   "test premise broken: this case no longer distinguishes FMA");
+    }
+
+    /// RECIP/RSQRT, including the operands that drive their flag paths:
+    /// zero (divide-by-zero), negative (Invalid for RSQRT), and sNaN.
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn recip_rsqrt_matches_interpreter_fr0_and_fr1() {
+        use crate::mips_isa::{OP_COP1, RS_S, RS_D, FUNCT_FRECIP, FUNCT_FRSQRT};
+        for fr1 in [false, true] {
+            for v in [4.0f64, 0.25f64, 1.0f64, 0.0f64, -0.0f64, -4.0f64,
+                      f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                let mut fpr = [0u64; 32];
+                fpr[6] = v.to_bits();          // fs = rd
+                fpr[8] = 0x1234_5678_9ABC_DEF0; // pre-existing fd = sa
+                for funct in [FUNCT_FRECIP, FUNCT_FRSQRT] {
+                    let d = make_r(OP_COP1, RS_D, 0, 6, 8, funct);
+                    assert_fpu_matches_interpreter(d, [0u64; 32], fpr, fr1);
+                }
+
+                let mut fpr_s = [0u64; 32];
+                fpr_s[6] = (v as f32).to_bits() as u64;
+                fpr_s[8] = 0x1234_5678_9ABC_DEF0;
+                for funct in [FUNCT_FRECIP, FUNCT_FRSQRT] {
+                    let s = make_r(OP_COP1, RS_S, 0, 6, 8, funct);
+                    assert_fpu_matches_interpreter(s, [0u64; 32], fpr_s, fr1);
+                }
+            }
+        }
+    }
+
+    /// PREFX is a hint: past the CU1 guard it must change nothing at all.
+    /// The emitter is empty, so this is really asserting that "empty" is the
+    /// same as what `exec_prefx` does.
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn prefx_matches_interpreter_and_changes_nothing() {
+        use crate::mips_isa::{OP_COP1X, FUNCT_PREFX};
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_8000_2000;
+        gpr[2] = 0x40;
+        let mut fpr = [0u64; 32];
+        fpr[8] = 0xA5A5_A5A5_A5A5_A5A5;
+        let instr = make_r(OP_COP1X, 1, 2, 3, 8, FUNCT_PREFX);
+        assert_fpu_matches_interpreter(instr, gpr, fpr, true);
+        assert_fpu_matches_interpreter(instr, gpr, fpr, false);
+    }
+
 
     #[test]
     #[cfg(feature = "mips4")]

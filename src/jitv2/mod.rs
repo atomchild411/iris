@@ -2,6 +2,11 @@
 
 pub mod jitv2;
 pub mod comp;
+pub mod cop0;
+pub mod atomics;
+pub mod hashstats;
+pub mod pcache;
+pub mod isa;
 pub mod opcode_support;
 pub mod analyzer;
 pub mod codegen;

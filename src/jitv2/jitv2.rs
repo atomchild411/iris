@@ -174,6 +174,24 @@ pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
 /// rather than the queue mostly sitting near-empty.
 pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
 
+/// Arrivals at a queued-but-uncompiled page before it jumps the queue: code
+/// being executed this often right now is worth compiling before older,
+/// colder requests (a program started just after a large compile otherwise
+/// waits seconds behind that compile's backlog, measured with jitcov on IP28).
+pub const HOT_PROMOTE_ARRIVALS: u32 = 256;
+
+/// The hot lane: a small second queue workers drain before the FIFO. One per
+/// process, like the JIT itself. Requests hold raw page pointers, so
+/// `CompileQueue::drain_pending` empties it too before any flush.
+pub static HOT_QUEUE: std::sync::LazyLock<crossbeam_queue::ArrayQueue<CompileRequest>> =
+    std::sync::LazyLock::new(|| crossbeam_queue::ArrayQueue::new(256));
+
+/// Put a copy of a request on the hot lane. A full lane just drops it: the
+/// page's FIFO request is still queued, so nothing is lost but the head start.
+pub fn push_hot_request(req: CompileRequest) {
+    let _ = HOT_QUEUE.push(req);
+}
+
 
 /// Page size for JIT v2 (§2.4) — matches the MIPS TLB/cache page granularity
 /// used throughout the codebase, and the granularity of the per-page
@@ -808,6 +826,13 @@ pub struct PhysicalCodePage {
     /// yet. Validity is owned by `compiled`'s bits together with `entry_gen`
     /// matching `current_gen()` — see `is_runnable`.
     func: std::sync::atomic::AtomicPtr<()>,
+    /// The FR mode `func` was compiled for. Distinct from the pin (`fr1`),
+    /// which is the mode the *next* compile targets: the two disagree while a
+    /// page used under both modes waits for its recompile. `publish` needs
+    /// it, because a compile for the other mode is never redundant with the
+    /// installed code, whatever entries the two share. Written only under
+    /// `publish_lock`.
+    func_fr1: std::sync::atomic::AtomicBool,
     /// Generation this `func`/`compiled` pair was last published against
     /// (§13.3 step 6). Only ever written to a value `>=` its current value;
     /// numerically advances only when the publish that wrote it was actually
@@ -828,6 +853,13 @@ pub struct PhysicalCodePage {
     /// of offset-scoped, since one request now serves however many offsets
     /// have accumulated in `requested` by the time it's dequeued.
     page_scheduled: std::sync::atomic::AtomicBool,
+    /// Arrivals at this page while its compile request was already queued
+    /// (`try_schedule_page` lost). Once it crosses [`HOT_PROMOTE_ARRIVALS`]
+    /// the page is hot *now* and gets one extra request on the hot lane
+    /// (`promoted` stops a second). Both reset whenever a compile for the
+    /// page completes (`clear_scheduled`).
+    hot_wait: std::sync::atomic::AtomicU32,
+    promoted: std::sync::atomic::AtomicBool,
     /// Pinned FR mode for this page, set once at page-claim time from live
     /// `STATUS_FR` and held fixed for the page's whole lifetime until the
     /// next `mega_flush`/`reset_to_unclaimed` (TODO revisit — see below).
@@ -1160,27 +1192,34 @@ pub struct PhysicalCodePage {
     /// A kill means "stop dispatching into `func` here", so a skip must not
     /// re-advertise the killed offset. `compiled` cannot answer that question
     /// on its own, because a narrowing skip clears bits there for an entirely
-    /// unrelated reason — hence a separate flag. Page-granular rather than
-    /// per-offset because the skip is all-or-nothing anyway: one kill on the
-    /// page simply costs that page one real recompile, which re-derives the
-    /// coverage honestly.
-    killed_since_snapshot: std::sync::atomic::AtomicBool,
-    /// **Unsynchronized, and sound because a page is never compiled twice at
-    /// once.** `page_scheduled` is a test-and-set taken by the dispatch gate
-    /// before a `CompileRequest` is sent and released only by
-    /// `handle_request`/`handle_request_deferred`'s exit scope guard — so it
-    /// stays held for the *whole* compile, not just the enqueue. A second
-    /// request for the same page therefore cannot even be sent, let alone
-    /// dequeued, while the first is still running, at any `thread_count`.
-    /// That is the same invariant that lets `Analyzer`'s 1024-entry buffer be
-    /// reused across compiles without locking.
+    /// unrelated reason — hence a separate record. A counter rather than a
+    /// flag: each snapshot notes the count when it was staged, and refuses a
+    /// skip once any kill has happened since, so a snapshot kept past a newer
+    /// compile's staging (see `snapshots`) still sees every kill after its
+    /// own. Page-granular because the skip is all-or-nothing anyway.
+    kills: std::sync::atomic::AtomicU32,
+    /// The churn-avoidance record: `committed` describes the `func` that is
+    /// installed right now, `staged` the compile in flight, if any.
     ///
-    /// A `Mutex` here would guard against nothing reachable while adding two
-    /// atomics and a 4KB compare inside a critical section. Dispatch never
-    /// touches this field at all — only a compiling thread does, plus the
-    /// exec thread's reset paths, which are mutually exclusive with compiles
-    /// by the same flag.
-    compile_snapshot: UnsafeCell<CompileSnapshot>,
+    /// Two slots because one lost the record whenever it was needed most. A
+    /// compile staged over the only slot (invalidating it) at compile time
+    /// and re-validated it at publish time, but on the deferred path the
+    /// publish waits in the seal queue after `page_scheduled` is released, and
+    /// a publish can also fail outright (stale generation, subsumed). In both
+    /// cases the page kept working code that no record vouched for, so every
+    /// request in between recompiled identical bytes: measured on an IP28
+    /// session as 1,338 of 6,500 compiles (`jitv2::hashstats`).
+    ///
+    /// A mutex because that same window lets a commit (in `publish_all`, on
+    /// any worker) run while another worker stages or skips for this page.
+    /// Only the compile path takes it; dispatch never does.
+    snapshots: Mutex<Snapshots>,
+    /// Diagnostics only (`jitv2::hashstats`): why the last
+    /// `try_skip_redundant_compile` refused. 0 = it did not, 1 = no valid
+    /// snapshot or FR mismatch, 2 = no installed func, 3 = entries not in the
+    /// last compile's set, 4 = a used word differs, 5 = gen moved, 6 =
+    /// entry_gen ahead, 7 = killed since the snapshot.
+    pub last_skip_reject: std::sync::atomic::AtomicU8,
 }
 
 /// What a successful compile of a page looked at, recorded so the next
@@ -1194,6 +1233,11 @@ pub struct PhysicalCodePage {
 /// *useful* rather than merely correct — a page where the guest rewrote a
 /// data constant, or any word the walk never reached, still matches, because
 /// only words the compile actually consumed are compared.
+struct Snapshots {
+    committed: CompileSnapshot,
+    staged: Option<Box<CompileSnapshot>>,
+}
+
 struct CompileSnapshot {
     /// Whether the fields below describe a real, still-installed compile.
     /// False on a fresh page and after any reset that drops `func` — a
@@ -1249,6 +1293,9 @@ struct CompileSnapshot {
     /// than a fault. A page whose FR pin legitimately flips therefore always
     /// takes a real recompile, exactly as it did before this cache existed.
     fr1: bool,
+    /// `PhysicalCodePage::kills` when this record was staged. A skip is
+    /// refused once the count has moved.
+    kills_at_stage: u32,
 }
 
 impl CompileSnapshot {
@@ -1260,6 +1307,7 @@ impl CompileSnapshot {
             used: [0u64; BITMAP_WORDS],
             entries: [0u64; BITMAP_WORDS],
             fr1: false,
+            kills_at_stage: 0,
         }
     }
 }
@@ -1302,16 +1350,20 @@ impl PhysicalCodePage {
             denied: new_bitmap_all_set(),
             compiled: new_bitmap(),
             func: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            func_fr1: std::sync::atomic::AtomicBool::new(false),
             entry_gen: AtomicU64::new(0),
             page_scheduled: std::sync::atomic::AtomicBool::new(false),
+            hot_wait: std::sync::atomic::AtomicU32::new(0),
+            promoted: std::sync::atomic::AtomicBool::new(false),
             fr1: std::sync::atomic::AtomicBool::new(false),
             fr_repin: std::sync::atomic::AtomicU8::new(FR_REPIN_NONE),
             fr_unpinned: std::sync::atomic::AtomicBool::new(false),
             publish_lock: Mutex::new(()),
             redundant_skipped: std::sync::atomic::AtomicU32::new(0),
             redundant_rejected: std::sync::atomic::AtomicU32::new(0),
-            killed_since_snapshot: std::sync::atomic::AtomicBool::new(false),
-            compile_snapshot: UnsafeCell::new(CompileSnapshot::new()),
+            kills: std::sync::atomic::AtomicU32::new(0),
+            snapshots: Mutex::new(Snapshots { committed: CompileSnapshot::new(), staged: None }),
+            last_skip_reject: std::sync::atomic::AtomicU8::new(0),
             instr_count: std::sync::atomic::AtomicU32::new(0),
             code_size: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "developer")]
@@ -1348,11 +1400,14 @@ impl PhysicalCodePage {
         // page permanently denylisted everywhere).
         for word in self.denied.iter() { word.store(u64::MAX, Ordering::Relaxed); }
         self.func.store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.func_fr1.store(false, Ordering::Relaxed);
         // The snapshot describes the `func` just dropped — see
         // `invalidate_compile_snapshot`.
         self.invalidate_compile_snapshot();
         self.entry_gen.store(0, Ordering::Relaxed);
         self.page_scheduled.store(false, Ordering::Relaxed);
+        self.hot_wait.store(0, Ordering::Relaxed);
+        self.promoted.store(false, Ordering::Relaxed);
         self.compiles_since_flush.store(0, Ordering::Relaxed);
         // Churn-avoidance tallies are per-flush-epoch (see the
         // `redundant_skipped` field), and this slot is additionally about to
@@ -1749,8 +1804,28 @@ impl PhysicalCodePage {
     pub fn kill(&self, offset_word: usize) {
         self.compiled[offset_word >> 6].fetch_and(!(1u64 << (offset_word & 63)), Ordering::Release);
         // Block the churn-avoidance skip until a real compile re-derives this
-        // page's coverage — see `killed_since_snapshot`.
-        self.killed_since_snapshot.store(true, Ordering::Release);
+        // page's coverage — see `kills`.
+        self.kills.fetch_add(1, Ordering::Release);
+    }
+
+    /// `kill` for an offset the compile path is denylisting in the same
+    /// breath: clears its `compiled` bit but does not bump `kills`.
+    ///
+    /// The kill count exists to stop a skip re-advertising an offset whose
+    /// dispatch should end. A denied offset cannot be re-advertised by a
+    /// skip at all: denials are masked out of every candidate set a skip is
+    /// asked to cover. Once a later generation clears `denied` and the offset
+    /// comes back, a skip still only re-advertises it if the installed `func`
+    /// has a case for it (`snap.entries`), for identical decoded bytes, in
+    /// the same FR mode, which is exactly when dispatching into it is right.
+    ///
+    /// Bumping here cost real work: every compile attempt that denied an
+    /// entry (excluded at its own entry, or a region too short) poisoned the
+    /// page's snapshot until a full recompile landed, and on an IP28 session
+    /// that refused 1,068 of 6,500 compiles' worth of skips.
+    #[inline]
+    pub fn kill_denylisted(&self, offset_word: usize) {
+        self.compiled[offset_word >> 6].fetch_and(!(1u64 << (offset_word & 63)), Ordering::Release);
     }
 
     /// Mark `offset_word` as a requested entry point (§13.2) — unconditional,
@@ -1808,6 +1883,19 @@ impl PhysicalCodePage {
     #[inline]
     pub fn clear_scheduled(&self) {
         self.page_scheduled.store(false, Ordering::Relaxed);
+        self.hot_wait.store(0, Ordering::Relaxed);
+        self.promoted.store(false, Ordering::Relaxed);
+    }
+
+    /// Count one arrival at this page while its request is already queued.
+    /// Returns `true` exactly once per wait, when the count reaches
+    /// [`HOT_PROMOTE_ARRIVALS`]: the caller then puts a copy of the request on
+    /// the hot lane. The FIFO copy, when it is eventually dequeued, is skipped
+    /// as redundant by the ordinary subsumption checks.
+    #[inline]
+    pub fn note_waiting_arrival(&self) -> bool {
+        self.hot_wait.fetch_add(1, Ordering::Relaxed) + 1 >= HOT_PROMOTE_ARRIVALS
+            && !self.promoted.swap(true, Ordering::Relaxed)
     }
 
     /// Clear every `requested` bit this compile's snapshot covered, after a
@@ -1905,9 +1993,19 @@ impl PhysicalCodePage {
     /// - `current_gen() > snap_gen`: the page mutated after this compile's
     ///   snapshot was taken — the compiled bytes are stale regardless of
     ///   entry coverage.
-    /// - `new_entries ⊆ compiled` (current, re-read under the lock): some
-    ///   other compile already published a superset of what this compile
-    ///   covers — redundant.
+    /// - `new_entries ⊆ compiled` (current, re-read under the lock) **for
+    ///   code of the same FR mode** (`fr1`, the mode this compile targeted):
+    ///   some other compile already published a superset of what this
+    ///   compile covers — redundant.
+    ///
+    /// The FR mode has to be part of that second test. Kernel pages run
+    /// under whichever mode the interrupted process uses, so one generation
+    /// can be compiled for FR1 and then, after the pin moves, for FR0. Were
+    /// the FR0 compile refused as "already covered", the page would be left
+    /// pinned FR0 with FR1 code and an FR1 churn snapshot: every later
+    /// request fails the skip on the mode, recompiles, and is refused again,
+    /// until the bytes change or the arena is flushed. That loop was seen
+    /// running thousands of rounds on a kernel page.
     ///
     /// `func`-then-`compiled`-then-`entry_gen` write order (all Release) means
     /// a reader that observes a `compiled` bit set (Acquire-paired via
@@ -1930,6 +2028,7 @@ impl PhysicalCodePage {
         snap_gen: u64,
         instr_count: usize,
         code_size: u32,
+        fr1: bool,
     ) -> bool {
         let _guard = self.publish_lock.lock();
 
@@ -1944,10 +2043,11 @@ impl PhysicalCodePage {
         // changed, about to be wiped by the entry_gen advance below. Only
         // skip-as-redundant when entry_gen already matches snap_gen (a pure
         // entry-coverage publish racing another one for the same bytes).
-        if self.entry_gen.load(Ordering::Relaxed) == snap_gen
-            && bitmap_is_subset_of(new_entries, &self.compiled)
-        {
-            return false; // some other compile already published everything this one covers, for this same generation
+        let same_gen = self.entry_gen.load(Ordering::Relaxed) == snap_gen;
+        let mode_switch = !self.func.load(Ordering::Relaxed).is_null()
+            && self.func_fr1.load(Ordering::Relaxed) != fr1;
+        if same_gen && !mode_switch && bitmap_is_subset_of(new_entries, &self.compiled) {
+            return false; // some other compile already published everything this one covers, for this same generation and mode
         }
 
         // Safety: `func` is a raw pointer write behind `&self` — sound
@@ -1956,6 +2056,7 @@ impl PhysicalCodePage {
         // to current_gen(); `publish_lock` excludes any concurrent writer of
         // these same three fields.
         self.func.store(func as *mut (), Ordering::Release);
+        self.func_fr1.store(fr1, Ordering::Relaxed);
         self.compiles_since_flush.fetch_add(1, Ordering::Relaxed);
         self.instr_count.store(instr_count as u32, Ordering::Relaxed);
         self.code_size.store(code_size, Ordering::Relaxed);
@@ -1966,7 +2067,10 @@ impl PhysicalCodePage {
 
         let prev_entry_gen = self.entry_gen.load(Ordering::Relaxed);
         let is_real_invalidation = snap_gen > prev_entry_gen;
-        if is_real_invalidation {
+        // Code for the other FR mode replaces the old function outright, so
+        // the old function's entries must go with it: its dispatch switch is
+        // gone, and the new one only has cases for `new_entries`.
+        if is_real_invalidation || mode_switch {
             // The old `compiled` bits refer to a now-superseded generation —
             // offsets compiled against bytes that no longer exist. Replace,
             // don't union: this compile's `new_entries` becomes the entire
@@ -2025,18 +2129,16 @@ impl PhysicalCodePage {
         gen_snap: u64,
         fr1: bool,
     ) {
-        // Safety: see `compile_snapshot`'s field doc — only a compiling
-        // thread reaches here, and a page is never compiled twice at once.
-        let snap = unsafe { &mut *self.compile_snapshot.get() };
-        // This compile re-derived coverage from scratch, so any kill that
-        // predates it is already accounted for in what it published.
-        self.killed_since_snapshot.store(false, Ordering::Release);
-        snap.valid = false;
-        snap.staged_gen = gen_snap;
-        snap.words.copy_from_slice(words);
-        snap.used.copy_from_slice(used);
-        snap.entries.copy_from_slice(entries);
-        snap.fr1 = fr1;
+        // Into the staging slot only: `committed` keeps describing the
+        // installed `func` until this compile's publish actually lands.
+        let mut rec = Box::new(CompileSnapshot::new());
+        rec.staged_gen = gen_snap;
+        rec.words.copy_from_slice(words);
+        rec.used.copy_from_slice(used);
+        rec.entries.copy_from_slice(entries);
+        rec.fr1 = fr1;
+        rec.kills_at_stage = self.kills.load(Ordering::Acquire);
+        self.snapshots.lock().staged = Some(rec);
     }
 
     /// Promote a staged record to usable, now that the publish it describes
@@ -2049,13 +2151,21 @@ impl PhysicalCodePage {
     /// cannot re-validate a snapshot for a function the reset discarded) —
     /// the record is dropped rather than committed, costing a future
     /// recompile instead of risking one that skips against the wrong bytes.
-    pub fn commit_compile_snapshot(&self, gen_snap: u64, entries: &[u64; BITMAP_WORDS]) {
-        // Safety: as `stage_compile_snapshot`.
-        let snap = unsafe { &mut *self.compile_snapshot.get() };
-        if snap.staged_gen == gen_snap && snap.entries == *entries {
-            snap.valid = true;
+    pub fn commit_compile_snapshot(&self, gen_snap: u64, entries: &[u64; BITMAP_WORDS], fr1: bool) {
+        let mut g = self.snapshots.lock();
+        // FR mode too: two compiles of one page at one generation can differ
+        // only in mode, and the record must describe the mode installed.
+        let matches = matches!(&g.staged, Some(r)
+            if r.staged_gen == gen_snap && r.entries == *entries && r.fr1 == fr1);
+        if matches {
+            let mut rec = g.staged.take().unwrap();
+            rec.valid = true;
+            g.committed = *rec;
         } else {
-            snap.valid = false;
+            // A publish landed that the staged record does not describe (a
+            // reset took it, or a newer compile replaced it). Whatever is
+            // installed now, `committed` no longer describes it.
+            g.committed.valid = false;
         }
     }
 
@@ -2066,8 +2176,7 @@ impl PhysicalCodePage {
     /// for them (see [`Self::redundant_skipped`]).
     #[inline]
     pub fn has_compile_snapshot(&self) -> bool {
-        // Safety: as `stage_compile_snapshot`.
-        unsafe { (*self.compile_snapshot.get()).valid }
+        self.snapshots.lock().committed.valid
     }
 
     /// Count one compile request answered by the snapshot — see
@@ -2104,16 +2213,12 @@ impl PhysicalCodePage {
     /// dispatch into nothing.
     #[inline]
     pub fn invalidate_compile_snapshot(&self) {
-        // Safety: the reset paths that call this run on the exec thread with
-        // no compile in flight for this page (see the field doc).
-        let snap = unsafe { &mut *self.compile_snapshot.get() };
-        snap.valid = false;
-        // Poison the staging slot too, not just `valid`: a compile that was
-        // in flight across this reset would otherwise come back and commit
-        // its record, re-validating a snapshot for a `func` this reset just
-        // threw away. `u64::MAX` can never be a real `gen_snap` (the counter
-        // starts at 0 and only increments), so no commit can match it.
-        snap.staged_gen = u64::MAX;
+        let mut g = self.snapshots.lock();
+        g.committed.valid = false;
+        // Drop the staging slot too: a compile in flight across this reset
+        // would otherwise come back and commit its record, re-validating a
+        // snapshot for a `func` this reset just threw away.
+        g.staged = None;
     }
 
     /// Churn-avoidance fast path (§13.3 step 2.5): decide whether the compile
@@ -2153,19 +2258,21 @@ impl PhysicalCodePage {
         gen_snap: u64,
         fr1: bool,
     ) -> bool {
-        // Safety: as `stage_compile_snapshot`.
-        let snap = unsafe { &*self.compile_snapshot.get() };
+        // Held for the whole check, so a commit on another worker cannot
+        // swap the record out from under the comparison.
+        let g = self.snapshots.lock();
+        let snap = &g.committed;
         if !snap.valid || snap.fr1 != fr1 {
-            return false;
+            { self.last_skip_reject.store(1, Ordering::Relaxed); return false; }
         }
         // A published `func` is what the snapshot describes; without one
         // there is nothing to re-validate. (Belt and braces — every path
         // that nulls `func` also invalidates the snapshot.)
         if self.func.load(Ordering::Relaxed).is_null() {
-            return false;
+            { self.last_skip_reject.store(2, Ordering::Relaxed); return false; }
         }
         if !bitmap_is_subset_of_plain(wanted_entries, &snap.entries) {
-            return false;
+            { self.last_skip_reject.store(3, Ordering::Relaxed); return false; }
         }
         for i in 0..BITMAP_WORDS {
             let mut bits = snap.used[i];
@@ -2174,7 +2281,7 @@ impl PhysicalCodePage {
                 bits &= bits - 1;
                 let w = i * 64 + bit;
                 if words[w] != snap.words[w] {
-                    return false;
+                    { self.last_skip_reject.store(4, Ordering::Relaxed); return false; }
                 }
             }
         }
@@ -2188,13 +2295,13 @@ impl PhysicalCodePage {
         // may have landed between the byte snapshot and here, in which case
         // the bytes we just compared are already history.
         if self.current_gen() > gen_snap {
-            return false;
+            { self.last_skip_reject.store(5, Ordering::Relaxed); return false; }
         }
         // Never move `entry_gen` backwards: a concurrent publish may have
         // already installed newer coverage at a higher generation, and
         // rewinding it would invalidate that publish's own code.
         if self.entry_gen.load(Ordering::Relaxed) > gen_snap {
-            return false;
+            { self.last_skip_reject.store(6, Ordering::Relaxed); return false; }
         }
         // Deliberately NOT `wanted_entries ⊆ compiled`. That is the wrong
         // question: `compiled` is what is currently *advertised*, which a
@@ -2209,15 +2316,15 @@ impl PhysicalCodePage {
         //
         // What DOES have to bail is a `kill` — it means "stop dispatching
         // into `func` here", so a skip must never re-advertise a killed
-        // offset. `killed_since_snapshot` is the exact condition;
+        // offset. `kills` moving since the snapshot is the exact condition;
         // `compiled` cannot express it, because a narrowing skip clears bits
         // there for an unrelated reason. In production every `kill` is
         // already paired with either an FR repin (caught by `snap.fr1 !=
         // fr1`) or a `denylist` (caught by `denied`, which the caller folds
         // into `wanted_entries`), so this is defence in depth rather than the
         // only guard — but it is the one that states the actual invariant.
-        if self.killed_since_snapshot.load(Ordering::Relaxed) {
-            return false;
+        if self.kills.load(Ordering::Acquire) != snap.kills_at_stage {
+            { self.last_skip_reject.store(7, Ordering::Relaxed); return false; }
         }
 
         // Leave exactly the coverage a real `publish` of this same candidate
@@ -2538,24 +2645,25 @@ impl Jitv2 {
         self.capacity
     }
 
-    /// Sum, across every pooled page with a published function, of the
-    /// page's `code_size` **rounded up to `Codegen::HOST_PAGE_SIZE`** —
-    /// dev-only diagnostic (`j2 stats`), the best available proxy for the
-    /// shared `Codegen`'s actual Cranelift memory-arena usage. Rounding
-    /// matters: `code_size` is raw compiled-machine-code bytes, but
-    /// `ArenaMemoryProvider` gives every function its own segment, always
-    /// rounded up to a full host page regardless of actual size — summing
-    /// raw `code_size` alone would under-report real arena consumption.
-    /// §13: page-granular now (one function per page), not per-offset — see
-    /// `PhysicalCodePage::code_size`'s own field doc.
+    /// Sum, across every pooled page with a published function, of that
+    /// page's `code_size` — diagnostic for `j2 status`.
+    ///
+    /// **Not rounded.** The page-rounding this used to do modelled
+    /// `ArenaMemoryProvider`, which gave every function its own
+    /// page-rounded segment; that provider no longer exists. The live
+    /// `PagedArenaMemoryProvider` packs allocations back to back, so a
+    /// function costs about its own `code_size`, and on a 16 KiB-page host
+    /// the old rounding over-reported a ~215-byte function by about 76x.
+    ///
+    /// NOT `#[cfg(feature = "developer")]`, though the commit this came
+    /// from added that: `j2 status` is read on `lightning` builds, and
+    /// gating a statistic to `developer` is how `last_code_size` came to
+    /// report 0 bytes in the only build worth measuring (see
+    /// rules/build/the-three-builds-we-actually-use.md).
     pub fn code_bytes_used(&self) -> u64 {
-        let page_size = crate::jitv2::codegen::Codegen::HOST_PAGE_SIZE;
         self.pages.iter()
             .filter(|page| !page.func().is_null())
-            .map(|page| {
-                let raw = page.code_size.load(Ordering::Relaxed) as u64;
-                raw.div_ceil(page_size) * page_size
-            })
+            .map(|page| page.code_size.load(Ordering::Relaxed) as u64)
             .sum()
     }
 
@@ -2636,6 +2744,7 @@ impl Jitv2 {
     /// whole operation self-contained now that `Jitv2` owns its own
     /// compile-queue lifecycle independently of `MipsCpu::stop()`/`start()`).
     fn mega_flush(&mut self) {
+        crate::jitv2::hashstats::FLUSH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pfn_to_slot.clear();
         let cap = self.pages.len();
         for (i, page) in self.pages.iter_mut().enumerate() {
@@ -2670,6 +2779,14 @@ impl Jitv2 {
             self.pages_used(), self.capacity(), function_count,
         );
         self.mega_flush();
+        // The retired workers' arena goes now: every page that could reach
+        // its code was just cleared, and this runs on the CPU thread outside
+        // compiled code. Dropped instead, it stayed mapped for the life of
+        // the process -- `SharedArena`'s `Drop` keeps any arena holding sealed
+        // code -- up to 512 MB each time the page pool ran out.
+        for codegen in stopped {
+            unsafe { codegen.release(); }
+        }
         if was_threaded {
             let stats = self.stats.clone();
             self.compile_queue.start(bus, stats);
@@ -2791,6 +2908,14 @@ pub(crate) fn push_compile_request(
 }
 
 pub struct CompileQueue {
+    /// The ISA level every worker's `Analyzer` walks at — the `CpuModel`'s
+    /// `MIPS4` const, set by `MipsExecutor::new` through [`set_isa`] before
+    /// the pool starts. Defaults to the process-wide value so tools and unit
+    /// tests that never publish one still behave as the build was configured.
+    ///
+    /// [`set_isa`]: CompileQueue::set_isa
+    mips4: bool,
+
     /// The one shared bounded MPMC ring: the CPU thread pushes
     /// (`CompileQueue::send`), every worker thread pops from the same
     /// `Arc` — no producer/consumer handoff needed (unlike the old
@@ -2871,6 +2996,7 @@ impl CompileQueue {
     /// [`Self::start`] to spawn the pool.
     pub fn new() -> Self {
         Self {
+            mips4: crate::jitv2::isa::mips4_enabled(),
             queue: Arc::new(crossbeam_queue::ArrayQueue::new(COMPILE_QUEUE_CAPACITY)),
             running: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
@@ -3046,6 +3172,9 @@ impl CompileQueue {
         while let Some(req) = queue.pop() {
             unsafe { (*req.page).clear_scheduled(); }
         }
+        while let Some(req) = HOT_QUEUE.pop() {
+            unsafe { (*req.page).clear_scheduled(); }
+        }
     }
 
     /// Public entry point for [`Self::drain_pending`] when the caller only
@@ -3059,6 +3188,15 @@ impl CompileQueue {
     /// Spawn the compile-thread pool with one freshly-reserved shared arena
     /// — today's normal entry point (`Machine::new`'s startup path). See
     /// `start_inner`'s own doc comment for the full contract.
+    /// Publish the CPU model's ISA level to the pool. Call before `start`.
+    ///
+    /// This replaces a process-global that jitv2 used to read from deep
+    /// inside `has_emitter`: the level now travels as data, from the model,
+    /// through the worker's `Analyzer`, into `classify`.
+    pub fn set_isa(&mut self, mips4: bool) {
+        self.mips4 = mips4;
+    }
+
     pub fn start(&mut self, bus: Arc<dyn BusDevice>, stats: Arc<JitStats>) {
         let state = Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
         let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
@@ -3111,6 +3249,9 @@ impl CompileQueue {
         if !self.threads.is_empty() {
             return;
         }
+        // Captured before the spawn loop: each worker builds its own
+        // `Analyzer` and needs the level by value, not through `&self`.
+        let worker_mips4 = self.mips4;
         self.running.store(true, Ordering::SeqCst);
         // Publish the arena every worker is about to build its own `Codegen`
         // on into the shared barrier state too — `j2 seal-queue`'s only way
@@ -3144,7 +3285,7 @@ impl CompileQueue {
             self.threads.push(
                 std::thread::Builder::new()
                     .name(format!("jitv2-compile-{i}"))
-                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count))
+                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4))
                     .expect("jitv2-compile spawn"),
             );
         }
@@ -3192,16 +3333,40 @@ impl CompileQueue {
     /// (`Codegen::new_with_shared_arena`) before resuming its loop — or
     /// `None` if it was a seal-only cycle, where the caller resumes in
     /// place with nothing to rebuild.
+    ///
+    /// Also returns `None`, without waiting for a generation bump, when there
+    /// is no cycle to wait for: the leader already released the barrier
+    /// before this worker got here (`quiesce_in_progress` cleared), or the
+    /// pool is stopping (`running` false). A worker that saw
+    /// `quiesce_in_progress` at the top of its loop can reach this function
+    /// only after a leader abandoned its cycle (`stop()` racing it) and
+    /// bumped `generation`; it would then wait for a bump that never comes
+    /// while `stop()` joins it forever -- confirmed live as a hung CPU thread
+    /// (`flush_from_cpu_thread` -> `stop` -> join, worker in this wait). A
+    /// cycle that really flushes cannot end without every worker parked
+    /// first, so a late arrival only ever follows an abandoned cycle, where
+    /// nothing was flushed and there is nothing to rebuild.
     fn park_at_barrier(
         barrier: &Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>,
+        running: &AtomicBool,
+        quiesce_in_progress: &AtomicBool,
     ) -> Option<(Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>, Arc<crate::jitv2::paged_memory::PagedArenaState>)> {
         let (mutex, cv) = &**barrier;
         let mut state = mutex.lock();
         let my_generation = state.generation;
+        if !quiesce_in_progress.load(Ordering::Acquire) || !running.load(Ordering::Relaxed) {
+            return None;
+        }
         state.parked_count += 1;
         cv.notify_all(); // wake the leader, which is waiting for parked_count to reach thread_count - 1
         while state.generation == my_generation {
-            cv.wait(&mut state);
+            if !running.load(Ordering::Relaxed) || !quiesce_in_progress.load(Ordering::Acquire) {
+                // Stopping, or the cycle ended without us: leave the count as
+                // we found it for whoever leads next.
+                state.parked_count = state.parked_count.saturating_sub(1);
+                return None;
+            }
+            cv.wait_for(&mut state, BARRIER_FOLLOWER_POLL_INTERVAL);
         }
         if !state.was_flush {
             return None;
@@ -3302,6 +3467,8 @@ impl CompileQueue {
         barrier: Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>,
         quiesce_in_progress: Arc<AtomicBool>,
         thread_count: usize,
+        // The CPU model’s ISA level, for this worker’s `Analyzer`.
+        mips4: bool,
     ) -> crate::jitv2::codegen::Codegen {
         // Pick up the L1-D geometry the CPU published for the inline
         // load/store path. The worker owns `codegen` by value for its whole
@@ -3332,7 +3499,7 @@ impl CompileQueue {
         }
 
 
-        let mut analyzer = crate::jitv2::analyzer::Analyzer::new();
+        let mut analyzer = crate::jitv2::analyzer::Analyzer::with_isa(mips4);
         let mut pending: crate::jitv2::comp::PendingCount = 0;
         // Wall-clock start of the current unbroken stretch of "queue empty
         // AND pending still non-empty after a non-forced publish attempt" —
@@ -3534,7 +3701,7 @@ impl CompileQueue {
                 run_leader_flush(codegen, function_count, pending);
             } else {
                 *pending = 0;
-                if let Some((arena, state)) = Self::park_at_barrier(&barrier) {
+                if let Some((arena, state)) = Self::park_at_barrier(&barrier, &running, &quiesce_in_progress) {
                     unsafe { codegen.reset_with_shared_arena(arena, state); }
                 } else {
                 }
@@ -3547,7 +3714,7 @@ impl CompileQueue {
                 run_leader_seal(codegen, pending);
             } else {
                 *pending = 0;
-                if let Some((arena, state)) = Self::park_at_barrier(&barrier) {
+                if let Some((arena, state)) = Self::park_at_barrier(&barrier, &running, &quiesce_in_progress) {
                     unsafe { codegen.reset_with_shared_arena(arena, state); }
                     function_count.store(codegen.function_count(), Ordering::Relaxed);
                 } else {
@@ -3569,14 +3736,16 @@ impl CompileQueue {
             // separately.
             if quiesce_in_progress.load(Ordering::Acquire) {
                 pending = 0;
-                if let Some((arena, state)) = Self::park_at_barrier(&barrier) {
+                if let Some((arena, state)) = Self::park_at_barrier(&barrier, &running, &quiesce_in_progress) {
                     unsafe { codegen.reset_with_shared_arena(arena, state); }
                     function_count.store(codegen.function_count(), Ordering::Relaxed);
                 } else {
                 }
                 continue;
             }
-            match queue.pop() {
+            // The hot lane first: pages being executed right now that are
+            // still waiting (see `HOT_QUEUE`).
+            match HOT_QUEUE.pop().or_else(|| queue.pop()) {
                 Some(req) => {
                     // Always the deferred/non-forced path — never
                     // handle_request's forced-seal one. Forced sealing
@@ -3750,6 +3919,60 @@ mod tests {
     /// specialize for the wrong FR mode, and because `emit_fr_mode_guard`
     /// suppresses itself when CU1 is clear that is not reliably caught —
     /// wrong FPR packing on `ldc1`/`lwc1` silently corrupts FP data.
+    /// A page compiled for FR1 and then re-pinned to FR0 at the same
+    /// generation (kernel code runs in whichever mode the interrupted process
+    /// uses) must accept the FR0 compile. Refusing it as "already covered"
+    /// left FR1 code, an FR1 churn snapshot and an FR0 pin, and every request
+    /// after that recompiled and was refused again: a loop seen running
+    /// thousands of rounds on one kernel page.
+    #[test]
+    fn same_gen_compile_for_the_other_fr_mode_publishes() {
+        let page = claimed_page(true);
+        let words = [0u32; ENTRIES_PER_PAGE];
+        let mut used = [0u64; BITMAP_WORDS];
+        used[0] = 0b111;
+        let mut e = [0u64; BITMAP_WORDS];
+        e[0] = 0b101;
+        // An FR1 compile at a new generation publishes (which unpins FR)
+        // and commits its snapshot.
+        page.stage_compile_snapshot(&words, &used, &e, 1, true);
+        assert!(page.publish(&e, 0x1000 as *const (), 1, 3, 0, true));
+        page.commit_compile_snapshot(1, &e, true);
+        // The next request comes from an FR0 context and takes the live mode;
+        // the churn skip rightly refuses FR1 code for it.
+        assert!(!page.take_fr_repin(false));
+        assert!(!page.try_skip_redundant_compile(&words, &e, 1, false));
+        // The FR0 compile of the same bytes and entries must install.
+        page.stage_compile_snapshot(&words, &used, &e, 1, false);
+        assert!(page.publish(&e, 0x2000 as *const (), 1, 3, 0, false), "a compile for the other FR mode is not redundant");
+        page.commit_compile_snapshot(1, &e, false);
+        assert_eq!(page.func(), 0x2000 as *const ());
+        // Now consistent: the next FR0 request is answered by the skip, and
+        // a duplicate FR0 compile is still refused as redundant.
+        assert!(!page.take_fr_repin(false));
+        assert!(page.try_skip_redundant_compile(&words, &e, 1, false), "the FR0 snapshot now serves FR0 requests");
+        assert!(!page.publish(&e, 0x3000 as *const (), 1, 3, 0, false), "same mode, same entries: still redundant");
+    }
+
+    /// Installing code for the other FR mode replaces the advertised entries
+    /// rather than adding to them: the old function and its dispatch switch
+    /// are gone, so an entry only it had must stop being dispatchable. The
+    /// sticky denials stay, since the bytes did not change.
+    #[test]
+    fn mode_switch_replaces_coverage_and_keeps_denials() {
+        let page = claimed_page(true);
+        let mut wide = [0u64; BITMAP_WORDS];
+        wide[0] = 0b1111;
+        let mut narrow = [0u64; BITMAP_WORDS];
+        narrow[0] = 0b0011;
+        assert!(page.publish(&wide, 0x1000 as *const (), 1, 3, 0, true));
+        page.denylist(40);
+        assert!(page.publish(&narrow, 0x2000 as *const (), 1, 3, 0, false));
+        assert!(page.is_published(0) && page.is_published(1));
+        assert!(!page.is_published(2) && !page.is_published(3), "entries only the FR1 function had must not stay advertised");
+        assert!(page.is_denylisted(40), "same bytes: denials stand");
+    }
+
     #[test]
     fn real_invalidation_drops_the_stale_fr_pin() {
         let page = claimed_page(false); // o32 tenant: FR0
@@ -3758,7 +3981,7 @@ mod tests {
         // A real invalidation: the guest replaced this page's bytes, so the
         // publish carries a generation strictly newer than `entry_gen`.
         let entries = [0u64; BITMAP_WORDS];
-        let published = page.publish(&entries, std::ptr::null(), 1, 1, 0);
+        let published = page.publish(&entries, std::ptr::null(), 1, 1, 0, false);
         assert!(published, "setup: a fresh generation must actually publish");
 
         // The next compile arrives from an n32 process (live FR=1). Before
@@ -3776,7 +3999,7 @@ mod tests {
         let page = claimed_page(false);
         let mut entries = [0u64; BITMAP_WORDS];
         entries[0] = 1;
-        assert!(page.publish(&entries, std::ptr::null(), 0, 1, 0));
+        assert!(page.publish(&entries, std::ptr::null(), 0, 1, 0, false));
 
         assert!(!page.take_fr_repin(true), "a coverage-only publish leaves the bytes alone, so the pin still describes them");
     }
@@ -3856,7 +4079,10 @@ mod tests {
         let followers: Vec<_> = (0..2)
             .map(|_| {
                 let barrier = barrier.clone();
-                std::thread::spawn(move || CompileQueue::park_at_barrier(&barrier))
+                std::thread::spawn(move || {
+                    let (running, quiesce) = (AtomicBool::new(true), AtomicBool::new(true));
+                    CompileQueue::park_at_barrier(&barrier, &running, &quiesce)
+                })
             })
             .collect();
 
@@ -3892,6 +4118,45 @@ mod tests {
         }
     }
 
+    /// The live hang: a worker saw `quiesce_in_progress` at the top of its
+    /// loop, but the leader abandoned the cycle (`stop()` raced it), bumped
+    /// `generation` and cleared the flag before the worker reached the
+    /// barrier. Parking must not wait for another bump.
+    #[test]
+    fn park_after_an_abandoned_cycle_returns_at_once() {
+        let barrier = Arc::new((parking_lot::Mutex::new(BarrierState::new()), parking_lot::Condvar::new()));
+        barrier.0.lock().generation += 1; // the leader's abandon
+        let (running, quiesce) = (AtomicBool::new(true), AtomicBool::new(false));
+        let start = std::time::Instant::now();
+        assert!(CompileQueue::park_at_barrier(&barrier, &running, &quiesce).is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(barrier.0.lock().parked_count, 0);
+    }
+
+    /// A worker already parked when the pool stops (`running` false, no
+    /// leader left to bump `generation`) must come back so `stop()`'s join
+    /// returns.
+    #[test]
+    fn parked_worker_returns_when_the_pool_stops() {
+        let barrier = Arc::new((parking_lot::Mutex::new(BarrierState::new()), parking_lot::Condvar::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let quiesce = Arc::new(AtomicBool::new(true));
+        let follower = {
+            let (barrier, running, quiesce) = (barrier.clone(), running.clone(), quiesce.clone());
+            std::thread::spawn(move || CompileQueue::park_at_barrier(&barrier, &running, &quiesce).is_none())
+        };
+        {
+            let (mutex, cv) = &*barrier;
+            let mut state = mutex.lock();
+            while state.parked_count < 1 {
+                cv.wait(&mut state);
+            }
+        }
+        running.store(false, Ordering::SeqCst);
+        assert!(follower.join().unwrap());
+        assert_eq!(barrier.0.lock().parked_count, 0);
+    }
+
     #[test]
     fn barrier_parks_followers_and_resumes_them_in_place_for_a_seal_only_cycle() {
         // Companion to the flush test above: a seal-only cycle
@@ -3903,7 +4168,10 @@ mod tests {
         let followers: Vec<_> = (0..2)
             .map(|_| {
                 let barrier = barrier.clone();
-                std::thread::spawn(move || CompileQueue::park_at_barrier(&barrier))
+                std::thread::spawn(move || {
+                    let (running, quiesce) = (AtomicBool::new(true), AtomicBool::new(true));
+                    CompileQueue::park_at_barrier(&barrier, &running, &quiesce)
+                })
             })
             .collect();
 
@@ -4000,6 +4268,22 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_page_is_promoted_once_at_the_threshold_and_rearms_after_a_compile() {
+        let page = PhysicalCodePage::new(1, std::ptr::null());
+        assert!(page.try_schedule_page(), "first request queues");
+        for _ in 1..HOT_PROMOTE_ARRIVALS {
+            assert!(!page.note_waiting_arrival(), "not hot yet");
+        }
+        assert!(page.note_waiting_arrival(), "promoted at the threshold");
+        assert!(!page.note_waiting_arrival(), "and only once per wait");
+        page.clear_scheduled(); // a compile for the page completed
+        for _ in 1..HOT_PROMOTE_ARRIVALS {
+            assert!(!page.note_waiting_arrival());
+        }
+        assert!(page.note_waiting_arrival(), "re-arms after the compile");
+    }
+
+    #[test]
     fn clear_scheduled_allows_a_fresh_try_schedule_page() {
         let counter = AtomicU64::new(0);
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -4072,6 +4356,43 @@ mod tests {
         assert_eq!(snap[0] & ((1 << 4) | (1 << 5)), (1 << 4) | (1 << 5), "both offsets stay marked");
     }
 
+    /// `code_bytes_used` sums raw `code_size`, with no page rounding.
+    ///
+    /// It used to round every published entry up to a hardcoded 4096, which
+    /// described `ArenaMemoryProvider` — one page-rounded segment per
+    /// function, a type that no longer exists. The live
+    /// `PagedArenaMemoryProvider` packs, so a function costs about its own
+    /// `code_size`.
+    ///
+    /// The constant was also wrong wherever the host page is not 4 KiB, which
+    /// includes every Apple Silicon Mac (16 KiB) and aarch64 Linux kernels
+    /// built for 16 or 64 KiB. That is why nothing here hardcodes a page size
+    /// and the failure message asks `region::page::size()` at runtime: the
+    /// page size is not a property of the target triple.
+    #[test]
+    fn code_bytes_used_is_not_page_rounded() {
+        let counter = AtomicU64::new(0);
+        let sizes = [215u32, 300, 48];
+        // One function per page: `code_bytes_used` sums one `code_size` per
+        // *page*, so three entries means three pages. Publishing three times
+        // into one page just overwrites its `code_size`.
+        let mut jit = Jitv2::new(sizes.len());
+
+        for (i, sz) in sizes.iter().enumerate() {
+            jit.pages[i].claim(i as Pfn + 1, &counter as *const AtomicU64, false);
+            let mut bits = [0u64; BITMAP_WORDS];
+            bits[0] |= 1u64;
+            assert!(jit.pages[i].publish(&bits, 0x1000 as *const (), 0, 1, *sz, false));
+        }
+
+        let expected: u64 = sizes.iter().map(|s| *s as u64).sum();
+        assert_eq!(
+            jit.code_bytes_used(), expected,
+            "must sum raw code_size; page-rounding would report {} instead",
+            sizes.len() as u64 * region::page::size() as u64,
+        );
+    }
+
     #[test]
     fn snapshot_compile_candidates_unions_requested_and_compiled_masked_by_denied() {
         let counter = AtomicU64::new(0);
@@ -4082,7 +4403,7 @@ mod tests {
         // offset 8: published (compiled) only, no fresh request.
         let mut bits = [0u64; BITMAP_WORDS];
         bits[0] |= 1u64 << 8;
-        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0));
+        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0, false));
         // offset 12: requested, but denylisted — must never appear regardless
         // of include_compiled.
         page.mark_requested(12);
@@ -4114,7 +4435,7 @@ mod tests {
         // Publish: set the bit -> now valid.
         let mut bits = [0u64; BITMAP_WORDS];
         bits[offset >> 6] |= 1u64 << (offset & 63);
-        assert!(page.publish(&bits, 0x1000 as *const (), 5, 1, 0));
+        assert!(page.publish(&bits, 0x1000 as *const (), 5, 1, 0, false));
         assert!(page.is_runnable(offset));
 
         // Page mutates (gen bumps past what the entry was compiled against):
@@ -4135,7 +4456,7 @@ mod tests {
         let offset = 4usize;
         let mut bits = [0u64; BITMAP_WORDS];
         bits[offset >> 6] |= 1u64 << (offset & 63);
-        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0));
+        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0, false));
         assert!(page.is_runnable(offset));
 
         page.kill(offset);
@@ -4149,7 +4470,7 @@ mod tests {
         // Same gen (0): a pure entry-coverage republish, not a real
         // invalidation — publish() still succeeds because `kill` cleared the
         // `compiled` bit, so the previous "subsumed" check no longer blocks it.
-        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0));
+        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0, false));
         assert!(page.is_runnable(offset), "offset must be re-publishable after kill");
     }
 
@@ -4174,7 +4495,7 @@ mod tests {
         bits[offset >> 6] |= 1u64 << (offset & 63);
 
         let old_fn = 0x1000usize as *const ();
-        assert!(page.publish(&bits, old_fn, 5, 1, 0));
+        assert!(page.publish(&bits, old_fn, 5, 1, 0, false));
         assert!(page.is_runnable(offset));
         assert_eq!(page.func(), old_fn);
 
@@ -4186,7 +4507,7 @@ mod tests {
         // stale-but-still-published entry) — gen_snap=6 was captured before
         // this second compile started, matching the page's now-current gen.
         let new_fn = 0x2000usize as *const ();
-        assert!(page.publish(&bits, new_fn, 6, 1, 0));
+        assert!(page.publish(&bits, new_fn, 6, 1, 0, false));
         assert!(page.is_runnable(offset), "recompiled entry must read valid once publish completes");
         assert_eq!(page.func(), new_fn, "func must be the NEW function, not the stale one, once gen reads as current");
     }
@@ -4219,8 +4540,8 @@ mod tests {
         func: *const (),
     ) {
         page.stage_compile_snapshot(words, used, entries, gen, fr1);
-        assert!(page.publish(entries, func, gen, 1, 0), "fixture publish must succeed");
-        page.commit_compile_snapshot(gen, entries);
+        assert!(page.publish(entries, func, gen, 1, 0, false), "fixture publish must succeed");
+        page.commit_compile_snapshot(gen, entries, fr1);
         assert!(page.has_compile_snapshot(), "fixture must leave a usable snapshot");
     }
 
@@ -4343,9 +4664,53 @@ mod tests {
         assert!(!page.try_skip_redundant_compile(&words, &entries, 5, false),
             "a staged-but-uncommitted record must never authorize a skip");
 
-        assert!(page.publish(&entries, 0x1000usize as *const (), 5, 1, 0));
-        page.commit_compile_snapshot(5, &entries);
+        assert!(page.publish(&entries, 0x1000usize as *const (), 5, 1, 0, false));
+        page.commit_compile_snapshot(5, &entries, false);
         assert!(page.has_compile_snapshot(), "the commit must make it usable");
+    }
+
+    #[test]
+    fn staging_a_recompile_keeps_the_installed_codes_snapshot_until_it_publishes() {
+        // The measured churn source (jitv2::hashstats on IP28): staging used to
+        // overwrite the only record, so while the new compile waited in the
+        // seal queue, or after its publish failed, the page kept code that no
+        // record vouched for and every request recompiled identical bytes.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        // A recompile is staged (its publish is not in yet).
+        counter.store(6, Ordering::Relaxed);
+        page.stage_compile_snapshot(&words, &used, &entries, 6, false);
+        assert!(page.has_compile_snapshot(),
+            "staging must not invalidate the record of the code still installed");
+        assert!(page.try_skip_redundant_compile(&words, &entries, 6, false),
+            "the installed code still matches the bytes, so a skip is still right");
+
+        // Its publish fails (the skip above already took generation 6).
+        assert!(!page.publish(&entries, 0x2000usize as *const (), 6, 1, 0, false));
+        assert!(page.has_compile_snapshot(),
+            "a failed publish leaves the old code, and its record, in place");
+    }
+
+    #[test]
+    fn a_publish_the_staged_record_does_not_describe_invalidates_the_committed_one() {
+        // A publish landed but is not the compile that was staged: the
+        // installed code is now something no record describes.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        counter.store(6, Ordering::Relaxed);
+        page.stage_compile_snapshot(&words, &used, &entries, 6, false);
+        let mut other_entries = [0u64; BITMAP_WORDS];
+        other_entries[0] |= 1u64 << 42;
+        assert!(page.publish(&other_entries, 0x3000usize as *const (), 6, 1, 0, false));
+        page.commit_compile_snapshot(6, &other_entries, false);
+        assert!(!page.has_compile_snapshot(),
+            "the committed record described the replaced code and must go");
     }
 
     #[test]
@@ -4365,11 +4730,11 @@ mod tests {
         let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
 
         page.stage_compile_snapshot(&words, &used, &entries, 5, false);
-        assert!(page.publish(&entries, 0x1000usize as *const (), 5, 1, 0));
+        assert!(page.publish(&entries, 0x1000usize as *const (), 5, 1, 0, false));
         // A different compile's publish tries to vouch for it.
         let mut other_entries = [0u64; BITMAP_WORDS];
         other_entries[0] |= 1u64 << 42;
-        page.commit_compile_snapshot(5, &other_entries);
+        page.commit_compile_snapshot(5, &other_entries, false);
         assert!(!page.has_compile_snapshot(),
             "a commit whose entries don't match the staged record must drop it, not validate it");
     }
@@ -4400,7 +4765,7 @@ mod tests {
 
         page.stage_compile_snapshot(&words, &used, &entries, 5, false);
         page.reset_to_unclaimed();
-        page.commit_compile_snapshot(5, &entries);
+        page.commit_compile_snapshot(5, &entries, false);
         assert!(!page.has_compile_snapshot(),
             "a commit arriving after a reset must not revive the snapshot");
     }
@@ -4587,7 +4952,7 @@ mod tests {
         counter.store(8, Ordering::Relaxed);
         assert!(!page.try_skip_redundant_compile(&changed, &only_10, 8, false),
             "a changed decoded word must force a real compile");
-        assert!(page.publish(&only_10, 0x2000usize as *const (), 8, 1, 0));
+        assert!(page.publish(&only_10, 0x2000usize as *const (), 8, 1, 0, false));
         assert!(!page.is_denylisted(40),
             "the real compile's publish must reset denied, healing any stale denial a skip carried");
     }
@@ -4671,8 +5036,8 @@ mod tests {
             used_b[i] |= !*w;
         }
         page.stage_compile_snapshot(&words, &used_b, &entries_b, 5, false);
-        assert!(page.publish(&entries_b, 0x2000usize as *const (), 5, 1, 0));
-        page.commit_compile_snapshot(5, &entries_b);
+        assert!(page.publish(&entries_b, 0x2000usize as *const (), 5, 1, 0, false));
+        page.commit_compile_snapshot(5, &entries_b, false);
         assert!(page.is_denylisted(40), "a same-gen publish must not reset denied");
 
         let mut only_10 = [0u64; BITMAP_WORDS];
@@ -4707,7 +5072,7 @@ mod tests {
         // Mechanically there is also a backstop, which is what this test
         // pins: every CPU-thread path that touches denial state (`j2 deny`
         // in the monitor, and the FR-guard's `jit_kill_entry`) also calls
-        // `kill()`, and `kill()` sets `killed_since_snapshot`, which refuses
+        // `kill()`, and `kill()` bumps `kills`, which refuses
         // the next skip outright so a real compile re-derives everything.
         //
         // If a future CPU-thread path ever denylists WITHOUT killing, this
@@ -4729,6 +5094,28 @@ mod tests {
         assert!(!page.try_skip_redundant_compile(&words, &only_10, 6, false),
             "a kill from the CPU thread must block the next skip, so a real compile re-derives \
              coverage and denial state rather than a skip carrying stale assumptions forward");
+    }
+
+    #[test]
+    fn a_compile_path_denial_does_not_block_a_skip_of_the_installed_code() {
+        // The compile path denies and un-publishes an entry together
+        // (`kill_denylisted`). That must not poison the page's snapshot: the
+        // denial already keeps the offset out of every skip's candidate set.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        page.denylist(40);
+        page.kill_denylisted(40);
+        let mut only_10 = [0u64; BITMAP_WORDS];
+        only_10[0] |= 1u64 << 10;
+        counter.store(6, Ordering::Relaxed);
+        assert!(page.try_skip_redundant_compile(&words, &only_10, 6, false),
+            "a compile-path denial must leave the installed code's snapshot usable");
+        assert!(!page.snapshot_compiled().iter().enumerate()
+            .any(|(i, w)| i == 0 && w & (1u64 << 40) != 0),
+            "the denied offset must not be re-advertised");
     }
 
     #[test]
@@ -4779,7 +5166,7 @@ mod tests {
         let offset = 7usize;
         let mut bits = [0u64; BITMAP_WORDS];
         bits[offset / 64] |= 1u64 << (offset % 64);
-        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0));
+        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0, false));
         assert!(page.is_runnable(offset));
 
         page.denylist(offset);
@@ -4803,22 +5190,22 @@ mod tests {
 
         let mut bits = [0u64; BITMAP_WORDS];
         bits[0] |= 1u64 << 4;
-        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0));
+        assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0, false));
         assert_eq!(page.compiles_since_flush(), 1);
 
         // A redundant publish (nothing new, same generation) must not count.
-        assert!(!page.publish(&bits, 0x1000 as *const (), 0, 1, 0));
+        assert!(!page.publish(&bits, 0x1000 as *const (), 0, 1, 0, false));
         assert_eq!(page.compiles_since_flush(), 1, "a subsumed/no-op publish must not increment the counter");
 
         let mut bits2 = [0u64; BITMAP_WORDS];
         bits2[0] |= 1u64 << 8;
-        assert!(page.publish(&bits2, 0x1000 as *const (), 0, 1, 0));
+        assert!(page.publish(&bits2, 0x1000 as *const (), 0, 1, 0, false));
         assert_eq!(page.compiles_since_flush(), 2);
 
         page.reset_to_unclaimed();
         assert_eq!(page.compiles_since_flush(), 0, "reset_to_unclaimed must clear it");
 
-        assert!(page.publish(&bits, 0x2000 as *const (), 0, 1, 0));
+        assert!(page.publish(&bits, 0x2000 as *const (), 0, 1, 0, false));
         assert_eq!(page.compiles_since_flush(), 1);
         page.reset_to_unclaimed();
         assert_eq!(page.compiles_since_flush(), 0, "reset_to_unclaimed must clear it too");
@@ -4924,11 +5311,11 @@ mod tests {
 
         // Two pages at instr_count=3 (sizes 100, 300), one at instr_count=5 (size 50).
         let slot_a = jit.page_for(0, 0, &dev, false).unwrap() as usize;
-        assert!(jit.pages[slot_a].publish(&bits0, 0x1000 as *const (), 0, 3, 100));
+        assert!(jit.pages[slot_a].publish(&bits0, 0x1000 as *const (), 0, 3, 100, false));
         let slot_b = jit.page_for(1, PAGE_SIZE, &dev, false).unwrap() as usize;
-        assert!(jit.pages[slot_b].publish(&bits0, 0x2000 as *const (), 0, 3, 300));
+        assert!(jit.pages[slot_b].publish(&bits0, 0x2000 as *const (), 0, 3, 300, false));
         let slot_c = jit.page_for(2, 2 * PAGE_SIZE, &dev, false).unwrap() as usize;
-        assert!(jit.pages[slot_c].publish(&bits0, 0x3000 as *const (), 0, 5, 50));
+        assert!(jit.pages[slot_c].publish(&bits0, 0x3000 as *const (), 0, 5, 50, false));
 
         let hist = jit.code_size_by_instr_count();
         let bucket3 = hist[3].expect("instr_count=3 bucket must be present");
@@ -5063,7 +5450,7 @@ mod tests {
         let mut q = CompileQueue::new();
         q.start(dev, std::sync::Arc::new(JitStats::default()));
 
-        // A real (non-null) gen counter: page.publish() calls current_gen(),
+        // A real (non-null) gen counter: page.publish(, false) calls current_gen(),
         // which is always safe now (reads the shared NEVER_COMPILABLE_GEN
         // fallback for a null gen), but this test wants a real, independent
         // counter behind it since it's exercising a real compile+publish,

@@ -127,6 +127,40 @@ fn is_snan_s(bits: u32) -> bool {
     (bits & 0x7F80_0000) == 0x7F80_0000 && (bits & 0x007F_FFFF) != 0 && (bits & 0x0040_0000) == 0
 }
 
+/// Negate by flipping the sign bit, which is what IEEE-754 negation *is*.
+///
+/// These exist because `-x.mul_add(y, z)` could not be trusted, back when the
+/// multiply-add family was computed with a fused `mul_add` (it no longer is:
+/// see `exec_madd_s`). LLVM rewrites `-fma(a, b, -c)` into `fma(-a, b, c)` —
+/// algebraically identical, and wrong for signed zeros. It made NMSUB.D(+0, +0, +0) return `+0.0` where MIPS IV
+/// requires `-((fs*ft) - fr)` = `-(+0.0)` = `-0.0`, and it did so only in
+/// NMSUB: MSUB, computing the very same inner FMA without the outer negation,
+/// returned `+0.0` correctly. Two "identical" expressions disagreeing is the
+/// tell.
+///
+/// Found 2026-09-22 by the jitv2 equivalence harness, which flagged a
+/// divergence against a new `fneg`-based JIT emitter that was doing the right
+/// thing. A bit flip is not reassociable, so it stays correct.
+///
+/// Only the *outer* negation needs this. Negating an operand (`-fr_val`
+/// feeding the addend) is a plain unary neg on a value LLVM cannot fold
+/// through an FMA, and is sign-correct as written.
+/// `black_box` is load-bearing, not decoration. A plain
+/// `f64::from_bits(v.to_bits() ^ SIGN)` does **not** survive: LLVM's
+/// InstCombine recognises that idiom as `fneg` and then re-applies the very
+/// reassociation this exists to prevent. Measured — the bit-twiddling version
+/// alone still returned `+0.0` for NMSUB.D(+0, +0, +0). The barrier stops
+/// LLVM tracing the value back to the FMA that produced it.
+#[inline]
+fn fneg_bits_s(v: f32) -> u32 {
+    std::hint::black_box(v).to_bits() ^ 0x8000_0000
+}
+
+#[inline]
+fn fneg_d_exact(v: f64) -> f64 {
+    f64::from_bits(std::hint::black_box(v).to_bits() ^ 0x8000_0000_0000_0000)
+}
+
 /// Same as `is_snan_s`, for IEEE-754 double-precision bit patterns.
 #[inline]
 fn is_snan_d(bits: u64) -> bool {
@@ -2647,7 +2681,17 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // counter — see `jitv2_compile_queue_handle`/`jitv2_stats`'s own
         // doc comments on the struct fields.
         #[cfg(feature = "jitv2")]
-        let jitv2 = crate::jitv2::Jitv2::new(crate::jitv2::JITV2_INITIAL_PAGE_CAPACITY);
+        let mut jitv2 = crate::jitv2::Jitv2::new(crate::jitv2::JITV2_INITIAL_PAGE_CAPACITY);
+        // The ISA level travels as data rather than through a global: the
+        // model's `MIPS4` const goes to the compile pool here and to this
+        // executor's own inline analyzer below, and from there into
+        // `classify`. The interpreter reads `C::MIPS4` at every decode; the
+        // compile workers have no `C` in scope, so they are handed the value
+        // before they exist. An R4400 must raise Reserved Instruction on
+        // MIPS IV encodings where an R5000/R10000 may execute them, and one
+        // binary serves both.
+        #[cfg(feature = "jitv2")]
+        jitv2.compile_queue.set_isa(C::MIPS4);
         #[cfg(feature = "jitv2")]
         let jitv2_compile_queue_handle = jitv2.compile_queue.queue_handle();
         #[cfg(feature = "jitv2")]
@@ -2762,9 +2806,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "jitv2")]
             jitv2_inline_compile: cfg!(feature = "jitv2_lockstep"),
             #[cfg(feature = "jitv2")]
-            jitv2_inline_analyzer: crate::jitv2::analyzer::Analyzer::new(),
+            jitv2_inline_analyzer: crate::jitv2::analyzer::Analyzer::with_isa(C::MIPS4),
+            // IRIS_JIT_DISPATCH=off starts with the JIT dispatch gate shut: the
+            // same binary as an interpreter-only reference, for comparing
+            // results against compiled code (cpu-tests/jitcov). The monitor's
+            // `j2 dispatch on|off` still flips it at runtime.
             #[cfg(feature = "jitv2")]
-            jitv2_dispatch_enabled: true,
+            jitv2_dispatch_enabled: !matches!(std::env::var("IRIS_JIT_DISPATCH").as_deref(), Ok("off") | Ok("0")),
             #[cfg(feature = "developer")]
             hw_read_fixup_replay: None,
             #[cfg(feature = "developer")]
@@ -2908,7 +2956,12 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             // it (see `codegen::JitConsts`). Republished on every call so a
             // tcache window remap keeps the constants honest.
             let consts = crate::jitv2::codegen::JitConsts {
-                core: core::num::NonZeroUsize::new(core_addr),
+                // IRIS_JIT_PIC=1: publish no core address, so codegen loads the
+                // hook pointers from the core instead of baking them. Compiled
+                // code then holds no host address at all (the memory helpers,
+                // the other baked address, are off unless IRIS_MEM_HELPERS is
+                // set) -- the property a persistent code cache needs.
+                core: if std::env::var_os("IRIS_JIT_PIC").is_some() { None } else { core::num::NonZeroUsize::new(core_addr) },
             };
             *j.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -3896,6 +3949,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     let status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
                     break 'gate if status != EXEC_FALLBACK { status } else { self.step_int() };
                 }
+                // A denylisted offset has nothing to compile against these
+                // bytes: `prepare` masks denied offsets out of every
+                // candidate set. Requesting anyway (a fresh arrival at a
+                // kernel entry the JIT excludes happens on every exception)
+                // cost a full page snapshot per arrival, and kept a page
+                // whose FR pin and installed code disagreed recompiling in a
+                // loop. It also moved the page's FR pin for a compile that
+                // could not use it. Once the bytes change (`entry_gen` behind
+                // `current_gen`), the next publish resets `denied`, so the
+                // arrival asks again as before.
+                if page.is_denylisted(entry_offset) && page.entry_gen() == page.current_gen() {
+                    break 'gate self.step_int();
+                }
                 let inline_compile = self.jitv2_inline_compile;
                 self.core.jit_trigger = false;
                 // Must mark requested before building `req` —
@@ -3930,6 +3996,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                             #[cfg(feature = "developer")]
                             page.mark_send_dropped_queue_full();
                         }
+                    } else if page.note_waiting_arrival() {
+                        // Already queued, and being executed hard while it
+                        // waits: jump the queue (jitv2::HOT_QUEUE).
+                        crate::jitv2::jitv2::push_hot_request(req);
                     }
                     break 'gate self.step_int();
                 }
@@ -8269,6 +8339,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         self.handle_exec_complete()
     }
+    // MADD/MSUB/NMADD/NMSUB.S/D: `fd = ±(fs*ft ± fr)`, *not* fused. MIPS IV
+    // rounds the product to the format and then adds, rounding again; the
+    // R10000 does it as one pass through its multiplier and a second through
+    // its adder (User's Manual, ch. 1). A fused multiply-add (`mul_add`)
+    // rounds once and differs in the last bit on many inputs, which compilers
+    // that emit MADD for `a*b + c` (MIPSpro, LLVM) do not expect. Rust never
+    // fuses a separate `*` and `+`. (MIPS32r6's MADDF is the fused one.)
     fn exec_madd_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fr_bits = (self.fpr_read_w)(&self.core, d.rs as u32);
@@ -8278,7 +8355,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_s(fr_bits, ft_bits, fs_bits);
         let write_w = self.fpr_write_w;
-        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, (fs_val.mul_add(ft_val, fr_val)).to_bits()))
+        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, (fs_val * ft_val + fr_val).to_bits()))
     }
     fn exec_madd_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8288,7 +8365,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fs_val = read_d(&self.core, d.rd as u32);
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_d(fr_val.to_bits(), ft_val.to_bits(), fs_val.to_bits());
-        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, fs_val.mul_add(ft_val, fr_val)))
+        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, fs_val * ft_val + fr_val))
     }
     fn exec_msub_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8299,7 +8376,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_s(fr_bits, ft_bits, fs_bits);
         let write_w = self.fpr_write_w;
-        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, (fs_val.mul_add(ft_val, -fr_val)).to_bits()))
+        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, (fs_val * ft_val - fr_val).to_bits()))
     }
     fn exec_msub_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8309,7 +8386,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fs_val = read_d(&self.core, d.rd as u32);
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_d(fr_val.to_bits(), ft_val.to_bits(), fs_val.to_bits());
-        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, fs_val.mul_add(ft_val, -fr_val)))
+        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, fs_val * ft_val - fr_val))
     }
     fn exec_nmadd_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8320,7 +8397,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_s(fr_bits, ft_bits, fs_bits);
         let write_w = self.fpr_write_w;
-        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, (-fs_val.mul_add(ft_val, fr_val)).to_bits()))
+        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, fneg_bits_s(fs_val * ft_val + fr_val)))
     }
     fn exec_nmadd_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8330,7 +8407,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fs_val = read_d(&self.core, d.rd as u32);
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_d(fr_val.to_bits(), ft_val.to_bits(), fs_val.to_bits());
-        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, -fs_val.mul_add(ft_val, fr_val)))
+        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, fneg_d_exact(fs_val * ft_val + fr_val)))
     }
     fn exec_nmsub_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8341,7 +8418,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fd_reg = d.sa as u32;
         let flags = Self::fpu_arith_flags_snan_only3_s(fr_bits, ft_bits, fs_bits);
         let write_w = self.fpr_write_w;
-        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, (-fs_val.mul_add(ft_val, -fr_val)).to_bits()))
+        self.fpu_update_fcsr(flags, |exec| write_w(&mut exec.core, fd_reg, fneg_bits_s(fs_val * ft_val - fr_val)))
     }
     fn exec_nmsub_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8351,7 +8428,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let fs_val = read_d(&self.core, d.rd as u32);
         let flags = Self::fpu_arith_flags_snan_only3_d(fr_val.to_bits(), ft_val.to_bits(), fs_val.to_bits());
         let fd_reg = d.sa as u32;
-        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, -fs_val.mul_add(ft_val, -fr_val)))
+        self.fpu_update_fcsr(flags, |exec| write_d(&mut exec.core, fd_reg, fneg_d_exact(fs_val * ft_val - fr_val)))
     }
 
     // LWC1 - Load Word to FPU
@@ -13302,8 +13379,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // keeping them always-on costs nothing.
                         {
                             let code_bytes = jit.code_bytes_used();
-                            writeln!(writer, "arena bytes (host-page-rounded, ~{}KiB/fn floor): {} ({:.1} KiB) across published entries — best-effort proxy for actual Cranelift arena size, not the arena's own byte count (cranelift_jit::Memory exposes none)",
-                                crate::jitv2::codegen::Codegen::HOST_PAGE_SIZE / 1024, code_bytes, code_bytes as f64 / 1024.0).unwrap();
+                            writeln!(writer, "arena bytes (sum of published code_size): {} ({:.1} KiB) — proxy for the Cranelift arena, for when `packing_stats` cannot be read (pool busy); the arena packs, so this is close but excludes alignment padding",
+                                code_bytes, code_bytes as f64 / 1024.0).unwrap();
                         }
                         // Everything below is genuinely developer-only
                         // (rejection reasons, fallback counters, stats fields
