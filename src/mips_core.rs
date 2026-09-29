@@ -1951,26 +1951,40 @@ impl MipsCore {
                 //     new deadline. Leave IP7 clear; the next architectural
                 //     match is a full 32-bit wrap away.
                 //
-                //  2. Compare != the last read, yet still behind the current
-                //     Count. The guest asked for a real deadline
+                //  2. Compare lies after the last read and at or before the
+                //     current Count. The guest asked for a real deadline
                 //     (`read_c0_count() + delta`) that we blew through while
                 //     emulating the handful of instructions between its read
                 //     and this write. On hardware IP7 would already be
                 //     asserted, so raise it now rather than waiting a wrap.
                 //
-                //  3. Compare is ahead of Count: an ordinary future deadline.
+                //  3. Compare is behind Count but not in that window: it is
+                //     no deadline the guest could have just missed, whatever
+                //     the signed distance says. `write_c0_compare(~0)` to
+                //     park the timer after an ack is the usual shape. On
+                //     hardware it matches only after Count climbs that far,
+                //     so leave IP7 clear, as for an ack.
+                //
+                //  4. Compare is ahead of Count: an ordinary future deadline.
                 //     Leave IP7 clear and let the timer deliver it.
                 //
-                // Every case re-arms schedule_compare_timer below; for 1 and
-                // 2 that is the full-wrap arm, which is correct -- there is
-                // no way to disable the MIPS timer, so "no deadline" is
-                // expressed as a match a wrap away.
+                // Every case re-arms schedule_compare_timer below; for 1 to 3
+                // that is an arm at the next architectural match, which is
+                // correct -- there is no way to disable the MIPS timer, so
+                // "no deadline" is expressed as a match far away.
                 let compare_u32 = self.cp0_compare as u32;
                 let in_future = compare_u32.wrapping_sub(count_before) != 0
                     && (compare_u32.wrapping_sub(count_before) as i32) > 0;
+                // Case 2's window, measured from the last read so it holds
+                // across a Count wrap: (last read, current Count].
+                let last_read = self.count_last_guest_read;
+                let since_last_read = compare_u32.wrapping_sub(last_read);
+                let missed = since_last_read != 0
+                    && since_last_read <= count_before.wrapping_sub(last_read);
                 if !in_future {
-                    if compare_u32 == self.count_last_guest_read {
-                        // Case 1: pure ack. IP7 stays cleared above.
+                    if compare_u32 == last_read || !missed {
+                        // Case 1 (pure ack) or 3 (parked far away). IP7
+                        // stays cleared above.
                         #[cfg(feature = "developer_ip7")]
                         { self.ip7_acks += 1; }
                     } else {
@@ -2004,7 +2018,8 @@ impl MipsCore {
                             self.cp0_compare as u32,
                             signed,
                             if in_future { "FUTURE " }
-                            else if compare_u32 == self.count_last_guest_read { "ACK    " }
+                            else if compare_u32 == last_read { "ACK    " }
+                            else if !missed { "PARKED " }
                             else { "LATE!  " },
                             self.fasttick_count.load(Ordering::Relaxed),
                             self.ip7_acks,
@@ -2560,6 +2575,47 @@ mod ip7_ticket_tests {
             pending & CAUSE_IP7, 0,
             "a Compare written behind Count is an overrun deadline: IP7 is \
              owed now, not a full 32-bit wrap from now"
+        );
+    }
+
+    /// Parking the timer far away after an ack -- `write_c0_compare(~0)`, as
+    /// cpu-tests' `cp0/compare_sets_ip7` does -- is behind Count by the
+    /// signed distance, but it is no deadline the guest could have missed:
+    /// it lies nowhere between the guest's last read and now. It must not
+    /// raise IP7. It did, which failed that test whenever its timer fired.
+    #[test]
+    fn a_compare_parked_far_away_does_not_raise_ip7() {
+        let mut core = core_past_its_compare();
+        let now = core.count_peek();
+        core.count_last_guest_read = now.wrapping_sub(3);
+        core.write_cp0(11, 0xFFFF_FFFF);
+
+        let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
+        assert_eq!(
+            pending & CAUSE_IP7, 0,
+            "Compare = 0xFFFFFFFF with Count near 0 is a match about 2^32 \
+             ticks away, not a deadline missed since the last read"
+        );
+    }
+
+    /// The missed-deadline window is measured from the last read, so it
+    /// holds when Count wraps between that read and the Compare write: a
+    /// read just before the wrap, a deadline just after it, and Count
+    /// materialized past both is still a deadline the guest just missed.
+    #[test]
+    fn a_missed_deadline_across_a_count_wrap_still_raises_ip7() {
+        let mut core = core_past_its_compare();
+        core.write_cp0(9, 0xFFFF_FF00);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        core.hot.cycles += 1; // see core_past_its_compare: let Count move
+        let now = core.count_peek();
+        assert!(now < 0x8000_0000, "Count should have wrapped by now: {now:#x}");
+
+        core.count_last_guest_read = 0xFFFF_FF80;
+        core.write_cp0(11, 0x10);
+        assert_ne!(
+            core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7, 0,
+            "a deadline between the last read and Count is owed across a wrap"
         );
     }
 }

@@ -48,6 +48,14 @@ skipped in both runs measured here, so it did not contribute to the 2100<->2101
 delta — but it can move the *total* by one without any test failing, which is
 another reason to compare identities rather than counts.
 
+Until 2026-09-29 the fired path also **failed** its second check, every time:
+the test parks the timer with `Compare = 0xFFFFFFFF`, and the Compare-write
+classifier in `mips_core.rs` read any Compare behind Count by the signed
+distance as a missed deadline and raised IP7 again. That was the intermittent
+"1 new" failing check on CI, in any of the four jobs, on any branch. The
+classifier now raises IP7 only for a Compare between the guest's last Count
+read and the current Count; a fired run shows one more *passed* check.
+
 **`make run`'s exit code is the failure count**, not a boolean: `Error 62` here
 means 62 failed checks, not "error 62". `Error 124` is different — that is
 `timeout(1)`, i.e. the run was killed (see below).
