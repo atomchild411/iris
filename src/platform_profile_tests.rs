@@ -15,7 +15,7 @@ mod tests {
     };
     use crate::eeprom_93c56::Eeprom93c56;
     use crate::ioc::{Ioc, IOC_BASE, IOC_SYS_ID, l1_regs, IOC_INT3_L1_STAT};
-    use crate::mgras::{self, reg as mgras_reg, Mgras, MGRAS_REG_OFF, MGRAS_SLOT_GFX_BASE};
+    use crate::mgras::{Mgras, GIO_ID, MGRAS_SLOT_GFX_BASE};
     use crate::traits::{BusDevice, Saveable};
     use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant, GR2_BASE};
 
@@ -185,35 +185,12 @@ mod tests {
     }
 
     #[test]
-    fn mgras_solid_impact_board_id() {
-        let cfg = ImpactSection {
-            gfx: ImpactSlot::Solid,
-            exp0: ImpactSlot::None,
-            exp1: ImpactSlot::None,
-        };
-        let m = Mgras::new(&cfg);
-        let addr = MGRAS_SLOT_GFX_BASE + MGRAS_REG_OFF + mgras_reg::BOARD_ID;
-        let id = m.read32(addr).data;
-        assert_eq!(id, mgras_reg::board_id_for(ImpactSlot::Solid));
-    }
-
-    #[test]
-    fn mgras_maximum_three_slot_map() {
-        let cfg = ImpactSection {
-            gfx: ImpactSlot::Solid,
-            exp0: ImpactSlot::High,
-            exp1: ImpactSlot::Max,
-        };
-        let m = Mgras::new(&cfg);
-        assert!(m.any_slot());
-        for (slot, kind) in [
-            (mgras::MGRAS_SLOT_GFX_BASE, ImpactSlot::Solid),
-            (mgras::MGRAS_SLOT_EXP0_BASE, ImpactSlot::High),
-            (mgras::MGRAS_SLOT_EXP1_BASE, ImpactSlot::Max),
-        ] {
-            let addr = slot + MGRAS_REG_OFF + mgras_reg::BOARD_ID;
-            assert_eq!(m.read32(addr).data, mgras_reg::board_id_for(kind));
-        }
+    fn mgras_answers_the_gio_id_probe() {
+        let cfg = ImpactSection { gfx: ImpactSlot::Solid, exp0: ImpactSlot::None, exp1: ImpactSlot::None };
+        let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ioc = crate::ioc::Ioc::new(false);
+        let m = Mgras::new(&cfg, ioc, hb.clone(), hb);
+        assert_eq!(m.read32(MGRAS_SLOT_GFX_BASE).data, GIO_ID);
     }
 
     #[test]
