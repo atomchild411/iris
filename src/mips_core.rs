@@ -431,10 +431,6 @@ pub struct MipsCore {
     /// ppmem window base — tcache's data source (`tc_base + phys`).
     #[cfg(all(feature = "jitv2", feature = "tcache"))]
     pub jit_tc_base: *mut u8,
-    /// 64MB-granularity mapped-region bitmap; bit `phys >> 26` set = the
-    /// region is fully mapped RAM and reachable through the window.
-    #[cfg(all(feature = "jitv2", feature = "tcache"))]
-    pub jit_tc_bitmap: *const u64,
     /// Base of the L2 tag array (`[L2Tag]`, `u32` each). The inline tcache
     /// store clears `has_code` on the written line so L1-I refills cannot
     /// reuse stale decoded instructions — mirroring `tc_invalidate_l2_code`.
@@ -1291,8 +1287,6 @@ impl MipsCore {
             jit_dc_data: std::ptr::null_mut(),
             #[cfg(all(feature = "jitv2", feature = "tcache"))]
             jit_tc_base: std::ptr::null_mut(),
-            #[cfg(all(feature = "jitv2", feature = "tcache"))]
-            jit_tc_bitmap: std::ptr::null(),
             #[cfg(all(feature = "jitv2", feature = "tcache"))]
             jit_l2_tags: std::ptr::null_mut(),
             #[cfg(all(feature = "jitv2", feature = "tcache"))]

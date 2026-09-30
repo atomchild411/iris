@@ -3094,7 +3094,6 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         #[cfg(feature = "tcache")]
         {
             self.core.jit_tc_base = self.cache.tcache_base_ptr();
-            self.core.jit_tc_bitmap = self.cache.tcache_bitmap_ptr() as *const u64;
             self.core.jit_tc_gen = self.cache.tcache_gen_ptr();
             self.core.jit_l2_tags = self.cache.jit_l2_tags_ptr();
         }

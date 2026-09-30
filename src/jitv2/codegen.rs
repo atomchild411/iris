@@ -3810,8 +3810,6 @@ fn core_offset_of_jit_dc_data() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_d
 #[cfg(feature = "tcache")]
 fn core_offset_of_jit_tc_base() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_base) as i32 }
 #[cfg(feature = "tcache")]
-fn core_offset_of_jit_tc_bitmap() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_bitmap) as i32 }
-#[cfg(feature = "tcache")]
 fn core_offset_of_jit_tc_gen() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_gen) as i32 }
 #[cfg(feature = "tcache")]
 fn core_offset_of_jit_l2_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_l2_tags) as i32 }
@@ -4028,11 +4026,10 @@ fn emit_inline_mem_guard<const STORE: bool>(
 
     // ---- 4. tcache: region must be mapped RAM ------------------------
     //
-    // `jit_tc_bitmap` is never null here: `install_jit_mem_ptrs` points it at
-    // the cache's own inline bitmap word, which exists from construction, and
-    // ppmem later publishes into that same word rather than replacing the
-    // pointer. No null check is emitted — one on every guest memory access to
-    // paper over a startup ordering problem would be paid forever.
+    // The bitmap is `MipsCore::ppmem_bitmap`, read at a fixed offset from the
+    // core: ppmem publishes the same bits there and into the cache's own
+    // copy in one statement on every remap, so it needs no pointer, no null
+    // check and no second load.
     #[cfg(feature = "tcache")]
     let proceed = {
         let mapped = emit_tc_mapped(ctx, phys);
@@ -4120,38 +4117,32 @@ fn emit_inline_mem_guard<const STORE: bool>(
 
 /// tcache's gate, step 4 of `emit_inline_mem_guard`: is `phys` in a region
 /// ppmem maps whole? Shared with the tagless path.
+///
+/// One load: the bitmap is the core's own `ppmem_bitmap` field. Reaching it
+/// through a pointer to the cache's copy put a second, dependent load on
+/// every guest load and store.
 #[cfg(feature = "tcache")]
 fn emit_tc_mapped(ctx: &mut EmitCtx, phys: Value) -> Value {
     let mem = MemFlagsData::trusted();
-    let ptr_ty = ctx.module.target_config().pointer_type();
     let i64t = ir::types::I64;
-    let bm_ptr = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
-        ir::immediates::Offset32::new(core_offset_of_jit_tc_bitmap()));
-    let bits = ctx.builder.ins().load(i64t, mem, bm_ptr, ir::immediates::Offset32::new(0));
-    // Tested `(bits >> region) & 1` here as a "two fewer IR instructions"
-    // simplification. It is not one: measured over 500 corpus pages with
-    // the inline path emitting, it produced *more* code (5,901,554 ->
-    // 5,966,525 bytes, +1.1%). Cranelift lowers the `1 << region` form
-    // better — the mask feeds a `test` directly, while the shift form
-    // needs the variable shift's result materialized first. Left as is.
-    // Test the region's bit as `(bits >> region) & 1` instead of building
-    // `1 << region` and masking with it — same predicate, one fewer IR
-    // instruction (no materialized `1`).
+    let bits = ctx.builder.ins().load(i64t, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, ppmem_bitmap) as i32));
+    // `bits & (1 << region)`, not `(bits >> region) & 1`. The shift form
+    // is one IR instruction shorter but not less code: over 500 corpus pages
+    // with the inline path emitting it produced more (5,901,554 -> 5,966,525
+    // bytes, +1.1%), because Cranelift feeds the mask straight into a `test`
+    // while the shift form needs the variable shift's result materialized
+    // first. On a live workload it was also slower: an awk array loop in
+    // IRIX 6.5.22 on the IP28 (aarch64 host) ran 4.6-4.9 s with the shift
+    // form and 4.0 s with this one.
     //
-    // Static code size says this is slightly worse (+1.1% over 500 corpus
-    // pages with the inline path emitting: 5,901,554 -> 5,966,525), but
-    // this sits on the hot path of every guest memory access and byte
-    // count has repeatedly mispredicted real throughput in this codebase.
-    // Under evaluation on a live workload.
-    //
-    // Shift counts are masked to 6 bits by both x86 and Cranelift's `ushr`
-    // definition, exactly as the old `ishl` relied on, so an out-of-range
-    // `region` behaves identically.
+    // Cranelift's `ishl` masks the shift count to 6 bits, as x86 and aarch64
+    // do, so an out-of-range `region` wraps rather than being undefined.
     let region = ctx.builder.ins().ushr_imm_s(phys, crate::ppmem::BITMAP_SHIFT as i64);
-    let shifted = ctx.builder.ins().ushr(bits, region);
-    let mapped = ctx.builder.ins().band_imm_s(shifted, 1);
-    let mapped = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, mapped, 0);
-    mapped
+    let one = ctx.builder.ins().iconst(i64t, 1);
+    let bit = ctx.builder.ins().ishl(one, region);
+    let hit = ctx.builder.ins().band(bits, bit);
+    ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, hit, 0)
 }
 
 /// The tcache inline path for a tagless cache (`JitDcGeometry::tagless`, the
