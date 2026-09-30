@@ -3834,8 +3834,9 @@ fn l1d_tag_dirty_off() -> i32 { std::mem::offset_of!(crate::mips_cache_v2::L1DTa
 struct InlineMemPath {
     fast_data_ptr: Value,
     /// Pointer to the matched L1-D tag, live in the fast block. Stores use it
-    /// to set the dirty flag, mirroring `mark_l1d_dirty`.
-    fast_tag_ptr: Value,
+    /// to set the dirty flag, mirroring `mark_l1d_dirty`. `None` on a tagless
+    /// cache, which has no L1-D model to update.
+    fast_tag_ptr: Option<Value>,
     /// Physical address of the access, live in the fast block. Needed by the
     /// tcache store path to index the jitv2 generation array.
     fast_phys: Value,
@@ -3864,6 +3865,11 @@ fn emit_inline_mem_guard<const STORE: bool>(
 
     let geom = ctx.dc_geometry;
     if !geom.supported {
+        return None;
+    }
+    // A tagless cache has an inline path only through tcache's window.
+    #[cfg(not(feature = "tcache"))]
+    if geom.tagless {
         return None;
     }
 
@@ -3956,6 +3962,11 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let va_off = ctx.builder.ins().band_imm_s(vaddr, 0xFFF);
     let phys = ctx.builder.ins().bor(phys_page, va_off);
 
+    #[cfg(feature = "tcache")]
+    if geom.tagless {
+        return Some(emit_tagless_tail(ctx, phys, size, fast_block, slow_block, join_block));
+    }
+
     // ---- 2. L1D tag match --------------------------------------------
     //
     // Mirrors `ensure_l1d_line`'s hit path exactly (mips_cache_v2.rs). On a
@@ -4024,32 +4035,7 @@ fn emit_inline_mem_guard<const STORE: bool>(
     // paper over a startup ordering problem would be paid forever.
     #[cfg(feature = "tcache")]
     let proceed = {
-        let bm_ptr = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
-            ir::immediates::Offset32::new(core_offset_of_jit_tc_bitmap()));
-        let bits = ctx.builder.ins().load(i64t, mem, bm_ptr, ir::immediates::Offset32::new(0));
-        // Tested `(bits >> region) & 1` here as a "two fewer IR instructions"
-        // simplification. It is not one: measured over 500 corpus pages with
-        // the inline path emitting, it produced *more* code (5,901,554 ->
-        // 5,966,525 bytes, +1.1%). Cranelift lowers the `1 << region` form
-        // better — the mask feeds a `test` directly, while the shift form
-        // needs the variable shift's result materialized first. Left as is.
-        // Test the region's bit as `(bits >> region) & 1` instead of building
-        // `1 << region` and masking with it — same predicate, one fewer IR
-        // instruction (no materialized `1`).
-        //
-        // Static code size says this is slightly worse (+1.1% over 500 corpus
-        // pages with the inline path emitting: 5,901,554 -> 5,966,525), but
-        // this sits on the hot path of every guest memory access and byte
-        // count has repeatedly mispredicted real throughput in this codebase.
-        // Under evaluation on a live workload.
-        //
-        // Shift counts are masked to 6 bits by both x86 and Cranelift's `ushr`
-        // definition, exactly as the old `ishl` relied on, so an out-of-range
-        // `region` behaves identically.
-        let region = ctx.builder.ins().ushr_imm_s(phys, crate::ppmem::BITMAP_SHIFT as i64);
-        let shifted = ctx.builder.ins().ushr(bits, region);
-        let mapped = ctx.builder.ins().band_imm_s(shifted, 1);
-        let mapped = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, mapped, 0);
+        let mapped = emit_tc_mapped(ctx, phys);
         ctx.builder.ins().band(proceed, mapped)
     };
 
@@ -4129,7 +4115,75 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let swizzled = emit_swizzle_index(ctx, index, size);
     let fast_data_ptr = ctx.builder.ins().iadd(base, swizzled);
 
-    Some(InlineMemPath { fast_data_ptr, fast_tag_ptr: tag_ptr, fast_phys: phys, slow_block, join_block })
+    Some(InlineMemPath { fast_data_ptr, fast_tag_ptr: Some(tag_ptr), fast_phys: phys, slow_block, join_block })
+}
+
+/// tcache's gate, step 4 of `emit_inline_mem_guard`: is `phys` in a region
+/// ppmem maps whole? Shared with the tagless path.
+#[cfg(feature = "tcache")]
+fn emit_tc_mapped(ctx: &mut EmitCtx, phys: Value) -> Value {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let i64t = ir::types::I64;
+    let bm_ptr = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(core_offset_of_jit_tc_bitmap()));
+    let bits = ctx.builder.ins().load(i64t, mem, bm_ptr, ir::immediates::Offset32::new(0));
+    // Tested `(bits >> region) & 1` here as a "two fewer IR instructions"
+    // simplification. It is not one: measured over 500 corpus pages with
+    // the inline path emitting, it produced *more* code (5,901,554 ->
+    // 5,966,525 bytes, +1.1%). Cranelift lowers the `1 << region` form
+    // better — the mask feeds a `test` directly, while the shift form
+    // needs the variable shift's result materialized first. Left as is.
+    // Test the region's bit as `(bits >> region) & 1` instead of building
+    // `1 << region` and masking with it — same predicate, one fewer IR
+    // instruction (no materialized `1`).
+    //
+    // Static code size says this is slightly worse (+1.1% over 500 corpus
+    // pages with the inline path emitting: 5,901,554 -> 5,966,525), but
+    // this sits on the hot path of every guest memory access and byte
+    // count has repeatedly mispredicted real throughput in this codebase.
+    // Under evaluation on a live workload.
+    //
+    // Shift counts are masked to 6 bits by both x86 and Cranelift's `ushr`
+    // definition, exactly as the old `ishl` relied on, so an out-of-range
+    // `region` behaves identically.
+    let region = ctx.builder.ins().ushr_imm_s(phys, crate::ppmem::BITMAP_SHIFT as i64);
+    let shifted = ctx.builder.ins().ushr(bits, region);
+    let mapped = ctx.builder.ins().band_imm_s(shifted, 1);
+    let mapped = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, mapped, 0);
+    mapped
+}
+
+/// The tcache inline path for a tagless cache (`JitDcGeometry::tagless`, the
+/// R10000's shadow cache): there is no L1-D model to probe, so once the
+/// address is translated and cacheable the only question is tcache's gate,
+/// and a hit is a plain access at `jit_tc_base + phys` — the same window,
+/// byte lanes and (for stores, in `emit_mem_write_split`) generation bump as
+/// the tagged path, less the tag match, LRU and dirty bit.
+///
+/// `phys` is cut to 32 bits first, as the callout does: the shadow cache
+/// hands `phys as u32` to the bus, so an address above 4GB aliases here
+/// exactly as it does there.
+#[cfg(feature = "tcache")]
+fn emit_tagless_tail(
+    ctx: &mut EmitCtx, phys: Value, size: MemSize,
+    fast_block: ir::Block, slow_block: ir::Block, join_block: ir::Block,
+) -> InlineMemPath {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+
+    let phys = ctx.builder.ins().band_imm_s(phys, 0xFFFF_FFFF);
+    let mapped = emit_tc_mapped(ctx, phys);
+    ctx.builder.ins().brif(mapped, fast_block, &[], slow_block, &[]);
+
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+    let base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(core_offset_of_jit_tc_base()));
+    let swizzled = emit_swizzle_index(ctx, phys, size);
+    let fast_data_ptr = ctx.builder.ins().iadd(base, swizzled);
+
+    InlineMemPath { fast_data_ptr, fast_tag_ptr: None, fast_phys: phys, slow_block, join_block }
 }
 
 /// Byte index within the data array/window for `size`, applying the
@@ -4618,9 +4672,11 @@ fn emit_mem_write_split(
     // mark_l1d_dirty: one byte store into the tag we already located. Set
     // unconditionally rather than read-modify-write — it is idempotent, and a
     // load+branch to skip an already-dirty line costs more than the store.
-    let one = ctx.builder.ins().iconst(ir::types::I8, 1);
-    ctx.builder.ins().store(mem, one, path.fast_tag_ptr,
-                            ir::immediates::Offset32::new(l1d_tag_dirty_off()));
+    if let Some(tag_ptr) = path.fast_tag_ptr {
+        let one = ctx.builder.ins().iconst(ir::types::I8, 1);
+        ctx.builder.ins().store(mem, one, tag_ptr,
+                                ir::immediates::Offset32::new(l1d_tag_dirty_off()));
+    }
 
     // This mirrors `MipsCache::write`'s hit path exactly — that path is the
     // specification, and the job here is to reproduce it, not to re-derive

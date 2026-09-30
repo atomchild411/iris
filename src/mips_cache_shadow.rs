@@ -146,6 +146,17 @@ pub struct ShadowCache<
     ic: UnsafeCell<Shadow>,
     dc: UnsafeCell<Shadow>,
     l2: UnsafeCell<Shadow>,
+    /// tcache: ppmem's window base, its mapped-region bitmap (published into
+    /// directly on every remap) and the jitv2 generation window. This cache
+    /// reads nothing through them — `read`/`write` go to `downstream`, whose
+    /// ppmem path uses the same window — they are here only so jitv2's inline
+    /// tcache path can serve this model too (`jit_dc_geometry`).
+    #[cfg(feature = "tcache")]
+    tc_base: UnsafeCell<*mut u8>,
+    #[cfg(feature = "tcache")]
+    tc_bitmap: UnsafeCell<u64>,
+    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    tc_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -190,6 +201,12 @@ impl<
             // Only the secondary keeps a data shadow: it is the one a PROM
             // walks with Index_Store_Data, and a 1 MB array is cheap once.
             l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, L2_SIZE / 8)),
+            #[cfg(feature = "tcache")]
+            tc_base: UnsafeCell::new(std::ptr::null_mut()),
+            #[cfg(feature = "tcache")]
+            tc_bitmap: UnsafeCell::new(0),
+            #[cfg(all(feature = "tcache", feature = "jitv2"))]
+            tc_gen: UnsafeCell::new(std::ptr::null_mut()),
         }
     }
 
@@ -290,6 +307,41 @@ impl<
     const DC_WAYS: usize = 1;
     const L2_SIZE: usize = L2_SIZE;
     const L2_LINE: usize = L2_LINE;
+
+    #[cfg(feature = "tcache")]
+    unsafe fn set_tcache_window(&self, base: *mut u8) {
+        unsafe { *self.tc_base.get() = base };
+    }
+
+    #[cfg(feature = "tcache")]
+    fn tcache_bitmap_ptr(&self) -> *mut u64 { self.tc_bitmap.get() }
+
+    #[cfg(feature = "tcache")]
+    fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
+
+    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    fn tcache_gen_ptr(&self) -> *mut u8 { unsafe { *self.tc_gen.get() as *mut u8 } }
+
+    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    unsafe fn set_tcache_gen_window(&self, gen_base: *mut std::sync::atomic::AtomicU64) {
+        unsafe { *self.tc_gen.get() = gen_base };
+    }
+
+    /// Under tcache, a tagless geometry: the inline path is the window alone.
+    /// Declined until both windows are published, as `CpuCache` does, so the
+    /// emitted code can assume them. Without tcache there is no inline path:
+    /// every access calls out, exactly as for `PassthroughCache`.
+    fn jit_dc_geometry(&self) -> crate::mips_cache_v2::JitDcGeometry {
+        #[cfg(all(feature = "tcache", feature = "jitv2"))]
+        if !unsafe { *self.tc_base.get() }.is_null() && !unsafe { *self.tc_gen.get() }.is_null() {
+            return crate::mips_cache_v2::JitDcGeometry {
+                supported: true,
+                tagless: true,
+                ..crate::mips_cache_v2::JitDcGeometry::unsupported()
+            };
+        }
+        crate::mips_cache_v2::JitDcGeometry::unsupported()
+    }
 
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         let r = self.downstream.read32(phys_addr as u32);
@@ -676,5 +728,23 @@ mod tests {
         assert_eq!(c.get_config(CACH_PI), (32768, 64));
         assert_eq!(c.get_config(CACH_PD), (32768, 32));
         assert_eq!(c.get_config(CACH_SD), (1048576, 128));
+    }
+
+    /// Under tcache the JIT serves this model through the window alone, and
+    /// only once both windows are published: the emitted code dereferences
+    /// them without a null check.
+    #[test]
+    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    fn tcache_offers_a_tagless_path_once_both_windows_exist() {
+        let c = cache();
+        assert!(!c.jit_dc_geometry().supported, "no window yet");
+        let mut window = [0u8; 8];
+        unsafe { c.set_tcache_window(window.as_mut_ptr()) };
+        assert!(!c.jit_dc_geometry().supported, "no generation window yet");
+        let mut gens = [std::sync::atomic::AtomicU64::new(0)];
+        unsafe { c.set_tcache_gen_window(gens.as_mut_ptr()) };
+        let g = c.jit_dc_geometry();
+        assert!(g.supported && g.tagless && !g.has_l2,
+            "tagless, and no L2 decode slots for a store to invalidate: {g:?}");
     }
 }

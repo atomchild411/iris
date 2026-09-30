@@ -113,6 +113,7 @@ mod zz_corpus {
             // never participates. `num_lines_shift` is unread when ways == 1.
             ways: 1,
             num_lines_shift: 0,
+            tagless: false,
         };
         let mut total: u64 = 0;
         let mut n_ok = 0u64;

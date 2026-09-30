@@ -212,6 +212,11 @@ pub struct JitDcGeometry {
     /// `set | (way << num_lines_shift)` = extended tag index. Only meaningful
     /// when `ways > 1`.
     pub num_lines_shift: u32,
+    /// No L1-D model at all: loads and stores go straight to memory, so under
+    /// tcache the inline path is the ppmem-window half alone, with no tag
+    /// probe, no LRU and no dirty bit (the R10000's shadow cache). The other
+    /// fields are then unused.
+    pub tagless: bool,
 }
 
 impl JitDcGeometry {
@@ -219,7 +224,7 @@ impl JitDcGeometry {
         Self {
             supported: false, line_shift: 0, num_lines_mask: 0, data_mask: 0,
             has_l2: false, l2_line_shift: 0, l2_num_lines_mask: 0,
-            ways: 1, num_lines_shift: 0,
+            ways: 1, num_lines_shift: 0, tagless: false,
         }
     }
 }
@@ -3009,6 +3014,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             l2_num_lines_mask: if HAS_L2 { (L2_CACHE_SIZE / L2_LINE - 1) as u64 } else { 0 },
             ways: DC_WAYS as u32,
             num_lines_shift: Self::DC_NUM_LINES_SHIFT as u32,
+            tagless: false,
         }
     }
 
