@@ -2961,6 +2961,21 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         &self.core.ppmem_bitmap as *const u64 as *mut u64
     }
 
+    /// ppmem: publish the data and generation window bases for the JIT's
+    /// direct load/store path, then re-publish the JIT's memory state so
+    /// codegen learns the path is available.
+    ///
+    /// # Safety
+    /// `base` and `gen` must be ppmem's window bases (`window_base`,
+    /// `gen_window_base`), which live for the process. Must run before the
+    /// compile queue starts: workers copy `JitConsts` once, at startup.
+    #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+    pub unsafe fn set_ppmem_window(&mut self, base: *mut u8, gen: *mut std::sync::atomic::AtomicU64) {
+        self.core.jit_pp_base = base;
+        self.core.jit_pp_gen = gen as *mut u8;
+        self.install_jit_mem_ptrs();
+    }
+
     /// tcache: hand the cache ppmem's window base and mapped-region bitmap, so
     /// cacheable RAM accesses read/write the window directly instead of copying
     /// line data into the cache's own arrays.
@@ -3068,6 +3083,11 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 // the other baked address, are off unless IRIS_MEM_HELPERS is
                 // set) -- the property a persistent code cache needs.
                 core: if std::env::var_os("IRIS_JIT_PIC").is_some() { None } else { core::num::NonZeroUsize::new(core_addr) },
+                // The cache keeps no line data, so a load or store can go
+                // straight to ppmem's window once one is published.
+                direct_mem: C::DATA_PASSTHROUGH
+                    && !self.core.jit_pp_base.is_null()
+                    && !self.core.jit_pp_gen.is_null(),
             };
             *j.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -10546,6 +10566,15 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         self.ppmem_bitmap_ptr
     }
 
+    /// ppmem: see `MipsExecutor::set_ppmem_window`.
+    ///
+    /// # Safety
+    /// Same contract as that method.
+    #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+    pub unsafe fn set_ppmem_window(&self, base: *mut u8, gen: *mut AtomicU64) {
+        unsafe { self.executor.lock().set_ppmem_window(base, gen) };
+    }
+
     /// tcache: see `MipsExecutor::set_tcache_window`.
     ///
     /// # Safety
@@ -14253,6 +14282,12 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     /// `PpMemSpace::set_bitmap_sink`.
     #[cfg(feature = "ppmem")]
     fn ppmem_bitmap_ptr(&self) -> *mut u64;
+    /// ppmem + jitv2: hand the JIT the data and generation window bases.
+    ///
+    /// # Safety
+    /// Same contract as `MipsExecutor::set_ppmem_window`.
+    #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+    unsafe fn set_ppmem_window(&self, base: *mut u8, gen: *mut AtomicU64);
     /// tcache: hand the cache ppmem's window base + mapped-region bitmap.
     ///
     /// # Safety
@@ -14305,6 +14340,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn interrupts_ptr(&self) -> *const AtomicU64 { MipsCpu::interrupts_ptr(self) }
     #[cfg(feature = "ppmem")]
     fn ppmem_bitmap_ptr(&self) -> *mut u64 { MipsCpu::ppmem_bitmap_ptr(self) }
+    #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+    unsafe fn set_ppmem_window(&self, base: *mut u8, gen: *mut AtomicU64) {
+        unsafe { MipsCpu::set_ppmem_window(self, base, gen) }
+    }
     #[cfg(feature = "tcache")]
     unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { MipsCpu::set_tcache_window(self, base) }

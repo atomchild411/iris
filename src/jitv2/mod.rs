@@ -97,6 +97,7 @@ mod zz_corpus {
             // (baked immediate vs load) is identical to production.
             crate::jitv2::codegen::JitConsts {
                 core: core::num::NonZeroUsize::new(core as *mut MipsCore as usize),
+                direct_mem: false,
             }
         };
         // R4400 L1-D: 16 KiB direct-mapped, 32-byte lines; 1 MiB L2 with

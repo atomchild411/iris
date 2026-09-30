@@ -446,6 +446,19 @@ pub struct MipsCore {
     /// stops retiring compiled regions.
     #[cfg(all(feature = "jitv2", feature = "tcache"))]
     pub jit_tc_gen: *mut u8,
+    /// ppmem's 4GB data window: guest physical `p` is at `jit_pp_base + p`.
+    /// Read by compiled code at run time rather than baked in, so a compiled
+    /// region holds no host address of guest memory (the property the
+    /// persistent code cache needs). Null = no window, and the direct path
+    /// is not emitted.
+    #[cfg(feature = "jitv2")]
+    pub jit_pp_base: *mut u8,
+    /// ppmem's generation window: the jitv2 counter for physical `p` is the
+    /// u64 at `jit_pp_gen + (p >> 12) * 8`. A direct store bumps it, exactly
+    /// as `PpMemory::bump_gen` does, or self-modifying code keeps running
+    /// stale compiled regions.
+    #[cfg(feature = "jitv2")]
+    pub jit_pp_gen: *mut u8,
 
     /// JIT v2: monomorphized C-ABI memory-access and exception-delivery
     /// hooks, installed once by `MipsExecutor::install_jit_hooks` (mirrors
@@ -1297,6 +1310,10 @@ impl MipsCore {
             jit_l2_tags: std::ptr::null_mut(),
             #[cfg(all(feature = "jitv2", feature = "tcache"))]
             jit_tc_gen: std::ptr::null_mut(),
+            #[cfg(feature = "jitv2")]
+            jit_pp_base: std::ptr::null_mut(),
+            #[cfg(feature = "jitv2")]
+            jit_pp_gen: std::ptr::null_mut(),
             #[cfg(feature = "jitv2")]
             read8_fn: jit_hooks_not_installed_read,
             #[cfg(feature = "jitv2")]

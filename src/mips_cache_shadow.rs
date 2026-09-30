@@ -273,6 +273,8 @@ impl<
     const VA_BITS: u32 = if R10K_OPS { 44 } else { 40 };
     const NAME: &'static str = "shadow";
     const R10K_CACHE_OPS: bool = R10K_OPS;
+    // `read`/`write` never consult the shadow: memory is the only store.
+    const DATA_PASSTHROUGH: bool = true;
 }
 
 impl<

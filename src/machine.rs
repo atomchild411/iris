@@ -849,6 +849,12 @@ impl Machine {
                 let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
                 (*phys_ptr).resync_ppmem_bitmap();
             }
+            // IP28: the JIT reads and writes RAM straight out of the window.
+            // Before the compile queue starts below, which copies JitConsts.
+            #[cfg(all(feature = "ip28", feature = "jitv2"))]
+            if let Some(sp) = phys.ppmem_space() {
+                unsafe { cpu.set_ppmem_window(sp.window_base(), sp.gen_window_base()) };
+            }
             // tcache: the cache reads RAM straight out of the same window.
             // Must come after set_bitmap_sink, so it captures the CPU's inline
             // field rather than the sink the space just abandoned.

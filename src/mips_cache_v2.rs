@@ -446,6 +446,10 @@ pub trait CpuModel: MipsCache {
     /// and `Index_Load_Data` returns into it, neither of which is true of the
     /// R4000 hit operations that share those encodings.
     const R10K_CACHE_OPS: bool = false;
+    /// Loads and stores go straight to memory, with no line data in between
+    /// (the R10000's shadow cache). The JIT then reads and writes ppmem's
+    /// window inline instead of calling out for every access.
+    const DATA_PASSTHROUGH: bool = false;
 }
 
 pub trait MipsCache: Send + Sync {

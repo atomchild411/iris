@@ -812,7 +812,7 @@ impl Codegen {
         use std::fmt::Write as _;
         let _ = write!(
             s,
-            "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} triple={} flags={}",
+            "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} direct={} dc={:?} triple={} flags={}",
             crate::jitv2::comp::max_instrs_per_compile(),
             crate::jitv2::comp::min_instrs_to_compile(),
             Self::opt_level_speed(),
@@ -823,6 +823,7 @@ impl Codegen {
             crate::jitv2::entry_preamble_forced(),
             skip_entry_preamble,
             crate::jitv2::isa::mips4_enabled(),
+            self.jit_consts.direct_mem,
             self.dc_geometry,
             isa.triple(),
             isa.flags(),
@@ -1155,7 +1156,7 @@ impl Codegen {
         if self.mem_helpers.iter().any(|h| h.is_some()) {
             return;
         }
-        if !self.dc_geometry.supported {
+        if !self.dc_geometry.supported && !self.jit_consts.direct_mem {
             // No inline fast path on this cache, so a helper would have
             // nothing to guard — every access calls out to Rust anyway.
             return;
@@ -3834,8 +3835,9 @@ fn l1d_tag_dirty_off() -> i32 { std::mem::offset_of!(crate::mips_cache_v2::L1DTa
 struct InlineMemPath {
     fast_data_ptr: Value,
     /// Pointer to the matched L1-D tag, live in the fast block. Stores use it
-    /// to set the dirty flag, mirroring `mark_l1d_dirty`.
-    fast_tag_ptr: Value,
+    /// to set the dirty flag, mirroring `mark_l1d_dirty`. `None` on the
+    /// direct path, which has no L1-D model to update.
+    fast_tag_ptr: Option<Value>,
     /// Physical address of the access, live in the fast block. Needed by the
     /// tcache store path to index the jitv2 generation array.
     fast_phys: Value,
@@ -3863,7 +3865,8 @@ fn emit_inline_mem_guard<const STORE: bool>(
     use crate::mips_core as mc;
 
     let geom = ctx.dc_geometry;
-    if !geom.supported {
+    let direct = ctx.jit_consts.direct_mem;
+    if !geom.supported && !direct {
         return None;
     }
 
@@ -3955,6 +3958,11 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let phys_page = ctx.builder.ins().band_imm_s(e_phys, !0xFFFi64);
     let va_off = ctx.builder.ins().band_imm_s(vaddr, 0xFFF);
     let phys = ctx.builder.ins().bor(phys_page, va_off);
+
+    #[cfg(feature = "ppmem")]
+    if direct {
+        return Some(emit_direct_mem_tail(ctx, phys, size, fast_block, slow_block, join_block));
+    }
 
     // ---- 2. L1D tag match --------------------------------------------
     //
@@ -4129,7 +4137,53 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let swizzled = emit_swizzle_index(ctx, index, size);
     let fast_data_ptr = ctx.builder.ins().iadd(base, swizzled);
 
-    Some(InlineMemPath { fast_data_ptr, fast_tag_ptr: tag_ptr, fast_phys: phys, slow_block, join_block })
+    Some(InlineMemPath { fast_data_ptr, fast_tag_ptr: Some(tag_ptr), fast_phys: phys, slow_block, join_block })
+}
+
+/// The direct path, for a cache that keeps no line data (the R10000
+/// shadow cache): once the address is translated and cacheable, the only
+/// question left is whether it lies in a region ppmem maps whole, and if so
+/// the access is a plain host load or store at `jit_pp_base + phys`.
+///
+/// Mirrors the callout exactly: `ShadowCache::read`/`write` pass `phys as
+/// u32` to `Physical`, whose direct path tests `ppmem_bitmap` and indexes
+/// the window, and `PpMemory` stores words natively, doublewords rotated by
+/// 32, halves at `^2` and bytes at `^3`. The 32-bit truncation is copied
+/// too, so an address above 4GB aliases here exactly as it does there.
+///
+/// The window base is loaded from the core, not baked, so the emitted code
+/// carries no host address of guest memory.
+#[cfg(feature = "ppmem")]
+fn emit_direct_mem_tail(
+    ctx: &mut EmitCtx, phys: Value, size: MemSize,
+    fast_block: ir::Block, slow_block: ir::Block, join_block: ir::Block,
+) -> InlineMemPath {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let i64t = ir::types::I64;
+
+    let phys = ctx.builder.ins().band_imm_s(phys, 0xFFFF_FFFF);
+
+    // `Physical::ppmem_mapped`: bit `phys >> BITMAP_SHIFT` of the bitmap
+    // ppmem publishes into the core on every remap.
+    let bits = ctx.builder.ins().load(i64t, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, ppmem_bitmap) as i32));
+    let region = ctx.builder.ins().ushr_imm_s(phys, crate::ppmem::BITMAP_SHIFT as i64);
+    let one = ctx.builder.ins().iconst(i64t, 1);
+    let bit = ctx.builder.ins().ishl(one, region);
+    let hit = ctx.builder.ins().band(bits, bit);
+    let mapped = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, hit, 0);
+    ctx.builder.ins().brif(mapped, fast_block, &[], slow_block, &[]);
+
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+    let base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, jit_pp_base) as i32));
+    let x = match size { MemSize::B8 | MemSize::B4 => 0, MemSize::B2 => 2, MemSize::B1 => 3 };
+    let index = if x == 0 { phys } else { ctx.builder.ins().bxor_imm_s(phys, x) };
+    let fast_data_ptr = ctx.builder.ins().iadd(base, index);
+
+    InlineMemPath { fast_data_ptr, fast_tag_ptr: None, fast_phys: phys, slow_block, join_block }
 }
 
 /// Byte index within the data array/window for `size`, applying the
@@ -4255,11 +4309,12 @@ fn emit_mem_read_split(
                                      ir::immediates::Offset32::new(0));
     let raw = if size == MemSize::B8 {
         // tcache's window stores doublewords word-swapped; the cache data
-        // array does not (see tc_read vs dc_read).
+        // array does not (see tc_read vs dc_read). The direct path reads the
+        // same window.
         #[cfg(feature = "tcache")]
         { ctx.builder.ins().rotl_imm_s(raw, 32) }
         #[cfg(not(feature = "tcache"))]
-        { raw }
+        { if ctx.jit_consts.direct_mem { ctx.builder.ins().rotl_imm_s(raw, 32) } else { raw } }
     } else if extend == LoadExtend::Sign {
         ctx.builder.ins().sextend(i64t, raw)
     } else {
@@ -4318,6 +4373,12 @@ pub struct JitConsts {
     /// to loading from memory, exactly as before, so an un-stamped `Codegen`
     /// stays correct (just no faster).
     pub core: Option<core::num::NonZeroUsize>,
+    /// Loads and stores may read and write ppmem's window directly
+    /// (`MipsCore::jit_pp_base`), skipping the L1-D model: set when the
+    /// cache keeps no line data (the R10000 shadow cache) and a window is
+    /// published. Only the choice is baked; the window address is loaded at
+    /// run time.
+    pub direct_mem: bool,
 }
 
 impl JitConsts {
@@ -4608,7 +4669,7 @@ fn emit_mem_write_split(
         #[cfg(feature = "tcache")]
         { ctx.builder.ins().rotl_imm_s(value, 32) }
         #[cfg(not(feature = "tcache"))]
-        { value }
+        { if ctx.jit_consts.direct_mem { ctx.builder.ins().rotl_imm_s(value, 32) } else { value } }
     } else {
         ctx.builder.ins().ireduce(size.ir_type(), value)
     };
@@ -4618,9 +4679,29 @@ fn emit_mem_write_split(
     // mark_l1d_dirty: one byte store into the tag we already located. Set
     // unconditionally rather than read-modify-write — it is idempotent, and a
     // load+branch to skip an already-dirty line costs more than the store.
-    let one = ctx.builder.ins().iconst(ir::types::I8, 1);
-    ctx.builder.ins().store(mem, one, path.fast_tag_ptr,
-                            ir::immediates::Offset32::new(l1d_tag_dirty_off()));
+    if let Some(tag_ptr) = path.fast_tag_ptr {
+        let one = ctx.builder.ins().iconst(ir::types::I8, 1);
+        ctx.builder.ins().store(mem, one, tag_ptr,
+                                ir::immediates::Offset32::new(l1d_tag_dirty_off()));
+    }
+
+    // Direct path: `PpMemory::bump_gen`, `gen[phys >> 12] += 1`, through the
+    // generation window. A plain add, as the tcache store below does: the
+    // Rust side's `fetch_add(Relaxed)` only differs from it when a DMA write
+    // lands on the same page at the same instant, and then the counter still
+    // moves.
+    if ctx.jit_consts.direct_mem {
+        let ptr_ty = ctx.module.target_config().pointer_type();
+        let gen_base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+            ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, jit_pp_gen) as i32));
+        let page = ctx.builder.ins().ushr_imm_s(path.fast_phys, 12);
+        let off = ctx.builder.ins().imul_imm_s(page, 8);
+        let gp = ctx.builder.ins().iadd(gen_base, off);
+        let cur = ctx.builder.ins().load(ir::types::I64, mem, gp,
+            ir::immediates::Offset32::new(0));
+        let inc = ctx.builder.ins().iadd_imm_s(cur, 1);
+        ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+    }
 
     // This mirrors `MipsCache::write`'s hit path exactly — that path is the
     // specification, and the job here is to reproduce it, not to re-derive
