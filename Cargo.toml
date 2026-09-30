@@ -191,6 +191,12 @@ jitv2 = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-
 # specifically; opt in with --features jitv2_opcodefusion once it's earned
 # more confidence.
 jitv2_opcodefusion = ["jitv2"]
+# IP28: the Indigo2 IMPACT machine (IP28) and its R10000 CPU. Without it the
+# IP28 profile and the R10000 model are refused at startup with a message
+# naming this feature, and none of their code is built, so nothing behind it
+# can reach the R4400/R5000 machines. It implies ppmem: IP28 guest RAM is
+# always mapped through the host MMU. Add jitv2 for the JIT, as elsewhere.
+ip28 = ["ppmem"]
 # jitv2 whole-page compile (§13, rules/jitv2/jit-v2-design.md): whole-page
 # compilation is now the standard and only JIT v2 design. Kept as a compatibility
 # alias for `jitv2` so downstream scripts and builds specifying `--features j2wp`

@@ -179,6 +179,7 @@ static void identify(void)
      * docs/r4600.md for where each R4600 answer comes from. */
     case IMP_R4600: cpu_kind = CPU_R4600; break;
     case IMP_R5000: cpu_kind = CPU_R5000; break;
+    case IMP_R10000: cpu_kind = CPU_R10000; break;
     default:        cpu_kind = 0; break;
     }
 }
@@ -188,6 +189,7 @@ static const char *cpu_name(void)
     if (cpu_kind == CPU_R4400) return "R4400";
     if (cpu_kind == CPU_R5000) return "R5000";
     if (cpu_kind == CPU_R4600) return "R4600";
+    if (cpu_kind == CPU_R10000) return "R10000";
     return "unknown";
 }
 

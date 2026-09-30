@@ -63,6 +63,16 @@ pub use crate::mips_isa::{
     C_HINV, C_HWBINV, C_FILL, C_HWB, C_HSV,
 };
 
+// R10000 reassigns cache operations 5, 6 and 7. Where an R4000 has
+// Hit_Invalidate, Hit_Writeback_Invalidate and Hit_Writeback, an R10000 has a
+// cache barrier and index-addressed load/store of the cache *data* array.
+// Confirmed against NetBSD's mips/include/cache_r10k.h, and against the IP28
+// PROM, whose secondary-cache SRAM test issues C_R10K_ISD(SD) — which this
+// emulator was executing as a hit-writeback, so nothing was ever stored.
+pub const C_R10K_CBARRIER: u32 = 5 << 2;
+pub const C_R10K_ILD: u32 = 6 << 2;
+pub const C_R10K_ISD: u32 = 7 << 2;
+
 /// Decode a raw cache_op field (5-bit: op[4:2] | target[1:0]) to a human-readable name.
 /// Matches the disassembler mnemonic convention used by gas/objdump.
 pub fn cache_op_name(op: u32) -> &'static str {
@@ -431,6 +441,11 @@ pub trait CpuModel: MipsCache {
     const VA_BITS: u32 = 40;
     /// Name as the guest and the benchmark report see it.
     const NAME: &'static str;
+    /// Cache ops 5/6/7 carry their R10000 meanings rather than their R4000 ones.
+    /// The executor needs this: `Index_Store_Data` takes its value from TagLo
+    /// and `Index_Load_Data` returns into it, neither of which is true of the
+    /// R4000 hit operations that share those encodings.
+    const R10K_CACHE_OPS: bool = false;
 }
 
 pub trait MipsCache: Send + Sync {
@@ -633,7 +648,19 @@ pub trait MipsCache: Send + Sync {
     ///
     /// For Index_Load_Tag operations, returns the tag value in TagLo CP0 register format
     /// For other operations, returns 0
-    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u32;
+    /// Perform a CACHE operation. For `Index_Load_Tag` the return is the
+    /// tag as software sees it, full width — an R10000 secondary tag does not
+    /// fit in 32 bits.
+    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64;
+
+    /// CP0 `ECC` ($26) on the way in to a cache-data store.
+    ///
+    /// On an R10000 the check bits ride with the data: `Index_Store_Data`
+    /// takes them from this register and `Index_Load_Data` returns them
+    /// there. Models that do not keep them ignore both of these.
+    fn set_cache_ecc(&self, _v: u32) {}
+    /// CP0 `ECC` after the last cache operation.
+    fn cache_op_ecc(&self) -> u32 { 0 }
 
     /// Write back dirty L1-D (and, if present, L2) lines covering
     /// `[phys_addr, phys_addr + size)` to memory, without invalidating them.
@@ -800,7 +827,7 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
         self.downstream.write64(aligned_addr, new_val)
     }
 
-    fn cache_op(&self, _cache_op: u32, _virt_addr: u64, _phys_addr: u64) -> u32 {
+    fn cache_op(&self, _cache_op: u32, _virt_addr: u64, _phys_addr: u64) -> u64 {
         // No-op for passthrough cache - just return 0
         0
     }
@@ -1064,6 +1091,7 @@ pub struct CpuCache<
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
     const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize,
+    const MODEL: u8,
 > {
     downstream: Arc<dyn BusDevice>,
 
@@ -1141,12 +1169,12 @@ unsafe impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, co
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> Send for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {}
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Send for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {}
 unsafe impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> Sync for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {}
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Sync for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {}
 
 // Per-level cache types, parameterised so each CPU model monomorphises its own.
 type ICacheT<const S: usize, const L: usize, const W: usize, const T: usize> =
@@ -1156,24 +1184,91 @@ type DCacheT<const S: usize, const L: usize, const W: usize, const T: usize, con
 type L2CacheT<const S: usize, const L: usize, const T: usize, const D: usize, const N: usize> =
     Cache<L2Tag, S, L, 1, { CacheKind::L2 as u8 }, T, D, N>;
 
+/// Which processor a monomorphisation models, as the `MODEL` const parameter.
+///
+/// This exists because the thing that distinguishes these parts *in this file*
+/// is not any one of the shape parameters. It was originally inferred from
+/// `IC_WAYS == 2`, which worked only while "2-way" and "R5000" named the same
+/// processor. They do not: the R10000 is also 2-way, and it shares neither the
+/// R5000's TagLo layout nor its cache-op semantics. Inferring identity from
+/// shape would have quietly given an R10000 every R5000 behaviour in the 40-odd
+/// places that branch on it, each one individually plausible.
+pub mod model {
+    pub const R4400: u8 = 0;
+    pub const R5000: u8 = 1;
+    pub const R10000: u8 = 2;
+}
+
 /// SGI Indy R4400: direct-mapped 16K L1s, 1 MB unified L2 owning the decode slots.
 pub type R4400Cache = CpuCache<16384, 16, 1, 1024,
                                16384, 16, 1, 1024, 2048,
                                1048576, 128, 8192, 131072, 262144, true,
-                               false, 0x0000_0440, 0x0000_0500, 48>;
+                               false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }>;
 /// SGI Indy R5000: 2-way 32K L1s, no secondary cache; L1I owns its decode slots.
 pub type R5000Cache = CpuCache<32768, 32, 2, 1024,
                                32768, 32, 2, 1024, 4096,
                                128, 128, 1, 16, 0, false,
-                               true, 0x0000_2321, 0x0000_2300, 48>;
+                               true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }>;
+/// SGI Indigo2 IMPACT R10000 (IP28), modelled for speed rather than fidelity.
+///
+/// The real part has two-way 32 KB L1s and a two-way secondary cache. This
+/// models all three **direct-mapped**, keeping the real total sizes and line
+/// sizes (64-byte L1I lines, 32-byte L1D, 128-byte L2).
+///
+/// That is deliberate. Associativity reaches software only through the
+/// way-select bits of `CACHE Index_*`, and the only thing an operating system
+/// does by index is flush the whole cache — which comes out the same for any
+/// geometry holding the same lines. Emulating ways costs a victim-selection
+/// and LRU update on every access and buys nothing IRIX can observe.
+///
+/// It also buys correctness here, not just speed. A two-way L1 *with* an L2 is
+/// a combination this file has never had: `fetch()` selects the two-way tag
+/// probe and the L1I-resident decode slots under one condition, and such a
+/// part needs the first with the second's alternative. Direct-mapped plus L2
+/// is exactly the R4400's shape, so every associativity and decode-slot branch
+/// already does the right thing for this model, unchanged.
+///
+/// What is *not* faked is anything software reads back: the PRId, the TLB
+/// size, MIPS IV decoding, and the cache tag layout the PROM's diagnostics
+/// inspect directly.
+#[cfg(feature = "ip28")]
+pub type R10000Cache = CpuCache<32768, 64, 1, 512,
+                                32768, 32, 1, 1024, 4096,
+                                1048576, 128, 8192, 131072, 262144, true,
+                                true, 0x0000_0900, 0x0000_0900, 64, { model::R10000 }>;
 
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     // Model discriminator: folds to a literal, so it replaces #[cfg(feature = "r5k")].
-    const IS_R5K: bool = IC_WAYS == 2;
+    // Keyed on MODEL, not on associativity — see `mod model`.
+    const IS_R5K: bool = MODEL == model::R5000;
+
+    /// IP28 bring-up watch: physical window to trace, from IRIS_IP28_WATCH.
+    /// Folds to a constant `None` on every model but the R10000, so the
+    /// non-IP28 hot path keeps no trace of this.
+    #[inline(always)]
+    fn ip28_watch() -> Option<u64> {
+        if !Self::R10K_CACHE_OPS { return None; }
+        static W: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *W.get_or_init(|| {
+            std::env::var("IRIS_IP28_WATCH").ok().and_then(|v| {
+                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()
+            })
+        })
+    }
+
+    #[inline(always)]
+    fn ip28_trace(&self, what: &str, addr: u64, val: u64) {
+        if let Some(w) = Self::ip28_watch() {
+            if (addr & !0x7f) == (w & !0x7f) {
+                eprintln!("ip28watch: {what:<18} addr={addr:#018x} val={val:#018x}");
+            }
+        }
+    }
+
     // Logical L2 size; 0 means the model has no secondary cache.
     pub const L2_SIZE: usize = if HAS_L2 { L2_CACHE_SIZE } else { 0 };
 
@@ -1298,7 +1393,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> From<Arc<dyn BusDevice>> for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> From<Arc<dyn BusDevice>> for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn from(downstream: Arc<dyn BusDevice>) -> Self {
         Self::new(downstream)
     }
@@ -1308,7 +1403,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     /// Check if we're tracking this physical address (for debug purposes)
     #[cfg(feature = "debug_cache")]
     #[inline]
@@ -2811,19 +2906,24 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> CpuModel for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuModel for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     const MIPS4: bool = MIPS4;
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
-    const NAME: &'static str = if IC_WAYS == 2 { "R5000" } else { "R4400" };
+    const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    const NAME: &'static str = match MODEL {
+        model::R5000 => "R5000",
+        model::R10000 => "R10000",
+        _ => "R4400",
+    };
 }
 
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> MipsCache for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> MipsCache for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn set_l1i_counters(&mut self, hit: Arc<AtomicU64>, fetch: Arc<AtomicU64>) {
         self.l1i_hit_count = hit;
         self.l1i_fetch_count = fetch;
@@ -3124,6 +3224,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
+        self.ip28_trace("read", phys_addr, 0);
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
         #[cfg(feature = "debug_cache")]
         {
@@ -3194,6 +3295,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
+        self.ip28_trace("write", phys_addr, val);
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
         #[cfg(feature = "debug_cache")]
         {
@@ -3320,7 +3422,55 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
     }
 
-    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u32 {
+    fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
+        if Self::R10K_CACHE_OPS && std::env::var_os("IRIS_IP28_CACHEOPS").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEEN: AtomicU32 = AtomicU32::new(0);
+            let bit = 1u32 << (cache_op & 0x1F);
+            let all = matches!(std::env::var("IRIS_IP28_CACHEOPS").as_deref(), Ok("all"));
+            if all || SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                eprintln!("ip28: op {} raw={:#04x} va={:#018x} arg={:#018x}",
+                          cache_op_name(cache_op), cache_op, virt_addr, phys_addr);
+            }
+        }
+        if Self::ip28_watch().is_some() {
+            self.ip28_trace(cache_op_name(cache_op), virt_addr, phys_addr);
+        }
+        // R10000 ops 5/6/7 are not the R4000 hit operations that share these
+        // encodings — see C_R10K_ISD. Handled before the shared decode below.
+        if Self::R10K_CACHE_OPS {
+            // The R10000 meanings are scoped to particular cache selects;
+            // outside those the R4000 operation on the same encoding still
+            // applies. cache_r10k.h annotates each one, and the IP28 PROM uses
+            // both readings of op 5: `Cache_Barrier` against the instruction
+            // cache, and R4000 `Hit_Invalidate` against the secondary.
+            let sel = cache_op & 3;
+            match cache_op & 0x1C {
+                // An ordering barrier. Nothing to do in a model with no
+                // speculative memory pipeline to hold back.
+                C_R10K_CBARRIER if sel == CACH_PI => return 0,
+                C_R10K_ILD if matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
+                    let is_l2 = sel == CACH_SD;
+                    // The index is a byte offset into the data array. Bit 0
+                    // selects the way on real silicon; this model is
+                    // direct-mapped, and bit 0 falls below the u64 slot index,
+                    // so it drops out without any special case.
+                    let slot = (virt_addr as usize) >> 3;
+                    if is_l2 && HAS_L2 {
+                        return self.l2.data()[slot & (L2_DATA - 1)];
+                    }
+                    return self.dc.data()[slot & (DC_DATA - 1)];
+                }
+                C_R10K_ISD if matches!(sel, CACH_SI | CACH_SD) => {
+                    let slot = (virt_addr as usize) >> 3;
+                    if HAS_L2 {
+                        self.l2.data_mut()[slot & (L2_DATA - 1)] = phys_addr;
+                    }
+                    return 0;
+                }
+                _ => {}
+            }
+        }
         // Decode cache operation
         let cache_target = cache_op & 0x3;   // bits [17:16]
         let operation = cache_op & 0x1C;     // bits [20:18] (shifted by 2)
@@ -3410,6 +3560,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     // L2 TagLo format:
                     //   [31:13] physical tag   [12:10] state   [9:7] PIdx
                     let tag: L2Tag = self.l2.get_tag(idx);
+                    if MODEL == model::R10000 {
+                        eprintln!("ip28: C_ILT(SD) idx={idx:#x} ptag={:#x} cs={:#x} pidx={:#x}",
+                                  tag.ptag(), tag.cs(), tag.pidx());
+                    }
                     let state = match tag.cs() {
                         L2_CS_INVALID => 0,
                         L2_CS_CLEAN_EXCLUSIVE => 4,
@@ -3418,7 +3572,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                         L2_CS_DIRTY_SHARED => 7,
                         _ => 0,
                     };
-                    (tag.ptag() << 13) | (state << 10) | (tag.pidx() << 7)
+                    ((tag.ptag() << 13) | (state << 10) | (tag.pidx() << 7)) as u64
                 } else if is_icache {
                     let tag: L1ITag = self.ic.get_tag(idx);
                     let raw_ptag = (tag.ptag >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
@@ -3426,11 +3580,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                         // R5000 L1-I TagLo:  [31:8] ptag  [7] L (lock)  [6] V
                         // Not the R4400 2-bit PState. We model no lock bit, so L=0.
                         let v = if tag.is_valid() { 1u32 << 6 } else { 0 };
-                        (raw_ptag << 8) | v
+                        ((raw_ptag << 8) | v) as u64
                     } else {
                         // R4400 L1-I TagLo:  [31:8] raw_ptag  [7:6] pstate (2=valid, 0=invalid)
                         let pstate = if tag.is_valid() { 2u32 } else { 0u32 };
-                        (raw_ptag << 8) | (pstate << 6)
+                        ((raw_ptag << 8) | (pstate << 6)) as u64
                     }
                 } else {
                     let tag: L1DTag = self.dc.get_tag(idx);
@@ -3445,7 +3599,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                         let v = if valid { 1u32 << 6 } else { 0 };
                         let d = if valid && (tag.dirty
                                     || tag.cs as u32 == L1D_CS_DIRTY_EXCLUSIVE) { 1u32 << 7 } else { 0 };
-                        (raw_ptag << 8) | d | v
+                        ((raw_ptag << 8) | d | v) as u64
                     } else {
                         // R4400 L1-D TagLo:  [31:8] raw_ptag  [7:6] pstate
                         // dirty=true promotes CleanExclusive→DirtyExclusive in TagLo output
@@ -3456,16 +3610,19 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                             L1D_CS_DIRTY_EXCLUSIVE => 3u32,
                             _ => 0u32,
                         };
-                        (raw_ptag << 8) | (pstate << 6)
+                        ((raw_ptag << 8) | (pstate << 6)) as u64
                     }
                 }
             }
 
             // Index Store Tag — write CP0 TagLo into internal tag
             C_IST => {
-                let tag_lo = phys_addr as u32;
+                let tag_lo = phys_addr as u32;  // R4000-family tags are 32-bit
 
                 if is_l2 {
+                    if MODEL == model::R10000 {
+                        eprintln!("ip28: C_IST(SD) idx={idx:#x} taglo={tag_lo:#010x} phys={phys_addr:#018x}");
+                    }
                     // L2 TagLo format:  [31:13] ptag   [12:10] state   [9:7] PIdx
                     let ptag = (tag_lo >> 13) & L2_PTAG_MASK;
                     let state = (tag_lo >> 10) & 0x7;
@@ -4027,7 +4184,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> Drop for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Drop for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn drop(&mut self) {
         self.ic.stop.store(true, Ordering::Relaxed);
     }
@@ -4039,7 +4196,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> Resettable for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Resettable for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn power_on(&self) {
         self.ic.tags_mut().fill(L1ITag::default());
         self.dc.tags_mut().fill(L1DTag::default());
@@ -4070,7 +4227,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
     fn save_tags_as_u32<TAG: Copy + Into<u32>>(tags: &[TAG]) -> Vec<u32> {
         tags.iter().map(|&t| t.into()).collect()
     }
@@ -4219,6 +4376,32 @@ mod tests {
         R4400Cache::new(mem as Arc<dyn BusDevice>)
     }
 
+    /// Deliberately the R5000's exact shape, differing *only* in `MODEL`. If
+    /// model identity is ever inferred from a shape parameter again, this
+    /// aliases onto the R5000 and the test below fails.
+    type NotAnR5000 = CpuCache<32768, 32, 2, 1024,
+                               32768, 32, 2, 1024, 4096,
+                               128, 128, 1, 16, 0, false,
+                               true, 0x0000_0900, 0x0000_0900, 64, { model::R10000 }>;
+
+    /// Two-way associativity is not an identity.
+    ///
+    /// `IS_R5K` used to be `IC_WAYS == 2`, which was true of every 2-way part
+    /// the file knew about. The R10000 is also 2-way and shares neither the
+    /// R5000's TagLo layout nor its cache-op semantics, so that inference would
+    /// have handed it R5000 behaviour at all 40-odd sites that branch on it —
+    /// silently, and each one plausible on its own.
+    #[test]
+    fn model_identity_is_explicit_and_not_inferred_from_associativity() {
+        assert_eq!(<R4400Cache as CpuModel>::NAME, "R4400");
+        assert_eq!(<R5000Cache as CpuModel>::NAME, "R5000");
+        assert_eq!(<NotAnR5000 as CpuModel>::NAME, "R10000");
+
+        assert!(R5000Cache::IS_R5K, "the R5000 is the R5000");
+        assert!(!NotAnR5000::IS_R5K, "a 2-way cache is not what makes an R5000");
+        assert!(!R4400Cache::IS_R5K);
+    }
+
     // Same helper for whichever CPU model a test wants to exercise.
     fn make_cache_of<C: MipsCache + From<Arc<dyn BusDevice>>>(mem: Arc<Memory>) -> C {
         C::from(mem as Arc<dyn BusDevice>)
@@ -4301,7 +4484,7 @@ mod tests {
             cache.cache_op(C_IST | CACH_PD, va, written as u64);
             let read_back = cache.cache_op(C_ILT | CACH_PD, va, idx);
             assert_eq!((read_back >> 6) & 0x3, 3, "R4400 DirtyExclusive must round-trip");
-            assert_eq!(read_back >> 8, raw_ptag, "physical tag must round-trip");
+            assert_eq!(read_back >> 8, raw_ptag as u64, "physical tag must round-trip");
         }
 
         // R5000: valid+dirty is D=1,V=1 (0xC0). Under the old code this was
@@ -4320,9 +4503,9 @@ mod tests {
                 let read_back = cache.cache_op(C_ILT | CACH_PD, va, idx);
                 assert_ne!(read_back & (1 << 6), 0,
                            "R5000 {label} line must read back V=1");
-                assert_eq!(read_back & (1 << 7), d_bit,
+                assert_eq!(read_back & (1 << 7), d_bit as u64,
                            "R5000 {label} line must round-trip its D bit");
-                assert_eq!(read_back >> 8, raw_ptag, "physical tag must round-trip");
+                assert_eq!(read_back >> 8, raw_ptag as u64, "physical tag must round-trip");
             }
         }
     }

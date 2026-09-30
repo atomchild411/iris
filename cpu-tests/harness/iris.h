@@ -114,6 +114,7 @@
 #define IMP_R4700         0x21
 #define IMP_R4650         0x22
 #define IMP_R5000         0x23
+#define IMP_R10000        0x09
 #define IMP_RM7000        0x27
 #define IMP_RM5200        0x28
 

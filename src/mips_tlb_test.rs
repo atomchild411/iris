@@ -440,4 +440,57 @@ mod tests {
             .join()
             .expect("thread panicked");
     }
+
+/// The JTLB is as big as the CPU model says, and no bigger.
+///
+/// The R10000 has 64 entries where the R4400 has 48. The count used to be a
+/// compile-time 48 for every model while `core.tlb_entries` was taken from the
+/// model, so on an R10000 the two disagreed: Random cycled over a range the
+/// array did not have, and a TLBWI to index 48..63 went nowhere. SGI's IP28
+/// diagnostic writes index 48 on its first cache-alias test, and every failure
+/// it reported was that write being dropped.
+#[test]
+fn tlb_size_follows_the_cpu_model() {
+    #[cfg(feature = "ip28")]
+    use crate::mips_cache_shadow::R10000ShadowCache;
+    use crate::mips_cache_v2::{R4400Cache, R5000Cache};
+    use crate::mips_exec::MipsCpuConfig;
+
+    assert_eq!(MipsCpuConfig::for_model::<R4400Cache>().tlb_entries, 48);
+    assert_eq!(MipsCpuConfig::for_model::<R5000Cache>().tlb_entries, 48);
+    #[cfg(feature = "ip28")]
+    assert_eq!(MipsCpuConfig::for_model::<R10000ShadowCache>().tlb_entries, 64);
+}
+
+/// An index past the live count is dropped; one inside it is kept.
+#[test]
+fn tlb_write_past_the_live_entry_count_is_dropped() {
+    let mut entry = TlbEntry::new();
+    entry.entry_hi = 0xC000_0000_0004_0000;
+
+    let mut r4400 = MipsTlb::new(48);
+    r4400.write(48, entry);
+    assert_eq!(r4400.read(48).entry_hi, 0, "48-entry TLB must drop index 48");
+}
+
+/// The other half of the pair, deliberately in its own `#[test]`.
+///
+/// `MipsTlb` carries its arrays inline and is large enough that **two** of
+/// them alive at once overflows a test thread's stack in a debug build — the
+/// single test these two replace aborted the whole binary with SIGABRT. It
+/// went unnoticed because every test run in this project passes `--release`,
+/// where the temporaries collapse; `cargo test` on its own is what an
+/// upstream reviewer would run. One TLB per test, as every neighbouring test
+/// already does.
+#[test]
+fn tlb_write_inside_a_larger_entry_count_is_kept() {
+    let mut entry = TlbEntry::new();
+    entry.entry_hi = 0xC000_0000_0004_0000;
+
+    let mut r10000 = MipsTlb::new(64);
+    r10000.write(48, entry);
+    assert_eq!(r10000.read(48).entry_hi, entry.entry_hi, "64-entry TLB must keep it");
+    r10000.write(63, entry);
+    assert_eq!(r10000.read(63).entry_hi, entry.entry_hi, "...and its last slot");
+}
 }

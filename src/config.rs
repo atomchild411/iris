@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
 /// Valid memory bank sizes in MB.
-pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128];
+pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256];
 
 /// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
 /// `kind = "cdrom"`; either works and they mean the same thing.
@@ -384,27 +384,52 @@ pub enum MachineProfile {
     IndyIp24,
     /// SGI Indigo2 IP22 — fullhouse MC/IOC, Newport XL on GIO gfx slot.
     Indigo2Ip22,
+    /// SGI Indigo2 IMPACT IP28 — an R10000 CPU module in the Indigo2 chassis.
+    ///
+    /// Shares the fullhouse MC/IOC/HPC3 with IP22 and differs in the decodes
+    /// inside them: MEMCFG's base field is shifted by 24 rather than 22 (so
+    /// its size granule is 16 MB, not 4), RAM lives at 0x20000000 with the
+    /// low-memory alias following it there, and both the MC chip revision and
+    /// the HPC3 board revision have to read high enough for the kernel to
+    /// call the board an IP28.
+    ///
+    /// Graphics is IMPACT, which is a register stub — an IP28 kernel carries
+    /// no Newport driver, so REX3 is not an alternative here.
+    Indigo2Ip28,
 }
 
 impl MachineProfile {
     /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
+    #[cfg(feature = "ip28")]
+    pub const ALL: [Self; 3] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28];
+    #[cfg(not(feature = "ip28"))]
     pub const ALL: [Self; 2] = [Self::IndyIp24, Self::Indigo2Ip22];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::IndyIp24 => "SGI Indy (IP24)",
             Self::Indigo2Ip22 => "SGI Indigo2 (IP22)",
+            Self::Indigo2Ip28 => "SGI Indigo2 IMPACT (IP28)",
         }
     }
 
     pub fn supported(self) -> bool {
         matches!(self, Self::IndyIp24 | Self::Indigo2Ip22)
+            || (cfg!(feature = "ip28") && matches!(self, Self::Indigo2Ip28))
     }
 
     /// MC/IOC/HPC3 Guinness vs Fullhouse layout. Indy IP24 is Guinness (`true`).
     pub fn guinness(self) -> bool {
         matches!(self, Self::IndyIp24)
+    }
+
+    /// The R10000 Indigo2. Selects the IP28 decodes inside the shared
+    /// fullhouse devices — see the variant's own documentation for the list.
+    ///
+    /// Always false without the `ip28` feature, so every IP28 decode folds away.
+    pub fn ip28(self) -> bool {
+        cfg!(feature = "ip28") && matches!(self, Self::Indigo2Ip28)
     }
 }
 
@@ -525,12 +550,27 @@ pub enum CpuModel {
     R4400,
     /// MIPS R5000, 2-way 32K L1s, no secondary cache, MIPS IV.
     R5000,
+    /// MIPS R10000, 2-way 32K L1s, 1 MB secondary cache, MIPS IV. The CPU in
+    /// the Indigo2 IMPACT (IP28). Bring-up only — see docs/ip28-bringup.md.
+    R10000,
 }
 
 impl CpuModel {
+    #[cfg(feature = "ip28")]
+    pub const ALL: [Self; 3] = [Self::R4400, Self::R5000, Self::R10000];
+    #[cfg(not(feature = "ip28"))]
     pub const ALL: [Self; 2] = [Self::R4400, Self::R5000];
+
+    /// Whether this build can run the model: the R10000 needs the `ip28` feature.
+    pub fn available(self) -> bool {
+        !matches!(self, Self::R10000) || cfg!(feature = "ip28")
+    }
     pub fn label(self) -> &'static str {
-        match self { Self::R4400 => "MIPS R4400", Self::R5000 => "MIPS R5000" }
+        match self {
+            Self::R4400 => "MIPS R4400",
+            Self::R5000 => "MIPS R5000",
+            Self::R10000 => "MIPS R10000",
+        }
     }
 }
 
@@ -1205,6 +1245,11 @@ impl MachineConfig {
 
     /// Validate bank sizes, returns a description of any errors.
     pub fn validate(&self) -> Result<(), String> {
+        if (self.machine.profile == MachineProfile::Indigo2Ip28 && !cfg!(feature = "ip28"))
+            || !self.machine.cpu.available()
+        {
+            return Err("IP28 / R10000 support is not built into this binary; rebuild with --features ip28".to_string());
+        }
         if !self.machine.profile.supported() {
             return Err(format!(
                 "machine profile \"{}\" is not implemented; use {}",
@@ -1235,9 +1280,11 @@ impl MachineConfig {
                 return Err(format!("graphics.board \"{name}\" and [impact] both claim the GIO gfx slot"));
             }
         }
-        if self.impact.any_enabled() && self.machine.profile != MachineProfile::Indigo2Ip22 {
+        if self.impact.any_enabled()
+            && !matches!(self.machine.profile, MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
+        {
             return Err(
-                "[impact] slots are preview-only on Indigo2 (machine.profile = indigo2_ip22)".into(),
+                "[impact] slots need an Indigo2 (machine.profile = indigo2_ip22 or indigo2_ip28)".into(),
             );
         }
         self.impact.validate()?;
@@ -1260,6 +1307,14 @@ impl MachineConfig {
                 return Err(format!(
                     "bank{} size {} MB is invalid (valid: {:?})",
                     i, sz, VALID_BANK_SIZES
+                ));
+            }
+            // The IP22/IP24 MC cannot express a 256 MB bank at its base
+            // shift; only the IP28's can.
+            if sz == 256 && !self.machine.profile.ip28() {
+                return Err(format!(
+                    "bank{} size 256 MB needs the IP28 (machine.profile = indigo2_ip28)",
+                    i
                 ));
             }
         }
@@ -1809,6 +1864,21 @@ mod export_tests {
         cfg.validate().expect("indigo2_ip22 should validate on default build");
         assert!(cfg.machine.profile.supported());
         assert!(!cfg.machine.profile.guinness());
+    }
+
+    #[test]
+    fn a_256_mb_bank_is_an_ip28_bank() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::Indigo2Ip22;
+        cfg.banks = [256, 128, 0, 0];
+        let err = cfg.validate().expect_err("the IP22 MC cannot express a 256 MB bank");
+        assert!(err.contains("256 MB"), "{err}");
+        #[cfg(feature = "ip28")]
+        {
+            cfg.machine.profile = MachineProfile::Indigo2Ip28;
+            cfg.machine.cpu = CpuModel::R10000;
+            cfg.validate().expect("the IP28 MC can");
+        }
     }
 }
 

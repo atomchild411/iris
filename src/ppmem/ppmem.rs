@@ -319,7 +319,7 @@ impl PpMemory {
     }
 
     #[cfg(feature = "jitv2")]
-    fn bump_gen_all(&self) {
+    pub fn bump_gen_all(&self) {
         for i in 0..self.gen_count() {
             unsafe { (*self.gen_base.add(i)).fetch_add(1, Ordering::Relaxed) };
         }
@@ -768,7 +768,8 @@ impl MappedMemory for PpMemSpace {
         for m in std::mem::take(&mut st.mappings) {
             // Best-effort: a failure here leaves the range mapped, which is
             // still safe — it just isn't reverted.
-            let _ = unsafe { self.space.unmap(m.at as usize, m.len as usize) };
+            // `scrub`, not `unmap`: see `AddrSpace::scrub`.
+            let _ = unsafe { self.space.scrub(m.at as usize, m.len as usize) };
             #[cfg(feature = "jitv2")]
             {
                 let gen_off = m.at / GEN_RATIO;
@@ -776,7 +777,7 @@ impl MappedMemory for PpMemSpace {
                 let gran = super::map::granularity() as u64;
                 if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 {
                     let _ = unsafe {
-                        self.gen_space.unmap(gen_off as usize, gen_len as usize)
+                        self.gen_space.scrub(gen_off as usize, gen_len as usize)
                     };
                 }
             }
@@ -1102,6 +1103,39 @@ mod tests {
             // Write through the last mirror, observe through the first.
             *(w.add(3 * 8 * MB + 64) as *mut u32) = 0xABCD_EF01;
             assert_eq!(*(w.add(64) as *const u32), 0xABCD_EF01, "mirror not bidirectional");
+        }
+    }
+
+    /// Clearing the mappings must leave the window readable. JIT compile
+    /// workers hold generation-counter pointers taken while a bank was mapped,
+    /// and read them from other threads while the CPU thread remaps; with
+    /// `PROT_NONE` there, that read was a SIGBUS that killed the emulator
+    /// (twice in IP28 boots). Without the fix this test dies the same way.
+    #[cfg(all(unix, feature = "jitv2"))]
+    #[test]
+    fn a_cleared_window_is_still_readable_through_old_pointers() {
+        let (space, _banks) = PpMemSpace::with_bank_sizes(&[8]).unwrap();
+        let base = 0x0800_0000u64;
+        space.map_bank(0, base, 8 * MB as u64, 8 * MB as u64).unwrap();
+        let data = unsafe { space.window_base().add(base as usize + 0x100) as *const u32 };
+        let gen = unsafe { space.gen_window_base().add((base as usize + 0x100) >> 12) };
+        unsafe {
+            *(data as *mut u32) = 0xFEED_FACE;
+            (*gen).fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        space.clear_mappings();
+
+        unsafe {
+            assert_eq!(*data, 0, "a cleared data range reads as zeros");
+            assert_eq!((*gen).load(std::sync::atomic::Ordering::Relaxed), 0,
+                "a cleared generation range reads as zero, which differs from the live counter");
+        }
+        // Mapped back, the bank's own contents and counter are there again.
+        space.map_bank(0, base, 8 * MB as u64, 8 * MB as u64).unwrap();
+        unsafe {
+            assert_eq!(*data, 0xFEED_FACE);
+            assert_eq!((*gen).load(std::sync::atomic::Ordering::Relaxed), 7);
         }
     }
 

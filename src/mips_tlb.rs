@@ -4,8 +4,20 @@ use crate::mips_exec::CacheAttr;
 use std::fmt::Write;
 use crate::snapshot::{u64_slice_to_toml, load_u64_slice};
 
-/// Number of TLB entries in R4000 (48 dual-entries = 96 pages)
+/// Default JTLB size: the R4000/R4400/R5000 count (48 dual-entries = 96 pages).
+///
+/// The *live* size is per-CPU-model and lives in `MipsTlb::num_entries`; this
+/// is only the default for `Default::default()` and for callers that do not
+/// name a model.
 pub const TLB_NUM_ENTRIES: usize = 48;
+
+/// Array capacity: the largest JTLB any modelled CPU has.
+///
+/// The R10000 has 64 entries where the R4400 has 48. Sizing the arrays to the
+/// maximum and carrying the live count separately keeps one concrete `MipsTlb`
+/// type — the lookup walks an MRU list that only ever contains live slots, so
+/// the unused tail costs nothing on the hot path.
+pub const TLB_MAX_ENTRIES: usize = 64;
 
 // ── TLB statistics (feature = "tlbstats") ────────────────────────────────────
 
@@ -508,12 +520,13 @@ impl ShadowEntry {
 
 /// Real R4000 TLB implementation
 ///
-/// Implements a fully associative JTLB (Joint TLB) with 48 dual-entries.
+/// Implements a fully associative JTLB (Joint TLB); `num_entries` dual-entries,
+/// 48 on R4x00/R5000 and 64 on the R10000.
 ///
 /// **32-bit mode (and 64-bit sign-extended ±2GB) fast path**: a 512KB `vmap`
 /// array indexed by VA[31:13] gives O(1) lookup.  Each slot holds the TLB
 /// entry index (0-47) or VMAP_MISS.  After the index is found we still verify
-/// ASID/Global and the valid/dirty bits — but the linear scan over 48 entries
+/// ASID/Global and the valid/dirty bits — but the linear scan over the entries
 /// is eliminated.
 ///
 /// For 64-bit VAs that are sign-extended 32-bit values (upper 32 bits all-zero
@@ -528,14 +541,17 @@ impl ShadowEntry {
 #[derive(Clone)]
 pub struct MipsTlb {
     /// Architectural TLB entries (read/written by TLBR/TLBWI/TLBWR/TLBP).
-    entries: [TlbEntry; TLB_NUM_ENTRIES],
+    entries: [TlbEntry; TLB_MAX_ENTRIES],
     /// Cache-friendly shadow used by translate() and probe().  Kept in sync
     /// with `entries` — rebuilt whenever an entry is written.
-    shadow: [ShadowEntry; TLB_NUM_ENTRIES],
+    shadow: [ShadowEntry; TLB_MAX_ENTRIES],
     /// Head of each MRU list (slot index, or MRU_NONE).
     mru_head: [u8; MRU_LISTS],
     /// `mru_next[list][slot]` — next slot in that list, or MRU_NONE.
-    mru_next: [[u8; TLB_NUM_ENTRIES]; MRU_LISTS],
+    mru_next: [[u8; TLB_MAX_ENTRIES]; MRU_LISTS],
+
+    /// Live JTLB entries for the CPU model in use (<= TLB_MAX_ENTRIES).
+    num_entries: usize,
     /// O(1) lookup for 32-bit (and sign-extended 64-bit) VAs.
     /// Indexed by VA[31:13] (19 bits).  Value = entry index or VMAP_MISS.
     vmap: [u8; VMAP_SIZE],
@@ -555,13 +571,14 @@ pub struct MipsTlb {
 
 impl MipsTlb {
     pub fn new(num_entries: usize) -> Self {
-        assert_eq!(num_entries, TLB_NUM_ENTRIES,
-            "MipsTlb currently requires exactly {} entries", TLB_NUM_ENTRIES);
+        assert!(num_entries > 1 && num_entries <= TLB_MAX_ENTRIES,
+            "MipsTlb supports 2..={} entries, got {}", TLB_MAX_ENTRIES, num_entries);
         let mut tlb = Self {
-            entries: [TlbEntry::new(); TLB_NUM_ENTRIES],
-            shadow: [ShadowEntry::invalid(); TLB_NUM_ENTRIES],
+            entries: [TlbEntry::new(); TLB_MAX_ENTRIES],
+            shadow: [ShadowEntry::invalid(); TLB_MAX_ENTRIES],
             mru_head: [0u8; MRU_LISTS],
-            mru_next: [[MRU_NONE; TLB_NUM_ENTRIES]; MRU_LISTS],
+            mru_next: [[MRU_NONE; TLB_MAX_ENTRIES]; MRU_LISTS],
+            num_entries,
             vmap: [VMAP_MISS; VMAP_SIZE],
             #[cfg(feature = "tlbcheck")]
             vmap_touched: std::collections::HashSet::new(),
@@ -570,10 +587,12 @@ impl MipsTlb {
         };
         for list in 0..MRU_LISTS {
             tlb.mru_head[list] = 0;
-            for i in 0..TLB_NUM_ENTRIES - 1 {
+            for i in 0..num_entries - 1 {
                 tlb.mru_next[list][i] = (i + 1) as u8;
             }
-            // slot 47 already MRU_NONE from array initialisation
+            // The last live slot is already MRU_NONE from array
+            // initialisation, and so is every slot past it — the unused tail
+            // of a 48-entry model never joins a list, so lookups never see it.
         }
         tlb
     }
@@ -667,7 +686,7 @@ impl MipsTlb {
         let (old_start, old_count) = old_range;
         self.vmap_clear(old_start, old_count);
         let old_end = old_start + old_count;
-        for i in 0..TLB_NUM_ENTRIES {
+        for i in 0..self.num_entries {
             if i == index {
                 continue;
             }
@@ -707,12 +726,12 @@ impl MipsTlb {
         // Two entries conflict if their VPN2 ranges intersect (after masking
         // by the wider of the two page masks) and they'd both be visible to
         // the same lookup: either entry is global, or both share an ASID.
-        for i in 0..TLB_NUM_ENTRIES {
+        for i in 0..self.num_entries {
             let a = &self.entries[i];
             if !a.is_valid_even() && !a.is_valid_odd() {
                 continue; // fully-invalid entries can't conflict
             }
-            for j in (i + 1)..TLB_NUM_ENTRIES {
+            for j in (i + 1)..self.num_entries {
                 let b = &self.entries[j];
                 if !b.is_valid_even() && !b.is_valid_odd() {
                     continue;
@@ -741,7 +760,7 @@ impl MipsTlb {
         // (an all-zero architectural entry) derives 0 for the same fields.
         // Both are correctly unmatchable — the bit patterns just differ by
         // construction — so comparing them here would be a false positive.
-        for i in 0..TLB_NUM_ENTRIES {
+        for i in 0..self.num_entries {
             let expected = ShadowEntry::from_entry(&self.entries[i]);
             let s = &self.shadow[i];
             if s.valid_dirty != expected.valid_dirty || s.asid != expected.asid
@@ -766,12 +785,12 @@ impl MipsTlb {
 
         // 3. MRU list integrity: each list must visit every slot exactly once.
         for list in 0..MRU_LISTS {
-            let mut seen = [false; TLB_NUM_ENTRIES];
+            let mut seen = [false; TLB_MAX_ENTRIES];
             let mut cur = self.mru_head[list];
             let mut count = 0usize;
             while cur != MRU_NONE {
                 let slot = cur as usize;
-                if slot >= TLB_NUM_ENTRIES {
+                if slot >= self.num_entries {
                     report(format!("MRU list {} contains out-of-range slot {}", list, slot));
                     break;
                 }
@@ -783,9 +802,9 @@ impl MipsTlb {
                 count += 1;
                 cur = self.mru_next[list][slot];
             }
-            let missing: Vec<usize> = (0..TLB_NUM_ENTRIES).filter(|&i| !seen[i]).collect();
+            let missing: Vec<usize> = (0..self.num_entries).filter(|&i| !seen[i]).collect();
             if !missing.is_empty() {
-                report(format!("MRU list {} is missing slot(s) {:?} (visited {} of {})", list, missing, count, TLB_NUM_ENTRIES));
+                report(format!("MRU list {} is missing slot(s) {:?} (visited {} of {})", list, missing, count, self.num_entries));
             }
         }
 
@@ -817,7 +836,7 @@ impl MipsTlb {
         {
             use std::collections::HashMap;
             let mut owners: HashMap<usize, (usize, bool)> = HashMap::new(); // vpn2 -> (most_recent_entry_idx, multiple)
-            for i in 0..TLB_NUM_ENTRIES {
+            for i in 0..self.num_entries {
                 let (start, count) = Self::vmap_range(&self.entries[i]);
                 for k in 0..count {
                     let vpn2 = start.wrapping_add(k);
@@ -882,7 +901,7 @@ impl MipsTlb {
             eprintln!("TLBCHECK VIOLATION [{}]: {}", context, msg);
         }
         eprintln!("TLBCHECK: dumping full TLB state for [{}]:", context);
-        for i in 0..TLB_NUM_ENTRIES {
+        for i in 0..self.num_entries {
             eprintln!("{}", self.format_entry(i));
         }
         true
@@ -1055,7 +1074,7 @@ impl Tlb for MipsTlb {
     }
 
     fn write(&mut self, index: usize, mut entry: TlbEntry) {
-        if index < self.entries.len() {
+        if index < self.num_entries {
             let mask = entry.page_mask | 0x1FFF;
             entry.selector_bit_shift = (mask.trailing_ones() - 1) as u8;
             entry.vcmp32   = !mask & 0x0000_0000_FFFF_E000;
@@ -1076,7 +1095,7 @@ impl Tlb for MipsTlb {
     }
 
     fn read(&self, index: usize) -> TlbEntry {
-        if index < self.entries.len() {
+        if index < self.num_entries {
             self.entries[index]
         } else {
             TlbEntry::new()
@@ -1117,7 +1136,7 @@ impl Tlb for MipsTlb {
     }
 
     fn format_entry(&self, index: usize) -> String {
-        if index >= self.entries.len() {
+        if index >= self.num_entries {
             return format!("Index {} out of bounds", index);
         }
         let e = &self.entries[index];
@@ -1188,14 +1207,14 @@ impl Tlb for MipsTlb {
     }
 
     fn power_on(&mut self) {
-        self.entries = [TlbEntry::new(); TLB_NUM_ENTRIES];
-        self.shadow  = [ShadowEntry::invalid(); TLB_NUM_ENTRIES];
+        self.entries = [TlbEntry::new(); TLB_MAX_ENTRIES];
+        self.shadow  = [ShadowEntry::invalid(); TLB_MAX_ENTRIES];
         for list in 0..MRU_LISTS {
             self.mru_head[list] = 0;
-            for i in 0..TLB_NUM_ENTRIES - 1 {
+            for i in 0..self.num_entries - 1 {
                 self.mru_next[list][i] = (i + 1) as u8;
             }
-            self.mru_next[list][TLB_NUM_ENTRIES - 1] = MRU_NONE;
+            self.mru_next[list][self.num_entries - 1] = MRU_NONE;
         }
         self.vmap.fill(VMAP_MISS);
         #[cfg(feature = "tlbcheck")]
@@ -1204,7 +1223,9 @@ impl Tlb for MipsTlb {
 
     fn save_state(&self) -> toml::Value {
         // Each entry stored as [page_mask, entry_hi, entry_lo0, entry_lo1]
-        let arr: Vec<toml::Value> = self.entries.iter().map(|e| {
+        // Only the live entries: a 48-entry model must still produce a
+        // 48-entry snapshot even though the array has room for 64.
+        let arr: Vec<toml::Value> = self.entries[..self.num_entries].iter().map(|e| {
             let words = [e.page_mask, e.entry_hi, e.entry_lo[0], e.entry_lo[1]];
             u64_slice_to_toml(&words)
         }).collect();
@@ -1214,7 +1235,7 @@ impl Tlb for MipsTlb {
     fn load_state(&mut self, v: &toml::Value) -> Result<(), String> {
         if let toml::Value::Array(arr) = v {
             for (i, item) in arr.iter().enumerate() {
-                if i >= TLB_NUM_ENTRIES { break; }
+                if i >= self.num_entries { break; }
                 let mut words = [0u64; 4];
                 load_u64_slice(item, &mut words);
                 let page_mask = words[0];
@@ -1240,19 +1261,19 @@ impl Tlb for MipsTlb {
                 };
             }
         }
-        for i in 0..TLB_NUM_ENTRIES {
+        for i in 0..self.num_entries {
             self.shadow[i] = ShadowEntry::from_entry(&self.entries[i]);
         }
         // Reset MRU lists to canonical order so snapshot restores are deterministic.
         for list in 0..MRU_LISTS {
             self.mru_head[list] = 0;
-            for i in 0..TLB_NUM_ENTRIES - 1 {
+            for i in 0..self.num_entries - 1 {
                 self.mru_next[list][i] = (i + 1) as u8;
             }
-            self.mru_next[list][TLB_NUM_ENTRIES - 1] = MRU_NONE;
+            self.mru_next[list][self.num_entries - 1] = MRU_NONE;
         }
         self.vmap.fill(VMAP_MISS);
-        for i in 0..TLB_NUM_ENTRIES {
+        for i in 0..self.num_entries {
             let (start, count) = Self::vmap_range(&self.entries[i]);
             self.vmap_fill_range(i, start, count);
         }

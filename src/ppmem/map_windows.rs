@@ -272,6 +272,18 @@ impl AddrSpace {
         }
         Ok(())
     }
+
+    /// The Unix backend's `scrub`. Not done here: a placeholder cannot be
+    /// made readable without committing a view, and IP28 is not built for
+    /// Windows. Falls back to `unmap`, which keeps the old fault-on-access
+    /// behaviour.
+    ///
+    /// # Safety
+    ///
+    /// Same as `unmap`.
+    pub unsafe fn scrub(&self, at: usize, len: usize) -> io::Result<()> {
+        unsafe { self.unmap(at, len) }
+    }
 }
 
 impl Drop for AddrSpace {
