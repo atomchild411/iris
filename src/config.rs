@@ -469,23 +469,10 @@ impl ImpactSection {
             || self.exp1 != ImpactSlot::None
     }
 
-    /// Hardware-valid slot population (rejects High+High and orphan expansion boards).
+    /// One IMPACT board, in the graphics slot; a second head is not modelled yet.
     pub fn validate(&self) -> Result<(), String> {
-        let slots = [self.gfx, self.exp0, self.exp1];
-        let high_count = slots.iter().filter(|&&s| s == ImpactSlot::High).count();
-        if high_count >= 2 {
-            return Err(
-                "[impact] High+High is invalid — at most one High IMPACT board per system".into(),
-            );
-        }
-        if self.exp0 != ImpactSlot::None && self.gfx == ImpactSlot::None {
-            return Err("[impact] exp0 requires gfx slot populated".into());
-        }
-        if self.exp1 != ImpactSlot::None && self.exp0 == ImpactSlot::None {
-            return Err("[impact] exp1 requires exp0 populated (Maximum IMPACT uses all three slots)".into());
-        }
-        if self.exp1 == ImpactSlot::Max && self.exp0 != ImpactSlot::High {
-            return Err("[impact] Maximum IMPACT expects exp0=high when exp1=max".into());
+        if self.exp0 != ImpactSlot::None || self.exp1 != ImpactSlot::None {
+            return Err("[impact] only the graphics slot (gfx) is supported so far".into());
         }
         Ok(())
     }

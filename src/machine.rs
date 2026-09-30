@@ -520,7 +520,8 @@ impl Machine {
         let nvram_provenance = cfg.nvram.clone();
 
         // REX3 Graphics — Newport only; skipped in headless mode or when XZ board selected
-        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.board != crate::config::GraphicsBoard::Newport {
+        // An IMPACT board takes the graphics slot and the window; no Newport then.
+        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.board != crate::config::GraphicsBoard::Newport || cfg.impact.any_enabled() {
             None
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
@@ -578,9 +579,9 @@ impl Machine {
             }
         };
 
-        // Indigo2 IMPACT/MGRAS preview — multi-slot GIO stub.
+        // Indigo2 IMPACT graphics in the GIO graphics slot.
         let mgras: Option<Arc<crate::mgras::Mgras>> = if !guinness && cfg.impact.any_enabled() {
-            Some(Arc::new(crate::mgras::Mgras::new(&cfg.impact)))
+            Some(Arc::new(crate::mgras::Mgras::new(&cfg.impact, ioc.clone(), heartbeat.clone(), fasttick_count.clone())))
         } else {
             None
         };
@@ -690,6 +691,7 @@ impl Machine {
         // Connect VINO to System Memory, install a video source, start DMA.
         // Source kind + broadcast standard come from `[vino]` in iris.toml.
         phys.vino.set_phys(phys.clone());
+        if let Some(mgras) = &phys.mgras { mgras.set_phys(phys.clone()); }
         let standard = match cfg.vino.standard {
             crate::config::VinoStandard::Ntsc => crate::video_source::VideoStandard::Ntsc,
             crate::config::VinoStandard::Pal  => crate::video_source::VideoStandard::Pal,
@@ -827,6 +829,7 @@ impl Machine {
         // happen before hpc3.scsi().start() (called later, from
         // Machine::start) actually spawns the worker thread that reads it.
         if let Some(rex3) = &phys.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(mgras) = &phys.mgras { mgras.set_cpu_cycles(cpu.cycles_ptr()); }
         if let Some(rex3) = &phys.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
         if let Some(gr2) = &phys.gr2 { gr2.set_cpu_cycles(cpu.cycles_ptr()); }
         if let Some(td) = &phys.testdev { td.attach_core(cpu.core_ptr()); }
@@ -1014,6 +1017,7 @@ impl Machine {
         // Program VC2 before the refresh thread runs so the first frame has size.
         self.apply_host_display_resolution();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
+        if let Some(mgras) = &self._phys.mgras { mgras.start_display(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
         if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
         #[cfg(feature = "ultra64")]
@@ -1102,6 +1106,7 @@ impl Machine {
     pub fn stop(&mut self) {
         self.cpu.stop();
         if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
+        if let Some(mgras) = &self._phys.mgras { mgras.stop_display(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.stop(); }
         if let Some(gr2) = &self._phys.gr2 { gr2.stop(); }
         self.hpc3.stop();
@@ -1175,6 +1180,9 @@ impl Machine {
     pub fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
         if let Some(g) = &self._phys.gr2 {
             return Some(g.clone() as Arc<dyn crate::gfx_display::GfxDisplay>);
+        }
+        if let Some(m) = &self._phys.mgras {
+            return Some(m.clone() as Arc<dyn crate::gfx_display::GfxDisplay>);
         }
         self._phys.rex3.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
     }
