@@ -384,10 +384,15 @@ struct IocIrqLine {
 struct IocTimerCallback {
     state: Arc<Mutex<IocState>>,
     source: IocInterrupt,
+    /// The status bar's clock-tick counter (see `Ioc::set_clock_ticks`).
+    ticks: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
 }
 
 impl TimerCallback for IocTimerCallback {
     fn callback(&self) {
+        if let Some(t) = self.ticks.get() {
+            t.fetch_add(1, Ordering::Relaxed);
+        }
         let mut state = self.state.lock();
         match self.source {
             IocInterrupt::Mappable0 => state.map_stat |= 1 << 0,
@@ -427,6 +432,8 @@ pub struct Ioc {
     event_tx: Arc<std::sync::OnceLock<mpsc::SyncSender<MachineEvent>>>,
     /// Shared heartbeat — IOC sets/clears HB_LED_RED/GREEN bits directly.
     heartbeat: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
+    /// Counter bumped on every 8254 timer 0/1 interrupt (see `set_clock_ticks`).
+    clock_ticks: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
     /// Shared timer manager for PIT channels.
     timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
 }
@@ -496,14 +503,17 @@ impl Ioc {
             source: IocInterrupt::Serial,
         });
 
+        let clock_ticks = Arc::new(std::sync::OnceLock::new());
         let timer0_cb = Arc::new(IocTimerCallback {
             state: state.clone(),
             source: IocInterrupt::Mappable0,
+            ticks: clock_ticks.clone(),
         });
 
         let timer1_cb = Arc::new(IocTimerCallback {
             state: state.clone(),
             source: IocInterrupt::Mappable1,
+            ticks: clock_ticks.clone(),
         });
 
         let ps2_cb = Arc::new(IocIrqLine {
@@ -525,6 +535,7 @@ impl Ioc {
             guinness,
             event_tx: Arc::new(std::sync::OnceLock::new()),
             heartbeat: Arc::new(std::sync::OnceLock::new()),
+            clock_ticks,
             timer_manager: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -536,6 +547,15 @@ impl Ioc {
 
     pub fn set_event_sender(&self, tx: mpsc::SyncSender<MachineEvent>) {
         let _ = self.event_tx.set(tx);
+    }
+
+    /// Count the kernel's clock ticks into the status bar's Hz counter. IRIX
+    /// keeps time with the 8254 (timer 0 is the system clock, timer 1 the
+    /// profiling clock) unless the IOC's 8254 is known broken, in which case
+    /// it uses CP0 Compare, which the CPU already counts. Either way the
+    /// counter shows the kernel's tick rate, and never both at once.
+    pub fn set_clock_ticks(&self, ticks: Arc<AtomicU64>) {
+        let _ = self.clock_ticks.set(ticks);
     }
 
     pub fn set_heartbeat(&self, heartbeat: Arc<AtomicU64>) {
