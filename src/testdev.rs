@@ -348,7 +348,7 @@ pub fn dump_json(core: &MipsCore, tag: u32) -> String {
         ("XContext", hex64(core.cp0_xcontext)),
         ("ECC",      hex32(core.cp0_ecc)),
         ("CacheErr", hex32(core.cp0_cacheerr)),
-        ("TagLo",    hex32(core.cp0_taglo)),
+        ("TagLo",    hex32(core.cp0_taglo as u32)),
         ("TagHi",    hex32(core.cp0_taghi)),
     ];
     let body: Vec<String> = cp0.iter().map(|(n, v)| format!("    \"{}\": {}", n, v)).collect();

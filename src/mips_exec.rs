@@ -24,6 +24,8 @@ pub const MIPS_LOG_INSN: u32 = 0x0001; // per-instruction disassembly trace
 pub const MIPS_LOG_TLB:  u32 = 0x0002; // TLB read/write/probe
 pub const MIPS_LOG_MEM:  u32 = 0x0004; // uncached memory accesses
 pub const MIPS_LOG_FPU:  u32 = 0x0008; // FP compare/condmove/convert operand+result trace
+pub const MIPS_LOG_CP0:  u32 = 0x0010; // CP0 register traffic: EPC/EntryHi/XContext writes,
+                                       // ECC and CacheErr accesses, Status.DE transitions
 
 /// Opt-in gate for the `developerx` Coprocessor-Unusable break (see the three
 /// `handle_exception*` wrappers). Off unless `IRIS_BREAK_CPU=1`.
@@ -41,6 +43,17 @@ fn cpu_unusable_break_enabled() -> bool {
 #[cfg(feature = "developer")]
 #[inline(always)]
 fn mips_log(bit: u32) -> bool {
+    devlog_is_active(LogModule::Mips) && (devlog_mask(LogModule::Mips) & bit) != 0
+}
+
+/// Like `mips_log`, but live in every build.
+///
+/// The IP28 bring-up traces this gates were plain environment variables that
+/// worked in release, and the machines they diagnose are booted in release —
+/// so they keep that reach. The cost is two relaxed atomic loads, against the
+/// `getenv` per call some of them used to do.
+#[inline(always)]
+fn mips_log_always(bit: u32) -> bool {
     devlog_is_active(LogModule::Mips) && (devlog_mask(LogModule::Mips) & bit) != 0
 }
 
@@ -333,7 +346,7 @@ struct CpuSnapshot {
     cp0_xcontext: u64,
     cp0_ecc: u32,
     cp0_cacheerr: u32,
-    cp0_taglo: u32,
+    cp0_taglo: u64,
     cp0_taghi: u32,
     cp0_errorepc: u64,
 
@@ -1158,6 +1171,18 @@ impl MipsCpuConfig {
     /// Cache geometry is fixed at compile time via constants in mips_cache_v2.
     pub const fn indy() -> Self {
         Self { tlb_entries: 48 }
+    }
+
+    /// The JTLB size the CPU model declares.
+    ///
+    /// `core.tlb_entries` is already taken from the model, so sizing the TLB
+    /// itself from anything else leaves the two disagreeing: Random cycles
+    /// over a range the array does not have, and a TLBWI to an index past the
+    /// end is silently dropped. The R10000 has 64 entries where the R4400 has
+    /// 48, and SGI's IP28 diagnostic writes index 48 on its first cache-alias
+    /// test — every one of its reported failures was that write going nowhere.
+    pub fn for_model<C: crate::mips_cache_v2::CpuModel>() -> Self {
+        Self { tlb_entries: C::TLB_ENTRIES }
     }
 }
 
@@ -2702,6 +2727,37 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 _       => 0b11,  // none / 4 MB
             };
             config |= ss << CONFIG_TR_SS;
+        }
+
+        // R10000 lays Config out completely differently from an R4000, and the
+        // PROM sizes its cache diagnostics from it. Fields, per NetBSD's
+        // mips/include/cpuregs.h (MIPS4_CONFIG_*):
+        //   [31:29] IC  primary I-cache size, as 4096 << field
+        //   [28:26] DC  primary D-cache size, likewise
+        //   [18:16] SS  secondary cache size
+        //   [15]    BE  big endian
+        //   [13]    SB  secondary block size, 0 = 64B, 1 = 128B
+        //   [2:0]   K0  kseg0 cacheability, which the PROM sets for itself
+        // Presenting an R4000 Config here told an R10000 PROM that its
+        // secondary cache size field was zero.
+        if C::R10K_CACHE_OPS {
+            let log2 = |n: usize| (n / 4096).trailing_zeros();
+            let mut c = 0u32;
+            c |= log2(32768) << 29;          // 32 KB L1I
+            c |= log2(32768) << 26;          // 32 KB L1D
+            c |= 1 << 15;                    // big endian
+            if C::L2_LINE == 128 { c |= 1 << 13; }
+            // Secondary cache size. The encoding is not in anything to hand,
+            // so it was swept against the PROM rather than guessed.
+            //
+            // 1 is the value to keep: IRIX reports "Secondary unified
+            // instruction/data cache size: 1 Mbyte", which agrees with this
+            // model's own `L2_SIZE`, and the PROM's power-on diagnostics pass
+            // and IRIX boots with it. 4 also passes POST but has IRIX report
+            // 8 MB, contradicting the model.
+            c |= 1 << 16;
+            c |= 2;                          // K0 = uncached at reset
+            config = c;
         }
 
         core.cp0_config = config;
@@ -4252,7 +4308,91 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// Handle an exception: update CP0 registers and jump to handler vector.
     /// Takes an ExecStatus with EXEC_IS_EXCEPTION set; extracts code and TLB-refill flag.
+    /// IP28 bring-up: dump everything about the one exception whose BadVAddr
+    /// is `IRIS_IP28_EXC_VADDR`.
+    ///
+    /// A first-N trace is useless for a fault that lands after thousands of
+    /// ordinary TLB misses, and reading the register file from the monitor
+    /// afterwards shows the guest's panic handler, not the fault. Costs one
+    /// relaxed load per exception on the R10000 model and folds away on every
+    /// other; exceptions are not a hot path.
+    #[inline]
+    fn ip28_trace_exception(&self, status: ExecStatus) {
+        if !C::R10K_CACHE_OPS {
+            return;
+        }
+        static WANT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let want = *WANT.get_or_init(|| {
+            std::env::var("IRIS_IP28_EXC_VADDR").ok().and_then(|v| {
+                let v = v.trim();
+                if v.is_empty() { return None; }
+                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()
+            })
+        });
+        let Some(want) = want else { return };
+
+        // Keep the run-up. The exception that panics the guest is the second
+        // one: the first is an ordinary miss, and its handler then faults.
+        // Only the run-up says what the handler was handed, and BadVAddr has
+        // already been overwritten by the time the match fires.
+        static RING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        const KEEP: usize = 12;
+        let line = format!(
+            "code={:<2} pc={:#018x} bd={} badvaddr={:#018x} xcontext={:#018x} \
+             context={:#018x} entryhi={:#018x} ra={:#018x}",
+            (status & CAUSE_EXCCODE_MASK) >> 2,
+            self.core.pc,
+            self.core.in_delay_slot as u8,
+            self.core.cp0_badvaddr,
+            self.core.cp0_xcontext,
+            self.core.cp0_context,
+            self.core.cp0_entryhi,
+            self.core.read_gpr(31),
+        );
+        if let Ok(mut ring) = RING.lock() {
+            if ring.len() == KEEP {
+                ring.remove(0);
+            }
+            ring.push(line);
+            if want == self.core.cp0_badvaddr {
+                eprintln!("ip28exc: --- last {} exceptions, oldest first ---", ring.len());
+                for (i, l) in ring.iter().enumerate() {
+                    eprintln!("ip28exc: [{i}] {l}");
+                }
+            }
+        }
+
+        if want != self.core.cp0_badvaddr {
+            return;
+        }
+        const NAMES: [&str; 32] = [
+            "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+            "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+        ];
+        let code = (status & CAUSE_EXCCODE_MASK) >> 2;
+        eprintln!(
+            "ip28exc: code={code} pc={:#018x} delay_slot={} badvaddr={:#018x} status={:#010x}",
+            self.core.pc, self.core.in_delay_slot, self.core.cp0_badvaddr,
+            self.core.cp0_status,
+        );
+        for i in 0..32u32 {
+            if self.core.read_gpr(i) == self.core.cp0_badvaddr {
+                eprintln!("ip28exc:   {} (${i}) holds the bad address", NAMES[i as usize]);
+            }
+        }
+        for chunk in (0..32u32).collect::<Vec<_>>().chunks(4) {
+            let mut line = String::from("ip28exc: ");
+            for &i in chunk {
+                line.push_str(&format!(" {:>4}={:#018x}", NAMES[i as usize], self.core.read_gpr(i)));
+            }
+            eprintln!("{line}");
+        }
+    }
+
     fn handle_exception(&mut self, status: ExecStatus) -> ExecStatus {
+        self.ip28_trace_exception(status);
         // In developer builds, bus/address error exceptions break into the
         // monitor at the fault site rather than dispatching to the MIPS
         // vector — must be decided before deliver_exception runs, since that
@@ -6663,7 +6803,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let op = cache_op & 0x1C;
 
         // Determine if this is a Hit operation that needs address translation
-        let needs_translation = matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV);
+        // On an R10000 the encodings for 5/6/7 are index operations, not the
+        // R4000 hit operations — translating them would fault on an index that
+        // is not a valid virtual address. See C_R10K_ISD in mips_cache_v2.
+        let sel = cache_op & 3;
+        let r10k_index_op = C::R10K_CACHE_OPS
+            && match op {
+                C_R10K_CBARRIER => sel == CACH_PI,
+                C_R10K_ILD => matches!(sel, CACH_PI | CACH_PD | CACH_SD),
+                C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
+                _ => false,
+            };
+        let needs_translation =
+            !r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV);
 
         let phys_addr = if needs_translation {
             // Hit operations need address translation
@@ -6677,19 +6829,73 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         // For Index_Store_Tag, pass TagLo via phys_addr
         let op = cache_op & 0x1C;
-        let phys_addr_or_taglo = if op == C_IST {
-            self.core.cp0_taglo as u64
+        // A cache tag is TagHi:TagLo, not TagLo alone. The IP28 PROM writes
+        // the low 32 bits to $28 and the bits above to $29 — a 36-bit
+        // secondary tag arrives as TagLo=0xffffcdfe, TagHi=0xf — so a model
+        // that reads only TagLo sees a different tag from the one written.
+        // Harmless for R4400/R5000, whose tags fit in 32 bits and who leave
+        // TagHi zero: the shift-in contributes nothing there.
+        let stores_taglo = op == C_IST || (r10k_index_op && op == C_R10K_ISD);
+        let phys_addr_or_taglo = if stores_taglo {
+            ((self.core.cp0_taghi as u64) << 32) | (self.core.cp0_taglo as u32 as u64)
         } else {
             phys_addr
         };
 
+        // On an R10000 the check bits travel with cache data through CP0 ECC.
+        if C::R10K_CACHE_OPS {
+            self.cache.set_cache_ecc(self.core.cp0_ecc);
+        }
+        // IP28 cache-error investigation (`log mips mask cp0`). Two kinds
+        // of op are worth seeing: one carrying non-zero check bits, which is a
+        // guest staging a parity error on purpose, and any op from outside the
+        // PROM — i.e. from a loaded diagnostic, which runs out of XKPHYS.
+        //
+        // Both halves of that gate were learned the hard way. Gating on ECC
+        // alone hid every op the IDE issued, because the IDE's ECC reads back
+        // zero: the exact symptom under investigation was also blinding the
+        // instrument to its cause. The cap then has to be generous, because a
+        // cap of 600 silently truncated a run at precisely the boundary and
+        // made a partial picture look like the whole one. It exists only so a
+        // hot loop cannot rewrite the timing it is measuring.
+        if crate::mips_core::cachediag_on() {
+            let from_prom = (self.core.pc >> 32) == 0xFFFF_FFFF;
+            // CBARRIER is pure ordering: it names no line and carries no check
+            // bits, and it outnumbers everything else ~8:1 (83534 of 94322 in
+            // one IDE run). Tracing it swamped the log and slowed the guest
+            // enough that the run no longer reached the loop being studied —
+            // so drop it unless it is carrying staged check bits.
+            let noise = op == C_R10K_CBARRIER && self.core.cp0_ecc == 0;
+            if (self.core.cp0_ecc != 0 || !from_prom) && !noise {
+                const CACHE_TRACE_CAP: u32 = 200_000;
+                static SEEN: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < CACHE_TRACE_CAP {
+                    crate::dlog!(LogModule::Mips,
+                        "ip28cd: CACHE op={:#04x} sel={} vaddr={:#018x} ECC={:#010x} \
+                         TagHi:Lo={:#010x}:{:#018x} pc={:#018x}",
+                        op, sel, virt_addr, self.core.cp0_ecc,
+                        self.core.cp0_taghi, self.core.cp0_taglo, self.core.pc);
+                } else if n == CACHE_TRACE_CAP {
+                    crate::dlog!(LogModule::Mips,
+                        "ip28cd: CACHE trace capped at {CACHE_TRACE_CAP} ops \
+                         — output past this point is incomplete");
+                }
+            }
+        }
         // Call unified cache interface
         let result = self.cache.cache_op(cache_op, virt_addr, phys_addr_or_taglo);
+        if C::R10K_CACHE_OPS && op == C_R10K_ILD {
+            self.core.cp0_ecc = self.cache.cache_op_ecc();
+        }
 
         // For Index_Load_Tag, update CP0 TagLo from result
-        if op == C_ILT {
-            self.core.cp0_taglo = result;
-            self.core.cp0_taghi = 0;
+        if op == C_ILT || (r10k_index_op && op == C_R10K_ILD) {
+            // Split back the way it arrived. Zeroing TagHi unconditionally
+            // threw away the top of every tag wider than 32 bits.
+            self.core.cp0_taglo = result & 0xFFFF_FFFF;
+            self.core.cp0_taghi = (result >> 32) as u32;
         }
 
         self.handle_exec_complete()
@@ -6917,6 +7123,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
         let value = self.core.read_cp0(rd_val);
+        self.ip28_cp0_trace("mfc0", rd_val, value);
         // Sign-extend 32-bit value to 64 bits
         self.core.write_gpr(rt_reg, value as u32 as i32 as i64 as u64);
         self.handle_exec_complete()
@@ -6927,6 +7134,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
         let value = self.core.read_cp0(rd_val);
+        self.ip28_cp0_trace("dmfc0", rd_val, value);
         self.core.write_gpr(rt_reg, value);
         self.handle_exec_complete()
     }
@@ -6935,13 +7143,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// The CP0 registers that are 64 bits wide.
     ///
     /// EntryLo0/1, Context, BadVAddr, EntryHi, EPC, XContext and ErrorEPC are
-    /// 64-bit in MIPS III and stay so in MIPS IV.
+    /// 64-bit in MIPS III and stay so in MIPS IV. TagLo is 32-bit on R4x00 but
+    /// 64-bit on the R10000, which is why it is asked of the model rather than
+    /// listed flat.
     fn cp0_is_64bit(reg: u32) -> bool {
-        matches!(reg, 2 | 3 | 4 | 8 | 10 | 14 | 20 | 30)
+        matches!(reg, 2 | 3 | 4 | 8 | 10 | 14 | 20 | 30) || (C::R10K_CACHE_OPS && reg == 28)
     }
 
     fn exec_mtc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
+        self.ip28_cp0_trace("mtc0", d.rd as u32, rt_val);
         let rd_val = d.rd as u32;
 
         // MTC0 moves the whole register. DMTC0 differs in what the
@@ -6976,8 +7187,22 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     // DMTC0 - Doubleword Move To CP0 (MIPS III)
+    /// IP28 bring-up: watch the cache-tag CP0 registers (26 ECC, 28 TagLo,
+    /// 29 TagHi) under `log mips mask cp0`. Only the R10000 model compiles
+    /// this in.
+    ///
+    /// The env-var form this replaced did an uncached `getenv` on every
+    /// DMTC0/MTC0, armed or not.
+    #[inline(always)]
+    fn ip28_cp0_trace(&self, what: &str, reg: u32, val: u64) {
+        if C::R10K_CACHE_OPS && matches!(reg, 26 | 28 | 29) && mips_log_always(MIPS_LOG_CP0) {
+            crate::dlog!(LogModule::Mips, "ip28cp0: {what} ${reg} = {val:#018x}");
+        }
+    }
+
     fn exec_dmtc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
+        self.ip28_cp0_trace("dmtc0", d.rd as u32, rt_val);
         let rd_val = d.rd as u32;
         self.core.write_cp0(rd_val, rt_val);
         self.handle_cp0_side_effects(rd_val);
@@ -7143,6 +7368,31 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // TLBWI - Write Indexed TLB Entry
     // Writes CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask to the TLB entry indexed by CP0.Index
+    /// Report every TLB write, under `log mips mask tlb`.
+    ///
+    /// `IRIS_IP28_TLBW=wired` additionally narrows it to writes below CP0
+    /// Wired — the mappings a kernel means never to be evicted. That stays an
+    /// environment variable because it selects a *subset*, which the module
+    /// mask has no way to express; the on/off is devlog's.
+    #[inline]
+    fn ip28_trace_tlb_write(&self, op: &str, index: usize, entry: &crate::mips_tlb::TlbEntry) {
+        if !mips_log_always(MIPS_LOG_TLB) {
+            return;
+        }
+        static WIRED_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let wired_only = *WIRED_ONLY.get_or_init(|| {
+            matches!(std::env::var("IRIS_IP28_TLBW").as_deref(), Ok("wired"))
+        });
+        if wired_only && index >= self.core.cp0_wired as usize {
+            return;
+        }
+        crate::dlog!(LogModule::Mips,
+            "ip28tlbw: {op} idx={index:<2} wired={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} \
+             mask={:#x} pc={:#018x}",
+            self.core.cp0_wired, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1],
+            entry.page_mask, self.core.pc);
+    }
+
     fn exec_tlbwi(&mut self) -> ExecStatus {
         // The slot is Index[5:0]. Masking rather than `%` matters twice:
         //
@@ -7168,7 +7418,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return self.handle_exec_complete();
         }
         let entry = self.create_tlb_entry_from_cp0();
-        //eprintln!("TLBWI idx={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} pc={:#018x}", index, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1], self.core.pc);
+        self.ip28_trace_tlb_write("tlbwi", index, &entry);
         self.tlb.write(index, entry);
         // Flushes the nutlb too — the TLB it caches just changed.
         self.nanotlb_invalidate();
@@ -7192,6 +7442,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.update_random();
         let index = (self.core.cp0_random as usize) % self.tlb.num_entries();
         let entry = self.create_tlb_entry_from_cp0();
+        self.ip28_trace_tlb_write("tlbwr", index, &entry);
         self.tlb.write(index, entry);
         self.nanotlb_invalidate();
 
@@ -7361,6 +7612,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // *guarantees* the next access misses and therefore calls `translate_fn`.
         self.resync_privilege_state();
 
+        // `log mips mask cp0`. If the target's top half is already gone by
+        // the time we get here, the guest wrote a truncated EPC; if it is
+        // intact and the next fetch is truncated anyway, the loss is
+        // downstream of this.
+        if C::R10K_CACHE_OPS && mips_log_always(MIPS_LOG_CP0) {
+            crate::dlog!(LogModule::Mips,
+                "ip28epc: eret -> {target:#018x} (epc={:#018x} errorepc={:#018x} status={:#010x})",
+                self.core.cp0_epc, self.core.cp0_errorepc, self.core.cp0_status);
+        }
 
         // ERET jumps immediately without delay slot
         self.core.pc = target;
@@ -14143,7 +14403,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         cp0u32!(cp0_status); cp0u32!(cp0_cause);
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
         cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
-        cp0u32!(cp0_taglo); cp0u32!(cp0_taghi);
+        cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
         cp0u64!(cp0_badvaddr); cp0u64!(cp0_epc); cp0u64!(cp0_errorepc);
         cp0u64!(cp0_entrylo0); cp0u64!(cp0_entrylo1); cp0u64!(cp0_context);
         cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext);
@@ -14208,7 +14468,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);
             ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
             ld32!(cp0_config); ld32!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
-            ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld32!(cp0_taglo); ld32!(cp0_taghi);
+            ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
             ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
             ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
             ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
@@ -14656,6 +14916,7 @@ mod xcontext_layout_tests {
                    "but it is inside a 44-bit CPU's");
     }
 }
+
 
 #[cfg(test)]
 mod round_to_int_mode_tests {

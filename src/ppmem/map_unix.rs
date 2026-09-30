@@ -276,6 +276,45 @@ impl AddrSpace {
     }
 }
 
+impl AddrSpace {
+    /// Replace `[at, at+len)` with private, zero-filled, read-write memory,
+    /// **retaining the claim** like `unmap` does.
+    ///
+    /// For ranges something may still point into. ppmem's generation window
+    /// is read by JIT compile workers through pointers taken while a bank was
+    /// mapped, and the data window by the DMA thread after a bitmap check; a
+    /// remap runs on the CPU thread meanwhile. With `PROT_NONE` there, a
+    /// reader in that window took the whole emulator down (SIGBUS in
+    /// `PhysicalCodePage::current_gen`, twice on IP28, where IRIX's kernel
+    /// rewrites MEMCFG1 during boot). Here it reads zeros, which the
+    /// generation check sees as a change and the bitmap never lets reach
+    /// guest-visible state.
+    ///
+    /// # Safety
+    ///
+    /// As `map`: whatever was mapped in the range is gone.
+    pub unsafe fn scrub(&self, at: usize, len: usize) -> io::Result<()> {
+        self.check_range(at, len);
+        let want = self.base.add(at);
+        let got = libc::mmap(
+            want as *mut libc::c_void,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        if got == libc::MAP_FAILED {
+            return Err(oserr("mmap(scrub)"));
+        }
+        assert_eq!(
+            got as usize, want as usize,
+            "ppmem: scrub landed at {got:p}, wanted {want:p}"
+        );
+        Ok(())
+    }
+}
+
 impl Drop for AddrSpace {
     fn drop(&mut self) {
         // One munmap releases the whole reservation including every view

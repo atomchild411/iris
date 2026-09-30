@@ -23,10 +23,16 @@ impl PhysPtr {
 use crate::physical::RamBank;
 use crate::prom::Prom;
 use crate::mc::MemoryController;
+
+/// Count on the IP28's 195 MHz R10000: half the pipeline clock, and what
+/// IRIX assumes there (see where the MC is created).
+const IP28_COUNT_HZ: u64 = 97_500_000;
 use crate::mips_tlb::MipsTlb;
 use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
 use crate::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
+#[cfg(feature = "ip28")]
+use crate::mips_cache_shadow::R10000ShadowCache;
 use crate::hpc3::Hpc3;
 use crate::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -257,6 +263,12 @@ impl Machine {
         let clock_fixed_mhz = cfg.clock.fixed_mhz;
         let cfg_cpu_model = cfg.machine.cpu;
 
+        if (cfg.machine.profile == MachineProfile::Indigo2Ip28 && !cfg!(feature = "ip28"))
+            || !cfg_cpu_model.available()
+        {
+            eprintln!("iris: IP28 / R10000 support is not built into this binary; rebuild with --features ip28");
+            std::process::exit(1);
+        }
         if !cfg.machine.profile.supported() {
             eprintln!(
                 "iris: machine profile \"{}\" is not implemented; use {}",
@@ -284,6 +296,10 @@ impl Machine {
         let model_has_l2 = match cfg_cpu_model {
             crate::config::CpuModel::R4400 => <R4400Cache as MipsCache>::L2_SIZE > 0,
             crate::config::CpuModel::R5000 => <R5000Cache as MipsCache>::L2_SIZE > 0,
+            #[cfg(feature = "ip28")]
+            crate::config::CpuModel::R10000 => <R10000ShadowCache as MipsCache>::L2_SIZE > 0,
+            #[cfg(not(feature = "ip28"))]
+            crate::config::CpuModel::R10000 => unreachable!("refused above without the ip28 feature"),
         };
         if !model_has_l2 {
             eeprom_mc.lock().set_cachsz(0);
@@ -291,7 +307,24 @@ impl Machine {
 
         // 1. Create all devices first
         // Memory Controller
-        let mc = MemoryController::new(eeprom_mc.clone(), guinness, cfg.banks);
+        let mc = MemoryController::new_for_profile(
+            eeprom_mc.clone(), guinness, cfg.banks, cfg.machine.profile.ip28());
+        // IP28: IRIX takes the CPU speed from the PROM's `cpufreq` (194, i.e.
+        // a 195 MHz R10000) instead of measuring it, and times with it: UST
+        // assumes Count at half that, and the RPSS cycle counter the MC clock
+        // at the CPU clock (Config.EC is 0, a 1:1 system-clock ratio) over the
+        // divider it programs. The generic 33 MHz Count and 50 MHz MC made
+        // UST run at a third of real time (Quake in slow motion) and the
+        // cycle counter at a quarter.
+        let ip28_count_hz: Option<u64> = if cfg.machine.profile.ip28() {
+            Some(clock_fixed_mhz.map_or(IP28_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64))
+        } else {
+            None
+        };
+        if let Some(count_hz) = ip28_count_hz {
+            // The R10000's Count ticks at half the pipeline clock.
+            mc.set_clock_hz(2 * count_hz);
+        }
 
         // RAM banks sized per config. addr_mask is initialized to mem_size-1;
         // remap_banks() updates it via set_addr_mask() when MEMCFG0/1 are written during POST.
@@ -325,7 +358,7 @@ impl Machine {
 
         // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
         // bindings so multiple `--ci` instances can coexist.
-        let ioc = if ci_enabled { Ioc::new_ci(guinness) } else { Ioc::new(guinness) };
+        let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28());
 
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket
@@ -651,6 +684,7 @@ impl Machine {
             mc.clone(),
             hpc3.clone(),
             prom_port,
+            cfg.machine.profile.ip28(),
         );
 
         // Wrap Physical in Arc
@@ -733,7 +767,7 @@ impl Machine {
         //    arm below monomorphises its own CPU — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         macro_rules! build_cpu { ($cache:ty) => {{
-        let cfg = MipsCpuConfig::indy();
+        let cfg = MipsCpuConfig::for_model::<$cache>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
 
@@ -751,7 +785,9 @@ impl Machine {
         // CP0 Count runs at a fixed frequency: DEFAULT_COUNT_HZ unless the
         // user overrode it via `[clock] fixed_mhz` or the CLI. Must happen
         // before the core starts executing.
-        if let Some(mhz) = clock_fixed_mhz {
+        if let Some(hz) = ip28_count_hz {
+            executor.core.set_count_hz(hz);
+        } else if let Some(mhz) = clock_fixed_mhz {
             executor.core.set_count_hz((mhz * 1_000_000.0) as u64);
         }
 
@@ -778,6 +814,13 @@ impl Machine {
         let cpu: Arc<dyn crate::mips_exec::CpuDevice> = match cfg_cpu_model {
             crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
             crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
+            // IP28 uses the shadow cache: out of the data path entirely, with
+            // tag and data arrays that exist only to answer CACHE ops and the
+            // PROM's diagnostics. See mips_cache_shadow.rs.
+            #[cfg(feature = "ip28")]
+            crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
+            #[cfg(not(feature = "ip28"))]
+            crate::config::CpuModel::R10000 => unreachable!("refused above without the ip28 feature"),
         };
 
         // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.

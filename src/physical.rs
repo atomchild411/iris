@@ -211,7 +211,24 @@ const PROM_END: u32  = 0x1FD00000;
 // accesses go through the normal lomem device_map entries — no direct bank pointer needed.
 const ALIAS_BASE: u32   = 0x00000000;
 const ALIAS_END: u32    = 0x00080000;
-const ALIAS_OFFSET: u32 = LOMEM_BASE;
+
+/// Where the 512 KB alias at physical 0 points.
+///
+/// The MC mirrors the bottom 512 KB of *memory*, and which physical address
+/// that is depends on the machine: LOMEM_BASE on IP22/IP24, 0x20000000 on
+/// IP28, whose RAM starts there and has nothing at lomem at all. With the
+/// offset fixed at LOMEM_BASE the whole window read back as zero on IP28.
+///
+/// That window is not spare space. ARCS builds its system parameter block at
+/// physical 0x1000 and its firmware vector table at 0x1800, and a 64-bit sash
+/// loads its firmware pointer straight out of 0x1018 — so the PROM's writes
+/// were being discarded and sash then dereferenced the null it read back.
+///
+/// Taken from the machine profile, never from the environment.
+fn alias_offset_for(ip28: bool) -> u32 {
+    if ip28 { HIMEM_BASE } else { LOMEM_BASE }
+}
+
 
 /// What one 64 KB `device_map` slot should point at after a MEMCFG write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,6 +325,10 @@ pub struct Physical {
     /// `u64` before that — never null, so the test needs no guard.
     #[cfg(feature = "ppmem")]
     ppmem_bitmap: *const u64,
+    /// IP28: the bank placement ppmem's window was last built for, so a
+    /// MEMCFG write that moves nothing leaves the window alone.
+    #[cfg(all(feature = "ppmem", feature = "ip28"))]
+    ppmem_last_placement: Option<([Option<(u32, u32, u32)>; 4], [usize; 4])>,
 
     pub rex3: Option<Arc<Rex3>>,
     /// Second Newport head (dual-head Indigo2 / `graphics.heads = 2`).
@@ -343,6 +364,10 @@ pub struct Physical {
     /// two, and a bank parked out there has to be unmapped again when it
     /// moves — see `plan_bank_slots`.
     banks_outside_windows: Vec<u32>,
+    /// Where the 512 KB alias at physical 0 points — see `alias_offset_for`.
+    alias_offset: u32,
+    /// This machine is an IP28. Only used to label the bank-map trace.
+    is_ip28: bool,
 
     trace: AtomicBool,
     start_tick: u64,
@@ -399,6 +424,8 @@ impl Physical {
         mc: MemoryController,
         hpc3: Hpc3,
         prom: PromPort,
+        // IP28: RAM starts at 0x20000000, so the low-memory alias follows it.
+        ip28: bool,
     ) -> Self {
         let host_freq = crate::platform::get_host_tick_frequency();
         let start_tick = crate::platform::get_host_ticks();
@@ -409,7 +436,7 @@ impl Physical {
         let gio_bus_error = GioBusErrorDevice { mc: mc.clone() };
         // Alias targets will be set in build_device_map once Physical is in final location
         let unmapped_ram = UnmappedRam;
-        let alias_bus = AliasBus::new(std::ptr::null::<ErrorBus>(), ALIAS_OFFSET);
+        let alias_bus = AliasBus::new(std::ptr::null::<ErrorBus>(), alias_offset_for(ip28));
         // VINO GIO alias: 0x1F08xxxx → 0x0008xxxx (subtract 0x1F000000 = add 0xFF000000)
         // GIO64 VINO aperture sits at 0x1F080000; the chip's primary registers
         // live at physical 0x00080000 (VINO_BASE). To map 0x1F080000 → 0x00080000
@@ -467,6 +494,8 @@ impl Physical {
             ppmem_gen_base,
             #[cfg(feature = "ppmem")]
             ppmem_bitmap,
+            #[cfg(all(feature = "ppmem", feature = "ip28"))]
+            ppmem_last_placement: None,
             rex3,
             rex3_head1,
             gr2,
@@ -487,6 +516,8 @@ impl Physical {
             black_hole,
             device_map,
             banks_outside_windows: Vec::new(),
+            alias_offset: alias_offset_for(ip28),
+            is_ip28: ip28,
             trace: AtomicBool::new(false),
             start_tick,
             host_freq,
@@ -571,14 +602,9 @@ impl Physical {
                 self.device_map[i as usize] = gr2_ptr;
             }
         } else if let Some(mgras_ptr) = mgras_ptr {
-            // Indigo2 IMPACT preview: MGRAS stub spans gfx + populated expansion slots.
+            // IMPACT in the graphics slot. The expansion slots stay unmapped so
+            // their probes bus-error, as empty slots do.
             for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
-                self.device_map[i as usize] = mgras_ptr;
-            }
-            for i in (GIO_SLOT0_BASE >> 16)..((GIO_SLOT0_END - 1) >> 16) + 1 {
-                self.device_map[i as usize] = mgras_ptr;
-            }
-            for i in (GIO_SLOT1_BASE >> 16)..((GIO_SLOT1_END - 1) >> 16) + 1 {
                 self.device_map[i as usize] = mgras_ptr;
             }
         }
@@ -631,7 +657,7 @@ impl Physical {
             self.device_map[i as usize] = prom_ptr;
         }
 
-        // Alias: points back into Physical itself with ALIAS_OFFSET added.
+        // Alias: points back into Physical itself with `alias_offset()` added.
         // So alias accesses go: AliasBus → Physical::read/write(addr + LOMEM_BASE)
         // → device_map lookup → whichever bank is mapped at LOMEM_BASE.
         // This way alias automatically tracks whatever MEMCFG maps at LOMEM_BASE.
@@ -647,6 +673,7 @@ impl Physical {
         self.vino_gio_alias.target = self as *const Physical as *const dyn BusDevice;
         let vino_gio_alias_ptr: *const dyn BusDevice = &self.vino_gio_alias;
         self.device_map[(0x1F080000u32 >> 16) as usize] = vino_gio_alias_ptr;
+
     }
 
     /// Remap memory banks in device_map.
@@ -669,12 +696,38 @@ impl Physical {
             &self.banks[3],
         ];
 
-        // ppmem: drop every mapping before re-placing the banks. Safe to leave
-        // the window briefly unmapped — remapping runs inside the CPU's MEMCFG
-        // store during PROM POST, before DMA is running (design doc §5.1).
+        // IP28: a MEMCFG write that leaves every bank where it was (IRIX's
+        // kernel rewrites MEMCFG1 during boot to fix the refresh bits) must
+        // not tear down and rebuild ppmem's window. JIT compile workers and
+        // the DMA thread are running by then, and the rebuild is exactly the
+        // window in which they used to fault.
+        #[cfg(all(feature = "ppmem", feature = "ip28"))]
+        let ppmem_placement_changed = {
+            let sizes = [0, 1, 2, 3].map(|i| self.banks[i].size());
+            let key = (bank_addrs, sizes);
+            let changed = self.ppmem_last_placement != Some(key);
+            self.ppmem_last_placement = Some(key);
+            changed
+        };
+        #[cfg(all(feature = "ppmem", not(feature = "ip28")))]
+        let ppmem_placement_changed = true;
+
+        // ppmem: drop every mapping before re-placing the banks. The comment
+        // this replaced said the window is safe to leave unmapped because
+        // remapping only runs during PROM POST, before DMA; that is not true
+        // on IP28 (see above), which is why ppmem scrubs rather than unmaps (see `AddrSpace::scrub`).
         #[cfg(feature = "ppmem")]
-        if let Some(sp) = &self.ppmem_space {
-            sp.clear_mappings();
+        if ppmem_placement_changed {
+            if let Some(sp) = &self.ppmem_space {
+                sp.clear_mappings();
+            }
+            // A bank now answering at an address another bank answered at
+            // must look changed to the JIT even if the two counters happen to
+            // be equal, so move every counter.
+            #[cfg(all(feature = "ip28", feature = "jitv2"))]
+            for b in &self.banks {
+                b.bump_gen_all();
+            }
         }
 
         for (bank_idx, maybe_bank) in bank_addrs.iter().enumerate() {
@@ -683,6 +736,9 @@ impl Physical {
                 continue;
             };
 
+            if self.is_ip28 {
+                eprintln!("iris: IP28 experiment: bank {bank_idx} -> base {conf_base:#010x} mask {addr_mask:#010x} limit {limit:#010x}");
+            }
             dlog_dev!(LogModule::Mc, "[MEMCFG] bank {} mapped at 0x{:08x}..0x{:08x} addr_mask={:08x} limit={:08x} ({}MB visible, {}MB per rank)",
                 bank_idx, conf_base, conf_base + limit,
                 addr_mask, limit, limit >> 20, (addr_mask + 1) >> 20);
@@ -693,7 +749,7 @@ impl Physical {
             // undersized bank repeats to fill `limit`, which is exactly the
             // SIMM mirroring `addr_mask` encodes — see docs/ppmem-design.md §5.
             #[cfg(feature = "ppmem")]
-            if let Some(sp) = &self.ppmem_space {
+            if let (true, Some(sp)) = (ppmem_placement_changed, &self.ppmem_space) {
                 // `addr_mask + 1` is the SIMM's mirror period, and `limit` the
                 // configured slot. They are independent: a dual-rank SIMM has a
                 // slot half the size of the bank (each rank placed separately),
@@ -740,8 +796,8 @@ impl Physical {
         // re-dispatch. AliasBus stays installed in device_map as the bus-path
         // equivalent; both see identical memory.
         #[cfg(feature = "ppmem")]
-        if let Some(sp) = &self.ppmem_space {
-            let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _)| base == LOMEM_BASE);
+        if let (true, Some(sp)) = (ppmem_placement_changed, &self.ppmem_space) {
+            let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _)| base == self.alias_offset);
             if bank0_mapped {
                 let alias_len = (ALIAS_END - ALIAS_BASE) as u64;
                 if (self.banks[0].size() as u64) >= alias_len {
