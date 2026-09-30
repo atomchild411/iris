@@ -1,0 +1,9 @@
+[package]
+name = "iris-hostcall"
+version = "0.1.0"
+edition = "2021"
+description = "Host services for IRIX programs under IRIS, reached through a private system call"
+license = "BSD-3-Clause"
+
+[dependencies]
+parking_lot = "0.12"

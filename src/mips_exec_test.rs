@@ -3625,6 +3625,63 @@ mod tests {
         assert_eq!(mem.get_word(addr), 0xDEADBEEF); // Memory unchanged
     }
 
+    /// A host call is answered in place: from user mode, `syscall` with a
+    /// registered number (here the self-test service through IRIX's indirect
+    /// form, `v0` = 1000, the number in `$4`) sets `v0`/`v1`/`a3` and moves on
+    /// to the next instruction with no exception. From kernel mode the same
+    /// instruction is an ordinary Syscall exception.
+    #[test]
+    #[cfg(feature = "hostcall")]
+    fn host_call_answers_user_syscall_and_leaves_kernel_alone() {
+        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK, STATUS_KSU_SHIFT, KSU_USER};
+        iris_hostcall::register(iris_hostcall::SELFTEST, Box::new(iris_hostcall::SelfTest));
+        let syscall = make_r(OP_SPECIAL, 0, 0, 0, 0, FUNCT_SYSCALL);
+        let set_call = |exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>, args: &[u64]| {
+            exec.core.write_gpr(2, iris_hostcall::SYS_SYSCALL as u64);
+            exec.core.write_gpr(4, iris_hostcall::SELFTEST as u64);
+            for i in 0..7 {
+                exec.core.write_gpr(5 + i as u32, args.get(i).copied().unwrap_or(0));
+            }
+        };
+
+        // Kernel mode: an ordinary exception.
+        let (mut exec, _) = create_executor();
+        set_call(&mut exec, &[iris_hostcall::SelfTest::PING, 7]);
+        let s = exec.exec(syscall);
+        assert!(s & EXEC_IS_EXCEPTION != 0 && (s >> 2) & 0x1F == EXC_SYS,
+                "a kernel-mode syscall must stay IRIX's");
+
+        // User mode: PING answers 0x1215 and the count of arguments before the
+        // first 0, with a3 = 0 (success) and no exception.
+        let (mut exec, mem) = create_executor();
+        let user = (exec.core.cp0_status & !STATUS_KSU_MASK & !STATUS_EXL & !STATUS_ERL)
+            | ((KSU_USER as u32) << STATUS_KSU_SHIFT);
+        exec.set_cp0_status(user);
+        exec.core.pc = 0x0040_0000;
+        set_call(&mut exec, &[iris_hostcall::SelfTest::PING, 7, 9]);
+        let s = exec.exec(syscall);
+        assert_eq!(s & EXEC_IS_EXCEPTION, 0, "a host call must not raise an exception");
+        assert_eq!(exec.core.read_gpr(2), 0x1215);
+        assert_eq!(exec.core.read_gpr(3), 2);
+        assert_eq!(exec.core.read_gpr(7), 0);
+        assert_eq!(exec.core.cp0_status & STATUS_EXL, 0);
+
+        // SUM reads the program's memory through the TLB: the bytes of one
+        // word at a user address.
+        mem.set_word(0x0010_0000, 0x0102_0304);
+        set_call(&mut exec, &[iris_hostcall::SelfTest::SUM, 0x0010_0000, 4]);
+        let s = exec.exec(syscall);
+        assert_eq!(s & EXEC_IS_EXCEPTION, 0);
+        assert_eq!((exec.core.read_gpr(2), exec.core.read_gpr(7)), (10, 0));
+
+        // A kernel address is refused, not read: the need-page answer, a3 = 1.
+        set_call(&mut exec, &[iris_hostcall::SelfTest::SUM, 0xFFFF_FFFF_8000_0000, 4]);
+        let s = exec.exec(syscall);
+        assert_eq!(s & EXEC_IS_EXCEPTION, 0);
+        assert_eq!((exec.core.read_gpr(2), exec.core.read_gpr(7)),
+                   (iris_hostcall::ENEEDPAGE, 1));
+    }
+
     #[test]
     fn test_syscall_break() {
         let (mut exec, _) = create_executor();
