@@ -917,7 +917,7 @@ impl Device for Ps2Controller {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 status".to_string())]
+        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
@@ -953,6 +953,16 @@ impl Device for Ps2Controller {
                 writeln!(writer, "PS/2: pressed Enter").unwrap();
                 return Ok(());
             }
+            if !args.is_empty() && args[0] == "mouse" {
+                let n = |i: usize| args.get(i).and_then(|v| v.parse::<i32>().ok());
+                let (Some(dx), Some(dy)) = (n(1), n(2)) else {
+                    return Err("Usage: ps2 mouse <dx> <dy> [buttons: 1 left, 2 right, 4 middle]".to_string());
+                };
+                let buttons = n(3).unwrap_or(0) as u8;
+                self.push_mouse_input(buttons, dx, dy, 0);
+                writeln!(writer, "PS/2: mouse {} {} buttons {}", dx, dy, buttons).unwrap();
+                return Ok(());
+            }
             if !args.is_empty() && args[0] == "status" {
                 let s = self.state.lock();
                 writeln!(writer, "PS/2 state: running={} scanning_enabled={} mouse_enabled={} mouse_id={} rx_queue_len={} mouse_queue_bytes={} scancode_set={} config={:02x} last_read={:02x}",
@@ -961,7 +971,7 @@ impl Device for Ps2Controller {
                     s.mouse_queue_bytes, s.scancode_set, s.config, s.last_read).unwrap();
                 return Ok(());
             }
-            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 status".to_string());
+            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string());
         }
         Err("Command not found".to_string())
     }
