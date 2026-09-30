@@ -1,0 +1,5597 @@
+{
+ "_about": [
+  "Our half of glapi.json; the other half is the Khronos OpenGL registry (khronos/gl.xml).",
+  "glapi_from_registry.py merges them. Everything here is ours: how each argument crosses to the",
+  "host (kind, counts, size tables, which calls must wait), the entry-point order -- which IS the",
+  "wire protocol's op numbering, so never reorder, only append -- and where IRIX 6.5's own",
+  "declarations differ from the registry's (irix_overrides, irix_only), which the guest's encoders",
+  "must follow to compile against IRIX's <GL/gl.h>.",
+  "The size tables (sizes: values a parameter-named array holds; get_multi: values a glGet returns)",
+  "are the counts the OpenGL 1.1/1.2 specification's state tables and each extension's specification",
+  "give for those parameters."
+ ],
+ "irix_overrides": {
+  "glTexImage3D": {
+   "params": {
+    "2": {
+     "type": "GLenum"
+    }
+   },
+   "why": "IRIX 6.5 declares internalformat GLenum (from EXT_texture3D); the registry has GLint. Different C types: the guest's definition must match IRIX's prototype."
+  },
+  "glEdgeFlagPointer": {
+   "params": {
+    "1": {
+     "type": "GLboolean"
+    }
+   },
+   "why": "IRIX 6.5 declares the pointer const GLboolean *; the registry has const void *. Different pointer types: the guest's definition must match IRIX's prototype."
+  }
+ },
+ "irix_only": {
+  "glSelectTextureSGIS": {
+   "name": "glSelectTextureSGIS",
+   "ret": "void",
+   "params": [
+    {
+     "type": "GLenum",
+     "name": "target",
+     "ptr": 0,
+     "const": false
+    }
+   ],
+   "why": "SGIS_multitexture, withdrawn in favour of ARB_multitexture and never in the registry; IRIX 6.5 has it and its programs use it."
+  },
+  "glMTexCoord2fSGIS": {
+   "name": "glMTexCoord2fSGIS",
+   "ret": "void",
+   "params": [
+    {
+     "type": "GLenum",
+     "name": "target",
+     "ptr": 0,
+     "const": false
+    },
+    {
+     "type": "GLfloat",
+     "name": "s",
+     "ptr": 0,
+     "const": false
+    },
+    {
+     "type": "GLfloat",
+     "name": "t",
+     "ptr": 0,
+     "const": false
+    }
+   ],
+   "why": "SGIS_multitexture, as glSelectTextureSGIS."
+  },
+  "glMTexCoord2fvSGIS": {
+   "name": "glMTexCoord2fvSGIS",
+   "ret": "void",
+   "params": [
+    {
+     "type": "GLenum",
+     "name": "target",
+     "ptr": 0,
+     "const": false
+    },
+    {
+     "type": "GLfloat",
+     "name": "v",
+     "ptr": 1,
+     "const": true
+    }
+   ],
+   "why": "SGIS_multitexture, as glSelectTextureSGIS."
+  }
+ },
+ "functions": [
+  {
+   "name": "glAccum",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glAlphaFunc",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glAreTexturesResident",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "inline",
+     "count": "n"
+    },
+    {
+     "elem": "u8",
+     "kind": "out",
+     "count": "n"
+    }
+   ]
+  },
+  {
+   "name": "glAreTexturesResidentEXT",
+   "sync": true,
+   "ext": "EXT_texture_object",
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "inline",
+     "count": "n"
+    },
+    {
+     "elem": "u8",
+     "kind": "out",
+     "count": "n"
+    }
+   ]
+  },
+  {
+   "name": "glArrayElement",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glArrayElementEXT",
+   "sync": false,
+   "ext": "EXT_vertex_array"
+  },
+  {
+   "name": "glBegin",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glBindTexture",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glBindTextureEXT",
+   "sync": false,
+   "ext": "EXT_texture_object"
+  },
+  {
+   "name": "glBitmap",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "u8",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height"
+     ],
+     "bitmap": true
+    }
+   ]
+  },
+  {
+   "name": "glBlendColor",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glBlendColorEXT",
+   "sync": false,
+   "ext": "EXT_blend_color"
+  },
+  {
+   "name": "glBlendEquation",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glBlendEquationEXT",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glBlendFunc",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCallList",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCallLists",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "inline",
+     "count": "n",
+     "typed": "type"
+    }
+   ]
+  },
+  {
+   "name": "glClear",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glClearAccum",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glClearColor",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glClearDepth",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glClearIndex",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glClearStencil",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glClipPlane",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glColor3b",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor3bv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i8",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glColor3d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor3dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glColor3f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor3fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glColor3i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor3iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glColor3s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor3sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glColor3ub",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor3ubv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u8",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glColor3ui",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor3uiv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glColor3us",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor3usv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u16",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glColor4b",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor4bv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i8",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glColor4d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor4dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glColor4f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor4fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glColor4i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor4iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glColor4s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor4sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glColor4ub",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor4ubv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u8",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glColor4ui",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor4uiv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glColor4us",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColor4usv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u16",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glColorMask",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColorMaterial",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glColorPointer",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "Color"
+    }
+   ]
+  },
+  {
+   "name": "glColorPointerEXT",
+   "sync": false,
+   "ext": "EXT_vertex_array",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "Color"
+    }
+   ]
+  },
+  {
+   "name": "glColorSubTable",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "count"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glColorTable",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glColorTableParameterfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "ColorTableParameterfvSGI",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glColorTableParameterfvSGI",
+   "sync": false,
+   "ext": "SGI_color_table",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "ColorTableParameterfvSGI",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glColorTableParameteriv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "ColorTableParameterivSGI",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glColorTableParameterivSGI",
+   "sync": false,
+   "ext": "SGI_color_table",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "ColorTableParameterivSGI",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glColorTableSGI",
+   "sync": true,
+   "ext": "SGI_color_table",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glConvolutionFilter1D",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glConvolutionFilter1DEXT",
+   "sync": true,
+   "ext": "EXT_convolution",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glConvolutionFilter2D",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glConvolutionFilter2DEXT",
+   "sync": true,
+   "ext": "EXT_convolution",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glConvolutionParameterf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glConvolutionParameterfEXT",
+   "sync": false,
+   "ext": "EXT_convolution"
+  },
+  {
+   "name": "glConvolutionParameterfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "ConvolutionParameterfvEXT",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glConvolutionParameterfvEXT",
+   "sync": false,
+   "ext": "EXT_convolution",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "ConvolutionParameterfvEXT",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glConvolutionParameteri",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glConvolutionParameteriEXT",
+   "sync": false,
+   "ext": "EXT_convolution"
+  },
+  {
+   "name": "glConvolutionParameteriv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "ConvolutionParameterivEXT",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glConvolutionParameterivEXT",
+   "sync": false,
+   "ext": "EXT_convolution",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "ConvolutionParameterivEXT",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glCopyColorSubTable",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyColorTable",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyColorTableSGI",
+   "sync": false,
+   "ext": "SGI_color_table"
+  },
+  {
+   "name": "glCopyConvolutionFilter1D",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyConvolutionFilter1DEXT",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyConvolutionFilter2D",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyConvolutionFilter2DEXT",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyPixels",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyTexImage1D",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyTexImage1DEXT",
+   "sync": false,
+   "ext": "EXT_copy_texture"
+  },
+  {
+   "name": "glCopyTexImage2D",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyTexImage2DEXT",
+   "sync": false,
+   "ext": "EXT_copy_texture"
+  },
+  {
+   "name": "glCopyTexSubImage1D",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyTexSubImage1DEXT",
+   "sync": false,
+   "ext": "EXT_copy_texture"
+  },
+  {
+   "name": "glCopyTexSubImage2D",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyTexSubImage2DEXT",
+   "sync": false,
+   "ext": "EXT_copy_texture"
+  },
+  {
+   "name": "glCopyTexSubImage3D",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glCopyTexSubImage3DEXT",
+   "sync": false,
+   "ext": "EXT_copy_texture"
+  },
+  {
+   "name": "glCullFace",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glDeformSGIX",
+   "sync": false,
+   "ext": "SGIX_polynomial_ffd"
+  },
+  {
+   "name": "glDeformationMap3dSGIX",
+   "sync": false,
+   "ext": "SGIX_polynomial_ffd",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "f64",
+     "kind": "map",
+     "target": "target",
+     "orders": [
+      [
+       "uorder",
+       "ustride"
+      ],
+      [
+       "vorder",
+       "vstride"
+      ],
+      [
+       "worder",
+       "wstride"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "name": "glDeformationMap3fSGIX",
+   "sync": false,
+   "ext": "SGIX_polynomial_ffd",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "map",
+     "target": "target",
+     "orders": [
+      [
+       "uorder",
+       "ustride"
+      ],
+      [
+       "vorder",
+       "vstride"
+      ],
+      [
+       "worder",
+       "wstride"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "name": "glDeleteLists",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glDeleteTextures",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "inline",
+     "count": "n"
+    }
+   ]
+  },
+  {
+   "name": "glDeleteTexturesEXT",
+   "sync": false,
+   "ext": "EXT_texture_object",
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "inline",
+     "count": "n"
+    }
+   ]
+  },
+  {
+   "name": "glDepthFunc",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glDepthMask",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glDepthRange",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glDetailTexFuncSGIS",
+   "sync": false,
+   "ext": "SGIS_detail_texture",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "n*2"
+    }
+   ]
+  },
+  {
+   "name": "glDisable",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glDisableClientState",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glDrawArrays",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glDrawArraysEXT",
+   "sync": false,
+   "ext": "EXT_vertex_array"
+  },
+  {
+   "name": "glDrawBuffer",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glDrawElements",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "drawindices",
+     "count": "count",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glDrawPixels",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glDrawRangeElements",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "drawindices",
+     "count": "count",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glEdgeFlag",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEdgeFlagPointer",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "u8",
+     "kind": "array",
+     "array": "EdgeFlag"
+    }
+   ]
+  },
+  {
+   "name": "glEdgeFlagPointerEXT",
+   "sync": false,
+   "ext": "EXT_vertex_array",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "u8",
+     "kind": "array",
+     "array": "EdgeFlag"
+    }
+   ]
+  },
+  {
+   "name": "glEdgeFlagv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u8",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glEnable",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEnableClientState",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEnd",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEndList",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEvalCoord1d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEvalCoord1dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glEvalCoord1f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEvalCoord1fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glEvalCoord2d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEvalCoord2dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glEvalCoord2f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEvalCoord2fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glEvalMesh1",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEvalMesh2",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEvalPoint1",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glEvalPoint2",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glFeedbackBuffer",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "deferred",
+     "count": "size"
+    }
+   ]
+  },
+  {
+   "name": "glFinish",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glFlush",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glFlushRasterSGIX",
+   "sync": false,
+   "ext": "SGIX_flush_raster"
+  },
+  {
+   "name": "glFogFuncSGIS",
+   "sync": false,
+   "ext": "SGIS_fog_function",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "n*2"
+    }
+   ]
+  },
+  {
+   "name": "glFogf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glFogfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "Fogfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glFogi",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glFogiv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "Fogiv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glFrameZoomSGIX",
+   "sync": false,
+   "ext": "SGIX_framezoom"
+  },
+  {
+   "name": "glFrontFace",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glFrustum",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glGenLists",
+   "sync": true,
+   "ext": null
+  },
+  {
+   "name": "glGenTextures",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "out",
+     "count": "n"
+    }
+   ]
+  },
+  {
+   "name": "glGenTexturesEXT",
+   "sync": true,
+   "ext": "EXT_texture_object",
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "out",
+     "count": "n"
+    }
+   ]
+  },
+  {
+   "name": "glGetBooleanv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "u8",
+     "kind": "out",
+     "get": "pname"
+    }
+   ]
+  },
+  {
+   "name": "glGetClipPlane",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "f64",
+     "kind": "out",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glGetColorTable",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "ColorTable",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetColorTableParameterfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "table": "ColorTableParameterfvSGI",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetColorTableParameterfvSGI",
+   "sync": true,
+   "ext": "SGI_color_table",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "table": "ColorTableParameterfvSGI",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetColorTableParameteriv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "table": "ColorTableParameterivSGI",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetColorTableParameterivSGI",
+   "sync": true,
+   "ext": "SGI_color_table",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "table": "ColorTableParameterivSGI",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetColorTableSGI",
+   "sync": true,
+   "ext": "SGI_color_table",
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "ColorTable",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetConvolutionFilter",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "ConvolutionFilter",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetConvolutionFilterEXT",
+   "sync": true,
+   "ext": "EXT_convolution",
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "ConvolutionFilter",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetConvolutionParameterfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "table": "ConvolutionParameterfvEXT",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetConvolutionParameterfvEXT",
+   "sync": true,
+   "ext": "EXT_convolution",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "table": "ConvolutionParameterfvEXT",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetConvolutionParameteriv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "table": "ConvolutionParameterivEXT",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetConvolutionParameterivEXT",
+   "sync": true,
+   "ext": "EXT_convolution",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "table": "ConvolutionParameterivEXT",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetDetailTexFuncSGIS",
+   "sync": true,
+   "ext": "SGIS_detail_texture",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "emulated": "DetailTexFunc"
+    }
+   ]
+  },
+  {
+   "name": "glGetDoublev",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "f64",
+     "kind": "out",
+     "get": "pname"
+    }
+   ]
+  },
+  {
+   "name": "glGetError",
+   "sync": true,
+   "ext": null
+  },
+  {
+   "name": "glGetFloatv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "get": "pname"
+    }
+   ]
+  },
+  {
+   "name": "glGetHistogram",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "Histogram",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetHistogramEXT",
+   "sync": true,
+   "ext": "EXT_histogram",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "Histogram",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetHistogramParameterfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetHistogramParameterfvEXT",
+   "sync": true,
+   "ext": "EXT_histogram",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetHistogramParameteriv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetHistogramParameterivEXT",
+   "sync": true,
+   "ext": "EXT_histogram",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetInstrumentsSGIX",
+   "sync": true,
+   "ext": "SGIX_instruments"
+  },
+  {
+   "name": "glGetIntegerv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "get": "pname"
+    }
+   ]
+  },
+  {
+   "name": "glGetLightfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "table": "Lightfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetLightiv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "table": "Lightiv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetListParameterfvSGIX",
+   "sync": true,
+   "ext": "SGIX_list_priority",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetListParameterivSGIX",
+   "sync": true,
+   "ext": "SGIX_list_priority",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetMapdv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f64",
+     "kind": "out",
+     "mapquery": [
+      "target",
+      "query"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "glGetMapfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "mapquery": [
+      "target",
+      "query"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "glGetMapiv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "mapquery": [
+      "target",
+      "query"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "glGetMaterialfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "table": "Materialfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetMaterialiv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "table": "Materialiv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetMinmax",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "Minmax",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetMinmaxEXT",
+   "sync": true,
+   "ext": "EXT_histogram",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "Minmax",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetMinmaxParameterfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetMinmaxParameterfvEXT",
+   "sync": true,
+   "ext": "EXT_histogram",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetMinmaxParameteriv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetMinmaxParameterivEXT",
+   "sync": true,
+   "ext": "EXT_histogram",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetPixelMapfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "pixelmap": "map"
+    }
+   ]
+  },
+  {
+   "name": "glGetPixelMapuiv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "out",
+     "pixelmap": "map"
+    }
+   ]
+  },
+  {
+   "name": "glGetPixelMapusv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "u16",
+     "kind": "out",
+     "pixelmap": "map"
+    }
+   ]
+  },
+  {
+   "name": "glGetPointerv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "void",
+     "kind": "out",
+     "pointer": "pname"
+    }
+   ]
+  },
+  {
+   "name": "glGetPointervEXT",
+   "sync": true,
+   "ext": "EXT_vertex_array",
+   "params": [
+    {},
+    {
+     "elem": "void",
+     "kind": "out",
+     "pointer": "pname"
+    }
+   ]
+  },
+  {
+   "name": "glGetPolygonStipple",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u8",
+     "kind": "outimage",
+     "dims": [
+      "32",
+      "32"
+     ],
+     "bitmap": true
+    }
+   ]
+  },
+  {
+   "name": "glGetSeparableFilter",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "SeparableFilter.row",
+     "format_param": "format",
+     "type_param": "type"
+    },
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "SeparableFilter.column",
+     "format_param": "format",
+     "type_param": "type"
+    },
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "SeparableFilter.span",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetSeparableFilterEXT",
+   "sync": true,
+   "ext": "EXT_convolution",
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "SeparableFilter.row",
+     "format_param": "format",
+     "type_param": "type"
+    },
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "SeparableFilter.column",
+     "format_param": "format",
+     "type_param": "type"
+    },
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "SeparableFilter.span",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetSharpenTexFuncSGIS",
+   "sync": true,
+   "ext": "SGIS_sharpen_texture",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "emulated": "SharpenTexFunc"
+    }
+   ]
+  },
+  {
+   "name": "glGetString",
+   "sync": true,
+   "ext": null
+  },
+  {
+   "name": "glGetTexEnvfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "table": "TexEnvfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetTexEnviv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "table": "TexEnviv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetTexFilterFuncSGIS",
+   "sync": true,
+   "ext": "SGIS_texture_filter4",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "emulated": "TexFilterFunc"
+    }
+   ]
+  },
+  {
+   "name": "glGetTexGendv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f64",
+     "kind": "out",
+     "table": "TexGendv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetTexGenfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "table": "TexGenfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetTexGeniv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "table": "TexGeniv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetTexImage",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims_from": "TexImage",
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glGetTexLevelParameterfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetTexLevelParameteriv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glGetTexParameterfv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "out",
+     "table": "TexParameterfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glGetTexParameteriv",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "out",
+     "table": "TexParameteriv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glHint",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glHistogram",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glHistogramEXT",
+   "sync": false,
+   "ext": "EXT_histogram"
+  },
+  {
+   "name": "glIndexMask",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glIndexPointer",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "Index"
+    }
+   ]
+  },
+  {
+   "name": "glIndexPointerEXT",
+   "sync": false,
+   "ext": "EXT_vertex_array",
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "Index"
+    }
+   ]
+  },
+  {
+   "name": "glIndexd",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glIndexdv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glIndexf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glIndexfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glIndexi",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glIndexiv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glIndexs",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glIndexsv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glIndexub",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glIndexubv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u8",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glInitNames",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glInstrumentsBufferSGIX",
+   "sync": false,
+   "ext": "SGIX_instruments",
+   "params": [
+    {},
+    {
+     "elem": "i32",
+     "kind": "deferred",
+     "count": "size"
+    }
+   ]
+  },
+  {
+   "name": "glInterleavedArrays",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "Interleaved"
+    }
+   ]
+  },
+  {
+   "name": "glIsEnabled",
+   "sync": true,
+   "ext": null
+  },
+  {
+   "name": "glIsList",
+   "sync": true,
+   "ext": null
+  },
+  {
+   "name": "glIsTexture",
+   "sync": true,
+   "ext": null
+  },
+  {
+   "name": "glIsTextureEXT",
+   "sync": true,
+   "ext": "EXT_texture_object"
+  },
+  {
+   "name": "glLightModelf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glLightModelfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "LightModelfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glLightModeli",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glLightModeliv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "LightModeliv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glLightf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glLightfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "Lightfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glLighti",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glLightiv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "Lightiv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glLineStipple",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glLineWidth",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glListBase",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glListParameterfSGIX",
+   "sync": false,
+   "ext": "SGIX_list_priority"
+  },
+  {
+   "name": "glListParameterfvSGIX",
+   "sync": false,
+   "ext": "SGIX_list_priority",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glListParameteriSGIX",
+   "sync": false,
+   "ext": "SGIX_list_priority"
+  },
+  {
+   "name": "glListParameterivSGIX",
+   "sync": false,
+   "ext": "SGIX_list_priority",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glLoadIdentity",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glLoadIdentityDeformationMapSGIX",
+   "sync": false,
+   "ext": "SGIX_polynomial_ffd"
+  },
+  {
+   "name": "glLoadMatrixd",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "16"
+    }
+   ]
+  },
+  {
+   "name": "glLoadMatrixf",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "16"
+    }
+   ]
+  },
+  {
+   "name": "glLoadName",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glLogicOp",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glMap1d",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "f64",
+     "kind": "map",
+     "target": "target",
+     "orders": [
+      [
+       "order",
+       "stride"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "name": "glMap1f",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "map",
+     "target": "target",
+     "orders": [
+      [
+       "order",
+       "stride"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "name": "glMap2d",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "f64",
+     "kind": "map",
+     "target": "target",
+     "orders": [
+      [
+       "uorder",
+       "ustride"
+      ],
+      [
+       "vorder",
+       "vstride"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "name": "glMap2f",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "map",
+     "target": "target",
+     "orders": [
+      [
+       "uorder",
+       "ustride"
+      ],
+      [
+       "vorder",
+       "vstride"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "name": "glMapGrid1d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glMapGrid1f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glMapGrid2d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glMapGrid2f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glMaterialf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glMaterialfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "Materialfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glMateriali",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glMaterialiv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "Materialiv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glMatrixMode",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glMinmax",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glMinmaxEXT",
+   "sync": false,
+   "ext": "EXT_histogram"
+  },
+  {
+   "name": "glMultMatrixd",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "16"
+    }
+   ]
+  },
+  {
+   "name": "glMultMatrixf",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "16"
+    }
+   ]
+  },
+  {
+   "name": "glNewList",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glNormal3b",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glNormal3bv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i8",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glNormal3d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glNormal3dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glNormal3f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glNormal3fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glNormal3i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glNormal3iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glNormal3s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glNormal3sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glNormalPointer",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "Normal"
+    }
+   ]
+  },
+  {
+   "name": "glNormalPointerEXT",
+   "sync": false,
+   "ext": "EXT_vertex_array",
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "Normal"
+    }
+   ]
+  },
+  {
+   "name": "glOrtho",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPassThrough",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPixelMapfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "mapsize"
+    }
+   ]
+  },
+  {
+   "name": "glPixelMapuiv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "u32",
+     "kind": "inline",
+     "count": "mapsize"
+    }
+   ]
+  },
+  {
+   "name": "glPixelMapusv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "u16",
+     "kind": "inline",
+     "count": "mapsize"
+    }
+   ]
+  },
+  {
+   "name": "glPixelStoref",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPixelStorei",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPixelTexGenSGIX",
+   "sync": false,
+   "ext": "SGIX_pixel_texture"
+  },
+  {
+   "name": "glPixelTransferf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPixelTransferi",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPixelZoom",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPointParameterfSGIS",
+   "sync": false,
+   "ext": "SGIS_point_parameters"
+  },
+  {
+   "name": "glPointParameterfvSGIS",
+   "sync": false,
+   "ext": "SGIS_point_parameters",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "PointParameterfvSGIS",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glPointSize",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPollInstrumentsSGIX",
+   "sync": true,
+   "ext": "SGIX_instruments",
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "out",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glPolygonMode",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPolygonOffset",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPolygonOffsetEXT",
+   "sync": false,
+   "ext": "EXT_polygon_offset"
+  },
+  {
+   "name": "glPolygonStipple",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {
+     "elem": "u8",
+     "kind": "image",
+     "dims": [
+      "32",
+      "32"
+     ],
+     "bitmap": true
+    }
+   ]
+  },
+  {
+   "name": "glPopAttrib",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPopClientAttrib",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPopMatrix",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPopName",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPrioritizeTextures",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "inline",
+     "count": "n"
+    },
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "n"
+    }
+   ]
+  },
+  {
+   "name": "glPrioritizeTexturesEXT",
+   "sync": false,
+   "ext": "EXT_texture_object",
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "inline",
+     "count": "n"
+    },
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "n"
+    }
+   ]
+  },
+  {
+   "name": "glPushAttrib",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPushClientAttrib",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPushMatrix",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glPushName",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos2d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos2dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos2f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos2fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos2i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos2iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos2s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos2sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos3d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos3dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos3f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos3fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos3i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos3iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos3s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos3sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos4d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos4dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos4f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos4fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos4i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos4iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glRasterPos4s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRasterPos4sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glReadBuffer",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glReadInstrumentsSGIX",
+   "sync": false,
+   "ext": "SGIX_instruments"
+  },
+  {
+   "name": "glReadPixels",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "outimage",
+     "dims": [
+      "width",
+      "height"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glRectd",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRectdv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "2"
+    },
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glRectf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRectfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "2"
+    },
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glRecti",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRectiv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "2"
+    },
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glRects",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRectsv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "2"
+    },
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glReferencePlaneSGIX",
+   "sync": false,
+   "ext": "SGIX_reference_plane",
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glRenderMode",
+   "sync": true,
+   "ext": null
+  },
+  {
+   "name": "glResetHistogram",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glResetHistogramEXT",
+   "sync": false,
+   "ext": "EXT_histogram"
+  },
+  {
+   "name": "glResetMinmax",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glResetMinmaxEXT",
+   "sync": false,
+   "ext": "EXT_histogram"
+  },
+  {
+   "name": "glRotated",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glRotatef",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glSampleMaskSGIS",
+   "sync": false,
+   "ext": "SGIS_multisample"
+  },
+  {
+   "name": "glSamplePatternSGIS",
+   "sync": false,
+   "ext": "SGIS_multisample"
+  },
+  {
+   "name": "glScaled",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glScalef",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glScissor",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glSelectBuffer",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {
+     "elem": "u32",
+     "kind": "deferred",
+     "count": "size"
+    }
+   ]
+  },
+  {
+   "name": "glSeparableFilter2D",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    },
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "height"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glSeparableFilter2DEXT",
+   "sync": true,
+   "ext": "EXT_convolution",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    },
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "height"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glShadeModel",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glSharpenTexFuncSGIS",
+   "sync": false,
+   "ext": "SGIS_sharpen_texture",
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "n*2"
+    }
+   ]
+  },
+  {
+   "name": "glSpriteParameterfSGIX",
+   "sync": false,
+   "ext": "SGIX_sprite"
+  },
+  {
+   "name": "glSpriteParameterfvSGIX",
+   "sync": false,
+   "ext": "SGIX_sprite",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "SpriteParameterfvSGIX",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glSpriteParameteriSGIX",
+   "sync": false,
+   "ext": "SGIX_sprite"
+  },
+  {
+   "name": "glSpriteParameterivSGIX",
+   "sync": false,
+   "ext": "SGIX_sprite",
+   "params": [
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "SpriteParameterivSGIX",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glStartInstrumentsSGIX",
+   "sync": false,
+   "ext": "SGIX_instruments"
+  },
+  {
+   "name": "glStencilFunc",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glStencilMask",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glStencilOp",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glStopInstrumentsSGIX",
+   "sync": false,
+   "ext": "SGIX_instruments"
+  },
+  {
+   "name": "glTagSampleBufferSGIX",
+   "sync": false,
+   "ext": "SGIX_tag_sample_buffer"
+  },
+  {
+   "name": "glTexCoord1d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord1dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord1f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord1fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord1i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord1iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord1s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord1sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord2d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord2dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord2f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord2fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord2i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord2iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord2s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord2sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord3d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord3dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord3f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord3fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord3i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord3iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord3s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord3sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord4d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord4dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord4f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord4fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord4i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord4iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoord4s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexCoord4sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoordPointer",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "TexCoord"
+    }
+   ]
+  },
+  {
+   "name": "glTexCoordPointerEXT",
+   "sync": false,
+   "ext": "EXT_vertex_array",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "TexCoord"
+    }
+   ]
+  },
+  {
+   "name": "glTexEnvf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexEnvfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "TexEnvfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glTexEnvi",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexEnviv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "TexEnviv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glTexFilterFuncSGIS",
+   "sync": false,
+   "ext": "SGIS_texture_filter4",
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "n"
+    }
+   ]
+  },
+  {
+   "name": "glTexGend",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexGendv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "table": "TexGendv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glTexGenf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexGenfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "TexGenfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glTexGeni",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexGeniv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "TexGeniv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glTexImage1D",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexImage2D",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexImage3D",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height",
+      "depth"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexImage3DEXT",
+   "sync": true,
+   "ext": "EXT_texture3D",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height",
+      "depth"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexImage4DSGIS",
+   "sync": true,
+   "ext": "SGIS_texture4D",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height",
+      "depth",
+      "size4d"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexParameterf",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexParameterfv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "table": "TexParameterfv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glTexParameteri",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTexParameteriv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "table": "TexParameteriv",
+     "key": "pname",
+     "default": 1
+    }
+   ]
+  },
+  {
+   "name": "glTexSubImage1D",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexSubImage1DEXT",
+   "sync": true,
+   "ext": "EXT_subtexture",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexSubImage2D",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexSubImage2DEXT",
+   "sync": true,
+   "ext": "EXT_subtexture",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexSubImage3D",
+   "sync": true,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height",
+      "depth"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexSubImage3DEXT",
+   "sync": true,
+   "ext": "EXT_texture3D",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height",
+      "depth"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTexSubImage4DSGIS",
+   "sync": true,
+   "ext": "SGIS_texture4D",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "image",
+     "dims": [
+      "width",
+      "height",
+      "depth",
+      "size4d"
+     ],
+     "format_param": "format",
+     "type_param": "type"
+    }
+   ]
+  },
+  {
+   "name": "glTranslated",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glTranslatef",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex2d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex2dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glVertex2f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex2fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glVertex2i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex2iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glVertex2s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex2sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glVertex3d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex3dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glVertex3f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex3fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glVertex3i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex3iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glVertex3s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex3sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glVertex4d",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex4dv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glVertex4f",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex4fv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glVertex4i",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex4iv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glVertex4s",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glVertex4sv",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glVertexPointer",
+   "sync": false,
+   "ext": null,
+   "params": [
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "Vertex"
+    }
+   ]
+  },
+  {
+   "name": "glVertexPointerEXT",
+   "sync": false,
+   "ext": "EXT_vertex_array",
+   "params": [
+    {},
+    {},
+    {},
+    {},
+    {
+     "elem": "void",
+     "kind": "array",
+     "array": "Vertex"
+    }
+   ]
+  },
+  {
+   "name": "glViewport",
+   "sync": false,
+   "ext": null
+  },
+  {
+   "name": "glActiveTextureARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glClientActiveTextureARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord1dARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord1dvARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord1fARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord1fvARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord1iARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord1ivARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord1sARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord1svARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "1"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord2dARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord2dvARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord2fARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord2fvARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord2iARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord2ivARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord2sARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord2svARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord3dARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord3dvARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord3fARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord3fvARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord3iARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord3ivARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord3sARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord3svARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "3"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord4dARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord4dvARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "f64",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord4fARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord4fvARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord4iARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord4ivARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "i32",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glMultiTexCoord4sARB",
+   "sync": false,
+   "ext": "ARB_multitexture"
+  },
+  {
+   "name": "glMultiTexCoord4svARB",
+   "sync": false,
+   "ext": "ARB_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "i16",
+     "kind": "inline",
+     "count": "4"
+    }
+   ]
+  },
+  {
+   "name": "glSelectTextureSGIS",
+   "sync": false,
+   "ext": "SGIS_multitexture"
+  },
+  {
+   "name": "glMTexCoord2fSGIS",
+   "sync": false,
+   "ext": "SGIS_multitexture"
+  },
+  {
+   "name": "glMTexCoord2fvSGIS",
+   "sync": false,
+   "ext": "SGIS_multitexture",
+   "params": [
+    {},
+    {
+     "elem": "f32",
+     "kind": "inline",
+     "count": "2"
+    }
+   ]
+  }
+ ],
+ "extensions": [
+  "EXT_abgr",
+  "EXT_blend_color",
+  "EXT_blend_logic_op",
+  "EXT_blend_minmax",
+  "EXT_blend_subtract",
+  "EXT_cmyka",
+  "EXT_convolution",
+  "EXT_copy_texture",
+  "EXT_histogram",
+  "EXT_packed_pixels",
+  "EXT_polygon_offset",
+  "EXT_rescale_normal",
+  "EXT_subtexture",
+  "EXT_texture",
+  "EXT_texture3D",
+  "EXT_texture_object",
+  "EXT_vertex_array",
+  "SGIS_detail_texture",
+  "SGIS_fog_function",
+  "SGIS_generate_mipmap",
+  "SGIS_multisample",
+  "SGIS_point_line_texgen",
+  "SGIS_point_parameters",
+  "SGIS_sharpen_texture",
+  "SGIS_texture4D",
+  "SGIS_texture_border_clamp",
+  "SGIS_texture_edge_clamp",
+  "SGIS_texture_filter4",
+  "SGIS_texture_lod",
+  "SGIS_texture_select",
+  "SGIX_calligraphic_fragment",
+  "SGIX_clipmap",
+  "SGIX_depth_texture",
+  "SGIX_flush_raster",
+  "SGIX_fog_offset",
+  "SGIX_framezoom",
+  "SGIX_impact_pixel_texture",
+  "SGIX_instruments",
+  "SGIX_interlace",
+  "SGIX_ir_instrument1",
+  "SGIX_list_priority",
+  "SGIX_pixel_texture",
+  "SGIX_pixel_tiles",
+  "SGIX_polynomial_ffd",
+  "SGIX_reference_plane",
+  "SGIX_shadow",
+  "SGIX_shadow_ambient",
+  "SGIX_sprite",
+  "SGIX_tag_sample_buffer",
+  "SGIX_texture_add_env",
+  "SGIX_texture_lod_bias",
+  "SGIX_texture_multi_buffer",
+  "SGIX_texture_scale_bias",
+  "SGIX_ycrcb",
+  "SGI_color_matrix",
+  "SGI_color_table",
+  "SGI_fft",
+  "SGI_texture_color_table",
+  "ARB_multitexture",
+  "SGIS_multitexture"
+ ],
+ "sizes": {
+  "CallLists": {
+   "GL_MAX_CONVOLUTION_WIDTH_EXT": 32794,
+   "GL_MAX_CONVOLUTION_HEIGHT": 98385
+  },
+  "ColorTableParameterfvSGI": {
+   "GL_COLOR_TABLE_SCALE": 4,
+   "GL_COLOR_TABLE_SCALE_SGI": 4,
+   "GL_COLOR_TABLE_BIAS": 4,
+   "GL_COLOR_TABLE_BIAS_SGI": 4
+  },
+  "ColorTableParameterivSGI": {
+   "GL_COLOR_TABLE_SCALE": 4,
+   "GL_COLOR_TABLE_SCALE_SGI": 4,
+   "GL_COLOR_TABLE_BIAS": 4,
+   "GL_COLOR_TABLE_BIAS_SGI": 4
+  },
+  "ConvolutionParameterfvEXT": {
+   "GL_CONVOLUTION_BORDER_MODE": 1,
+   "GL_CONVOLUTION_BORDER_MODE_EXT": 1,
+   "GL_CONVOLUTION_FILTER_SCALE": 4,
+   "GL_CONVOLUTION_FILTER_SCALE_EXT": 4,
+   "GL_CONVOLUTION_FILTER_BIAS": 4,
+   "GL_CONVOLUTION_FILTER_BIAS_EXT": 4
+  },
+  "ConvolutionParameterivEXT": {
+   "GL_CONVOLUTION_BORDER_MODE": 1,
+   "GL_CONVOLUTION_BORDER_MODE_EXT": 1,
+   "GL_CONVOLUTION_FILTER_SCALE": 4,
+   "GL_CONVOLUTION_FILTER_SCALE_EXT": 4,
+   "GL_CONVOLUTION_FILTER_BIAS": 4,
+   "GL_CONVOLUTION_FILTER_BIAS_EXT": 4
+  },
+  "Fogfv": {
+   "GL_FOG_INDEX": 1,
+   "GL_FOG_DENSITY": 1,
+   "GL_FOG_START": 1,
+   "GL_FOG_END": 1,
+   "GL_FOG_MODE": 1,
+   "GL_FOG_COLOR": 4,
+   "GL_FOG_OFFSET_VALUE_SGIX": 4
+  },
+  "Fogiv": {
+   "GL_FOG_INDEX": 1,
+   "GL_FOG_DENSITY": 1,
+   "GL_FOG_START": 1,
+   "GL_FOG_END": 1,
+   "GL_FOG_MODE": 1,
+   "GL_FOG_COLOR": 4,
+   "GL_FOG_OFFSET_VALUE_SGIX": 4
+  },
+  "LightModelfv": {
+   "GL_LIGHT_MODEL_LOCAL_VIEWER": 1,
+   "GL_LIGHT_MODEL_TWO_SIDE": 1,
+   "GL_LIGHT_MODEL_AMBIENT": 4
+  },
+  "LightModeliv": {
+   "GL_LIGHT_MODEL_LOCAL_VIEWER": 1,
+   "GL_LIGHT_MODEL_TWO_SIDE": 1,
+   "GL_LIGHT_MODEL_AMBIENT": 4
+  },
+  "Lightfv": {
+   "GL_AMBIENT": 4,
+   "GL_DIFFUSE": 4,
+   "GL_SPECULAR": 4,
+   "GL_POSITION": 4,
+   "GL_SPOT_DIRECTION": 3,
+   "GL_SPOT_EXPONENT": 1,
+   "GL_SPOT_CUTOFF": 1,
+   "GL_CONSTANT_ATTENUATION": 1,
+   "GL_LINEAR_ATTENUATION": 1,
+   "GL_QUADRATIC_ATTENUATION": 1
+  },
+  "Lightiv": {
+   "GL_AMBIENT": 4,
+   "GL_DIFFUSE": 4,
+   "GL_SPECULAR": 4,
+   "GL_POSITION": 4,
+   "GL_SPOT_DIRECTION": 3,
+   "GL_SPOT_EXPONENT": 1,
+   "GL_SPOT_CUTOFF": 1,
+   "GL_CONSTANT_ATTENUATION": 1,
+   "GL_LINEAR_ATTENUATION": 1,
+   "GL_QUADRATIC_ATTENUATION": 1
+  },
+  "Materialfv": {
+   "GL_AMBIENT": 4,
+   "GL_DIFFUSE": 4,
+   "GL_SPECULAR": 4,
+   "GL_EMISSION": 4,
+   "GL_SHININESS": 1,
+   "GL_AMBIENT_AND_DIFFUSE": 4,
+   "GL_COLOR_INDEXES": 3
+  },
+  "Materialiv": {
+   "GL_AMBIENT": 4,
+   "GL_DIFFUSE": 4,
+   "GL_SPECULAR": 4,
+   "GL_EMISSION": 4,
+   "GL_SHININESS": 1,
+   "GL_AMBIENT_AND_DIFFUSE": 4,
+   "GL_COLOR_INDEXES": 3
+  },
+  "PixelTransformParameterfvSGI": {
+   "GL_CONVOLUTION_BORDER_MODE": 1,
+   "GL_CONVOLUTION_BORDER_MODE_EXT": 1,
+   "GL_CONVOLUTION_FILTER_SCALE": 4,
+   "GL_CONVOLUTION_FILTER_SCALE_EXT": 4,
+   "GL_CONVOLUTION_FILTER_BIAS": 4,
+   "GL_CONVOLUTION_FILTER_BIAS_EXT": 4,
+   "GL_CONVOLUTION_FORMAT": 1,
+   "GL_CONVOLUTION_FORMAT_EXT": 1,
+   "GL_CONVOLUTION_WIDTH": 1,
+   "GL_CONVOLUTION_WIDTH_EXT": 1,
+   "GL_CONVOLUTION_HEIGHT": 1,
+   "GL_CONVOLUTION_HEIGHT_EXT": 1,
+   "GL_MAX_CONVOLUTION_WIDTH": 1,
+   "GL_MAX_CONVOLUTION_WIDTH_EXT": 1,
+   "GL_MAX_CONVOLUTION_HEIGHT": 1,
+   "GL_MAX_CONVOLUTION_HEIGHT_EXT": 1
+  },
+  "PixelTransformParameterivSGI": {
+   "GL_CONVOLUTION_BORDER_MODE": 1,
+   "GL_CONVOLUTION_BORDER_MODE_EXT": 1,
+   "GL_CONVOLUTION_FILTER_SCALE": 4,
+   "GL_CONVOLUTION_FILTER_SCALE_EXT": 4,
+   "GL_CONVOLUTION_FILTER_BIAS": 4,
+   "GL_CONVOLUTION_FILTER_BIAS_EXT": 4,
+   "GL_CONVOLUTION_FORMAT": 1,
+   "GL_CONVOLUTION_FORMAT_EXT": 1,
+   "GL_CONVOLUTION_WIDTH": 1,
+   "GL_CONVOLUTION_WIDTH_EXT": 1,
+   "GL_CONVOLUTION_HEIGHT": 1,
+   "GL_CONVOLUTION_HEIGHT_EXT": 1,
+   "GL_MAX_CONVOLUTION_WIDTH": 1,
+   "GL_MAX_CONVOLUTION_WIDTH_EXT": 1,
+   "GL_MAX_CONVOLUTION_HEIGHT": 1,
+   "GL_MAX_CONVOLUTION_HEIGHT_EXT": 1
+  },
+  "PointParameterfvSGIS": {
+   "GL_POINT_SIZE_MIN_SGIS": 1,
+   "GL_POINT_SIZE_MAX_SGIS": 1,
+   "GL_POINT_FADE_THRESHOLD_SIZE_SGIS": 1,
+   "GL_DISTANCE_ATTENUATION_SGIS": 3
+  },
+  "SpriteParameterfvSGIX": {
+   "GL_SPRITE_MODE_SGIX": 1,
+   "GL_SPRITE_AXIS_SGIX": 3,
+   "GL_SPRITE_TRANSLATION_SGIX": 3
+  },
+  "SpriteParameterivSGIX": {
+   "GL_SPRITE_MODE_SGIX": 1,
+   "GL_SPRITE_AXIS_SGIX": 3,
+   "GL_SPRITE_TRANSLATION_SGIX": 3
+  },
+  "TexEnvfv": {
+   "GL_TEXTURE_ENV_MODE": 1,
+   "GL_TEXTURE_ENV_COLOR": 4
+  },
+  "TexEnviv": {
+   "GL_TEXTURE_ENV_MODE": 1,
+   "GL_TEXTURE_ENV_COLOR": 4
+  },
+  "TexGendv": {
+   "GL_TEXTURE_GEN_MODE": 1,
+   "GL_OBJECT_PLANE": 4,
+   "GL_EYE_PLANE": 4
+  },
+  "TexGenfv": {
+   "GL_TEXTURE_GEN_MODE": 1,
+   "GL_OBJECT_PLANE": 4,
+   "GL_EYE_PLANE": 4
+  },
+  "TexGeniv": {
+   "GL_TEXTURE_GEN_MODE": 1,
+   "GL_OBJECT_PLANE": 4,
+   "GL_EYE_PLANE": 4
+  },
+  "TexParameterfv": {
+   "GL_TEXTURE_BORDER_COLOR": 4,
+   "GL_TEXTURE_MAG_FILTER": 1,
+   "GL_TEXTURE_MIN_FILTER": 1,
+   "GL_TEXTURE_WRAP_S": 1,
+   "GL_TEXTURE_WRAP_T": 1,
+   "GL_TEXTURE_WRAP_R": 1,
+   "GL_TEXTURE_WRAP_R_EXT": 1,
+   "GL_DETAIL_TEXTURE_LEVEL_SGIS": 1,
+   "GL_DETAIL_TEXTURE_MODE_SGIS": 1,
+   "GL_DUAL_TEXTURE_SELECT_SGIS": 1,
+   "GL_QUAD_TEXTURE_SELECT_SGIS": 1,
+   "GL_TEXTURE_MIN_LOD": 1,
+   "GL_TEXTURE_MIN_LOD_SGIS": 1,
+   "GL_TEXTURE_MAX_LOD": 1,
+   "GL_TEXTURE_MAX_LOD_SGIS": 1,
+   "GL_TEXTURE_BASE_LEVEL": 1,
+   "GL_TEXTURE_BASE_LEVEL_SGIS": 1,
+   "GL_TEXTURE_MAX_LEVEL": 1,
+   "GL_TEXTURE_MAX_LEVEL_SGIS": 1,
+   "GL_TEXTURE_CLIPMAP_CENTER_SGIX": 2,
+   "GL_TEXTURE_CLIPMAP_FRAME_SGIX": 1,
+   "GL_TEXTURE_CLIPMAP_OFFSET_SGIX": 2,
+   "GL_POST_TEXTURE_FILTER_BIAS_SGIX": 4,
+   "GL_POST_TEXTURE_FILTER_SCALE_SGIX": 4,
+   "GL_TEXTURE_COMPARE_SGIX": 1,
+   "GL_TEXTURE_COMPARE_OPERATOR_SGIX": 1,
+   "GL_TEXTURE_CLIPMAP_VIRTUAL_DEPTH_SGIX": 3
+  },
+  "TexParameteriv": {
+   "GL_TEXTURE_BORDER_COLOR": 4,
+   "GL_TEXTURE_MAG_FILTER": 1,
+   "GL_TEXTURE_MIN_FILTER": 1,
+   "GL_TEXTURE_WRAP_S": 1,
+   "GL_TEXTURE_WRAP_T": 1,
+   "GL_TEXTURE_WRAP_R": 1,
+   "GL_TEXTURE_WRAP_R_EXT": 1,
+   "GL_DETAIL_TEXTURE_LEVEL_SGIS": 1,
+   "GL_DETAIL_TEXTURE_MODE_SGIS": 1,
+   "GL_DUAL_TEXTURE_SELECT_SGIS": 1,
+   "GL_QUAD_TEXTURE_SELECT_SGIS": 1,
+   "GL_TEXTURE_MIN_LOD": 1,
+   "GL_TEXTURE_MIN_LOD_SGIS": 1,
+   "GL_TEXTURE_MAX_LOD": 1,
+   "GL_TEXTURE_MAX_LOD_SGIS": 1,
+   "GL_TEXTURE_BASE_LEVEL": 1,
+   "GL_TEXTURE_BASE_LEVEL_SGIS": 1,
+   "GL_TEXTURE_MAX_LEVEL": 1,
+   "GL_TEXTURE_MAX_LEVEL_SGIS": 1,
+   "GL_TEXTURE_CLIPMAP_CENTER_SGIX": 2,
+   "GL_TEXTURE_CLIPMAP_FRAME_SGIX": 1,
+   "GL_TEXTURE_CLIPMAP_OFFSET_SGIX": 2,
+   "GL_POST_TEXTURE_FILTER_BIAS_SGIX": 4,
+   "GL_POST_TEXTURE_FILTER_SCALE_SGIX": 4,
+   "GL_TEXTURE_COMPARE_SGIX": 1,
+   "GL_TEXTURE_COMPARE_OPERATOR_SGIX": 1,
+   "GL_TEXTURE_CLIPMAP_VIRTUAL_DEPTH_SGIX": 3
+  },
+  "GetTexParameterfv": {
+   "GL_TEXTURE_CLIPMAP_VIRTUAL_DEPTH_SGIX": 3
+  },
+  "GetTexParameteriv": {
+   "GL_TEXTURE_CLIPMAP_VIRTUAL_DEPTH_SGIX": 3
+  }
+ },
+ "get_multi": {
+  "GL_CURRENT_COLOR": 4,
+  "GL_CURRENT_NORMAL": 3,
+  "GL_CURRENT_TEXTURE_COORDS": 4,
+  "GL_CURRENT_RASTER_COLOR": 4,
+  "GL_CURRENT_RASTER_POSITION": 4,
+  "GL_CURRENT_RASTER_TEXTURE_COORDS": 4,
+  "GL_MODELVIEW_MATRIX": 16,
+  "GL_PROJECTION_MATRIX": 16,
+  "GL_TEXTURE_MATRIX": 16,
+  "GL_VIEWPORT": 4,
+  "GL_DEPTH_RANGE": 2,
+  "GL_FOG_COLOR": 4,
+  "GL_LIGHT_MODEL_AMBIENT": 4,
+  "GL_POLYGON_MODE": 2,
+  "GL_COLOR_CLEAR_VALUE": 4,
+  "GL_COLOR_WRITEMASK": 4,
+  "GL_ACCUM_CLEAR_VALUE": 4,
+  "GL_SCISSOR_BOX": 4,
+  "GL_MAP1_GRID_DOMAIN": 2,
+  "GL_MAP2_GRID_DOMAIN": 4,
+  "GL_MAP2_GRID_SEGMENTS": 2,
+  "GL_MAX_VIEWPORT_DIMS": 2,
+  "GL_POINT_SIZE_RANGE": 2,
+  "GL_LINE_WIDTH_RANGE": 2,
+  "GL_BLEND_COLOR_EXT": 4,
+  "GL_BLEND_COLOR": 4,
+  "GL_COLOR_MATRIX_SGI": 16,
+  "GL_COLOR_MATRIX": 16,
+  "GL_DISTANCE_ATTENUATION_SGIS": 3,
+  "GL_FOG_OFFSET_VALUE_SGIX": 4,
+  "GL_SPRITE_AXIS_SGIX": 3,
+  "GL_SPRITE_TRANSLATION_SGIX": 3,
+  "GL_REFERENCE_PLANE_EQUATION_SGIX": 4
+ }
+}

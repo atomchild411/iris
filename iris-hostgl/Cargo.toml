@@ -1,0 +1,15 @@
+[package]
+name = "iris-hostgl"
+version = "0.1.0"
+edition = "2021"
+description = "Host OpenGL for IRIX programs under IRIS, through host call 3000"
+license = "BSD-3-Clause"
+
+[dependencies]
+iris-hostcall = { path = "../iris-hostcall" }
+log = "0.4"
+
+# The only backend so far is Apple's OpenGL.framework (CGL); elsewhere the
+# crate builds and registers nothing.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

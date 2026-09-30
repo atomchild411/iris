@@ -921,6 +921,15 @@ impl Mgras {
         }
     }
 
+    /// Composite a host GL frame at a screen position (see `Board::composite`).
+    pub fn composite(&self, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize) -> bool {
+        let ok = self.board.lock().composite(x, y, bgra, stride, w, h);
+        if ok {
+            self.dirty.store(true, Ordering::Release);
+        }
+        ok
+    }
+
     /// Give the board its path to system memory, for DMA.
     pub fn set_phys(&self, mem: Arc<dyn BusDevice>) {
         self.board.lock().mem = Some(mem.clone());
@@ -1219,4 +1228,22 @@ impl BusDevice for Mgras {
     fn write16(&self, addr: u32, val: u16) -> u32 { self.do_write(addr, 16, val as u64); BUS_OK }
     fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.do_read(addr, 64)) }
     fn write64(&self, addr: u32, val: u64) -> u32 { self.do_write(addr, 64, val); BUS_OK }
+}
+
+/// The board as the display host GL presents into: frames land in the
+/// framebuffer under their window (see `Board::composite`). It cannot know the
+/// guest X server's window ids, so only frames that say where their window is
+/// are taken; the rest go back to the program to put up itself.
+#[cfg(feature = "hostgl")]
+pub struct ImpactScreen(pub Arc<Mgras>);
+
+#[cfg(feature = "hostgl")]
+impl iris_hostcall::Display for ImpactScreen {
+    fn present(&self, _window: u32, _bgra: &[u8], _stride: usize, _width: usize, _height: usize) -> bool {
+        false
+    }
+
+    fn present_at(&self, _window: u32, x: i32, y: i32, bgra: &[u8], stride: usize, width: usize, height: usize) -> bool {
+        self.0.composite(x, y, bgra, stride, width, height)
+    }
 }

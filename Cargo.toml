@@ -1,5 +1,5 @@
 [workspace]
-members = ["iris-gui", "iris-hostcall"]
+members = ["iris-gui", "iris-hostcall", "iris-hostgl"]
 
 [package]
 name = "iris"
@@ -277,6 +277,12 @@ daynaport = []
 # IRIX untouched. Off by default -- a guest that never issues one cannot tell
 # the difference.
 hostcall = ["dep:iris-hostcall"]
+# Host OpenGL for IRIX programs (iris-hostgl/): host call 3000, answered by
+# replaying the replacement libGL's command stream on the host GPU. The IRIX
+# side libraries are the iris-guest-tools project
+# (github.com/atomchild411/iris-guest-tools). macOS only for now (CGL); on
+# other hosts the service is not registered and the guest's libGL says so.
+hostgl = ["hostcall", "dep:iris-hostgl"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -319,6 +325,7 @@ pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12", optional = true }
 raw_sync      = { version = "0.1",  optional = true }
 iris-hostcall = { path = "iris-hostcall", optional = true }
+iris-hostgl = { path = "iris-hostgl", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }
 

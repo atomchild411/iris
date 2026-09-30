@@ -242,6 +242,8 @@ impl Machine {
         // when the feature is built in, so a guest can prove the trap works.
         #[cfg(feature = "hostcall")]
         iris_hostcall::register(iris_hostcall::SELFTEST, Box::new(iris_hostcall::SelfTest));
+        #[cfg(feature = "hostgl")]
+        iris_hostgl::register();
         Self::new_with_testdev(cfg, None)
     }
 
@@ -731,6 +733,11 @@ impl Machine {
         // Source kind + broadcast standard come from `[vino]` in iris.toml.
         phys.vino.set_phys(phys.clone());
         if let Some(mgras) = &phys.mgras { mgras.set_phys(phys.clone()); }
+        // Host GL frames composite straight into the IMPACT framebuffer.
+        #[cfg(feature = "hostgl")]
+        if let Some(mgras) = &phys.mgras {
+            iris_hostcall::set_display(Arc::new(crate::mgras::ImpactScreen(mgras.clone())));
+        }
         let standard = match cfg.vino.standard {
             crate::config::VinoStandard::Ntsc => crate::video_source::VideoStandard::Ntsc,
             crate::config::VinoStandard::Pal  => crate::video_source::VideoStandard::Pal,
