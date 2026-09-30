@@ -174,23 +174,6 @@ pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
 /// rather than the queue mostly sitting near-empty.
 pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
 
-/// Arrivals at a queued-but-uncompiled page before it jumps the queue: code
-/// being executed this often right now is worth compiling before older,
-/// colder requests (a program started just after a large compile otherwise
-/// waits seconds behind that compile's backlog, measured with jitcov on IP28).
-pub const HOT_PROMOTE_ARRIVALS: u32 = 256;
-
-/// The hot lane: a small second queue workers drain before the FIFO. One per
-/// process, like the JIT itself. Requests hold raw page pointers, so
-/// `CompileQueue::drain_pending` empties it too before any flush.
-pub static HOT_QUEUE: std::sync::LazyLock<crossbeam_queue::ArrayQueue<CompileRequest>> =
-    std::sync::LazyLock::new(|| crossbeam_queue::ArrayQueue::new(256));
-
-/// Put a copy of a request on the hot lane. A full lane just drops it: the
-/// page's FIFO request is still queued, so nothing is lost but the head start.
-pub fn push_hot_request(req: CompileRequest) {
-    let _ = HOT_QUEUE.push(req);
-}
 
 
 /// Page size for JIT v2 (§2.4) — matches the MIPS TLB/cache page granularity
@@ -853,13 +836,6 @@ pub struct PhysicalCodePage {
     /// of offset-scoped, since one request now serves however many offsets
     /// have accumulated in `requested` by the time it's dequeued.
     page_scheduled: std::sync::atomic::AtomicBool,
-    /// Arrivals at this page while its compile request was already queued
-    /// (`try_schedule_page` lost). Once it crosses [`HOT_PROMOTE_ARRIVALS`]
-    /// the page is hot *now* and gets one extra request on the hot lane
-    /// (`promoted` stops a second). Both reset whenever a compile for the
-    /// page completes (`clear_scheduled`).
-    hot_wait: std::sync::atomic::AtomicU32,
-    promoted: std::sync::atomic::AtomicBool,
     /// Pinned FR mode for this page, set once at page-claim time from live
     /// `STATUS_FR` and held fixed for the page's whole lifetime until the
     /// next `mega_flush`/`reset_to_unclaimed` (TODO revisit — see below).
@@ -1353,8 +1329,6 @@ impl PhysicalCodePage {
             func_fr1: std::sync::atomic::AtomicBool::new(false),
             entry_gen: AtomicU64::new(0),
             page_scheduled: std::sync::atomic::AtomicBool::new(false),
-            hot_wait: std::sync::atomic::AtomicU32::new(0),
-            promoted: std::sync::atomic::AtomicBool::new(false),
             fr1: std::sync::atomic::AtomicBool::new(false),
             fr_repin: std::sync::atomic::AtomicU8::new(FR_REPIN_NONE),
             fr_unpinned: std::sync::atomic::AtomicBool::new(false),
@@ -1406,8 +1380,6 @@ impl PhysicalCodePage {
         self.invalidate_compile_snapshot();
         self.entry_gen.store(0, Ordering::Relaxed);
         self.page_scheduled.store(false, Ordering::Relaxed);
-        self.hot_wait.store(0, Ordering::Relaxed);
-        self.promoted.store(false, Ordering::Relaxed);
         self.compiles_since_flush.store(0, Ordering::Relaxed);
         // Churn-avoidance tallies are per-flush-epoch (see the
         // `redundant_skipped` field), and this slot is additionally about to
@@ -1883,19 +1855,6 @@ impl PhysicalCodePage {
     #[inline]
     pub fn clear_scheduled(&self) {
         self.page_scheduled.store(false, Ordering::Relaxed);
-        self.hot_wait.store(0, Ordering::Relaxed);
-        self.promoted.store(false, Ordering::Relaxed);
-    }
-
-    /// Count one arrival at this page while its request is already queued.
-    /// Returns `true` exactly once per wait, when the count reaches
-    /// [`HOT_PROMOTE_ARRIVALS`]: the caller then puts a copy of the request on
-    /// the hot lane. The FIFO copy, when it is eventually dequeued, is skipped
-    /// as redundant by the ordinary subsumption checks.
-    #[inline]
-    pub fn note_waiting_arrival(&self) -> bool {
-        self.hot_wait.fetch_add(1, Ordering::Relaxed) + 1 >= HOT_PROMOTE_ARRIVALS
-            && !self.promoted.swap(true, Ordering::Relaxed)
     }
 
     /// Clear every `requested` bit this compile's snapshot covered, after a
@@ -3172,9 +3131,6 @@ impl CompileQueue {
         while let Some(req) = queue.pop() {
             unsafe { (*req.page).clear_scheduled(); }
         }
-        while let Some(req) = HOT_QUEUE.pop() {
-            unsafe { (*req.page).clear_scheduled(); }
-        }
     }
 
     /// Public entry point for [`Self::drain_pending`] when the caller only
@@ -3743,9 +3699,7 @@ impl CompileQueue {
                 }
                 continue;
             }
-            // The hot lane first: pages being executed right now that are
-            // still waiting (see `HOT_QUEUE`).
-            match HOT_QUEUE.pop().or_else(|| queue.pop()) {
+            match queue.pop() {
                 Some(req) => {
                     // Always the deferred/non-forced path — never
                     // handle_request's forced-seal one. Forced sealing
@@ -4265,22 +4219,6 @@ mod tests {
         assert!(page.try_schedule_page(), "first caller for a fresh page must win");
         assert!(!page.try_schedule_page(), "second caller before clear_scheduled must lose");
         assert!(!page.try_schedule_page(), "still losing on a third call");
-    }
-
-    #[test]
-    fn a_waiting_page_is_promoted_once_at_the_threshold_and_rearms_after_a_compile() {
-        let page = PhysicalCodePage::new(1, std::ptr::null());
-        assert!(page.try_schedule_page(), "first request queues");
-        for _ in 1..HOT_PROMOTE_ARRIVALS {
-            assert!(!page.note_waiting_arrival(), "not hot yet");
-        }
-        assert!(page.note_waiting_arrival(), "promoted at the threshold");
-        assert!(!page.note_waiting_arrival(), "and only once per wait");
-        page.clear_scheduled(); // a compile for the page completed
-        for _ in 1..HOT_PROMOTE_ARRIVALS {
-            assert!(!page.note_waiting_arrival());
-        }
-        assert!(page.note_waiting_arrival(), "re-arms after the compile");
     }
 
     #[test]

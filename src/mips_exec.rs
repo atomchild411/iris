@@ -4046,10 +4046,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                             #[cfg(feature = "developer")]
                             page.mark_send_dropped_queue_full();
                         }
-                    } else if page.note_waiting_arrival() {
-                        // Already queued, and being executed hard while it
-                        // waits: jump the queue (jitv2::HOT_QUEUE).
-                        crate::jitv2::jitv2::push_hot_request(req);
                     }
                     break 'gate self.step_int();
                 }
