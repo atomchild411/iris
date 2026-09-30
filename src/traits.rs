@@ -265,6 +265,11 @@ pub trait DmaClient: Send + Sync {
     /// Returns (status, writeback) where writeback is an optional (addr, val16) memory write
     /// to be executed by the caller under its own lock (e.g. SeeqState) for atomicity.
     fn write(&self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>);
+    /// How far the device may read ahead of the guest: `Some(n)` when the
+    /// guest is polling this channel's position and the device has read `n`
+    /// words beyond the position the guest last saw (see HAL2's codec A).
+    /// `None` when it is not being polled.
+    fn read_ahead_of_poll(&self) -> Option<u64> { None }
 }
 
 /// Asynchronous system-level events sent from devices to the machine event loop.

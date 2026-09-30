@@ -12,6 +12,7 @@ use rtrb::{RingBuffer, Producer};
 // HAL2 Register Offsets (relative to 0x1FBD8000)
 pub const HAL2_ISR: u32 = 0x10; // Interrupt Status Register
 pub const HAL2_REV: u32 = 0x20; // Revision
+
 pub const HAL2_IAR: u32 = 0x30; // Indirect Address Register
 pub const HAL2_IDR0: u32 = 0x40; // Indirect Data Register 0
 pub const HAL2_IDR1: u32 = 0x50; // Indirect Data Register 1
@@ -117,6 +118,81 @@ const RING_BUF_MULTIPLIER: usize = 16;
 // Consecutive dry reads before giving up prebuf and opening stream anyway.
 const DRY_LIMIT: u32 = 100;
 
+/// How often a running channel wakes to move samples. A timer per sample
+/// (every 21-91 us) cannot keep real time on a host thread: every late or
+/// coalesced tick consumed guest audio more slowly than the codec rate, which
+/// played as stretched, ever more delayed sound. Instead each wake moves the
+/// number of frames the wall clock says are due.
+///
+/// It must be well under a millisecond. IRIX refills its 202-frame playback
+/// ring from a 1 kHz callback that reads the DMA position each time; at 2 ms
+/// the position stood still on every other read, and IRIX let the DMA lap
+/// the ring: once a lap it wrote only the lap's remainder, and the rest
+/// replayed stale audio (a 199-frame jump back every 20 ms at 11025 Hz, 6 ms
+/// at 44.1 kHz -- slow, robotic sound).
+const PACE_PERIOD: Duration = Duration::from_micros(250);
+/// After a host stall, frames more than this far behind are skipped rather
+/// than moved in one burst (which would only add latency).
+const PACE_MAX_BACKLOG: Duration = Duration::from_millis(100);
+/// How much faster than real time a channel may catch up after a late wake
+/// (5/4): see `Pacer::due`.
+const PACE_CATCHUP_NUM: u64 = 5;
+/// How far (in milliseconds of audio) codec A may read past the DMA position
+/// the guest last polled. IRIX refills its 202-frame playback ring from a
+/// 1 kHz callback, writing only a little ahead of the position it reads.
+/// Emulated, that callback runs late when the host is busy (GLQuake), and a
+/// channel paced by the wall clock alone then ran into slots not yet
+/// refilled and replayed the previous lap (18 ms chunks at 11025 Hz: the
+/// "robot" sound). Coupled to the guest's polls, the channel waits for a
+/// late callback instead; the host output buffer covers the wait. A guest
+/// that does not poll the position (no poll for 50 ms) is not held back.
+const READ_AHEAD_MS: u64 = 1;
+const PACE_CATCHUP_DEN: u64 = 4;
+
+/// Wall-clock frame pacing for one channel: how many frames are due now.
+struct Pacer {
+    start: Instant,
+    rate: u64,
+    done: u64,
+}
+
+impl Pacer {
+    fn new(rate: u32) -> Self {
+        Self { start: Instant::now(), rate: rate as u64, done: 0 }
+    }
+
+    /// Frames to move now, counting them as done: what the wall clock says is
+    /// due, but never much more than one period's worth.
+    ///
+    /// The DMA position must move smoothly, as on the hardware. IRIX writes
+    /// its playback ring only a few milliseconds ahead of the position it
+    /// polls; when a late wake (a busy host) moved everything due at once,
+    /// the position leapt past what IRIX had written, the channel read the
+    /// previous lap's samples, and sound under load (GLQuake) repeated in
+    /// 18 ms chunks. A late wake now moves at most PACE_CATCHUP times a
+    /// period's frames and the backlog drains over the next wakes.
+    fn due(&mut self) -> u64 {
+        let elapsed = self.start.elapsed();
+        let target = (elapsed.as_nanos() as u64).saturating_mul(self.rate) / 1_000_000_000;
+        let backlog = target.saturating_sub(self.done);
+        let max_backlog = self.rate * PACE_MAX_BACKLOG.as_millis() as u64 / 1000;
+        if backlog > max_backlog {
+            // Skip the stall rather than replay it.
+            self.done = target - max_backlog;
+        }
+        let per_period = (self.rate * PACE_PERIOD.as_micros() as u64).div_ceil(1_000_000);
+        let cap = (per_period * PACE_CATCHUP_NUM).div_ceil(PACE_CATCHUP_DEN).max(per_period + 1);
+        let due = target.saturating_sub(self.done).min(cap);
+        self.done += due;
+        due
+    }
+
+    /// Frames `due` handed out but not moved after all: still due.
+    fn give_back(&mut self, frames: u64) {
+        self.done -= frames;
+    }
+}
+
 // Sample rates to try when opening the persistent output stream, in order.
 const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
 
@@ -145,41 +221,61 @@ unsafe impl Sync for AudioOut {}
 // Simple skip/repeat resampler using a fixed-point accumulator.
 // Produces output at `out_rate` from input at `in_rate`.
 // Call `push_sample` for every input sample pair; it pushes 0, 1, or 2 pairs to the ring.
+/// Converts the codec's rate to the host stream's by Catmull-Rom interpolation.
+///
+/// It used to repeat the last sample (zero-order hold). From 44.1 or 48 kHz
+/// to 48 kHz that is nearly harmless, but Quake plays at 11025 Hz, where each
+/// sample became a 4-or-5-sample step: the staircase put loud images of every
+/// sound around 11 kHz and its multiples, and the games sounded metallic and
+/// robotic. A real DAC at 11025 Hz filters those images out; interpolating
+/// through the samples does most of the same.
 struct Resampler {
     in_rate: u32,
     out_rate: u32,
-    // Accumulator: tracks fractional position in output-sample units * in_rate.
-    // We advance by out_rate each input sample and emit whenever acc >= in_rate.
+    // Position of the next output between h[1] and h[2], in 1/out_rate
+    // input-sample units: an exact rational step, so no drift.
     acc: u64,
-    // Last seen sample (for repeat)
-    last_l: i16,
-    last_r: i16,
+    // The last four input frames, oldest first; output is interpolated
+    // between h[1] and h[2] (two input samples of latency).
+    h: [[f32; 2]; 4],
 }
 
 impl Resampler {
     fn new(in_rate: u32, out_rate: u32) -> Self {
-        Self { in_rate, out_rate, acc: 0, last_l: 0, last_r: 0 }
+        Self { in_rate, out_rate, acc: 0, h: [[0.0; 2]; 4] }
     }
 
     fn passthrough(&self) -> bool { self.in_rate == self.out_rate }
 
-    /// Push one input stereo pair. Returns 0, 1, or 2 output pairs via the closure.
+    /// Push one input stereo pair; emits the output pairs it completes.
     fn push(&mut self, l: i16, r: i16, prod: &mut Producer<i16>) {
-        self.last_l = l;
-        self.last_r = r;
         if self.passthrough() {
             let _ = prod.push(l);
             let _ = prod.push(r);
             return;
         }
-        self.acc += self.out_rate as u64;
-        // Emit one output sample for each full in_rate unit accumulated
-        while self.acc >= self.in_rate as u64 {
-            self.acc -= self.in_rate as u64;
-            let _ = prod.push(l);
-            let _ = prod.push(r);
+        self.h = [self.h[1], self.h[2], self.h[3], [l as f32, r as f32]];
+        let out = self.out_rate as u64;
+        while self.acc < out {
+            let t = self.acc as f32 / out as f32;
+            for c in 0..2 {
+                let v = catmull_rom(self.h[0][c], self.h[1][c], self.h[2][c], self.h[3][c], t);
+                let _ = prod.push(v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+            }
+            self.acc += self.in_rate as u64;
         }
+        self.acc -= out;
     }
+}
+
+/// The Catmull-Rom spline through p1 and p2 at t in [0, 1).
+fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    0.5 * (2.0 * p1
+        + (p2 - p0) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
 }
 
 // ─── Per-channel mutable state, lives inside a Mutex ─────────────────────────
@@ -197,12 +293,19 @@ struct CodecAState {
     dry: u32,
     nonzero_seen: bool,
     timer_id: Option<TimerId>,
+    /// The DMA channel the armed timer reads, and what it has done since
+    /// it was armed: callbacks, frames read, reads that found no data.
+    armed_ch: Option<usize>,
+    calls: u64,
+    frames: u64,
+    dry_reads: u64,
 }
 
 impl CodecAState {
     fn new() -> Self {
         Self { out: None, resampler: None, prebuffering: true, prebuf: Vec::new(),
-               dry: 0, nonzero_seen: false, timer_id: None }
+               dry: 0, nonzero_seen: false, timer_id: None,
+               armed_ch: None, calls: 0, frames: 0, dry_reads: 0 }
     }
     fn reset_audio(&mut self) {
         // Keep `out` — stream stays open.  Just reset codec-side state.
@@ -211,6 +314,10 @@ impl CodecAState {
         self.prebuf.clear();
         self.dry = 0;
         self.nonzero_seen = false;
+        self.armed_ch = None;
+        self.calls = 0;
+        self.frames = 0;
+        self.dry_reads = 0;
         if let Some(o) = &self.out {
             o.playing.store(false, Ordering::Relaxed);
         }
@@ -247,6 +354,9 @@ struct Hal2State {
     isr: u16,
     iar: u16,
     idr: [u16; 4],
+    /// The last indirect accesses (IAR, then IDR0..3 as they stood), for
+    /// `hal2 status`.
+    iar_log: std::collections::VecDeque<(u16, [u16; 4])>,
 
     // Internal Registers
     // ctrl[0] = CTRL1 (IDR0), ctrl[1] = CTRL2 IDR0, ctrl[2] = CTRL2 IDR1
@@ -280,6 +390,22 @@ impl Hal2State {
     fn codecb_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.codecb_ctrl[0]) }
     fn aestx_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.aestx_ctrl[0]) }
     fn aesrx_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.aesrx_ctrl[0]) }
+}
+
+/// A clock generator's output rate. It is a Bresenham counter: every master
+/// clock adds `inc`, and each time the sum reaches the modulus it ticks and
+/// the modulus is taken off -- at most one tick a master clock. The modulus
+/// is programmed as `modctrl = inc - mod - 1`. A modulus of 0 ticks on every
+/// master clock: IRIX sets 44.1 kHz from the 44.1 kHz master as inc 0,
+/// modctrl 0xffff, which is that, not a stopped clock.
+fn bres_rate(master: u32, inc: u16, modctrl: u16) -> u32 {
+    let inc = inc as u32;
+    let modulus = inc.wrapping_sub(modctrl as u32).wrapping_sub(1) & 0xFFFF;
+    if modulus == 0 || inc >= modulus {
+        master
+    } else {
+        master * inc / modulus
+    }
 }
 
 fn decode_ctrl1(ctrl1: u16) -> (usize, usize, usize) {
@@ -330,17 +456,28 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
             let (p, mut c) = RingBuffer::<i16>::new(ring_size);
             let underruns_cb = underruns.clone();
             let playing_cb = playing.clone();
+            // IRIS_HAL2_CAPTURE=<file>: also write what the host plays, raw
+            // interleaved 16-bit little-endian stereo at the stream rate --
+            // the end of the whole chain, to check or listen to offline.
+            let mut capture = std::env::var_os("IRIS_HAL2_CAPTURE")
+                .and_then(|p| std::fs::File::create(p).ok())
+                .map(std::io::BufWriter::new);
             let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 for sample in data.iter_mut() {
-                    *sample = match c.pop() {
-                        Ok(v) => v as f32 / 32768.0,
+                    let v = match c.pop() {
+                        Ok(v) => v,
                         Err(_) => {
                             if playing_cb.load(Ordering::Relaxed) {
                                 underruns_cb.fetch_add(1, Ordering::Relaxed);
                             }
-                            0.0
+                            0
                         }
                     };
+                    if let Some(w) = capture.as_mut() {
+                        use std::io::Write;
+                        let _ = w.write_all(&v.to_le_bytes());
+                    }
+                    *sample = v as f32 / 32768.0;
                 }
             };
             match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
@@ -399,6 +536,7 @@ impl Hal2 {
                 isr: 0,
                 iar: 0,
                 idr: [0; 4],
+                iar_log: std::collections::VecDeque::new(),
                 codeca_ctrl: [0; 3],
                 codecb_ctrl: [0; 3],
                 aestx_ctrl: [0; 3],
@@ -476,19 +614,38 @@ impl Hal2 {
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
 
-        let period = Duration::from_secs_f64(1.0 / pitch_rate as f64);
         let dma_client = self.dma_clients[dma_ch].clone();
         let ca_state = self.ca_state.clone();
+        let mut pacer = Pacer::new(pitch_rate);
 
-        let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
+        self.ca_state.lock().armed_ch = Some(dma_ch);
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+            let mut due = pacer.due();
+            // Keep within READ_AHEAD_MS of the position the guest last polled
+            // (see READ_AHEAD_MS); the rest stays due for the next wake.
+            if let Some(ahead_words) = dma_client.read_ahead_of_poll() {
+                let words_per_frame: u64 = match mode { MODE_MONO => 1, MODE_QUAD => 4, _ => 2 };
+                let limit = (pitch_rate as u64 * READ_AHEAD_MS).div_ceil(1000);
+                let allowed = limit.saturating_sub(ahead_words / words_per_frame);
+                if due > allowed {
+                    pacer.give_back(due - allowed);
+                    due = allowed;
+                }
+            }
+            if due == 0 {
+                return TimerReturn::Continue;
+            }
             let mut st = ca_state.lock();
+            st.calls += 1;
 
             // No audio output — still drain DMA so the kernel doesn't hang
             // waiting for PDMA_CTRL_ACT to clear.
             let stream_rate = match st.out.as_ref() {
                 Some(o) => o.stream_rate,
                 None => {
-                    let _ = read_frame_from(&dma_client, mode);
+                    for _ in 0..due {
+                        let _ = read_frame_from(&dma_client, mode);
+                    }
                     return TimerReturn::Continue;
                 }
             };
@@ -500,49 +657,52 @@ impl Hal2 {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz (pitch={}) → {}Hz", rate, pitch_rate, stream_rate);
             }
 
-            let frame = read_frame_from(&dma_client, mode);
-            let was_prebuffering = st.prebuffering;
+            for _ in 0..due {
+                let frame = read_frame_from(&dma_client, mode);
+                if frame.is_some() { st.frames += 1; } else { st.dry_reads += 1; }
+                let was_prebuffering = st.prebuffering;
 
-            match frame {
-                Some((l, r)) => {
-                    st.dry = 0;
-                    if !st.nonzero_seen && (l != 0 || r != 0) {
-                        dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
-                        st.nonzero_seen = true;
+                match frame {
+                    Some((l, r)) => {
+                        st.dry = 0;
+                        if !st.nonzero_seen && (l != 0 || r != 0) {
+                            dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
+                            st.nonzero_seen = true;
+                        }
+                        if st.prebuffering {
+                            // Accumulate before feeding the ring to prevent underrun.
+                            st.prebuf.push(l);
+                            st.prebuf.push(r);
+                            if st.prebuf.len() >= prebuf_samples(rate) {
+                                let samples = std::mem::take(&mut st.prebuf);
+                                st.push_to_ring(&samples);
+                                dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed ({} frames)", samples.len() / 2);
+                                st.prebuffering = false;
+                            }
+                        } else {
+                            // Active: push directly.
+                            st.push_to_ring(&[l, r]);
+                        }
                     }
-                    if st.prebuffering {
-                        // Accumulate before feeding the ring to prevent underrun.
-                        st.prebuf.push(l);
-                        st.prebuf.push(r);
-                        if st.prebuf.len() >= prebuf_samples(rate) {
+                    None => {
+                        st.dry += 1;
+                        if st.prebuffering && !st.prebuf.is_empty() && st.dry >= DRY_LIMIT {
+                            // Flush whatever we buffered so far rather than waiting forever.
                             let samples = std::mem::take(&mut st.prebuf);
                             st.push_to_ring(&samples);
-                            dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed ({} frames)", samples.len() / 2);
+                            dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed (dry) after {} dry reads", st.dry);
                             st.prebuffering = false;
+                            st.dry = 0;
                         }
-                    } else {
-                        // Active: push directly.
-                        st.push_to_ring(&[l, r]);
                     }
                 }
-                None => {
-                    st.dry += 1;
-                    if st.prebuffering && !st.prebuf.is_empty() && st.dry >= DRY_LIMIT {
-                        // Flush whatever we buffered so far rather than waiting forever.
-                        let samples = std::mem::take(&mut st.prebuf);
-                        st.push_to_ring(&samples);
-                        dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed (dry) after {} dry reads", st.dry);
-                        st.prebuffering = false;
-                        st.dry = 0;
-                    }
-                }
-            }
 
-            // Prebuffering just finished — real audio is now flowing into the ring,
-            // so the cpal callback can start treating an empty ring as a genuine underrun.
-            if was_prebuffering && !st.prebuffering {
-                if let Some(o) = &st.out {
-                    o.playing.store(true, Ordering::Relaxed);
+                // Prebuffering just finished — real audio is now flowing into the ring,
+                // so the cpal callback can start treating an empty ring as a genuine underrun.
+                if was_prebuffering && !st.prebuffering {
+                    if let Some(o) = &st.out {
+                        o.playing.store(true, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -575,17 +735,19 @@ impl Hal2 {
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
 
-        let period = Duration::from_secs_f64(1.0 / rate as f64);
         let dma_client = self.dma_clients[dma_ch].clone();
+        let mut pacer = Pacer::new(rate);
 
-        let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
-            let _ = dma_client.write(0, false);
-            if mode == MODE_STEREO || mode == MODE_QUAD {
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+            for _ in 0..pacer.due() {
                 let _ = dma_client.write(0, false);
-            }
-            if mode == MODE_QUAD {
-                let _ = dma_client.write(0, false);
-                let _ = dma_client.write(0, false);
+                if mode == MODE_STEREO || mode == MODE_QUAD {
+                    let _ = dma_client.write(0, false);
+                }
+                if mode == MODE_QUAD {
+                    let _ = dma_client.write(0, false);
+                    let _ = dma_client.write(0, false);
+                }
             }
             TimerReturn::Continue
         });
@@ -615,14 +777,16 @@ impl Hal2 {
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
 
-        let period = Duration::from_secs_f64(1.0 / rate as f64);
         let dma_client = self.dma_clients[dma_ch].clone();
         let ar_state = self.ar_state.clone();
+        let mut pacer = Pacer::new(rate);
 
-        let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
-            if let Some((val, st, _)) = dma_client.read() {
-                if !st.refused() {
-                    ar_state.lock().loopback.push_back(val);
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+            for _ in 0..pacer.due() {
+                if let Some((val, st, _)) = dma_client.read() {
+                    if !st.refused() {
+                        ar_state.lock().loopback.push_back(val);
+                    }
                 }
             }
             TimerReturn::Continue
@@ -653,13 +817,15 @@ impl Hal2 {
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
 
-        let period = Duration::from_secs_f64(1.0 / rate as f64);
         let dma_client = self.dma_clients[dma_ch].clone();
         let ar_state = self.ar_state.clone();
+        let mut pacer = Pacer::new(rate);
 
-        let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
-            let val = ar_state.lock().loopback.pop_front().unwrap_or(0);
-            let _ = dma_client.write(val, false);
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+            for _ in 0..pacer.due() {
+                let val = ar_state.lock().loopback.pop_front().unwrap_or(0);
+                let _ = dma_client.write(val, false);
+            }
             TimerReturn::Continue
         });
 
@@ -739,20 +905,19 @@ impl Hal2 {
                 1 => 44100,
                 _ => 48000,
             };
-            let inc = state.bres_clock_inc[i] as u32;
-            let modctrl = state.bres_clock_modctrl[i] as u32;
-            let mod_val = inc.wrapping_sub(modctrl).wrapping_sub(1) & 0xFFFF;
-            if inc == 0 {
-                state.bres_clock_rate[i] = 0;
-            } else if mod_val > 0 {
-                state.bres_clock_rate[i] = (master * inc) / mod_val;
-            }
+            state.bres_clock_rate[i] = bres_rate(master,
+                state.bres_clock_inc[i], state.bres_clock_modctrl[i]);
         }
     }
 
     fn handle_iar_write(&self, val: u16) {
         let mut state = self.state.lock();
         state.iar = val;
+        let idr = state.idr;
+        if state.iar_log.len() == 32 {
+            state.iar_log.pop_front();
+        }
+        state.iar_log.push_back((val, idr));
 
         let is_read  = (val & IAR_ACCESS_READ) != 0;
         let typ      = val & IAR_TYPE_MASK;
@@ -1140,6 +1305,8 @@ impl Device for Hal2 {
                     ca.prebuffering,
                     ca.timer_id.map_or("none".to_string(), |id| format!("{:#x}", id)),
                 ).unwrap();
+                writeln!(writer, "Codec A timer: reads ch={}  calls={}  frames={}  dry reads={}",
+                    ca.armed_ch.map_or("-".to_string(), |c| c.to_string()), ca.calls, ca.frames, ca.dry_reads).unwrap();
                 drop(ca);
                 writeln!(writer, "cpal underruns (samples): {}", self.underruns.load(Ordering::Relaxed)).unwrap();
 
@@ -1153,6 +1320,13 @@ impl Device for Hal2 {
                     ar.loopback.len(),
                 ).unwrap();
                 drop(ar);
+                let log: Vec<(u16, [u16; 4])> = self.state.lock().iar_log.iter().copied().collect();
+                writeln!(writer, "Recent indirect accesses (IAR: IDR0 IDR1 IDR2 IDR3), oldest first:").unwrap();
+                for (iar, idr) in log {
+                    writeln!(writer, "  {:04x}{}: {:04x} {:04x} {:04x} {:04x}", iar,
+                        if iar & IAR_ACCESS_READ != 0 { " (read)" } else { "" },
+                        idr[0], idr[1], idr[2], idr[3]).unwrap();
+                }
             }
             _ => return Err("Usage: hal2 status".to_string()),
         }
@@ -1164,6 +1338,18 @@ impl Device for Hal2 {
 mod tests {
     use super::*;
     use rtrb::RingBuffer;
+
+    #[test]
+    fn bres_modulus_zero_runs_at_the_master_rate() {
+        // What IRIX writes for 44.1 kHz from the 44.1 kHz master, and for
+        // 48 kHz from 48 kHz: both are the master rate.
+        assert_eq!(bres_rate(44100, 0, 0xFFFF), 44100);
+        assert_eq!(bres_rate(48000, 1, 0xFFFF), 48000);
+        // inc 4, modulus 8 (modctrl = 4 - 8 - 1): half the master rate.
+        assert_eq!(bres_rate(44100, 4, 4u16.wrapping_sub(8).wrapping_sub(1)), 22050);
+        // No increment into a nonzero modulus never ticks.
+        assert_eq!(bres_rate(48000, 0, 0u16.wrapping_sub(4).wrapping_sub(1)), 0);
+    }
 
     fn resample(in_rate: u32, out_rate: u32, n_frames: usize) -> usize {
         let (mut prod, mut cons) = RingBuffer::<i16>::new(n_frames * 4 + 16);
@@ -1202,6 +1388,53 @@ mod tests {
         // 44100 → 48000: ratio ~1.0884, so 44100 in → 48000 out (over one second of audio)
         let out = resample(44100, 48000, 44100);
         assert_eq!(out, 48000, "44100→48000: expected 48000 frames, got {}", out);
+    }
+
+    /// A late wake must not move a burst: after a 10 ms stall at 11025 Hz
+    /// the next call moves at most 1.25 periods' worth, and the backlog is
+    /// still delivered over the following calls.
+    #[test]
+    fn pacer_spreads_catch_up_after_a_late_wake() {
+        let mut p = Pacer::new(11025);
+        p.start -= Duration::from_millis(10);
+        let per_period = (11025 * PACE_PERIOD.as_micros() as u64).div_ceil(1_000_000);
+        let first = p.due();
+        assert!(first <= (per_period * 5).div_ceil(4).max(per_period + 1), "moved {} at once", first);
+        let mut total = first;
+        for _ in 0..200 { total += p.due(); }
+        assert!(total >= 110, "backlog not delivered: {}", total);
+    }
+
+    /// A 1 kHz tone at 11025 Hz, resampled to 48 kHz, against the ideal
+    /// sine at the best-fitting delay. Repeating samples (the old resampler)
+    /// misses by about a fifth of the amplitude; interpolation must be close.
+    #[test]
+    fn resampler_11025_to_48000_follows_the_waveform() {
+        let (inr, outr, f, amp) = (11025u32, 48000u32, 1000.0f64, 16000.0f64);
+        let n = 11025;
+        let (mut prod, mut cons) = RingBuffer::<i16>::new(n * 12);
+        let mut r = Resampler::new(inr, outr);
+        for k in 0..n {
+            let v = (amp * (2.0 * std::f64::consts::PI * f * k as f64 / inr as f64).sin()) as i16;
+            r.push(v, v, &mut prod);
+        }
+        drop(prod);
+        let mut out = Vec::new();
+        while let Ok(v) = cons.pop() { out.push(v as f64); }
+        let left: Vec<f64> = out.iter().step_by(2).copied().collect();
+        let body = &left[1000..left.len() - 1000];
+        let mut best = f64::MAX;
+        for step in 0..400 {
+            let delay = step as f64 * 0.01; // input samples
+            let mut err = 0.0;
+            for (j, v) in body.iter().enumerate() {
+                let t = (j + 1000) as f64 / outr as f64 - delay / inr as f64;
+                let want = amp * (2.0 * std::f64::consts::PI * f * t).sin();
+                err += (v - want) * (v - want);
+            }
+            best = best.min((err / body.len() as f64).sqrt() / amp);
+        }
+        assert!(best < 0.03, "RMS error {:.3} of the amplitude", best);
     }
 
     #[test]

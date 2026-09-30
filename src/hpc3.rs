@@ -312,6 +312,19 @@ impl PdmaCallback for Hpc3Irq {
 
 struct PdmaChannel {
     id: usize,
+    /// Device-side reads and writes since power-on (see `pdma status`).
+    dev_reads: u64,
+    dev_writes: u64,
+    /// CPU reads of the CBP register: how often a driver polls the DMA
+    /// position (a ring with no end-of-descriptor interrupts is refilled so).
+    cbp_polls: u64,
+    /// The last CBP reads: (microseconds since the first, value, bytes the
+    /// device had read by then), for `pdma polls N`.
+    cbp_log: std::collections::VecDeque<(u64, u32, u64)>,
+    cbp_log_t0: Option<std::time::Instant>,
+    /// Device reads when the guest last read CBP, and when.
+    reads_at_poll: u64,
+    last_poll: Option<std::time::Instant>,
     cbp: u32,
     nbdp: u32,
     bc: u32,
@@ -371,6 +384,13 @@ impl PdmaChannel {
             dump_is_write: false,
             transaction_id: 0,
             bytes_transferred: 0,
+            dev_reads: 0,
+            dev_writes: 0,
+            cbp_polls: 0,
+            cbp_log: std::collections::VecDeque::new(),
+            cbp_log_t0: None,
+            reads_at_poll: 0,
+            last_poll: None,
             width_16: false,
             crbdp: 0, cpfxbdp: 0, ppfxbdp: 0, tx_new_packet: true, rown: false, last_rx_ctrl: 0xFFFFFFFF,
         }
@@ -510,6 +530,7 @@ fn start_transaction(&mut self) {
 
     fn dma_read(&mut self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
         if !self.is_active() { return None; }
+        self.dev_reads += 1;
 
         // PBUS DMA (Channels 0-7) always operates on 32-bit words
         // but only uses the most significant 8 or 16 bits.
@@ -569,6 +590,7 @@ fn start_transaction(&mut self) {
     }
 
     fn dma_write(&mut self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
+        self.dev_writes += 1;
         if !self.is_active() {
             dlog_dev!(LogModule::Pdma, "PDMA[{}]: dma_write refused — channel not active (CBP={:08x} BC={:08x})", self.id, self.cbp, self.bc);
             return (DmaStatus(DmaStatus::NOT_ACTIVE), None);
@@ -716,6 +738,15 @@ impl DmaClient for PdmaClientImpl {
     fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
         self.channel.lock().dma_read()
     }
+    fn read_ahead_of_poll(&self) -> Option<u64> {
+        let c = self.channel.lock();
+        // A guest that has not read CBP for a while is not steering by it.
+        match c.last_poll {
+            Some(t) if t.elapsed() < std::time::Duration::from_millis(50) =>
+                Some(c.dev_reads.saturating_sub(c.reads_at_poll)),
+            _ => None,
+        }
+    }
     fn write(&self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
         self.channel.lock().dma_write(val, eop)
     }
@@ -738,7 +769,16 @@ struct PbusDmaOps;
 impl PdmaChannelOps for PbusDmaOps {
     fn read(&self, chan: &mut PdmaChannel, reg: u32) -> u32 {
         match reg {
-            HPC3_PDMA_CBP => chan.cbp,
+            HPC3_PDMA_CBP => {
+                chan.cbp_polls += 1;
+                chan.reads_at_poll = chan.dev_reads;
+                chan.last_poll = Some(std::time::Instant::now());
+                let t0 = *chan.cbp_log_t0.get_or_insert_with(std::time::Instant::now);
+                if chan.cbp_log.len() == 64 { chan.cbp_log.pop_front(); }
+                let entry = (t0.elapsed().as_micros() as u64, chan.cbp, chan.dev_reads * 4);
+                chan.cbp_log.push_back(entry);
+                chan.cbp
+            }
             HPC3_PDMA_NBDP => chan.nbdp,
             HPC3_PDMA_CTRL => {
                 let val = chan.ctrl;
@@ -1414,8 +1454,17 @@ impl Device for Hpc3 {
                         let dir_str = if i == 8 || i == 9 {
                             if (c.ctrl & SCSI_CTRL_DIR) != 0 { " DIR=OUT" } else { " DIR=IN" }
                         } else { "" };
-                        writeln!(writer, "  [{:2}] {:8}: Active={} CBP={:08x} NBDP={:08x} BC={:08x} CRBDP={:08x} Endian={}{} CTRL={:02x}",
-                            i, type_str, c.is_active(), c.cbp, c.nbdp, c.bc, c.crbdp, if c.endian { "Little" } else { "Big" }, dir_str, c.ctrl).unwrap();
+                        writeln!(writer, "  [{:2}] {:8}: Active={} CBP={:08x} NBDP={:08x} BC={:08x} CRBDP={:08x} Endian={}{} CTRL={:02x} reads={} writes={} cbp_polls={}",
+                            i, type_str, c.is_active(), c.cbp, c.nbdp, c.bc, c.crbdp, if c.endian { "Little" } else { "Big" }, dir_str, c.ctrl, c.dev_reads, c.dev_writes, c.cbp_polls).unwrap();
+                    }
+                    return Ok(());
+                }
+                "polls" => {
+                    let ch: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let c = self.pdma_channels.get(ch).ok_or("pdma polls: no such channel")?.lock();
+                    writeln!(writer, "last CBP reads on channel {} (us, CBP, bytes read by the device):", ch).unwrap();
+                    for (t, v, b) in c.cbp_log.iter() {
+                        writeln!(writer, "  {:>12} {:08x} {}", t, v, b).unwrap();
                     }
                     return Ok(());
                 }
