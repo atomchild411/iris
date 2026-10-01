@@ -545,8 +545,13 @@ impl Renderer for GlRenderer {
         let state = self.state.as_mut().unwrap();
         let gl    = &state.gl;
 
-        // Handle window resize — take the latest queued size.
-        let (win_w, win_h) = if let Some((w, h)) = self.window_size.lock().take() {
+        // Handle window resize — take the latest queued size. Taken out of the
+        // lock first: written as `if let Some(..) = self.window_size.lock().take()`
+        // the guard lives through the else branches (edition 2021), and
+        // `inner_size()` there waits on the main thread, which takes this same
+        // lock for every Resized event -- a deadlock at start-up.
+        let queued = self.window_size.lock().take();
+        let (win_w, win_h) = if let Some((w, h)) = queued {
             state.surface.resize(
                 &state.context,
                 NonZeroU32::new(w).unwrap(),
