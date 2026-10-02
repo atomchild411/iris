@@ -40,6 +40,11 @@ pub mod reg {
     pub const FILLMODE: u32 = 0x110;
     pub const CONFIG: u32 = 0x112;
     pub const XYWIN: u32 = 0x115;
+    /// Background colour, where an opaque stipple draws its 0 bits: a colour
+    /// index, or in RGB modes blue (bits 23:12) and green (11:0), 12 bits
+    /// each, with red in the next register.
+    pub const BG_COLOR: u32 = 0x140;
+    pub const BG_COLOR_RED: u32 = 0x141;
     /// The clip rectangle: x and y ranges, each `min << 16 | max`, and its
     /// control (bit 0 enable, bit 4 keep the inside rather than the outside).
     pub const CLIP_X: u32 = 0x147;
@@ -67,6 +72,10 @@ const OP_LINE: u32 = 0x5;
 const OP_BLOCK: u32 = 0x8;
 /// Fill mode: lines follow the 32-bit line stipple pattern.
 const FILL_LINE_STIPPLE: u32 = 1 << 5;
+/// Fill mode: the line stipple is opaque, its 0 bits drawn in the background
+/// colour instead of left alone. The desktop shades icons this way: a 50%
+/// pattern of the foreground and background colours.
+const FILL_LINE_STIPPLE_OPAQUE: u32 = 1 << 6;
 /// Status: command FIFO empty, engine and pixel processors idle, revision 1.
 const STATUS_IDLE: u32 = 0x100 | (1 << 4);
 /// Config: Y-flip.
@@ -460,15 +469,18 @@ impl Raster {
         let (mut x, mut y) = (signed16(s >> 16), signed16(s));
         let (x1, y1) = (signed16(e >> 16), signed16(e));
         let color = self.current_block().color;
-        let stipple = (self.reg(reg::FILLMODE) & FILL_LINE_STIPPLE != 0).then(|| self.reg(reg::LINE_STIPPLE));
+        let fm = self.reg(reg::FILLMODE);
+        let stipple = (fm & FILL_LINE_STIPPLE != 0).then(|| self.reg(reg::LINE_STIPPLE));
+        let background = (stipple.is_some() && fm & FILL_LINE_STIPPLE_OPAQUE != 0).then(|| self.background());
         let (dx, dy) = ((x1 - x).abs(), -(y1 - y).abs());
         let (sx, sy) = (if x < x1 { 1 } else { -1 }, if y < y1 { 1 } else { -1 });
         let mut err = dx + dy;
         let mut k = 0u32;
         loop {
-            if stipple.map_or(true, |p| p & (1 << (31 - k % 32)) != 0) {
+            let lit = stipple.map_or(true, |p| p & (1 << (31 - k % 32)) != 0);
+            if let Some(c) = if lit { Some(color) } else { background } {
                 let (fx, fy) = self.to_fb(x, y);
-                self.put(fx, fy, color);
+                self.put(fx, fy, c);
             }
             if x == x1 && y == y1 {
                 break;
@@ -485,6 +497,19 @@ impl Raster {
             k += 1;
         }
         true
+    }
+
+    /// The background colour, in the same form as the drawing colour: packed
+    /// RGB in RGB modes (from three 12-bit components, like the fast-fill
+    /// colour), a colour index otherwise.
+    fn background(&self) -> u32 {
+        let bg = self.reg(reg::BG_COLOR);
+        if self.rgb_mode() {
+            let red = self.reg(reg::BG_COLOR_RED) & 0xFFF;
+            pack_rgb(red >> 4, (bg & 0xFFF) >> 4, ((bg >> 12) & 0xFFF) >> 4)
+        } else {
+            bg & 0xFFF
+        }
     }
 
     fn fill(&mut self, b: &Block) {
@@ -819,5 +844,56 @@ mod tests {
         r.write(reg::LINE_START, 300 << 16 | 40, false);
         r.write(reg::LINE_END, 303 << 16 | 40, true);
         assert_eq!((300..304).map(|x| px(&r, x, 40)).collect::<Vec<_>>(), [9, 0, 9, 0]);
+    }
+
+    /// What the IRIX desktop sends to shade an icon: fill mode 0x60 (line
+    /// stipple, opaque), the foreground in RED, the background in BG_COLOR.
+    /// Both colours land; nothing underneath shows through.
+    #[test]
+    fn opaque_stippled_line_draws_zero_bits_in_the_background_colour() {
+        let mut r = x_server();
+        r.write(reg::FILLMODE, FILL_LINE_STIPPLE | FILL_LINE_STIPPLE_OPAQUE, false);
+        r.write(reg::RED, 0xF << 12, false);
+        r.write(reg::BG_COLOR, 0x7, false);
+        r.write(reg::LINE_STIPPLE, 0xAAAA_AAAA, false);
+        r.write(reg::IR_ALIAS, 0x15, false);
+        r.write(reg::LINE_START, 300 << 16 | 40, false);
+        r.write(reg::LINE_END, 303 << 16 | 40, true);
+        assert_eq!((300..304).map(|x| px(&r, x, 40)).collect::<Vec<_>>(), [0xF, 7, 0xF, 7]);
+    }
+
+    /// In RGB modes the background is three 12-bit components across two
+    /// registers, as IRIX writes it for a 12-bit window's icon: a 0xf0 grey
+    /// is 0xf00f00 (blue, green) and 0xf00 (red). These are the values from
+    /// a trace of the desktop repainting its Icon Catalog.
+    #[test]
+    fn opaque_stipple_background_in_rgb_modes() {
+        let mut r = x_server();
+        r.write(reg::PP1FILLMODE, 0x0C00_4004, false); // RGB pixel type
+        r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+        r.write(reg::FILLMODE, FILL_LINE_STIPPLE | FILL_LINE_STIPPLE_OPAQUE, false);
+        r.write(reg::PACKEDCOLOR, 0xA0_A0A0, false);
+        r.write(reg::BG_COLOR, 0xC00_700, false);
+        r.write(reg::BG_COLOR_RED, 0x300, false);
+        r.write(reg::LINE_STIPPLE, 0xAAAA_AAAA, false);
+        r.write(reg::IR_ALIAS, 0x15, false);
+        r.write(reg::LINE_START, 300 << 16 | 40, false);
+        r.write(reg::LINE_END, 301 << 16 | 40, true);
+        assert_eq!(px(&r, 300, 40), 0xA0_A0A0);
+        assert_eq!(px(&r, 301, 40), pack_rgb(0x30, 0x70, 0xC0), "red 0x30, green 0x70, blue 0xc0");
+    }
+
+    /// Without the opaque bit, BG_COLOR plays no part.
+    #[test]
+    fn transparent_stipple_ignores_the_background_colour() {
+        let mut r = x_server();
+        r.write(reg::FILLMODE, FILL_LINE_STIPPLE, false);
+        r.write(reg::RED, 0xF << 12, false);
+        r.write(reg::BG_COLOR, 0x7, false);
+        r.write(reg::LINE_STIPPLE, 0x5555_5555, false);
+        r.write(reg::IR_ALIAS, 0x15, false);
+        r.write(reg::LINE_START, 300 << 16 | 40, false);
+        r.write(reg::LINE_END, 303 << 16 | 40, true);
+        assert_eq!((300..304).map(|x| px(&r, x, 40)).collect::<Vec<_>>(), [0, 0xF, 0, 0xF]);
     }
 }
