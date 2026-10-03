@@ -27,6 +27,7 @@ use iris_hostcall::{Fault, GuestMemory, PAGE};
 use crate::backend::Backend;
 use crate::calls;
 use crate::draw::{self, Draw};
+use crate::accum;
 use crate::emul;
 use crate::gl::*;
 
@@ -95,6 +96,8 @@ pub struct ClientSide {
     pub interlace: bool,
     /// The SGI features the host has not got, done in the fragment stage.
     pub emul: emul::Emul,
+    /// The accumulation buffers framebuffer objects cannot have (accum.rs).
+    pub accum: accum::Accum,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -119,6 +122,7 @@ pub struct Exec<'a> {
     pub backend: &'a dyn Backend,
     pub client: &'a mut ClientSide,
     pub draws: &'a HashMap<u32, Draw>,
+    pub current_draw: u32,
     pub current_read: u32,
     /// Pixels on their way through, one buffer per image argument of the
     /// command (glSeparableFilter2D has two, glGetSeparableFilter three), so
@@ -296,6 +300,7 @@ pub const MAX_TEXTURE_UNITS: i64 = 8;
 pub trait GetValue: Copy {
     fn to_i64(self) -> i64;
     fn from_i64(v: i64) -> Self;
+    fn from_f32(v: f32) -> Self;
 }
 
 macro_rules! get_value {
@@ -305,6 +310,9 @@ macro_rules! get_value {
                 self as i64
             }
             fn from_i64(v: i64) -> Self {
+                v as Self
+            }
+            fn from_f32(v: f32) -> Self {
                 v as Self
             }
         }
@@ -322,6 +330,7 @@ impl<'a> Exec<'a> {
         backend: &'a dyn Backend,
         client: &'a mut ClientSide,
         draws: &'a HashMap<u32, Draw>,
+        current_draw: u32,
         current_read: u32,
     ) -> Exec<'a> {
         Exec {
@@ -333,6 +342,7 @@ impl<'a> Exec<'a> {
             backend,
             client,
             draws,
+            current_draw,
             current_read,
             scratch: Vec::new(),
             staged: Vec::new(),
@@ -1119,6 +1129,37 @@ impl<'a> Exec<'a> {
         r
     }
 
+    /// glAccum, on the drawable drawn into (accum.rs).
+    pub fn accum(&mut self, op: u32, value: f32) {
+        self.resolve_read();
+        let draws = self.draws;
+        self.client.accum.retain(|id| draws.contains_key(&id));
+        let Some(d) = self.draws.get(&self.current_draw) else { return };
+        // An operation that is not one does nothing (the specification's
+        // GL_INVALID_ENUM is not raised: the host has no accumulation
+        // buffer to raise it about).
+        self.client.accum.op(self.current_draw, d.w, d.h, op, value);
+    }
+
+    /// glClearAccum: the value is ours to keep, as the buffer is.
+    pub fn clear_accum(&mut self, r: f32, g: f32, b: f32, a: f32) {
+        self.client.accum.set_clear_value([r, g, b, a]);
+    }
+
+    /// glClear: the accumulation buffer's bit is ours, the rest the host's.
+    pub fn clear(&mut self, mask: u32) {
+        if mask & accum::GL_ACCUM_BUFFER_BIT != 0 {
+            if let Some(d) = self.draws.get(&self.current_draw) {
+                self.client.accum.clear(self.current_draw, d.w, d.h);
+            }
+        }
+        let rest = mask & !accum::GL_ACCUM_BUFFER_BIT;
+        if rest != 0 {
+            // SAFETY: the current context's GL.
+            unsafe { glClear(rest) };
+        }
+    }
+
     /// Before anything reads the framebuffer: a multisampled drawable's
     /// samples have to be resolved into the buffer reads come from.
     pub fn resolve_read(&mut self) {
@@ -1196,6 +1237,20 @@ impl<'a> Exec<'a> {
     /// 8 is far above what IRIX-era software asks for (Quake III wants 2), and
     /// a ceiling is easier to raise later than a wrong answer is to find.
     pub fn get_limit<T: GetValue>(&mut self, pname: u32, out: &mut [T]) {
+        // The accumulation buffer is this library's (accum.rs), not the
+        // host's, which has none to report.
+        if (accum::GL_ACCUM_RED_BITS..=accum::GL_ACCUM_ALPHA_BITS).contains(&pname) {
+            if let Some(v) = out.first_mut() {
+                *v = T::from_i64(accum::ACCUM_BITS);
+            }
+            return;
+        }
+        if pname == accum::GL_ACCUM_CLEAR_VALUE {
+            for (v, c) in out.iter_mut().zip(self.client.accum.clear_value()) {
+                *v = T::from_f32(c);
+            }
+            return;
+        }
         if pname != GL_MAX_TEXTURE_UNITS_ARB {
             return;
         }
