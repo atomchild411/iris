@@ -465,13 +465,13 @@ fn pixels_by_reference_across_pages_in_guest_byte_order() {
     assert_eq!(pixel(&out, 64, 3, 8), [0, 0, 0, 255], "just outside");
 }
 
-/// IRIX numbers UNSIGNED_SHORT_5_6_5 0x8362 and UNSIGNED_BYTE_2_3_3_REV
-/// 0x8363, the other way round from the standard. Each must be sized and
-/// drawn as the guest meant it, and read back the same way.
+/// UNSIGNED_SHORT_5_6_5 (0x8363) and UNSIGNED_BYTE_2_3_3_REV (0x8362), as
+/// IRIX 6.5.22's <GL/gl.h> and OpenGL 1.2 number them. Each must be sized
+/// and drawn as the guest meant it, and read back the same way.
 #[test]
-fn irix_packed_5_6_5_and_2_3_3_rev_keep_their_meaning() {
-    const IRIX_5_6_5: i32 = 0x8362;
-    const IRIX_2_3_3_REV: i32 = 0x8363;
+fn packed_5_6_5_and_2_3_3_rev_keep_their_meaning() {
+    const IRIX_5_6_5: i32 = 0x8363;
+    const IRIX_2_3_3_REV: i32 = 0x8362;
     const GL_RGB: i32 = 0x1907;
     let mut g = Guest::new(64);
     g.context(0x0040_0004, 32, 32);
