@@ -577,20 +577,61 @@ pages; raw images and relocatable `.text` in 4 KB pieces). Scripts:
 
 | | pages | share |
 |---|---|---|
-| byte-identical to a page of a file (or the PROM) | 4,189 | **93.2%** |
-| its code is in a file, but at another offset in the page | 160 | 3.6% |
-| its code is in no file | 146 | 3.2% |
+| byte-identical to a page of a file (or the PROM) | 4,391 | **97.7%** |
+| its code is in a file, but at another offset in the page | 41 | 0.9% |
+| its code is in none of the copied files | 63 | 1.4% |
+
+(First count 64.5%, then 93.2%: the copy had missed `/usr/etc` and the
+compiler's executables, then `/lib32`, where `/usr/lib32/libc.so.1` points.)
 
 - The identical pages cover the kernel (`/unix`, ~600 pages), the PROM, rld,
   libc, libcrypto, the MIPSpro compiler, bash, sh, Perl, X, sshd, ssh-keygen,
   openssl and less. Their page hash, and so their cache key, can be computed
   from the file: AOT can produce exactly these blobs offline.
 - At another offset: `sash`, which the PROM relocates when it loads it (15),
-  and pages whose code also occurs in libc variants (85; not yet explained).
-- In no file: mostly FR1. Candidates: code the kernel copies or builds at boot
-  (exception vectors, trampolines). Not yet identified.
+  PROM code copied into RAM (4), kernel code copied elsewhere (4); the rest
+  single pages, probably chance matches of 4 instructions.
+- In none of the copied files: a search of the whole 36 GB disk image found
+  the code of 49 of them on disk (files not copied, or deleted since, like the
+  workload's own test programs); 10 are nowhere on disk (7 of them FR0, boot
+  time: code generated or relocated in memory); 4 had no distinctive run.
+- Content of all 104: code, not data (84-94% of words decode as
+  instructions, the rest mostly zeros); the only strings are symbol and
+  section names, library paths and `mload version 7.0`.
 - Entropy: ssh-keygen and openssl ran from file pages like everything else;
   keys and random data are data and never reach the key or the code. A blob
-  does store its whole 4 KB page, so a page that mixed code with live data
-  would put that data on disk; for the 93% this is file content, and the
-  remaining ~300 pages are the ones to inspect.
+  stores its whole 4 KB page, so a page mixing code with live data would put
+  that data on disk; none of the pages in this run did. Storing and comparing
+  only the decoded words would close that path for good.
+
+## AOT step 1: can static analysis predict the entries? (2026-10-04)
+
+`scratch/jitcache-aot/step1.py`, over the 4,315 file pages: runtime entries
+(the union over each page's variants) against entries found statically in the
+file.
+
+| static entries | runtime entries predicted | pages fully covered |
+|---|---|---|
+| symbols, calls, return sites, cross-page branches, code addresses in data, page start | 9.7% | 0 |
+| + in-page branch targets and fall-throughs (3x as many entries) | 23.7% | 0 |
+
+Pages average **75 runtime entries**, spread over every kind of instruction
+in proportion to how common it is. The cause is in `step_jit`: an arrival
+with `jit_trigger` set at an offset with no compiled code requests a compile
+with that offset added, and `eret` sets the trigger
+(`exec_complete_pc_set`). So every return from an interrupt, a TLB miss or a
+system call adds the instruction it lands on, and interrupts land anywhere on
+a hot page.
+
+So purely static AOT would serve a page until the first `eret` lands on an
+unpredicted offset, then recompile it (union-on-miss), and so on. Directions:
+
+1. **Don't compile for `eret` landings** (interpret on to the next published
+   entry instead). Entry sets would become close to static, recompiles fewer
+   for the JIT as a whole, and AOT viable. Cost: a short interpreted stretch
+   after each interrupt return. Needs measuring: compile requests by arrival
+   class, and the interpreted instructions per `eret`.
+2. **Profile-guided AOT:** the warm cache already is the record of real entry
+   sets; AOT supplies the code, recorded runs the entries (a shipped base).
+3. **Every instruction an entry** for AOT blobs: measure the code size and
+   speed cost of a switch with up to 1,024 cases.
