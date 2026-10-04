@@ -4,6 +4,9 @@ Status, 2026-09-24: implemented behind `IRIS_JIT_CACHE=1` (`src/cpu/jitv2/pcache
 under verification. Where the implementation departs from the plan below, the
 section says so.
 
+Branch `jitcache-explore` (experimental, not for upstream yet): the sections
+from "Organizing the cache by program" on are explorations, not plans.
+
 Update, 2026-10-04: the cache is bounded: `[jitv2] cache_max_mb` (default
 1024) and `cache_keep_builds` (default 3), with eviction that keeps reused
 pages over pages written once. See "Bounds and eviction".
@@ -343,3 +346,220 @@ and the shared libraries (quickstart-prelinked at fixed addresses, so their
 pages are byte-identical in memory), compile each with a superset of plausible
 entry points (symbols, branch targets, return sites), and write blobs. The
 first boot of a fresh build would then start warm.
+
+## Organizing the cache by program (exploration, 2026-10-04)
+
+The cache is keyed by page content, so it already serves any program that has
+run before: an application's text pages, and its shared libraries' (PIC and
+quickstart-prelinked), have the same bytes in every run, wherever IRIX puts
+them. What the store does not know is *which program a page belongs to*. That
+matters for two things the flat store cannot do well:
+
+- **Eviction.** Boot is the same every time and is worth keeping. Firing up an
+  editor or Netscape is what one user does and another doesn't. Half of a
+  program's working set is worth much less than all of it: the first page that
+  misses puts the program behind the compile queue again.
+- **Prefetch.** Each lookup today is triggered by a request, one page at a
+  time, and a program's start is a burst of a few hundred requests. If the
+  cache knew that page X begins Netscape's start, it could read the whole
+  start-up set at once, before the requests arrive.
+
+### Ways to know the program
+
+**A. Watch exec (needs knowledge of the guest).** At IRIX's `execve` the path
+is a user string at `a0`; iris can read it through the guest TLB the way the
+monitor does. Identity is the path plus a hash of the first text page run in
+user mode afterwards, so a replaced binary is a new program. Precise and cheap,
+but per guest OS (syscall numbers differ between IRIX, NetBSD and others), and
+per ABI.
+
+**B. Watch the address space (guest-agnostic).** A program starts as a new
+ASID running user-mode code at a page not seen in that ASID before. Identity is
+the content hash of the entry page plus the virtual address of the entry. No OS
+knowledge, but exec within one process is a boundary it has to infer, and
+`crt1`'s start-up code is common to many programs (the entry page also holds
+the program's first functions, which usually make it distinct; to be checked).
+
+**C. Learn successors, name nothing.** Record, per page, the pages that were
+requested soon after it in the same ASID. On a hit, prefetch those successors.
+This learns "Netscape's start" without ever naming Netscape, works for any
+guest, and needs no exec boundary. Shared-library pages have many successors,
+so fan-out has to be capped, or keyed by the previous page as well (a short
+Markov context).
+
+These combine: C as the general mechanism, with A's names when the guest is
+known (for display, and for whole-program eviction).
+
+### Working sets
+
+Whichever way it is found, a program's **working set** is the ordered list of
+(page hash, FR, entries) that its first seconds request, recorded per run. With
+working sets:
+
+- a page's value is taken from the working sets that contain it: how often and
+  how recently each ran. Kernel and libc pages are in every set and rank
+  highest; a page only one forgotten program used ranks lowest;
+- eviction removes the least valuable *working set* as a unit, after
+  probation, rather than scattering misses across many programs;
+- prefetch on a program's first page reads its set into a bounded in-memory
+  side table, not into the JIT arena: the arena is finite (a mega-flush at
+  4,096 pages), so blobs are installed only when a request arrives, but from
+  memory instead of from disk.
+
+Working sets are hints. A stale one costs a wasted read; it can never serve
+wrong code, because every blob still passes the page compare and the
+fingerprint.
+
+### Storage that follows from it
+
+- **Packs.** Like git's loose objects and packfiles: new blobs are written
+  loose, as today, and a program's protected working set is periodically
+  rewritten as one pack file (an index of page hashes, then the blobs). Start-up
+  is then one sequential read or one `mmap` instead of hundreds of opens, and
+  eviction of a program is deleting one file.
+- **Compression.** Blobs average 64 KB for a 4 KB guest page, most of it code;
+  machine code typically compresses 2-3x (zstd, fast to decompress). That would
+  halve or better the disk and the I/O, at some CPU per load: measure against
+  the 8 µs load.
+- **A shipped base.** Boot, the kernel, libc and the desktop are the same for
+  everyone on a given IRIX release and IRIS build. That base could come from
+  the AOT path above (or from a recorded session) as a read-only pack, with
+  each user's own programs learned on top.
+
+### Experiments before building any of this
+
+1. **Traces.** Log every request with time, page hash, FR, ASID, kernel/user
+   and PC, and the path at each `execve` (A), over a set of scenarios on the
+   same machine: boot only; boot and the desktop; Netscape's start; an editor;
+   `less` on a big file; a compile; Maya's start.
+2. **Analysis of the traces.** How many pages each scenario adds beyond boot;
+   how much scenarios share (kernel, libc, X and Motif libraries); whether the
+   entry page identifies a program (B); how predictable successors are (C);
+   how much of a program's cold start is compile time (the gap between first
+   request and running compiled code).
+3. **Simulated policies.** Replay the traces against LRU, the two-segment
+   policy above and working-set eviction, at caps of 256 MB, 512 MB and 1 GB,
+   with hit rate and time-to-warm as the result. This picks the policy with
+   data before any of it is written into `pcache.rs`.
+4. **Prefetch value.** In one scenario, prefetch the recorded working set at
+   the program's first page and measure time to its first window, against the
+   plain warm cache.
+
+The bounds above are worth building first, independent of this: they fix
+unbounded growth with a policy that the experiments can later refine.
+
+## Beyond pages: whole functions, whole binaries (exploration, 2026-10-04)
+
+The unit today is a 4 KB physical page compiled as one Cranelift function with
+a dispatch switch over its entries; control that leaves the page goes back
+through the dispatcher. The cache inherits that unit. Two larger units are
+worth exploring, and the cache's key (content, not address) carries over to
+both.
+
+### Caching whole guest functions
+
+A guest function (entry to `jr ra`) can span pages, and today it is split
+wherever a page ends, with a dispatch between the pieces.
+
+- **Unit and key.** A function is compiled as one region over the pages it
+  touches. Its key is the ordered list of (page hash, FR) of those pages plus
+  the entry offset; a hit needs every page's 4 KB compare, and the region is
+  valid while all of its pages are unchanged (a generation check per page,
+  where today there is one).
+- **Finding functions at run time.** `jal` targets are entries; a `jr ra` ends
+  one; the pages a function reaches between them are its extent. Recorded per
+  run, this is the same kind of trace as the working sets above.
+- **What it buys:** no dispatch at page boundaries inside a function, Cranelift
+  optimizing across them, and calls between cached functions chained directly
+  instead of through the dispatcher.
+- **What it costs:** invalidation gets wider (a write to any of the pages kills
+  the region), regions overlap (a page in several functions), and the arena
+  holds duplicates. Measure: how many hot functions actually cross a page; how
+  much time goes to page-boundary dispatch today.
+
+### AOT for whole binaries
+
+Everything a program runs is in its ELF file before it runs, so an offline tool
+can fill the cache (or one pack per binary) before the first launch.
+
+- **The pages are predictable.** Non-PIC IRIX executables load their text at
+  the link address, unrelocated; DSOs are PIC, and quickstart-prelinked at
+  fixed addresses. A text page in memory has the file's bytes, including
+  whatever follows the text in the same page, so its hash can be computed from
+  the file. The FR mode follows the ABI in the ELF header (o32 FR0; n32 and 64
+  FR1).
+- **Entries:** the symbol table (`.dynsym`, and `.symtab` or the `.mdebug`
+  procedure table where not stripped), every `jal` target, return sites after
+  calls, the GOT's function addresses, and jump tables found from their
+  relocations. A superset is fine: the switch just has more cases.
+- **Units:** pages first (the current store, no runtime change); whole functions
+  once the section above exists.
+- **What to AOT:** the kernel (`/unix`), `rld`, libc and the X and Motif
+  libraries for everyone; per user, the binaries they actually run (the
+  working sets above say which).
+- **Verification:** the same as for the runtime cache (fingerprint, page
+  compare), plus jitcov and A/B runs, AOT cache against an empty one.
+- **Measure first:** how much of an AOT'd page's entry set the program
+  actually uses, and how close AOT gets to a warm runtime cache on boot and on
+  a program's first start.
+
+## A second layer: Cranelift's incremental cache (exploration, 2026-10-04)
+
+Cranelift 0.134 has an experimental `incremental-cache` feature
+(`cranelift_codegen::incremental_cache`, `Context::compile_with_cache`): it
+keys a compile on the function's IR (its "stencil": the IR with external names
+abstracted out) plus the Cranelift version and the target's flags, SHA-256
+hashed, and caches the compiled stencil (postcard-serialized). We don't use
+it.
+
+| | our cache (`pcache`) | Cranelift's incremental cache |
+|---|---|---|
+| key | page bytes, FR, codegen fingerprint, **iris binary hash** | IR + Cranelift version + ISA flags |
+| looked up | before our IR is built | after it is built |
+| a hit skips | IR building and Cranelift | Cranelift's backend (lowering, regalloc, emission) |
+| a hit costs | ~8 µs | our IR build + hashing it + deserializing |
+| after a rebuild | always cold | warm wherever the emitted IR didn't change |
+
+The IR is exactly the right test for "did codegen change": a moved core field
+changes an offset in the IR, a changed helper signature changes the IR, and a
+Rust helper whose body changed is called from the current build anyway. So a
+second layer keyed on IR would keep the cache warm across rebuilds that don't
+touch the JIT, for us while developing and for users across releases.
+
+**Design:** keep `pcache` as layer 1 (per build, 8 µs). On a layer-1 miss,
+build the IR, look it up in a layer-2 store shared by all builds (under
+`<base>/ir/`, same bounds); on a hit skip the backend and write the result to
+layer 1. A rebuild's first session then pays only for our IR build per page.
+
+**Measure first:**
+1. How the 22 ms per page splits between our IR build and Cranelift's
+   backend. Layer 2 is worth it only if the backend dominates.
+2. Whether our IR is deterministic: compile one page twice, compare keys; then
+   across two builds that differ in unrelated code. (A `HashMap` order or a
+   host address in the IR would make every key miss; never wrong code.)
+3. The hit rate across a real rebuild, with
+   `enable_incremental_compilation_cache_checks` on (it recompiles every hit
+   and asserts the result is identical).
+
+## Open question: what counts as reuse (2026-10-04)
+
+`jitcache-bounds` promotes a blob on any hit, so a mega-flush's reloads count
+as reuse. In the cold session above, 126 blobs were promoted before the
+session's one mega-flush and about 890 after it: 88% of that session's
+promotions came from the flush. That protects the kernel, libc and the shell,
+as it should, but also anything hot across a flush, such as a package build
+running for an hour; and protected blobs are evicted least recently used
+first, so boot's pages, last used at boot, would go before the build's.
+
+Options:
+
+1. **Promote only on a hit in a later run** than the one that wrote the blob
+   (the process remembers what it wrote); a same-run hit only refreshes the
+   mtime. Small; candidate for the bounds PR itself.
+2. **Count the runs** a blob has been reused in (a counter in the name).
+3. **Frequency-aware protected eviction:** runs reused first, then recency
+   (needs 2).
+
+Test: the four sessions above plus one long session with several mega-flushes
+(a package build in the guest), with and without option 1. The trace replay
+experiments above can compare 2 and 3.
