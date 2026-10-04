@@ -55,6 +55,19 @@ is easiest to understand by reading the commit.
   `ensure_nveeprom_exists`, `reset_nveeprom`) and call them alongside the
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 
+### JIT v2
+
+- **The persistent code cache is bounded.** `[jitv2] cache_max_mb` (default
+  1024) caps the cache directory, all builds together, and
+  `cache_keep_builds` (default 3) how many builds' caches are kept. New
+  blobs are on probation (`.jc`) until they serve a lookup, then protected
+  (`.jh`); over the cap, a pass deletes down to 80%: unused builds, then
+  probation blobs, then protected ones least recently used first, so a run
+  that compiles many pages once can't push out what every boot reuses. A
+  build another iris process is running is never deleted; a page keeps at
+  most 16 variants. New monitor command `jitcache [status|prune|clear]`.
+  Details and measurements: `docs/jitv2-persistent-cache.md`.
+
 ## September 2026
 
 ### Graphics (REX3)

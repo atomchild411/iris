@@ -4,6 +4,10 @@ Status, 2026-09-24: implemented behind `IRIS_JIT_CACHE=1` (`src/cpu/jitv2/pcache
 under verification. Where the implementation departs from the plan below, the
 section says so.
 
+Update, 2026-10-04: the cache is bounded: `[jitv2] cache_max_mb` (default
+1024) and `cache_keep_builds` (default 3), with eviction that keeps reused
+pages over pages written once. See "Bounds and eviction".
+
 Update, 2026-10-01: the toggle is now `[jitv2] cache`/`cache_dir` in
 `iris.toml` (also exposed in the iris-gui config editor), which
 `Jitv2Config::apply_env` (`src/config.rs`) turns into the `IRIS_JIT_CACHE`/
@@ -113,7 +117,8 @@ as first written:
 - At startup the directory is scanned into an index
   `(page-hash, fr) -> [blob]`. About 3,000 files for a session: milliseconds.
 - Pruning: keep the newest three build directories, and cap total size
-  (LRU by access time).
+  (LRU by access time). As built (2026-10-04), the cap evicts pages never
+  reused before reused ones; see "Bounds and eviction".
 
 ## Lookup and insert
 
@@ -215,6 +220,101 @@ cache): at most 48 compiles of any page per session, 8,600-9,100 in total
 results as above (hits 80-96%, Cranelift time 45, 18 and 14 s). R4400 and
 R5000 Indy boots still reach login.
 
+## Bounds and eviction
+
+Until 2026-10-04 the only bounds were "three builds" and "a new variant
+deletes the ones it covers". Nothing capped bytes, so the cache grew with every
+machine configuration, guest release and one-off program, and a 17th variant
+of a page was written but never read (lookups read 16) or deleted. Pruning
+could also delete the build directory of another iris process still running.
+
+### Settings
+
+- `[jitv2] cache_max_mb` (`IRIS_JIT_CACHE_MAX_MB`), default **1024**: the
+  whole cache directory, all builds together, counted in allocated blocks (as
+  `du` counts).
+- `[jitv2] cache_keep_builds` (`IRIS_JIT_CACHE_KEEP_BUILDS`), default 3.
+
+### What a page is worth
+
+Plain LRU is the wrong policy: a session that builds packages in the guest
+compiles thousands of pages once, and under LRU they push out the kernel and
+libc pages every boot needs. A page that has been *reused* is worth more than
+one that was only *written*, and the filesystem holds that without an index:
+
+- **Probation** (`.jc`): every new blob.
+- **Protected** (`.jh`): a blob that has served a lookup. The first hit renames
+  `.jc` to `.jh` (atomic, no lock); every hit also sets the file's mtime, which
+  is its recency.
+- A variant that covers others replaces them, and **inherits their
+  protection**: union-on-miss rewrites boot pages with more entries, and that
+  must not put them back on probation.
+
+Promotion and the mtime update are jobs for the writer thread, never the
+compile thread.
+
+### Eviction (`pcache::collect`)
+
+Over the cap, a pass deletes down to **80%** of it (so the next write does not
+start another pass), in this order:
+
+1. build directories other than the running one that no process has used in
+   the last 15 minutes, least recently used first;
+2. probation blobs, oldest first;
+3. protected blobs, least recently used first.
+
+Emptied page and fingerprint directories go with their last blob; temp files
+older than an hour (a writer that died) go too. Beyond the size cap, only the
+`cache_keep_builds` most recently used builds are kept, again never one in use.
+
+A pass runs at startup on a background thread, and on the writer thread after
+every 5% of the cap written. The directory can therefore pass the cap by a few
+percent between passes; the next pass brings it back. A pass is a directory
+walk with one `stat` per file (a few thousand files): milliseconds.
+
+**Several processes:** a lock on `<base>/.lock` lets one pass run at a time
+(the others skip theirs); each running process touches its build's `.used`
+every 5 minutes, which keeps step 1 and the build count away from it. A blob
+deleted under a reader is a miss: a failed read or check is never served.
+
+**Variants:** a page keeps at most 16; past that, the variants with the fewest
+entries go first, then the least recently used.
+
+### Monitor
+
+`jitcache` (or `jitcache status`): the session's counters, the size against
+the cap, probation and protected bytes, and each build's size. `jitcache
+prune` runs a pass now; `jitcache clear` deletes this build's blobs (other
+builds may belong to running processes).
+
+### Results (2026-10-04, IP28 / R10000, IRIX 6.5.22, 4 compile threads)
+
+Four sessions in a row on one cache directory. Each session: boot, then over
+ssh either a light workload (`ls -lR /usr/include`, a small `cc` compile) or a
+flood (`nm` over 300 shared libraries, a dozen `man` pages, `file` over 3,000
+files, `cc` and `CC` compiles), then a clean shutdown.
+
+| session | cap | workload | hits | cache after | probation / protected |
+|---|---|---|---|---|---|
+| 1 cold | 1024 MB | light | 19.2% | 231 MB | 127 / 23 MB |
+| 2 warm | 1024 MB | light | 78.8% | 295 MB | 99 / 195 MB |
+| 3 | 320 MB | flood | 73.8% | 324 MB | 36 / 284 MB |
+| 4 warm | 320 MB | light | **85.0%** | 313 MB | 25 / 257 MB |
+
+(Probation and protected are from the monitor shortly before shutdown;
+"cache after" is `du` after it.) The flood's pages took the evictions
+(65 MB in session 3, 67 MB at session 4's start), the reused set stayed, and
+session 4 hits more than session 2: its pages had grown more entries meanwhile.
+
+The first version did not pass protection on to a covering variant. With a
+256 MB cap the protected set then shrank 200 → 179 → 154 MB across the same
+sessions and the warm boot after the flood fell to 64%, because union-on-miss
+had put boot pages back on probation. The inheritance rule above fixed it.
+
+Unit tests (`pcache::tests`) cover the eviction order and the 80% target, a
+build in use surviving both the count and the cap, measuring without deleting,
+stale temp files, promotion on a hit, inheritance, and the variant limit.
+
 ## Risks
 
 - **A hidden input left out of the fingerprint** serves code compiled for a
@@ -222,7 +322,8 @@ R5000 Indy boots still reach login.
   fingerprint, and `IRIS_JIT_CACHE=off` as a kill switch.
 - **Disk-resident executable code:** the cache directory is the user's own;
   blobs are never shared between machines or users.
-- **Size:** roughly 3,000 blobs per build for this workload.
+- **Size:** roughly 3,000 blobs per build for this workload; bounded by
+  `cache_max_mb` since 2026-10-04.
 
 ## Implementation steps
 

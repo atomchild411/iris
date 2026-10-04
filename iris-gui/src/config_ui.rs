@@ -359,6 +359,14 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                 .hint_text("blank = platform cache dir")
                 .desired_width(280.0));
             ui.end_row();
+            ui.label("Cache size cap, MB (IRIS_JIT_CACHE_MAX_MB)");
+            ui.add(egui::DragValue::new(&mut cfg.jitv2.cache_max_mb).range(64..=65536).speed(16.0))
+                .on_hover_text("All builds together. Over the cap, pages that were never reused go first, then the least recently used.");
+            ui.end_row();
+            ui.label("Builds kept (IRIS_JIT_CACHE_KEEP_BUILDS)");
+            ui.add(egui::DragValue::new(&mut cfg.jitv2.cache_keep_builds).range(1..=16).speed(0.1))
+                .on_hover_text("Every rebuild of iris starts a new cache; older builds' caches are kept up to this count.");
+            ui.end_row();
         });
     }
     ui.separator();

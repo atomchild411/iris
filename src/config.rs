@@ -662,13 +662,31 @@ pub struct Jitv2Config {
     /// A directory that doesn't exist yet is created on first use.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cache_dir: String,
+    /// Size cap in MB for the whole cache directory, all builds together
+    /// (`IRIS_JIT_CACHE_MAX_MB`). Over it, blobs never reused go first, then
+    /// the least recently used; see `pcache::collect`.
+    #[serde(default = "default_jit_cache_max_mb")]
+    pub cache_max_mb: u64,
+    /// How many builds' caches to keep (`IRIS_JIT_CACHE_KEEP_BUILDS`). Every
+    /// rebuild is a new, empty cache; the older ones stay until there are more
+    /// than this, or the size cap needs the room.
+    #[serde(default = "default_jit_cache_keep_builds")]
+    pub cache_keep_builds: usize,
 }
 
 fn default_jitv2_threads() -> usize { 1 }
+fn default_jit_cache_max_mb() -> u64 { 1024 }
+fn default_jit_cache_keep_builds() -> usize { 3 }
 
 impl Default for Jitv2Config {
     fn default() -> Self {
-        Self { threads: default_jitv2_threads(), cache: false, cache_dir: String::new() }
+        Self {
+            threads: default_jitv2_threads(),
+            cache: false,
+            cache_dir: String::new(),
+            cache_max_mb: default_jit_cache_max_mb(),
+            cache_keep_builds: default_jit_cache_keep_builds(),
+        }
     }
 }
 
@@ -679,6 +697,12 @@ impl Jitv2Config {
     pub fn apply_env(&self) {
         set_or_remove_env("IRIS_JIT_CACHE", if self.cache { "1" } else { "" });
         set_or_remove_env("IRIS_JIT_CACHE_DIR", &self.cache_dir);
+        // Defaults are left to pcache, so an externally set variable still
+        // wins over a config that doesn't change them.
+        let non_default = |v: u64, d: u64| if v == d { String::new() } else { v.to_string() };
+        set_or_remove_env("IRIS_JIT_CACHE_MAX_MB", &non_default(self.cache_max_mb, default_jit_cache_max_mb()));
+        set_or_remove_env("IRIS_JIT_CACHE_KEEP_BUILDS",
+            &non_default(self.cache_keep_builds as u64, default_jit_cache_keep_builds() as u64));
     }
 }
 

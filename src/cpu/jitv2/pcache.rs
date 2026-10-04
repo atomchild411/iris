@@ -28,12 +28,23 @@
 //! filesystem work on a page that has never been cached. Several emulators
 //! can share a cache, since every write is a temp file plus a rename.
 //!
+//! Bounds (`[jitv2] cache_max_mb`, default 1024, and `cache_keep_builds`,
+//! default 3; `IRIS_JIT_CACHE_MAX_MB` / `IRIS_JIT_CACHE_KEEP_BUILDS`): a blob
+//! is written on probation (`.jc`) and becomes protected (`.jh`) the first
+//! time it serves a lookup; every hit also sets its mtime. Over the cap, a
+//! collection pass deletes down to 80% of it: build directories no other
+//! process is using, oldest first, then probation blobs, then protected ones,
+//! least recently used first (`collect`). So a session that compiles many
+//! pages once (a package build in the guest) cannot push out the pages every
+//! boot reuses.
+//!
 //! A hit is always verified against the full 4 KB of page words stored in the
 //! blob, so no hash collision can serve code for other bytes.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 use crate::cpu::jitv2::{BITMAP_WORDS, ENTRIES_PER_PAGE};
 
@@ -45,9 +56,25 @@ const MAGIC: [u8; 8] = *b"IRISJC\0\0";
 /// Bump when the file layout changes. (A codegen change needs no bump: it
 /// changes the executable, and with it the build id.)
 const FORMAT: u32 = 1;
-/// How many build directories survive startup pruning.
-const KEEP_BUILDS: usize = 3;
-/// A lookup reads at most this many variants of one page.
+/// `[jitv2] cache_max_mb`'s default: the whole cache directory, all builds.
+pub const DEFAULT_MAX_MB: u64 = 1024;
+/// `[jitv2] cache_keep_builds`'s default.
+pub const DEFAULT_KEEP_BUILDS: usize = 3;
+/// A collection pass deletes down to this share of the cap, so the next
+/// write doesn't start another one.
+const TARGET_PERCENT: u64 = 80;
+/// The writer starts a pass after writing this share of the cap.
+const COLLECT_EVERY_PERCENT: u64 = 5;
+/// A running process touches its build's `.used` this often ...
+const HEARTBEAT: Duration = Duration::from_secs(5 * 60);
+/// ... and a build touched this recently is in use: never deleted whole.
+const IN_USE: Duration = Duration::from_secs(15 * 60);
+/// A temp file this old was left by a writer that died.
+const STALE_TMP: Duration = Duration::from_secs(60 * 60);
+/// A blob not yet reused, and one that has served a lookup.
+const PROBATION: &str = "jc";
+const PROTECTED: &str = "jh";
+/// A page keeps at most this many variants; a lookup reads at most this many.
 const MAX_VARIANTS: usize = 16;
 const REPORT_EVERY: u64 = 500;
 
@@ -85,40 +112,67 @@ fn default_base() -> Option<PathBuf> {
     Some(cache.join("iris").join("jitv2"))
 }
 
-/// `<base>/<build-id>`, created on first use; `None` if it can't be.
-fn root() -> Option<&'static PathBuf> {
-    static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
-    ROOT.get_or_init(|| {
+struct Limits {
+    max_bytes: u64,
+    keep_builds: usize,
+}
+
+/// The bounds, from `IRIS_JIT_CACHE_MAX_MB` / `IRIS_JIT_CACHE_KEEP_BUILDS`
+/// (`[jitv2] cache_max_mb` / `cache_keep_builds`).
+fn limits() -> &'static Limits {
+    static L: OnceLock<Limits> = OnceLock::new();
+    L.get_or_init(|| {
+        let var = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        Limits {
+            max_bytes: var("IRIS_JIT_CACHE_MAX_MB").unwrap_or(DEFAULT_MAX_MB).max(1) << 20,
+            keep_builds: var("IRIS_JIT_CACHE_KEEP_BUILDS").map_or(DEFAULT_KEEP_BUILDS, |n| n as usize).max(1),
+        }
+    })
+}
+
+struct Dirs {
+    base: PathBuf,
+    /// `<base>/<build-id>`.
+    build: PathBuf,
+}
+
+/// The base and this build's directory, created on first use; `None` if they
+/// can't be. The first call also starts the collector thread: one pass now,
+/// then a heartbeat on `.used` so other processes see this build in use.
+fn dirs() -> Option<&'static Dirs> {
+    static DIRS: OnceLock<Option<Dirs>> = OnceLock::new();
+    DIRS.get_or_init(|| {
         let base = match std::env::var_os("IRIS_JIT_CACHE_DIR") {
             Some(d) => PathBuf::from(d),
             None => default_base()?,
         };
         let exe = std::fs::read(std::env::current_exe().ok()?).ok()?;
         let id = hex(&blake3::hash(&exe).as_bytes()[..16]);
-        let dir = base.join(id);
-        std::fs::create_dir_all(&dir).ok()?;
-        // Mark this build as the most recently used one, for pruning.
-        let _ = std::fs::File::create(dir.join(".used"));
-        prune_builds(&base);
-        Some(dir)
+        let build = base.join(id);
+        std::fs::create_dir_all(&build).ok()?;
+        touch_used(&build);
+        let (b, d) = (base.clone(), build.clone());
+        let _ = std::thread::Builder::new().name("jitcache-gc".into()).spawn(move || {
+            let l = limits();
+            collect(&b, &d, l.max_bytes, l.keep_builds, SystemTime::now(), true);
+            loop {
+                std::thread::sleep(HEARTBEAT);
+                touch_used(&d);
+            }
+        });
+        Some(Dirs { base, build })
     }).as_ref()
 }
 
-/// Keep the `KEEP_BUILDS` most recently used build directories.
-fn prune_builds(base: &Path) {
-    let Ok(rd) = std::fs::read_dir(base) else { return };
-    let mut builds: Vec<(std::time::SystemTime, PathBuf)> = rd
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| {
-            let used = std::fs::metadata(e.path().join(".used")).and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            (used, e.path())
-        })
-        .collect();
-    builds.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, old) in builds.into_iter().skip(KEEP_BUILDS) {
-        let _ = std::fs::remove_dir_all(old);
+/// `<base>/<build-id>`.
+fn root() -> Option<&'static PathBuf> {
+    dirs().map(|d| &d.build)
+}
+
+/// Mark a build as in use now (its `.used` file's mtime).
+fn touch_used(build: &Path) {
+    if let Ok(f) = std::fs::File::create(build.join(".used")) {
+        let _ = f.set_modified(SystemTime::now());
     }
 }
 
@@ -170,6 +224,12 @@ static STORES: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 static UNION_ADDED: AtomicU64 = AtomicU64::new(0);
 static LOAD_NS: AtomicU64 = AtomicU64::new(0);
+/// Probation blobs promoted to protected by their first hit.
+static PROMOTED: AtomicU64 = AtomicU64::new(0);
+static EVICTED_FILES: AtomicU64 = AtomicU64::new(0);
+static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Bytes written since the last collection pass.
+static WRITTEN_SINCE_COLLECT: AtomicU64 = AtomicU64::new(0);
 
 /// A compile whose output can't be stored (relocations, or a configuration
 /// that bakes host addresses).
@@ -189,11 +249,12 @@ pub fn note_load_time(d: std::time::Duration) {
 pub fn summary() -> String {
     let (l, h) = (LOOKUPS.load(Relaxed), HITS.load(Relaxed));
     format!(
-        "jitcache: lookups={l} hits={h} ({:.1}%) stored={} refused={} union_added={} compare_fail={} bad_files={} load_us_avg={:.0}",
+        "jitcache: lookups={l} hits={h} ({:.1}%) stored={} refused={} union_added={} compare_fail={} bad_files={} load_us_avg={:.0} promoted={} evicted={} ({} MB)",
         if l == 0 { 0.0 } else { 100.0 * h as f64 / l as f64 },
         STORES.load(Relaxed), REFUSED.load(Relaxed), UNION_ADDED.load(Relaxed),
         COMPARE_FAILS.load(Relaxed), BAD_FILES.load(Relaxed),
         if h == 0 { 0.0 } else { LOAD_NS.load(Relaxed) as f64 / h as f64 / 1000.0 },
+        PROMOTED.load(Relaxed), EVICTED_FILES.load(Relaxed), EVICTED_BYTES.load(Relaxed) >> 20,
     )
 }
 
@@ -327,9 +388,13 @@ fn variant_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     rd.filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jc"))
+        .filter(|p| is_blob(p))
         .take(MAX_VARIANTS)
         .collect()
+}
+
+fn is_blob(p: &Path) -> bool {
+    p.extension().is_some_and(|x| x == PROBATION || x == PROTECTED)
 }
 
 fn discard_bad(path: &Path) {
@@ -351,7 +416,7 @@ pub fn lookup(
         eprintln!("{}", summary());
     }
     let dir = page_dir(fp, ph, fr1)?;
-    let mut best: Option<Blob> = None;
+    let mut best: Option<(Blob, PathBuf)> = None;
     for path in variant_files(&dir) {
         let Ok(buf) = std::fs::read(&path) else { continue };
         // Only a covering variant is worth the full check.
@@ -365,14 +430,14 @@ pub fn lookup(
             COMPARE_FAILS.fetch_add(1, Relaxed);
             continue;
         }
-        if best.as_ref().is_none_or(|b| count(&blob.entries) > count(&b.entries)) {
-            best = Some(blob);
+        if best.as_ref().is_none_or(|(b, _)| count(&blob.entries) > count(&b.entries)) {
+            best = Some((blob, path));
         }
     }
-    if best.is_some() {
-        HITS.fetch_add(1, Relaxed);
-    }
-    best
+    let (blob, path) = best?;
+    HITS.fetch_add(1, Relaxed);
+    send(Job::Touch(path));
+    Some(blob)
 }
 
 /// Every entry any stored variant of this page has, for union-on-miss. Only
@@ -381,12 +446,7 @@ pub fn known_entries(fp: &Fingerprint, ph: &PageHash, fr1: bool) -> Entries {
     let mut all = [0u64; BITMAP_WORDS];
     let Some(dir) = page_dir(fp, ph, fr1) else { return all };
     for path in variant_files(&dir) {
-        let Ok(mut f) = std::fs::File::open(&path) else { continue };
-        let mut buf = vec![0u8; HEADER_LEN];
-        if std::io::Read::read_exact(&mut f, &mut buf).is_err() {
-            continue;
-        }
-        if let Some(h) = decode_header(&buf) {
+        if let Some(h) = read_header(&path) {
             if &h.fp == fp && &h.ph == ph && h.fr1 == fr1 {
                 for (a, e) in all.iter_mut().zip(&h.entries) {
                     *a |= e;
@@ -399,16 +459,19 @@ pub fn known_entries(fp: &Fingerprint, ph: &PageHash, fr1: bool) -> Entries {
 
 // ---- writer --------------------------------------------------------------
 
-struct Job {
-    fp: Fingerprint,
-    ph: PageHash,
-    fr1: bool,
-    blob: Blob,
+enum Job {
+    Store { fp: Fingerprint, ph: PageHash, fr1: bool, blob: Box<Blob> },
+    /// A blob served a lookup: promote it and mark it recently used.
+    Touch(PathBuf),
 }
 
 /// Queue a successful compile for writing. Returns at once; a background
 /// thread does the filesystem work.
 pub fn store(fp: Fingerprint, ph: PageHash, fr1: bool, blob: Blob) {
+    send(Job::Store { fp, ph, fr1, blob: Box::new(blob) });
+}
+
+fn send(job: Job) {
     static TX: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
     let tx = TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
@@ -416,43 +479,348 @@ pub fn store(fp: Fingerprint, ph: PageHash, fr1: bool, blob: Blob) {
             .name("jitcache-writer".into())
             .spawn(move || {
                 for job in rx {
-                    write_job(job);
+                    match job {
+                        Job::Store { fp, ph, fr1, blob } => write_job(fp, ph, fr1, &blob),
+                        Job::Touch(path) => touch(&path),
+                    }
                 }
             })
             .expect("spawn jitcache writer");
         std::sync::Mutex::new(tx)
     });
-    let _ = tx.lock().unwrap().send(Job { fp, ph, fr1, blob });
+    let _ = tx.lock().unwrap().send(job);
 }
 
-fn write_job(job: Job) {
-    let Some(dir) = page_dir(&job.fp, &job.ph, job.fr1) else { return };
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
+/// A blob served a lookup: a probation blob becomes protected, and either way
+/// its mtime becomes now, its recency for eviction. A blob deleted meanwhile
+/// is simply gone.
+fn touch(path: &Path) {
+    let mut path = path.to_path_buf();
+    if path.extension().is_some_and(|x| x == PROBATION) {
+        let to = path.with_extension(PROTECTED);
+        if std::fs::rename(&path, &to).is_err() {
+            return;
+        }
+        PROMOTED.fetch_add(1, Relaxed);
+        path = to;
     }
-    let bytes = encode(&job.fp, &job.ph, job.fr1, &job.blob);
-    let name = format!("{}.jc", hex(&entries_hash(&job.blob.entries)));
+    if let Ok(f) = std::fs::File::options().write(true).open(&path) {
+        let _ = f.set_modified(SystemTime::now());
+    }
+}
+
+fn write_job(fp: Fingerprint, ph: PageHash, fr1: bool, blob: &Blob) {
+    let Some(dir) = page_dir(&fp, &ph, fr1) else { return };
+    let Some(written) = write_blob(&dir, &fp, &ph, fr1, blob) else { return };
+    STORES.fetch_add(1, Relaxed);
+    let l = limits();
+    let since = WRITTEN_SINCE_COLLECT.fetch_add(written, Relaxed) + written;
+    if since >= l.max_bytes * COLLECT_EVERY_PERCENT / 100 {
+        WRITTEN_SINCE_COLLECT.store(0, Relaxed);
+        if let Some(d) = dirs() {
+            collect(&d.base, &d.build, l.max_bytes, l.keep_builds, SystemTime::now(), true);
+        }
+    }
+}
+
+/// Write one variant into its page directory: temp file, rename, then drop
+/// the variants it covers and trim to `MAX_VARIANTS`. Returns the bytes
+/// written.
+fn write_blob(dir: &Path, fp: &Fingerprint, ph: &PageHash, fr1: bool, blob: &Blob) -> Option<u64> {
+    std::fs::create_dir_all(dir).ok()?;
+    let bytes = encode(fp, ph, fr1, blob);
+    let stem = hex(&entries_hash(&blob.entries));
+    // The variants the new one covers can never be chosen over it again, so
+    // they go once it is written. It takes their place, and so keeps any
+    // protection they earned: union-on-miss rewrites a page that boot reuses
+    // with more entries, and that must not put the page back on probation.
+    let covered: Vec<PathBuf> = variant_files(dir).into_iter()
+        .filter(|p| !p.file_stem().is_some_and(|n| n == stem.as_str()))
+        .filter(|p| read_header(p).is_some_and(|h| covers(&blob.entries, &h.entries)))
+        .collect();
+    let protected = dir.join(format!("{stem}.{PROTECTED}")).exists()
+        || covered.iter().any(|p| p.extension().is_some_and(|x| x == PROTECTED));
+    let name = format!("{stem}.{}", if protected { PROTECTED } else { PROBATION });
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, dir.join(&name)).is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    for path in covered {
+        let _ = std::fs::remove_file(&path);
+    }
+    if protected {
+        // The same entry set still on probation is now a duplicate.
+        let _ = std::fs::remove_file(dir.join(format!("{stem}.{PROBATION}")));
+    }
+    trim_variants(dir, &stem);
+    Some(bytes.len() as u64)
+}
+
+fn read_header(path: &Path) -> Option<Header> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; HEADER_LEN];
+    std::io::Read::read_exact(&mut f, &mut buf).ok()?;
+    decode_header(&buf)
+}
+
+fn mtime(path: &Path) -> SystemTime {
+    std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Keep at most `MAX_VARIANTS` in a page directory (a lookup reads no more):
+/// past that, the variants with the fewest entries go first, then the least
+/// recently used. `keep` (the one just written) always stays.
+fn trim_variants(dir: &Path, keep: &str) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut all: Vec<(u32, SystemTime, PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| is_blob(p) && !p.file_stem().is_some_and(|n| n == keep))
+        .map(|p| (read_header(&p).map_or(0, |h| count(&h.entries)), mtime(&p), p))
+        .collect();
+    if all.len() < MAX_VARIANTS {
         return;
     }
-    STORES.fetch_add(1, Relaxed);
-    // A variant the new one covers can never be chosen over it again.
-    for path in variant_files(&dir) {
-        if path.file_name().is_some_and(|n| n == name.as_str()) {
-            continue;
-        }
-        let Ok(mut f) = std::fs::File::open(&path) else { continue };
-        let mut buf = vec![0u8; HEADER_LEN];
-        if std::io::Read::read_exact(&mut f, &mut buf).is_ok() {
-            if let Some(h) = decode_header(&buf) {
-                if covers(&job.blob.entries, &h.entries) {
+    all.sort_by_key(|a| (a.0, a.1));
+    for (_, _, p) in all.iter().take(all.len() + 1 - MAX_VARIANTS) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+// ---- bounds --------------------------------------------------------------
+
+/// What a collection pass found, and what it deleted.
+#[derive(Default, Debug)]
+pub struct Usage {
+    /// Bytes in blobs after the pass, and how they split.
+    pub total: u64,
+    pub probation: u64,
+    pub protected: u64,
+    /// Per build directory: (name, bytes, is this process's build).
+    pub builds: Vec<(String, u64, bool)>,
+    pub evicted_files: u64,
+    pub evicted_bytes: u64,
+    /// Another process held the lock, so this pass did nothing.
+    pub skipped: bool,
+}
+
+struct FileInfo {
+    path: PathBuf,
+    size: u64,
+    mtime: SystemTime,
+    protected: bool,
+}
+
+struct BuildInfo {
+    name: String,
+    path: PathBuf,
+    used: SystemTime,
+    files: Vec<FileInfo>,
+    gone: bool,
+}
+
+impl BuildInfo {
+    fn bytes(&self) -> u64 {
+        if self.gone { 0 } else { self.files.iter().map(|f| f.size).sum() }
+    }
+}
+
+/// What a file takes on disk: its allocated blocks where the platform says,
+/// so the cap matches `du`, otherwise its length.
+fn disk_size(m: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        m.blocks() * 512
+    }
+    #[cfg(not(unix))]
+    {
+        m.len()
+    }
+}
+
+/// Every blob under one build directory; stale temp files are deleted on the
+/// way.
+fn scan_build(build: &Path, now: SystemTime) -> Vec<FileInfo> {
+    let mut out = Vec::new();
+    let dirs = |d: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(d).into_iter().flatten().filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path()).collect()
+    };
+    for fp in dirs(build) {
+        for page in dirs(&fp) {
+            for e in std::fs::read_dir(&page).into_iter().flatten().filter_map(|e| e.ok()) {
+                let path = e.path();
+                let Ok(m) = e.metadata() else { continue };
+                let mt = m.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                if is_blob(&path) {
+                    let protected = path.extension().is_some_and(|x| x == PROTECTED);
+                    out.push(FileInfo { path, size: disk_size(&m), mtime: mt, protected });
+                } else if path.extension().is_some_and(|x| x == "tmp")
+                    && now.duration_since(mt).unwrap_or_default() > STALE_TMP
+                {
                     let _ = std::fs::remove_file(&path);
                 }
             }
         }
     }
+    out
+}
+
+/// One collection pass over the cache at `base`, whose running build is
+/// `current`. With `evict`, it keeps the `keep_builds` most recently used
+/// builds and, over `max_bytes`, deletes down to `TARGET_PERCENT` of it:
+///
+/// 1. builds other than `current` that no process has touched within
+///    `IN_USE`, least recently used first;
+/// 2. probation blobs, oldest mtime first;
+/// 3. protected blobs, oldest mtime first.
+///
+/// A build in use by another process is never deleted whole (its blobs can
+/// still go in steps 2 and 3, and a deleted blob is only a miss). One pass at
+/// a time across processes (a lock on `<base>/.lock`). Without `evict` it
+/// only measures.
+pub fn collect(base: &Path, current: &Path, max_bytes: u64, keep_builds: usize, now: SystemTime, evict: bool) -> Usage {
+    let mut u = Usage::default();
+    let _lock = if evict {
+        let Ok(f) = std::fs::File::create(base.join(".lock")) else { return u };
+        if f.try_lock().is_err() {
+            u.skipped = true;
+            return u;
+        }
+        Some(f)
+    } else {
+        None
+    };
+    let in_use = |b: &BuildInfo| b.path == current || now.duration_since(b.used).unwrap_or_default() < IN_USE;
+
+    let mut builds: Vec<BuildInfo> = std::fs::read_dir(base).into_iter().flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| {
+            let path = e.path();
+            BuildInfo {
+                name: e.file_name().to_string_lossy().into_owned(),
+                used: mtime(&path.join(".used")),
+                files: scan_build(&path, now),
+                path,
+                gone: false,
+            }
+        })
+        .collect();
+    // Most recently used first; the running build counts as the most recent.
+    builds.sort_by_key(|b| std::cmp::Reverse((b.path == current, b.used)));
+
+    let remove_build = |b: &mut BuildInfo, u: &mut Usage| {
+        if std::fs::remove_dir_all(&b.path).is_ok() {
+            u.evicted_files += b.files.len() as u64;
+            u.evicted_bytes += b.bytes();
+            b.gone = true;
+        }
+    };
+    if evict {
+        for b in builds.iter_mut().skip(keep_builds) {
+            if !in_use(b) {
+                remove_build(b, &mut u);
+            }
+        }
+    }
+    let mut total: u64 = builds.iter().map(|b| b.bytes()).sum();
+    if evict && total > max_bytes {
+        let target = max_bytes * TARGET_PERCENT / 100;
+        for b in builds.iter_mut().rev() {
+            if total <= target {
+                break;
+            }
+            if !b.gone && !in_use(b) {
+                total -= b.bytes();
+                remove_build(b, &mut u);
+            }
+        }
+        for protected in [false, true] {
+            let mut files: Vec<&mut FileInfo> = builds.iter_mut().filter(|b| !b.gone)
+                .flat_map(|b| b.files.iter_mut()).filter(|f| f.protected == protected).collect();
+            files.sort_by_key(|f| f.mtime);
+            for f in files {
+                if total <= target {
+                    break;
+                }
+                if std::fs::remove_file(&f.path).is_ok() {
+                    total -= f.size;
+                    u.evicted_files += 1;
+                    u.evicted_bytes += f.size;
+                    f.size = 0;
+                    // An emptied page directory, and then its fingerprint
+                    // directory, go too (remove_dir fails while not empty).
+                    if let Some(page) = f.path.parent() {
+                        if std::fs::remove_dir(page).is_ok() {
+                            let _ = page.parent().map(std::fs::remove_dir);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for b in &builds {
+        if b.gone {
+            continue;
+        }
+        for f in &b.files {
+            if f.protected { u.protected += f.size } else { u.probation += f.size }
+        }
+        u.builds.push((b.name.clone(), b.bytes(), b.path == current));
+    }
+    u.total = u.probation + u.protected;
+    EVICTED_FILES.fetch_add(u.evicted_files, Relaxed);
+    EVICTED_BYTES.fetch_add(u.evicted_bytes, Relaxed);
+    u
+}
+
+// ---- monitor -------------------------------------------------------------
+
+fn describe(u: &Usage, max_bytes: u64) -> String {
+    let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+    let mut s = format!(
+        "{}\njitcache: {:.1} MB of {:.0} MB ({:.1} MB probation, {:.1} MB protected)",
+        summary(), mb(u.total), mb(max_bytes), mb(u.probation), mb(u.protected),
+    );
+    for (name, bytes, current) in &u.builds {
+        s.push_str(&format!("\n  {name}  {:.1} MB{}", mb(*bytes), if *current { "  (this build)" } else { "" }));
+    }
+    if u.evicted_files > 0 {
+        s.push_str(&format!("\n  evicted {} blobs, {:.1} MB", u.evicted_files, mb(u.evicted_bytes)));
+    }
+    if u.skipped {
+        s.push_str("\n  another process is collecting; nothing done");
+    }
+    s
+}
+
+/// `jitcache [status|prune|clear]` on the monitor. `None` when the cache is
+/// off.
+pub fn monitor(arg: Option<&str>) -> Option<Result<String, String>> {
+    if !enabled() {
+        return None;
+    }
+    let d = dirs()?;
+    let l = limits();
+    Some(match arg.unwrap_or("status") {
+        "status" => Ok(describe(&collect(&d.base, &d.build, l.max_bytes, l.keep_builds, SystemTime::now(), false), l.max_bytes)),
+        "prune" => Ok(describe(&collect(&d.base, &d.build, l.max_bytes, l.keep_builds, SystemTime::now(), true), l.max_bytes)),
+        "clear" => {
+            // This build's blobs only: other builds may belong to running
+            // processes.
+            for fp in std::fs::read_dir(&d.build).into_iter().flatten().filter_map(|e| e.ok()) {
+                if fp.file_type().is_ok_and(|t| t.is_dir()) {
+                    let _ = std::fs::remove_dir_all(fp.path());
+                }
+            }
+            Ok(describe(&collect(&d.base, &d.build, l.max_bytes, l.keep_builds, SystemTime::now(), false), l.max_bytes))
+        }
+        other => Err(format!("jitcache: unknown '{other}'; usage: jitcache [status|prune|clear]")),
+    })
 }
 
 #[cfg(test)]
@@ -489,6 +857,197 @@ mod tests {
             assert!(decode(&bad, &fp, &ph, true).is_none(), "flip at {i}");
         }
         assert!(decode(&bytes[..bytes.len() - 1], &fp, &ph, true).is_none());
+    }
+
+    /// A fresh directory under the system temp dir, removed when dropped.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("iris-pcache-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            TempDir(d)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const MB: u64 = 1 << 20;
+    const T0: Duration = Duration::from_secs(1_000_000_000);
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + T0 + Duration::from_secs(secs)
+    }
+
+    /// A build directory used at `used`.
+    fn build(base: &Path, name: &str, used: SystemTime) -> PathBuf {
+        let b = base.join(name);
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::File::create(b.join(".used")).unwrap().set_modified(used).unwrap();
+        b
+    }
+
+    /// A blob file of `size` bytes, last used at `mtime`.
+    fn file(build: &Path, page: &str, name: &str, size: u64, mtime: SystemTime) -> PathBuf {
+        let d = build.join("fp").join(page);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join(name);
+        std::fs::write(&p, vec![0u8; size as usize]).unwrap();
+        std::fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+        p
+    }
+
+    #[test]
+    fn eviction_order_and_target() {
+        let t = TempDir::new("order");
+        let now = at(100_000);
+        let cur = build(&t.0, "cur", now);
+        let old = build(&t.0, "old", at(0));
+        // Another process ran this build a minute ago: in use.
+        let busy = build(&t.0, "busy", now - Duration::from_secs(60));
+        let old_blob = file(&old, "p1", "a.jh", 2 * MB, at(50_000));
+        let busy_blob = file(&busy, "p1", "a.jh", 2 * MB, at(1));
+        let prob_old = file(&cur, "p1", "a.jc", 2 * MB, at(10));
+        let prob_new = file(&cur, "p2", "b.jc", 2 * MB, at(20));
+        let prot_old = file(&cur, "p3", "c.jh", 2 * MB, at(5));
+        let prot_new = file(&cur, "p4", "d.jh", 2 * MB, at(30));
+        // 12 MB against a 10 MB cap: delete down to 8 MB.
+        let u = collect(&t.0, &cur, 10 * MB, 3, now, true);
+        // The unused build goes whole, then the oldest probation blob, even
+        // though a protected blob is older still.
+        assert!(!old.exists() && !old_blob.exists());
+        assert!(!prob_old.exists());
+        assert!(prob_new.exists() && prot_old.exists() && prot_new.exists() && busy_blob.exists());
+        assert_eq!(u.total, 8 * MB);
+        assert_eq!((u.evicted_files, u.evicted_bytes), (2, 4 * MB));
+        // An emptied page directory is removed with its last blob.
+        assert!(!prob_old.parent().unwrap().exists());
+
+        // A 5 MB cap (target 4 MB): the last probation blob, then the least
+        // recently used protected one, which is in the busy build: its blobs
+        // can go, though the build is never removed whole.
+        let u = collect(&t.0, &cur, 5 * MB, 3, now, true);
+        assert!(!prob_new.exists() && !busy_blob.exists());
+        assert!(prot_old.exists() && prot_new.exists() && busy.exists());
+        assert_eq!((u.total, u.protected), (4 * MB, 4 * MB));
+    }
+
+    #[test]
+    fn keeps_recent_builds_and_builds_in_use() {
+        let t = TempDir::new("keep");
+        let now = at(100_000);
+        let cur = build(&t.0, "cur", at(0)); // the running build ranks first anyway
+        let b1 = build(&t.0, "b1", at(5_000));
+        let b2 = build(&t.0, "b2", at(4_000));
+        let b3 = build(&t.0, "b3", at(3_000));
+        let busy = build(&t.0, "busy", now - Duration::from_secs(120));
+        collect(&t.0, &cur, 1 << 40, 3, now, true);
+        // Kept: cur, busy (in use) and b1 (the newest of the rest), so b2 and b3
+        // are over the count of 3; busy is in use and survives regardless.
+        assert!(cur.exists() && busy.exists() && b1.exists());
+        assert!(!b2.exists() && !b3.exists());
+    }
+
+    #[test]
+    fn measuring_deletes_nothing() {
+        let t = TempDir::new("measure");
+        let now = at(100_000);
+        let cur = build(&t.0, "cur", now);
+        let old = build(&t.0, "old", at(0));
+        file(&cur, "p", "a.jc", 3 * MB, at(1));
+        file(&old, "p", "a.jh", 3 * MB, at(1));
+        let u = collect(&t.0, &cur, MB, 1, now, false);
+        assert!(old.exists());
+        assert_eq!((u.total, u.probation, u.protected, u.evicted_files), (6 * MB, 3 * MB, 3 * MB, 0));
+        assert!(u.builds.iter().any(|(n, b, c)| n == "cur" && *b == 3 * MB && *c));
+    }
+
+    #[test]
+    fn stale_temp_files_are_removed() {
+        let t = TempDir::new("tmp");
+        let now = SystemTime::now();
+        let cur = build(&t.0, "cur", now);
+        let stale = file(&cur, "p", ".a.jc.1.tmp", 10, now - 2 * STALE_TMP);
+        let fresh = file(&cur, "p", ".b.jc.2.tmp", 10, now);
+        collect(&t.0, &cur, 1 << 40, 3, now, true);
+        assert!(!stale.exists() && fresh.exists());
+    }
+
+    #[test]
+    fn a_hit_promotes_and_refreshes() {
+        let t = TempDir::new("touch");
+        let p = file(&t.0, "p", "a.jc", 10, at(0));
+        touch(&p);
+        let promoted = p.with_extension(PROTECTED);
+        assert!(!p.exists() && promoted.exists());
+        assert!(mtime(&promoted) > at(1_000_000));
+        // A second hit only refreshes.
+        std::fs::File::options().write(true).open(&promoted).unwrap().set_modified(at(0)).unwrap();
+        touch(&promoted);
+        assert!(promoted.exists() && mtime(&promoted) > at(1_000_000));
+    }
+
+    #[test]
+    fn a_covering_variant_inherits_protection() {
+        let t = TempDir::new("inherit");
+        let fp = [4u8; 16];
+        let mut small = [0u64; BITMAP_WORDS];
+        small[0] = 0b01;
+        let mut big = small;
+        big[0] = 0b11;
+        let b = blob(small, 1);
+        let ph = page_hash(&b.words);
+        write_blob(&t.0, &fp, &ph, false, &b).unwrap();
+        let first = t.0.join(format!("{}.{PROBATION}", hex(&entries_hash(&small))));
+        assert!(first.exists());
+        touch(&first); // reused: protected
+        // Union-on-miss writes a superset: it replaces the protected variant
+        // and stays protected.
+        write_blob(&t.0, &fp, &ph, false, &blob(big, 1)).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&t.0).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![format!("{}.{PROTECTED}", hex(&entries_hash(&big)))]);
+        // A superset of a probation-only page stays on probation.
+        let mut other = [0u64; BITMAP_WORDS];
+        other[1] = 1;
+        let ph2 = page_hash(&blob(other, 2).words);
+        let d2 = t.0.join("p2");
+        write_blob(&d2, &fp, &ph2, false, &blob(other, 2)).unwrap();
+        other[1] = 3;
+        write_blob(&d2, &fp, &ph2, false, &blob(other, 2)).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&d2).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![format!("{}.{PROBATION}", hex(&entries_hash(&other)))]);
+    }
+
+    #[test]
+    fn variants_are_capped() {
+        let t = TempDir::new("variants");
+        let fp = [3u8; 16];
+        let dir = t.0.join("page");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Variant i has i+1 entries; all from the same page.
+        let mut names = Vec::new();
+        for i in 0..MAX_VARIANTS + 2 {
+            let mut e = [0u64; BITMAP_WORDS];
+            e[0] = (1u64 << (i + 1)) - 1;
+            let b = blob(e, 9);
+            let ph = page_hash(&b.words);
+            let stem = hex(&entries_hash(&e));
+            std::fs::write(dir.join(format!("{stem}.{PROBATION}")), encode(&fp, &ph, false, &b)).unwrap();
+            names.push(stem);
+        }
+        // The one "just written" has a single entry, and still stays.
+        trim_variants(&dir, &names[0]);
+        let left: Vec<String> = std::fs::read_dir(&dir).unwrap()
+            .map(|e| e.unwrap().path().file_stem().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(left.len(), MAX_VARIANTS);
+        assert!(left.contains(&names[0]));
+        // The fewest-entry others went: variants 1 and 2.
+        assert!(!left.contains(&names[1]) && !left.contains(&names[2]));
     }
 
     #[test]

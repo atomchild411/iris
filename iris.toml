@@ -257,10 +257,15 @@ mode           = "nat"
 # and the persistent on-disk compiled-page cache across runs (see
 # docs/jitv2-persistent-cache.md). cache_dir blank/unset = the platform's
 # user cache directory; a directory that doesn't exist yet is created.
+# cache_max_mb caps the whole directory (all builds); over it, pages never
+# reused go first, then the least recently used. cache_keep_builds: how many
+# builds' caches to keep (every rebuild starts a new one).
 #[jitv2]
-#threads   = 1
-#cache     = false
-#cache_dir = ""
+#threads           = 1
+#cache             = false
+#cache_dir         = ""
+#cache_max_mb      = 1024
+#cache_keep_builds = 3
 
 # Debug knobs, applied as environment variables at start.
 #[debug]
