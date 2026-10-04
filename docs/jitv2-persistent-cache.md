@@ -563,3 +563,34 @@ Options:
 Test: the four sessions above plus one long session with several mega-flushes
 (a package build in the guest), with and without option 1. The trace replay
 experiments above can compare 2 and 3.
+
+## AOT step 0: do the pages IRIX runs exist in its files? (2026-10-04)
+
+One IP28 session with the cache on (IRIX 6.5.22m: boot, `ls -lR`, a `cc`
+compile, `ssh-keygen -t ed25519`, `openssl rand/genrsa/dgst/speed`, `less`,
+`nm`, shutdown): 4,495 distinct compiled (page, FR). Then every ELF file that
+could have run was copied off the guest (kernel, rld, every DSO, every
+executable outside large applications; 3,872 files), plus `sash` from the
+volume header and the PROM image, and each was laid out as in memory (PT_LOAD
+pages; raw images and relocatable `.text` in 4 KB pieces). Scripts:
+`scratch/jitcache-aot/{match,partial,anyoff}.py`.
+
+| | pages | share |
+|---|---|---|
+| byte-identical to a page of a file (or the PROM) | 4,189 | **93.2%** |
+| its code is in a file, but at another offset in the page | 160 | 3.6% |
+| its code is in no file | 146 | 3.2% |
+
+- The identical pages cover the kernel (`/unix`, ~600 pages), the PROM, rld,
+  libc, libcrypto, the MIPSpro compiler, bash, sh, Perl, X, sshd, ssh-keygen,
+  openssl and less. Their page hash, and so their cache key, can be computed
+  from the file: AOT can produce exactly these blobs offline.
+- At another offset: `sash`, which the PROM relocates when it loads it (15),
+  and pages whose code also occurs in libc variants (85; not yet explained).
+- In no file: mostly FR1. Candidates: code the kernel copies or builds at boot
+  (exception vectors, trampolines). Not yet identified.
+- Entropy: ssh-keygen and openssl ran from file pages like everything else;
+  keys and random data are data and never reach the key or the code. A blob
+  does store its whole 4 KB page, so a page that mixed code with live data
+  would put that data on disk; for the 93% this is file content, and the
+  remaining ~300 pages are the ones to inspect.
