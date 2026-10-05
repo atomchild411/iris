@@ -80,3 +80,45 @@ pub fn status_line() -> String {
         perf.cpu_core, perf.rex3_core, perf.refresh_core
     )
 }
+
+/// Exploration: `IRIS_QOS="cpu=interactive,compile=utility"` sets the macOS
+/// QoS class of the MIPS CPU thread (`cpu`) and of each jitv2 compile worker
+/// (`compile`), from inside the thread. Classes: `interactive`, `initiated`,
+/// `default`, `utility`, `background`. QoS is what decides performance versus
+/// efficiency cores on Apple Silicon (`THREAD_AFFINITY_POLICY` is ignored
+/// there). A no-op elsewhere, and when the variable doesn't name the role.
+pub fn apply_qos(role: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use libc::qos_class_t::*;
+        let Ok(spec) = std::env::var("IRIS_QOS") else { return };
+        let Some(class) = spec.split(',').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k.trim() == role).then(|| v.trim().to_string())
+        }) else { return };
+        let qos = match class.as_str() {
+            "interactive" => QOS_CLASS_USER_INTERACTIVE,
+            "initiated" => QOS_CLASS_USER_INITIATED,
+            "default" => QOS_CLASS_DEFAULT,
+            "utility" => QOS_CLASS_UTILITY,
+            "background" => QOS_CLASS_BACKGROUND,
+            other => {
+                eprintln!("iris: IRIS_QOS: unknown class {other:?} for {role}");
+                return;
+            }
+        };
+        let before = current_qos();
+        let rc = unsafe { libc::pthread_set_qos_class_self_np(qos, 0) };
+        eprintln!("iris: QoS {role}: {before} -> {} (rc {rc})", current_qos());
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = role;
+}
+
+#[cfg(target_os = "macos")]
+fn current_qos() -> String {
+    let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+    let mut prio: libc::c_int = 0;
+    unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut prio) };
+    format!("{class:?}/{prio}")
+}

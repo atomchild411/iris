@@ -3120,7 +3120,10 @@ impl CompileQueue {
             self.threads.push(
                 std::thread::Builder::new()
                     .name(format!("jitv2-compile-{i}"))
-                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4))
+                    .spawn(move || {
+                        crate::thread_affinity::apply_qos("compile");
+                        Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4)
+                    })
                     .expect("jitv2-compile spawn"),
             );
         }

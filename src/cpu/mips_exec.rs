@@ -11227,6 +11227,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
 
         *self.thread.lock() = Some(thread::Builder::new().name("MIPS-CPU".to_string()).stack_size(16 * 1024 * 1024).spawn(move || {
             crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::MipsCpu);
+            crate::thread_affinity::apply_qos("cpu");
             let mut guard = executor.lock();
 
             // A freshly spawned OS thread has its own host FPU rounding-mode

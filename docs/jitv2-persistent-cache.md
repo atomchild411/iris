@@ -736,3 +736,46 @@ faster (less CPU taken by the compile threads). `opt_level=none` saves another
 quarter of compile time for code ~5% slower on `cc` and equal on SHA-256 (the
 seqcst preambles already block most of what the e-graph pass could do).
 `single_pass` regalloc compiles fast but its code is far slower.
+
+## Thread priorities, thread count, and recompiles (2026-10-04)
+
+`IRIS_QOS="cpu=<class>,compile=<class>"` (`thread_affinity::apply_qos`) sets
+the macOS QoS class from inside the MIPS CPU thread and each compile worker.
+Every thread runs at `QOS_CLASS_DEFAULT` today. One session each, default
+compiler settings, cache off (host load 5-8 from the desktop):
+
+| | ms per compile | `cc` 1st / 2nd run | SHA-256 MB/s |
+|---|---|---|---|
+| default (3 runs) | 19.2-20.7 | 13.8-18.2 / 7.15-7.32 | 16.1-16.6 |
+| cpu `interactive`, compile `utility` | 29.0 | 23.6 / 9.2 | 16.4 |
+| cpu `interactive` | 20.3 | 17.0 / 7.3 | 16.3 |
+| cpu `interactive`, compile `background` | 113.8 | 25.4 / 11.1 | 16.1 |
+
+Demoting the compile threads moves them to efficiency cores and slows
+everything; promoting the CPU thread changes nothing (it already runs on a
+performance core). QoS is not the lever.
+
+Compile threads, verifier off, one session each (4: three):
+
+| threads | ms per compile | compiles | `cc` 1st / 2nd | SHA-256 |
+|---|---|---|---|---|
+| 2 | 11.6 | 7,142 | 15.4 / 7.2 | 15.9 |
+| 4 | 12.2-12.7 | 9,400-10,000 | 13.8-15.1 / 6.75-7.0 | 16.8-17.1 |
+| 6 | 13.8 | 12,482 | 15.9 / 7.3 | 17.2 |
+| 8 | 16.2 | 13,507 | 16.1 / 7.5 | 17.2 |
+
+Four is the sweet spot. More threads slow each compile and do more compiles
+without finishing sooner, because of recompiles (`IRIS_JIT_HASHSTATS`):
+
+| threads | compile attempts | distinct pages | same page, same bytes, same flush epoch | after a flush |
+|---|---|---|---|---|
+| 2 | 10,000 | 4,745 | 2,946 (29%) | 2,309 |
+| 4 | 13,000 | 5,115 | 5,107 (39%) | 2,778 |
+| 8 | 17,000 | 5,313 | 8,580 (50%) | 3,107 |
+
+40-50% of compile work recompiles an unchanged page because a new entry
+arrived (one function per page, so a new entry recompiles the whole page).
+The sooner a compile starts after a page's first request, the fewer entries
+it has collected and the more recompiles follow. That is the next lever:
+collect entries for longer before the first compile, or predict the common
+ones, or make adding an entry cheaper than a whole-page compile.
