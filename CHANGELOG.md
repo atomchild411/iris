@@ -67,6 +67,12 @@ is easiest to understand by reading the commit.
   build another iris process is running is never deleted; a page keeps at
   most 16 variants. New monitor command `jitcache [status|prune|clear]`.
   Details and measurements: `docs/jitv2-persistent-cache.md`.
+- **The persistent code cache is kept in memory too.** Stored and loaded
+  pages stay in memory up to `[jitv2] cache_ram_mb` (default 256), an index
+  of the pages on disk answers misses without a filesystem call, and at
+  startup recently reused pages are preloaded in the background
+  (`cache_preload`). A hit from memory takes under a microsecond instead of
+  tens to hundreds from disk.
 
 ## September 2026
 
