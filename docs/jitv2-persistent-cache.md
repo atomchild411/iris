@@ -705,3 +705,34 @@ configuration, bloated entry sets). Parked.
 Kept from it: the bounded cache is the win (turn it on by default once
 bounded), and the ~10% steady-state gap between cold and warm runs is compile
 threads taking CPU from the emulator -- the next thing to look at.
+
+## Compile time: where it goes, and the verifier (2026-10-04)
+
+`jitpasses` (monitor; Cranelift's per-pass timer summed over every compile)
+on a cold session (cache off, 4 compile threads; `scratch/jitcache-speed`):
+8,134 compiles, 168 s, 20.7 ms each.
+
+| part | time | share |
+|---|---|---|
+| IR verifier (`enable_verifier`, Cranelift's default; jitv2 never sets it) | 63.8 s | 38% |
+| register allocation (backtracking) | 45.3 s | 27% |
+| e-graph optimization (`opt_level=speed`) | 42.3 s | 25% |
+| lowering and emission | 13.9 s | 8% |
+| jitv2's own IR building, define, checks | 5.0 s | 3% |
+
+The verifier is jitv2's safety net for invalid IR (a rejection declines the
+region), but across 20 sessions today (~150-200k compiles) it rejected
+nothing. `IRIS_JIT_CL_FLAGS` passes Cranelift flags; three sessions each:
+
+| | ms per compile | boot | session | `cc` 2nd run | SHA-256 MB/s |
+|---|---|---|---|---|---|
+| default | 19.2-20.7 | 18.4 | 49.5-52.8 | 7.15-7.32 | 16.1-16.6 |
+| `enable_verifier=false` | 12.2-12.7 | 17.3 | 44.9-46.4 | 6.75-7.02 | 16.8-17.1 |
+| + `opt_level=none` | 9.3-9.6 | 17.3-17.4 | 44.1-45.2 | 7.17-7.28 | 17.0-17.1 |
+| + `regalloc_algorithm=single_pass` (one run) | 8.4 | 19.5 | 57.3 | 11.92 | 9.6 |
+
+Verifier off: compiles 38% faster, sessions ~9% shorter, steady state ~4%
+faster (less CPU taken by the compile threads). `opt_level=none` saves another
+quarter of compile time for code ~5% slower on `cc` and equal on SHA-256 (the
+seqcst preambles already block most of what the e-graph pass could do).
+`single_pass` regalloc compiles fast but its code is far slower.

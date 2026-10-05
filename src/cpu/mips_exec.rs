@@ -11446,6 +11446,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             #[cfg(feature = "jitv2")]
             ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 memhelpers [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "jitv2")]
+            ("jitpasses".to_string(), "Where JIT compile time goes: Cranelift's per-pass times summed over every compile, and the rest (exploration)".to_string()),
+            #[cfg(feature = "jitv2")]
             ("jitcache".to_string(), "Persistent JIT code cache: jitcache [status] (size per build, probation/protected, hits) | jitcache prune (a collection pass now) | jitcache clear (this build's blobs)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
@@ -12495,6 +12497,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     }
                     _ => return Err("Unknown TLB subcommand".to_string()),
                 }
+                Ok(())
+            }
+            #[cfg(feature = "jitv2")]
+            "jitpasses" => {
+                writeln!(writer, "{}", crate::cpu::jitv2::hashstats::pass_report()).unwrap();
                 Ok(())
             }
             #[cfg(feature = "jitv2")]

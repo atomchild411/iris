@@ -537,6 +537,17 @@ impl Codegen {
         let opt_level = if Self::opt_level_speed() { "speed" } else { "none" };
         flag_builder.set("opt_level", opt_level).unwrap();
         flag_builder.set("is_pic", "false").unwrap();
+        // Exploration: extra Cranelift flags, "name=value,name=value"
+        // (e.g. enable_verifier=false,regalloc_algorithm=single_pass).
+        if let Ok(extra) = std::env::var("IRIS_JIT_CL_FLAGS") {
+            for kv in extra.split(',').filter(|s| !s.is_empty()) {
+                if let Some((k, v)) = kv.split_once('=') {
+                    if let Err(e) = flag_builder.set(k.trim(), v.trim()) {
+                        eprintln!("jitv2: IRIS_JIT_CL_FLAGS {kv}: {e}");
+                    }
+                }
+            }
+        }
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
         let mut jit_builder = cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());

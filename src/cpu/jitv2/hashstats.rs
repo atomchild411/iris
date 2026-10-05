@@ -185,3 +185,46 @@ pub fn record(pfn: u32, words: &[u32; ENTRIES_PER_PAGE], used: &[u64; BITMAP_WOR
             COMPILE_NS.load(Ordering::Relaxed) / 1000 / COMPILE_N.load(Ordering::Relaxed).max(1));
     }
 }
+
+
+// ---- exploration: where compile time goes --------------------------------------
+
+struct PassAgg {
+    passes: cranelift_codegen::timing::PassTimes,
+    total: std::time::Duration,
+    compiles: u64,
+    instrs: u64,
+}
+
+fn pass_agg() -> &'static Mutex<PassAgg> {
+    static A: OnceLock<Mutex<PassAgg>> = OnceLock::new();
+    A.get_or_init(|| Mutex::new(PassAgg {
+        passes: Default::default(), total: Default::default(), compiles: 0, instrs: 0,
+    }))
+}
+
+/// After every real compile (always on, unlike the rest of this module):
+/// Cranelift's own per-pass times for it (thread-local, taken here on the
+/// compile thread) and our total for the same compile.
+pub fn note_pass_times(total: std::time::Duration, instrs: usize) {
+    let pt = cranelift_codegen::timing::take_current();
+    let mut a = pass_agg().lock().unwrap();
+    a.passes.add(&pt);
+    a.total += total;
+    a.compiles += 1;
+    a.instrs += instrs as u64;
+}
+
+/// `jitpasses` on the monitor.
+pub fn pass_report() -> String {
+    let a = pass_agg().lock().unwrap();
+    let cl = a.passes.total();
+    format!(
+        "{} compiles, {} instructions; compile time {:.1} s ({:.2} ms each, {:.1} us per instruction)\n\
+         Cranelift's passes {:.1} s; the rest (IR building, define, our checks) {:.1} s\n{}",
+        a.compiles, a.instrs, a.total.as_secs_f64(),
+        a.total.as_secs_f64() * 1e3 / a.compiles.max(1) as f64,
+        a.total.as_secs_f64() * 1e6 / a.instrs.max(1) as f64,
+        cl.as_secs_f64(), a.total.saturating_sub(cl).as_secs_f64(), a.passes,
+    )
+}
