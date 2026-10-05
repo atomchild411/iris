@@ -179,9 +179,10 @@ fn sample(st: &mut State) {
         ms_per_compile: if compiles > 0.0 { c.compile_ns.saturating_sub(c0.compile_ns) as f32 / 1e6 / compiles } else { 0.0 },
         hit_frac: if lookups > 0.0 { hits / lookups } else { 0.0 },
         lookups_s: lookups / dt,
-        hit_us: if hits > 0.0 { c.cache_hit_ns.saturating_sub(c0.cache_hit_ns) as f32 / 1e3 / hits } else { 0.0 },
+        // A hit took some time, however little: keep it above 0, which means "none".
+        hit_us: if hits > 0.0 { (c.cache_hit_ns.saturating_sub(c0.cache_hit_ns) as f32 / 1e3 / hits).max(0.01) } else { 0.0 },
         miss_us: if lookups > hits {
-            c.cache_miss_ns.saturating_sub(c0.cache_miss_ns) as f32 / 1e3 / (lookups - hits)
+            (c.cache_miss_ns.saturating_sub(c0.cache_miss_ns) as f32 / 1e3 / (lookups - hits)).max(0.01)
         } else { 0.0 },
         flushes: c.flushes,
         compiled_frac: {
@@ -391,7 +392,7 @@ fn blend(dst: u32, src: u32, alpha: u32) -> u32 {
 /// Microseconds for a header: one decimal under 10 (a lookup served from
 /// memory takes well under one), none above.
 fn us(v: f32) -> String {
-    if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") }
+    if v <= 0.0 { "-".to_string() } else if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") }
 }
 
 /// A round number at or above `v` for an auto-scaled bar: 1, 2 or 5 times a
@@ -516,7 +517,9 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     // second, auto-scaled.
     let comp = avg(&|s| s.compiles_s);
     let loads = avg(&|s| s.loads_s);
-    let peak = hist.iter().map(|s| s.compiles_s + s.loads_s).fold(0.0, f32::max);
+    // The scale creeps: it follows the last 10 s, not the whole minute, so
+    // one burst doesn't flatten the steady state for a minute after.
+    let peak = hist.iter().rev().take(20).map(|s| s.compiles_s + s.loads_s).fold(0.0, f32::max);
     let scale = nice_scale(peak);
     cv.header(x, y, "pages/s", &[("compiled", RED), ("from cache", GREEN)],
         &format!("{:.0} ms/compile  scale {}", avg(&|s| s.ms_per_compile), scale));
