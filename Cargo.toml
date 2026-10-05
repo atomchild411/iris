@@ -366,6 +366,11 @@ path = "src/bin/jitv2_verify.rs"
 required-features = ["jitv2"]
 
 [[bin]]
+name = "jitv2_entrycost"
+path = "src/bin/jitv2_entrycost.rs"
+required-features = ["jitv2"]
+
+[[bin]]
 name = "jitv2_pcp_dump"
 path = "src/bin/jitv2_pcp_dump.rs"
 required-features = ["jitv2", "j2wp"]

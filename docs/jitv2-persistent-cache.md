@@ -631,3 +631,63 @@ So static analysis is enough for AOT on 90% of pages; the open cost is
 compiling about 5 times the entries a run needs. Next: compile pages offline
 with their runtime entries and with the static set, and compare code size,
 compile time and then speed.
+
+## AOT step 2: what do static entry sets cost, and what does AOT buy? (2026-10-04)
+
+**Offline** (`src/bin/jitv2_entrycost.rs`): every cached page of the step 0
+session compiled three ways.
+
+| entry set | entries | instructions walked | code | bytes/instr | compile time |
+|---|---|---|---|---|---|
+| runtime | 197,676 | 1.61 M | 119 MB | 77.3 | 43 s |
+| static | 989,806 | 4.29 M | 392 MB | 95.7 | 142 s |
+| static + runtime | 991,615 | 4.30 M | 392 MB | 95.8 | 142 s |
+
+The static set reaches 2.7x the instructions (whole pages where a run used a
+function or two; per page the code ratio has median 3.9x, p90 28x) and costs
+24% more code per instruction (entry overhead).
+
+**In sessions** (`scratch/jitcache-speed/speed.sh`; IP28 clone, IRIX 6.5.22,
+4 compile threads; boot, then twice: `cc -O2` of a 400-function file,
+`ls -lR /usr/include`, `nm` of libc, `ssh-keygen -t ed25519`; then `openssl
+speed sha256`; guest `time`, seconds). `IRIS_JIT_STATIC_ENTRIES` adds a page's
+static entries to every compile.
+
+Static entries at run time, cache off (two sessions each):
+
+| | normal | static entries |
+|---|---|---|
+| boot to ssh | 18.5, 19.3 | 22.7, 22.4 |
+| `cc` first / second run | 17.1, 13.1 / 7.1, 6.9 | 23.8, 20.2 / 9.0, 9.2 |
+| SHA-256 MB/s | 16.4, 16.5 | 15.5, 16.0 |
+| Cranelift time | 204-210 s | 343-387 s |
+
+Compiling AOT-sized entry sets at run time is a loss: bigger compiles, a longer
+queue, and 3-6% slower steady-state code.
+
+Start-up, JIT in normal mode, cache empty / warm (filled by one normal
+session) / AOT-style (filled by one session in static-entry mode, standing in
+for an offline AOT of the pages this workload uses; 626 MB against 288 MB):
+
+| | cold | warm | AOT-style |
+|---|---|---|---|
+| boot to ssh | 17.4, 18.4 | 17.4, 16.3 | 16.4, 16.3 |
+| whole session | 48.8, 49.6 | 40.1, 39.0 | 40.4, 37.3 |
+| `cc` first run | 15.2, 13.7 | 8.7, 10.8 | 10.1, 8.1 |
+| `ls` first run | 0.75, 0.72 | 0.59, 0.57 | 0.42, 0.43 |
+| `cc` second run | 7.2, 6.8 | 6.8, 6.4 | 7.0, 6.9 |
+| SHA-256 MB/s | 16.0, 16.3 | 17.8, 17.9 | 17.7, 17.7 |
+| cache hits | 23-24% | 86-88% | 84-94% |
+| Cranelift time | 172-174 s | 42-50 s | 30-60 s |
+
+- An AOT-style cache starts programs about as fast as a warm one: first runs
+  30-45% faster than cold, the session ~20% shorter.
+- Steady state gains too, warm or AOT: SHA-256 +10% over cold, because the
+  compile threads no longer take CPU from the emulator.
+- Against warm, AOT-style costs ~1% steady-state (bigger code) and 2.2x the
+  disk, and wins some first runs (`ls`) where its broader entry sets avoid
+  recompiles.
+
+So AOT is worth having as a cache filled without having run the programs
+(a shipped base, a fresh build's first boot), not as a compile mode. Leaner
+static sets (only code likely to run) would cut the disk and the 1%.

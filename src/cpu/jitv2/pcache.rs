@@ -778,6 +778,50 @@ pub fn collect(base: &Path, current: &Path, max_bytes: u64, keep_builds: usize, 
     u
 }
 
+// ---- exploration: static entry sets ----------------------------------------
+
+/// Pages that got entries from `IRIS_JIT_STATIC_ENTRIES`, and how many.
+pub static STATIC_PAGES: AtomicU64 = AtomicU64::new(0);
+pub static STATIC_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// `IRIS_JIT_STATIC_ENTRIES=<json>`: `{"<page hash hex>": [word offsets]}`,
+/// the entries static analysis of a page's ELF file predicts (exported by the
+/// AOT exploration scripts). The bitmap for these page words, if listed.
+pub fn static_entries(words: &[u32; ENTRIES_PER_PAGE]) -> Option<Entries> {
+    static MAP: OnceLock<Option<std::collections::HashMap<[u8; 16], Entries>>> = OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        let path = std::env::var_os("IRIS_JIT_STATIC_ENTRIES")?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let raw: std::collections::HashMap<String, Vec<u16>> = serde_json::from_str(&text).ok()?;
+        let mut m = std::collections::HashMap::new();
+        for (k, offs) in raw {
+            let mut key = [0u8; 16];
+            if k.len() != 32 {
+                continue;
+            }
+            for (i, b) in key.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&k[2 * i..2 * i + 2], 16).unwrap_or(0);
+            }
+            let mut e = [0u64; BITMAP_WORDS];
+            for o in offs {
+                if (o as usize) < ENTRIES_PER_PAGE {
+                    e[o as usize >> 6] |= 1u64 << (o % 64);
+                }
+            }
+            m.insert(key, e);
+        }
+        eprintln!("jitcache: static entry sets for {} pages from {}", m.len(), std::path::Path::new(&path).display());
+        Some(m)
+    }).as_ref()?;
+    let e = *map.get(&page_hash(words))?;
+    let n = STATIC_PAGES.fetch_add(1, Relaxed) + 1;
+    STATIC_ENTRIES.fetch_add(count(&e) as u64, Relaxed);
+    if n % 500 == 0 {
+        eprintln!("jitcache: static entries added to {n} compiles ({} entries)", STATIC_ENTRIES.load(Relaxed));
+    }
+    Some(e)
+}
+
 // ---- monitor -------------------------------------------------------------
 
 fn describe(u: &Usage, max_bytes: u64) -> String {

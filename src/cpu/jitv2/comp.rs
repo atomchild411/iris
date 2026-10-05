@@ -271,7 +271,17 @@ fn prepare_multi_entry_compile(
     // re-walked every time some OTHER offset on the same page gets
     // requested — see `snapshot_compile_candidates`'s own doc comment for
     // the exact bit algebra and the `include_compiled` gen guard).
-    let candidate_bits = page.snapshot_compile_candidates(same_gen);
+    #[allow(unused_mut)]
+    let mut candidate_bits = page.snapshot_compile_candidates(same_gen);
+    // Exploration (AOT): `IRIS_JIT_STATIC_ENTRIES` adds the entries static
+    // analysis of the page's ELF file predicts, so every compile is the one
+    // an ahead-of-time compiler would make. Denied offsets stay out.
+    if let Some(extra) = crate::cpu::jitv2::pcache::static_entries(&words) {
+        let allowed = page.snapshot_denied_raw(); // inverted: 1 = allowed
+        for i in 0..crate::cpu::jitv2::BITMAP_WORDS {
+            candidate_bits[i] |= extra[i] & allowed[i];
+        }
+    }
     let mut candidates: Vec<u16> = Vec::new();
     for word_idx in 0..crate::cpu::jitv2::BITMAP_WORDS {
         let bits = candidate_bits[word_idx];
