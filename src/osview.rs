@@ -198,6 +198,8 @@ const MARGIN: usize = 8;
 const LINE: usize = 16;
 const BAR_H: usize = 14;
 const STRIP_H: usize = 48;
+/// The cache's hit/miss strip chart.
+const CACHE_H: usize = 40;
 /// One compile worker's row: a thin bar beside its number and figures.
 const ROW_H: usize = 16;
 const ROW_BAR_H: usize = 10;
@@ -269,6 +271,42 @@ impl Canvas<'_> {
         }
     }
 
+    /// A strip chart with several series overlaid on one scale: each is
+    /// filled at `ALPHA` over whatever is already there, so overlaps show
+    /// both, and topped with a solid line so its value stays readable.
+    fn strip_overlay(&mut self, x: usize, y: usize, w: usize, h: usize, series: &[(&[f32], u32)], scale: f32) {
+        self.fill(x, y, w, h, FRAME);
+        self.fill(x + 1, y + 1, w - 2, h - 2, BG);
+        self.fill(x, y + h, w, 2, FRAME);
+        let cols = (w - 2) / 4;
+        let inner_h = (h - 2) as f32;
+        // Every fill first, then every line, so no series' line is buried
+        // under another's fill.
+        for lines in [false, true] {
+            for &(values, c) in series {
+                for (i, v) in values.iter().rev().take(cols).enumerate() {
+                    let vh = ((v / scale.max(1e-6)).clamp(0.0, 1.0) * inner_h).round() as usize;
+                    if vh == 0 {
+                        continue;
+                    }
+                    let cx = x + w - 1 - (i + 1) * 4;
+                    let top = y + 1 + (h - 2 - vh);
+                    if lines {
+                        self.fill(cx, top, 4, 1, c);
+                        continue;
+                    }
+                    for py in top + 1..y + h - 1 {
+                        for px in cx..cx + 4 {
+                            if let Some(p) = self.buf.get_mut(py * self.stride + px) {
+                                *p = blend(*p, c, ALPHA);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A thin bar for a per-worker row: frame, bands, no heavy border.
     fn row_bar(&mut self, x: usize, y: usize, w: usize, bands: &[(f32, u32)]) {
         let y = y + (ROW_H - ROW_BAR_H) / 2 - 1;
@@ -299,6 +337,19 @@ impl Canvas<'_> {
     }
 }
 
+/// Overlaid series' fill opacity (0..=255).
+const ALPHA: u32 = 190;
+
+/// `src` over `dst` at `alpha`/255, channel by channel (0xAABBGGRR, opaque).
+fn blend(dst: u32, src: u32, alpha: u32) -> u32 {
+    let mix = |shift: u32| {
+        let d = (dst >> shift) & 0xFF;
+        let s = (src >> shift) & 0xFF;
+        ((s * alpha + d * (255 - alpha)) / 255) << shift
+    };
+    0xFF00_0000 | mix(16) | mix(8) | mix(0)
+}
+
 /// A round number at or above `v` for an auto-scaled bar: 1, 2 or 5 times a
 /// power of ten.
 fn nice_scale(v: f32) -> f32 {
@@ -326,9 +377,10 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     let y0 = MARGIN;
     let inner_w = PANEL_W - 2 * MARGIN;
     let workers = hist.last().map_or(0, |s| s.worker_busy.len());
-    // the MIPS strip, five bars with headers, the worker header and a row per worker
-    let panel_h = 2 * MARGIN + (LINE + 2 + STRIP_H + 10) + 5 * (LINE + 2 + BAR_H + 10)
-        + (LINE + 2) + workers * ROW_H + 10 - 8;
+    // the MIPS strip, four bars with headers, the worker header and a row per
+    // worker, and the cache strip
+    let panel_h = 2 * MARGIN + (LINE + 2 + STRIP_H + 10) + 4 * (LINE + 2 + BAR_H + 10)
+        + (LINE + 2) + workers * ROW_H + 10 + (LINE + 2 + CACHE_H + 2);
     cv.fill(x0, y0, PANEL_W, panel_h, BG);
     let x = x0 + MARGIN;
     let mut y = y0 + MARGIN;
@@ -416,15 +468,18 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
         if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 }
     };
     let (hit_us, miss_us) = (avg_nz(&|s| s.hit_us), avg_nz(&|s| s.miss_us));
+    // Hits and misses per second over the last minute, overlaid.
+    let hits: Vec<f32> = hist.iter().map(|s| s.loads_s).collect();
+    let misses: Vec<f32> = hist.iter().map(|s| (s.lookups_s - s.loads_s).max(0.0)).collect();
+    let scale = nice_scale(hits.iter().chain(misses.iter()).copied().fold(0.0, f32::max));
     let note = if lookups > 0.0 {
-        format!("{:.0}% of {:.0}/s  hit {:.0}us miss {:.0}us", hit * 100.0, lookups, hit_us, miss_us)
+        format!("{:.0}% of {:.0}/s  hit {:.0}us miss {:.0}us  scale {}", hit * 100.0, lookups, hit_us, miss_us, scale)
     } else {
-        "idle".to_string()
+        format!("idle  scale {}", scale)
     };
     cv.header(x, y, "jit cache", &[("hit", GREEN), ("miss", RED)], &note);
     y += LINE + 2;
-    let miss = if lookups > 0.0 { 1.0 - hit } else { 0.0 };
-    cv.bar(x, y, inner_w, &[(hit, GREEN), (miss, RED)]);
+    cv.strip_overlay(x, y, inner_w, CACHE_H, &[(&hits, GREEN), (&misses, RED)], scale);
 }
 
 #[cfg(test)]
