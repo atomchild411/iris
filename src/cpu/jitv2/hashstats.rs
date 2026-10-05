@@ -80,8 +80,9 @@ struct Stats {
 /// `IRIS_JIT_HASHSTATS_LOG=<file>`: also append one line per compile, so two
 /// runs can be compared for cross-run reuse (what a persistent cache would
 /// hit). Fields: page-content key, pfn, flush epoch, FR mode, instruction
-/// count, entry bitmap (16 hex words).
-fn log_line(kp: u64, pfn: u32, epoch: u64, entries: &[u64; BITMAP_WORDS], fr1: bool, instrs: usize) {
+/// count, microseconds since start (exploration), entry bitmap (16 hex words).
+fn log_line(kp: u64, pfn: u32, epoch: u64, entries: &[u64; BITMAP_WORDS], fr1: bool, instrs: usize,
+            used: &[u64; BITMAP_WORDS], words: &[u32; ENTRIES_PER_PAGE]) {
     static LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
     let log = LOG.get_or_init(|| {
         std::env::var_os("IRIS_JIT_HASHSTATS_LOG").and_then(|p| {
@@ -90,8 +91,16 @@ fn log_line(kp: u64, pfn: u32, epoch: u64, entries: &[u64; BITMAP_WORDS], fr1: b
     });
     if let Some(f) = log {
         use std::io::Write;
-        let mut line = format!("{kp:016x} {pfn:x} {epoch} {} {instrs} ", fr1 as u8);
+        let mut line = format!("{kp:016x} {pfn:x} {epoch} {} {instrs} {} ", fr1 as u8,
+            crate::cpu::jitv2::jitv2::compile_clock_us());
         for w in entries { line.push_str(&format!("{w:016x}")); }
+        // exploration: the words the walk decoded, and the page itself
+        if std::env::var_os("IRIS_JIT_HASHSTATS_LOG_FULL").is_some() {
+            line.push(' ');
+            for w in used { line.push_str(&format!("{w:016x}")); }
+            line.push(' ');
+            for w in words { line.push_str(&format!("{w:08x}")); }
+        }
         line.push('\n');
         let _ = f.lock().unwrap().write_all(line.as_bytes());
     }
@@ -128,7 +137,7 @@ pub fn record(pfn: u32, words: &[u32; ENTRIES_PER_PAGE], used: &[u64; BITMAP_WOR
               reject_code: u8) {
     let epoch = FLUSH_EPOCH.load(Ordering::Relaxed);
     let kp = key_page(words, fr1);
-    log_line(kp, pfn, epoch, entries, fr1, instr_count);
+    log_line(kp, pfn, epoch, entries, fr1, instr_count, used, words);
     let ke = key_exact(words, used, entries, fr1);
     let mut s = stats().lock().unwrap();
     s.compiles += 1;

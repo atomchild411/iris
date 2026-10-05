@@ -779,3 +779,32 @@ The sooner a compile starts after a page's first request, the fewer entries
 it has collected and the more recompiles follow. That is the next lever:
 collect entries for longer before the first compile, or predict the common
 ones, or make adding an entry cheaper than a whole-page compile.
+
+## Delaying the first compile, and where recompiles come from (2026-10-04)
+
+`IRIS_JIT_COMPILE_DELAY_US` (exploration): a worker leaves a request from the
+normal queue alone until its page has been queued that long (the hot lane is
+not delayed). Verifier off, one session each:
+
+| delay | same-page recompiles | `cc` 1st / 2nd | SHA-256 MB/s |
+|---|---|---|---|
+| none (3 runs) | 5,090-5,129 | 13.8-15.1 / 6.75-7.02 | 16.8-17.1 |
+| 2 ms | 5,524 | 15.2 / 6.95 | 17.2 |
+| 10 ms | 5,082 | 15.9 / 6.88 | 17.2 |
+| 50 ms | 4,761 | 13.1 / 6.99 | 17.1 |
+
+No effect worth having. With timestamps in the compile log
+(`IRIS_JIT_HASHSTATS_LOG`, plus decoded words and page with
+`IRIS_JIT_HASHSTATS_LOG_FULL`), the time from a page's compile to its next
+recompile: under 100 ms 11%, 0.1-1 s 20%, over 1 s 69%. 57% of recompiles add
+4 or more entries; 14% add none. Of the entries recompiles add, **89% lie
+outside the code the previous compile decoded**: new code on the same page
+(another function, a path not yet run), found seconds later. Only 4-5% each
+are branch targets, fall-throughs or return sites inside the previous region,
+so predicting entries inside compiled code would remove ~11-14% of them.
+
+So recompiles are inherent to one function per page: every newly reached piece
+of a page recompiles all of it. The structural fix is compiling only the new
+region and adding it to the page (several functions per page, entry table per
+offset) -- a design change in the core of jitv2. Separately, the 14% of
+recompiles that add no entry at all are waste worth finding.

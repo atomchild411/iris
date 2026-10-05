@@ -188,6 +188,25 @@ pub static HOT_QUEUE: std::sync::LazyLock<crossbeam_queue::ArrayQueue<CompileReq
 
 /// Put a copy of a request on the hot lane. A full lane just drops it: the
 /// page's FIFO request is still queued, so nothing is lost but the head start.
+/// Exploration: `IRIS_JIT_COMPILE_DELAY_US=<n>` -- a worker leaves a request
+/// from the normal queue alone until its page has been queued this long, so
+/// entries that arrive meanwhile join the first compile instead of each
+/// causing a recompile. Hot-lane requests are not delayed. 0 (unset) = off.
+pub fn compile_delay_us() -> u64 {
+    static D: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        let d = std::env::var("IRIS_JIT_COMPILE_DELAY_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if d != 0 { eprintln!("jitv2: compile delay {d} us"); }
+        d
+    })
+}
+
+/// Microseconds since the first call (a process-local clock for the above).
+pub fn compile_clock_us() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+}
+
 pub fn push_hot_request(req: CompileRequest) {
     let _ = HOT_QUEUE.push(req);
 }
@@ -688,6 +707,9 @@ pub struct PhysicalCodePage {
     /// of offset-scoped, since one request now serves however many offsets
     /// have accumulated in `requested` by the time it's dequeued.
     page_scheduled: std::sync::atomic::AtomicBool,
+    /// Exploration (`IRIS_JIT_COMPILE_DELAY_US`): when this page was last
+    /// queued, in `compile_clock_us()` microseconds.
+    scheduled_at_us: AtomicU64,
     /// Arrivals at this page while its compile request was already queued
     /// (`try_schedule_page` lost). Once it crosses [`HOT_PROMOTE_ARRIVALS`]
     /// the page is hot *now* and gets one extra request on the hot lane
@@ -1188,6 +1210,7 @@ impl PhysicalCodePage {
             func_fr1: std::sync::atomic::AtomicBool::new(false),
             entry_gen: AtomicU64::new(0),
             page_scheduled: std::sync::atomic::AtomicBool::new(false),
+            scheduled_at_us: AtomicU64::new(0),
             hot_wait: std::sync::atomic::AtomicU32::new(0),
             promoted: std::sync::atomic::AtomicBool::new(false),
             fr1: std::sync::atomic::AtomicBool::new(false),
@@ -1696,7 +1719,16 @@ impl PhysicalCodePage {
     /// sends, not about tracking which offsets are wanted.
     #[inline]
     pub fn try_schedule_page(&self) -> bool {
-        !self.page_scheduled.swap(true, Ordering::Relaxed)
+        let fresh = !self.page_scheduled.swap(true, Ordering::Relaxed);
+        if fresh && compile_delay_us() != 0 {
+            self.scheduled_at_us.store(compile_clock_us(), Ordering::Relaxed);
+        }
+        fresh
+    }
+
+    /// How long ago this page was queued (exploration: compile delay).
+    pub fn queued_for_us(&self) -> u64 {
+        compile_clock_us().saturating_sub(self.scheduled_at_us.load(Ordering::Relaxed))
     }
 
     /// Read-only peek at the page-level in-flight flag — diagnostic use
@@ -3583,7 +3615,29 @@ impl CompileQueue {
             }
             // The hot lane first: pages being executed right now that are
             // still waiting (see `HOT_QUEUE`).
-            match HOT_QUEUE.pop().or_else(|| queue.pop()) {
+            let hot = HOT_QUEUE.pop();
+            let from_hot = hot.is_some();
+            let mut next = hot.or_else(|| queue.pop());
+            // Exploration: hold a young request back (see `compile_delay_us`).
+            // The queue is FIFO, so if its head is too young, so is
+            // everything behind it: put it back and wait. If the queue is
+            // full, it can't go back, and is compiled now instead.
+            if let Some(req) = next.take() {
+                let age = if from_hot { u64::MAX } else { unsafe { &*req.page }.queued_for_us() };
+                let delay = compile_delay_us();
+                if delay != 0 && age < delay {
+                    match queue.push(req) {
+                        Ok(()) => {
+                            std::thread::sleep(std::time::Duration::from_micros((delay - age).clamp(50, 2000)));
+                            continue;
+                        }
+                        Err(req) => next = Some(req),
+                    }
+                } else {
+                    next = Some(req);
+                }
+            }
+            match next {
                 Some(req) => {
                     // Always the deferred/non-forced path — never
                     // handle_request's forced-seal one. Forced sealing
