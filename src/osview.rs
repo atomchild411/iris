@@ -54,6 +54,8 @@ struct Counters {
     busy_ns: u64,
     cache_lookups: u64,
     cache_hits: u64,
+    cache_hit_ns: u64,
+    cache_miss_ns: u64,
     flushes: u32,
     instrs: u64,
     interpreted: u64,
@@ -76,9 +78,11 @@ impl Counters {
             c.compile_ns = f.compile_ns.load(Relaxed);
             c.busy_ns = f.busy_ns.load(Relaxed);
             c.flushes = f.flush_events.load(Relaxed);
-            let (lookups, hits) = crate::cpu::jitv2::pcache::lookup_counts();
+            let (lookups, hits, hit_ns, miss_ns) = crate::cpu::jitv2::pcache::lookup_counts();
             c.cache_lookups = lookups;
             c.cache_hits = hits;
+            c.cache_hit_ns = hit_ns;
+            c.cache_miss_ns = miss_ns;
             let n = (f.compile_threads.load(Relaxed) as usize).min(crate::cpu::jit_feedback::MAX_WORKERS);
             c.worker_busy_ns = f.worker_busy_ns[..n].iter().map(|a| a.load(Relaxed)).collect();
             c.worker_compiles = f.worker_compiles[..n].iter().map(|a| a.load(Relaxed)).collect();
@@ -100,6 +104,9 @@ struct Sample {
     ms_per_compile: f32,
     hit_frac: f32,
     lookups_s: f32,
+    /// Average time of this interval's lookups that hit, and that missed (µs).
+    hit_us: f32,
+    miss_us: f32,
     flushes: u32,
     /// Share of the interval's instructions that ran compiled.
     compiled_frac: f32,
@@ -136,6 +143,10 @@ fn sample(st: &mut State) {
         ms_per_compile: if compiles > 0.0 { c.compile_ns.saturating_sub(c0.compile_ns) as f32 / 1e6 / compiles } else { 0.0 },
         hit_frac: if lookups > 0.0 { hits / lookups } else { 0.0 },
         lookups_s: lookups / dt,
+        hit_us: if hits > 0.0 { c.cache_hit_ns.saturating_sub(c0.cache_hit_ns) as f32 / 1e3 / hits } else { 0.0 },
+        miss_us: if lookups > hits {
+            c.cache_miss_ns.saturating_sub(c0.cache_miss_ns) as f32 / 1e3 / (lookups - hits)
+        } else { 0.0 },
         flushes: c.flushes,
         compiled_frac: {
             let all = c.instrs.saturating_sub(c0.instrs) as f32;
@@ -397,7 +408,19 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     // lookups.
     let lookups = avg(&|s| s.lookups_s);
     let hit = if lookups > 0.0 { avg(&|s| s.hit_frac) } else { 0.0 };
-    let note = if lookups > 0.0 { format!("{:.0}% of {:.0}/s", hit * 100.0, lookups) } else { "idle".to_string() };
+    // Lookup times, averaged over the samples that had any: a hit lists the
+    // page's directory and reads and checks its variant files; a miss is the
+    // listing alone, or variants that don't cover the entries.
+    let avg_nz = |f: &dyn Fn(&Sample) -> f32| -> f32 {
+        let v: Vec<f32> = hist.iter().rev().take(4).map(f).filter(|&x| x > 0.0).collect();
+        if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 }
+    };
+    let (hit_us, miss_us) = (avg_nz(&|s| s.hit_us), avg_nz(&|s| s.miss_us));
+    let note = if lookups > 0.0 {
+        format!("{:.0}% of {:.0}/s  hit {:.0}us miss {:.0}us", hit * 100.0, lookups, hit_us, miss_us)
+    } else {
+        "idle".to_string()
+    };
     cv.header(x, y, "jit cache", &[("hit", GREEN), ("miss", RED)], &note);
     y += LINE + 2;
     let miss = if lookups > 0.0 { 1.0 - hit } else { 0.0 };
@@ -428,6 +451,8 @@ mod tests {
                     ms_per_compile: 12.4,
                     hit_frac: 0.4 + 0.5 * t,
                     lookups_s: 250.0,
+                    hit_us: 11.0,
+                    miss_us: 4.0,
                     flushes: 2,
                     compiled_frac: 0.3 + 0.65 * t,
                     worker_busy: vec![0.9 * (1.0 - t), 0.7 * (1.0 - t), 0.4, 0.1],
