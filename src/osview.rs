@@ -29,6 +29,39 @@ pub static INSTRS: AtomicU64 = AtomicU64::new(0);
 /// read-modify-write on the interpreter's path.
 static INTERPRETED: AtomicU64 = AtomicU64::new(0);
 
+/// `MipsCore::flops`, registered by `MipsCpu::new` (`set_flops_source`).
+static FLOPS_SRC: std::sync::atomic::AtomicPtr<u64> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Where the CPU counts its floating-point operations (valid for the life of
+/// the process, as `cycles_ptr` is).
+pub fn set_flops_source(p: *const u64) {
+    FLOPS_SRC.store(p as *mut u64, Relaxed);
+}
+
+fn flops_now() -> u64 {
+    let p = FLOPS_SRC.load(Relaxed);
+    // Written by the CPU thread only; a torn or stale read is just one
+    // sample's noise.
+    if p.is_null() { 0 } else { unsafe { std::ptr::read_volatile(p) } }
+}
+
+/// Floating-point operations in one MIPS instruction: 1 for add, sub, mul,
+/// div, sqrt, recip and rsqrt (COP1, single or double), 2 for the
+/// multiply-add family (MADD, MSUB, NMADD, NMSUB; COP1X), 0 for everything
+/// else (moves, compares, conversions, loads and stores).
+#[inline(always)]
+pub fn flops_of(raw: u32) -> u32 {
+    match raw >> 26 {
+        0x11 => {
+            let fmt = (raw >> 21) & 0x1F;
+            let funct = raw & 0x3F;
+            ((fmt == 16 || fmt == 17) && matches!(funct, 0..=4 | 21 | 22)) as u32
+        }
+        0x13 => (matches!((raw & 0x3F) >> 3, 4..=7) as u32) * 2,
+        _ => 0,
+    }
+}
+
 /// One interpreted instruction (from `step_int`).
 #[inline(always)]
 pub fn count_interpreted() {
@@ -61,6 +94,7 @@ struct Counters {
     interpreted: u64,
     worker_busy_ns: Vec<u64>,
     worker_compiles: Vec<u64>,
+    flops: u64,
 }
 
 impl Counters {
@@ -69,6 +103,7 @@ impl Counters {
         let mut c = Counters {
             instrs: INSTRS.load(Relaxed),
             interpreted: INTERPRETED.load(Relaxed),
+            flops: flops_now(),
             ..Default::default()
         };
         #[cfg(feature = "jitv2")]
@@ -113,6 +148,7 @@ struct Sample {
     /// Per compile worker: busy share of the interval, compiles per second.
     worker_busy: Vec<f32>,
     worker_cps: Vec<f32>,
+    mflops: f32,
 }
 
 struct State {
@@ -153,6 +189,7 @@ fn sample(st: &mut State) {
             let int = c.interpreted.saturating_sub(c0.interpreted) as f32;
             if all > 0.0 { (1.0 - int / all).clamp(0.0, 1.0) } else { 0.0 }
         },
+        mflops: c.flops.saturating_sub(c0.flops) as f32 / 1e6 / dt,
         worker_busy: c.worker_busy_ns.iter().enumerate()
             .map(|(i, &b)| (b.saturating_sub(c0.worker_busy_ns.get(i).copied().unwrap_or(b)) as f32 / 1e9 / dt).min(1.0))
             .collect(),
@@ -198,8 +235,9 @@ const MARGIN: usize = 8;
 const LINE: usize = 16;
 const BAR_H: usize = 14;
 const STRIP_H: usize = 48;
-/// The cache's hit/miss strip chart.
+/// The cache's hit/miss strip chart, and the MFLOPS one.
 const CACHE_H: usize = 40;
+const FLOPS_H: usize = 40;
 /// One compile worker's row: a thin bar beside its number and figures.
 const ROW_H: usize = 16;
 const ROW_BAR_H: usize = 10;
@@ -363,6 +401,19 @@ fn nice_scale(v: f32) -> f32 {
     10.0 * p
 }
 
+/// The latest sample as text (`osview` on the monitor), sampling now if due.
+pub fn report() -> String {
+    let mut st = STATE.lock().unwrap();
+    sample(&mut st);
+    let Some(s) = st.history.back() else { return "osview: no sample yet (try again in a second)".to_string() };
+    format!(
+        "MIPS {:.1}  MFLOPS {:.2}  compiled {:.1}%  queue {:.0}%  code area {:.0}%  flushes {}\n\
+         compile threads {:.2} of {} busy  compiles/s {:.0}  cache lookups/s {:.0} hits {:.0}%  hit {:.0}us miss {:.0}us",
+        s.mips, s.mflops, s.compiled_frac * 100.0, s.queue * 100.0, s.arena * 100.0, s.flushes,
+        s.busy, s.threads, s.compiles_s, s.lookups_s, s.hit_frac * 100.0, s.hit_us, s.miss_us,
+    )
+}
+
 /// Draw the panel into `buf` (the debug overlay's 0xAABBGGRR buffer, row
 /// stride `stride`) for a `width` x `height` display.
 pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &[u8]) {
@@ -379,7 +430,7 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     let workers = hist.last().map_or(0, |s| s.worker_busy.len());
     // the MIPS strip, four bars with headers, the worker header and a row per
     // worker, and the cache strip
-    let panel_h = 2 * MARGIN + (LINE + 2 + STRIP_H + 10) + 4 * (LINE + 2 + BAR_H + 10)
+    let panel_h = 2 * MARGIN + (LINE + 2 + STRIP_H + 10) + (LINE + 2 + FLOPS_H + 10) + 4 * (LINE + 2 + BAR_H + 10)
         + (LINE + 2) + workers * ROW_H + 10 + (LINE + 2 + CACHE_H + 2);
     cv.fill(x0, y0, PANEL_W, panel_h, BG);
     let x = x0 + MARGIN;
@@ -401,6 +452,17 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     y += LINE + 2;
     cv.strip(x, y, inner_w, STRIP_H, &mips, scale, GREEN);
     y += STRIP_H + 10;
+
+    // MFLOPS: floating-point operations (multiply-add counted as two).
+    let mflops: Vec<f32> = hist.iter().map(|s| s.mflops).collect();
+    let fl_avg = if mflops.is_empty() { 0.0 } else { mflops.iter().sum::<f32>() / mflops.len() as f32 };
+    let fl_max = mflops.iter().copied().fold(0.0, f32::max);
+    let scale = nice_scale(fl_max);
+    cv.header(x, y, "MFLOPS", &[("guest", CYAN)],
+        &format!("{:.1}  max {:.1}  avg {:.1}  scale {}", last.mflops, fl_max, fl_avg, scale));
+    y += LINE + 2;
+    cv.strip(x, y, inner_w, FLOPS_H, &mflops, scale, CYAN);
+    y += FLOPS_H + 10;
 
     // How the guest's instructions ran: compiled code or the interpreter.
     let compiled = avg(&|s| s.compiled_frac);
@@ -486,6 +548,21 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
 mod tests {
     use super::*;
 
+    #[test]
+    fn counts_floating_point_operations() {
+        let cop1 = |fmt: u32, funct: u32| (0x11 << 26) | (fmt << 21) | (2 << 16) | (4 << 11) | (6 << 6) | funct;
+        assert_eq!(flops_of(cop1(17, 0)), 1); // add.d
+        assert_eq!(flops_of(cop1(16, 2)), 1); // mul.s
+        assert_eq!(flops_of(cop1(17, 4)), 1); // sqrt.d
+        assert_eq!(flops_of(cop1(17, 6)), 0); // mov.d
+        assert_eq!(flops_of(cop1(17, 0x32)), 0); // c.eq.d
+        assert_eq!(flops_of(cop1(20, 0x21)), 0); // cvt.d.w
+        assert_eq!(flops_of((0x13 << 26) | 0x21), 2); // madd.d
+        assert_eq!(flops_of((0x13 << 26) | 0x39), 2); // nmsub.d
+        assert_eq!(flops_of((0x13 << 26) | 0x01), 0); // ldxc1
+        assert_eq!(flops_of(0x8FBF_0010), 0); // lw ra
+    }
+
     /// Draws the panel with a minute of made-up history; with
     /// `OSVIEW_PNG=<path>` it also writes the result, to look at the layout.
     #[test]
@@ -512,6 +589,7 @@ mod tests {
                     compiled_frac: 0.3 + 0.65 * t,
                     worker_busy: vec![0.9 * (1.0 - t), 0.7 * (1.0 - t), 0.4, 0.1],
                     worker_cps: vec![40.0 * (1.0 - t), 30.0 * (1.0 - t), 18.0, 4.0],
+                    mflops: 12.0 + 30.0 * (t * 5.0).sin().abs(),
                 });
             }
             st.mips_max = 60.0;

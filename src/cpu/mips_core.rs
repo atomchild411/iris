@@ -816,6 +816,11 @@ pub struct MipsCore {
     /// page-crossing over-trigger `jit_trigger`'s own doc comment describes.
     #[cfg(feature = "jitv2")]
     pub syscall_pending: bool,
+    /// Floating-point operations retired (`crate::osview::flops_of`), by the
+    /// interpreter (`step_int`) and by compiled code (at its cycle-count
+    /// flush points). Written only by the CPU thread; read by the osview
+    /// panel through `crate::osview::set_flops_source`.
+    pub flops: u64,
 
     // --- everything below is cold: not touched on the common per-instruction path ---
 
@@ -1344,6 +1349,7 @@ impl MipsCore {
             cur_code_pfn: u32::MAX, // no page tracked yet
             #[cfg(feature = "jitv2")]
             syscall_pending: false,
+            flops: 0,
             cp0_index: 0,
             cp0_random: 0,
             cp0_entrylo0: 0,
