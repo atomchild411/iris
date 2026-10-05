@@ -691,3 +691,17 @@ for an offline AOT of the pages this workload uses; 626 MB against 288 MB):
 So AOT is worth having as a cache filled without having run the programs
 (a shipped base, a fresh build's first boot), not as a compile mode. Leaner
 static sets (only code likely to run) would cut the disk and the 1%.
+
+## AOT: parked (2026-10-04)
+
+Against a warm cache, AOT gains nothing measurable (start-up about equal,
+steady state ~1% slower, 2.2x the disk). Everything it beats cold by comes
+from having a cache at all, which the persistent cache gives after one
+ordinary run. AOT's unique benefit is the first run of each program or build;
+its cost would be permanent machinery (ELF analysis, a guest file copy, an
+offline writer that must reproduce the emulator's build id and codegen
+configuration, bloated entry sets). Parked.
+
+Kept from it: the bounded cache is the win (turn it on by default once
+bounded), and the ~10% steady-state gap between cold and warm runs is compile
+threads taking CPU from the emulator -- the next thing to look at.
