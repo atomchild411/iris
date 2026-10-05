@@ -578,8 +578,8 @@ pages; raw images and relocatable `.text` in 4 KB pieces). Scripts:
 | | pages | share |
 |---|---|---|
 | byte-identical to a page of a file (or the PROM) | 4,391 | **97.7%** |
-| its code is in a file, but at another offset in the page | 41 | 0.9% |
-| its code is in none of the copied files | 63 | 1.4% |
+| its code is in a file, but at another offset in the page | 38 | 0.8% |
+| its code is in none of the copied files | 66 | 1.5% |
 
 (First count 64.5%, then 93.2%: the copy had missed `/usr/etc` and the
 compiler's executables, then `/lib32`, where `/usr/lib32/libc.so.1` points.)
@@ -588,13 +588,13 @@ compiler's executables, then `/lib32`, where `/usr/lib32/libc.so.1` points.)
   libc, libcrypto, the MIPSpro compiler, bash, sh, Perl, X, sshd, ssh-keygen,
   openssl and less. Their page hash, and so their cache key, can be computed
   from the file: AOT can produce exactly these blobs offline.
-- At another offset: `sash`, which the PROM relocates when it loads it (15),
-  PROM code copied into RAM (4), kernel code copied elsewhere (4); the rest
-  single pages, probably chance matches of 4 instructions.
+- At another offset: `sash`, which the PROM relocates when it loads it (12),
+  kernel code copied elsewhere (7), rld (2), PROM code copied into RAM (1);
+  the rest single pages, probably chance matches of 4 instructions.
 - In none of the copied files: a search of the whole 36 GB disk image found
-  the code of 49 of them on disk (files not copied, or deleted since, like the
-  workload's own test programs); 10 are nowhere on disk (7 of them FR0, boot
-  time: code generated or relocated in memory); 4 had no distinctive run.
+  the code of 46 of them on disk (files not copied, or deleted since, like the
+  workload's own test programs); 18 are nowhere on disk (12 of them FR0, boot
+  time: code generated or relocated in memory); 2 had no distinctive run.
 - Content of all 104: code, not data (84-94% of words decode as
   instructions, the rest mostly zeros); the only strings are symbol and
   section names, library paths and `mload version 7.0`.
@@ -607,31 +607,27 @@ compiler's executables, then `/lib32`, where `/usr/lib32/libc.so.1` points.)
 ## AOT step 1: can static analysis predict the entries? (2026-10-04)
 
 `scratch/jitcache-aot/step1.py`, over the 4,315 file pages: runtime entries
-(the union over each page's variants) against entries found statically in the
-file.
+(the union over each page's variants; 45.5 per page on average) against
+entries found statically in the file.
 
-| static entries | runtime entries predicted | pages fully covered |
-|---|---|---|
-| symbols, calls, return sites, cross-page branches, code addresses in data, page start | 9.7% | 0 |
-| + in-page branch targets and fall-throughs (3x as many entries) | 23.7% | 0 |
+| static entries | runtime entries predicted | pages fully covered | static / runtime entries |
+|---|---|---|---|
+| symbols, calls, return sites, cross-page branches, code addresses in data, page start | 41.2% | 5.9% | 1.7x |
+| + in-page branch targets, fall-throughs, after `syscall`/`break`/`cache`/`cop0`, after `jr`'s slot | **99.1%** | **90.2%** | 5.1x |
+| the same without fall-throughs | 72.1% | 10.7% | 3.5x |
 
-Pages average **75 runtime entries**, spread over every kind of instruction
-in proportion to how common it is. The cause is in `step_jit`: an arrival
-with `jit_trigger` set at an offset with no compiled code requests a compile
-with that offset added, and `eret` sets the trigger
-(`exec_complete_pc_set`). So every return from an interrupt, a TLB miss or a
-system call adds the instruction it lands on, and interrupts land anywhere on
-a hot page.
+Entries come from trigger arrivals (`step_jit`): page start, branch targets
+the interpreter reaches *and* the instruction after a not-taken branch's
+slot (`branch_delay(pc+8)` goes through the same trigger), system call entry
+and return, and JIT exits. An `eret` only triggers when returning from a
+system call (`exec_eret`, `syscall_pending`), so interrupt and TLB-miss
+returns don't add entries.
 
-So purely static AOT would serve a page until the first `eret` lands on an
-unpredicted offset, then recompile it (union-on-miss), and so on. Directions:
+(An earlier version of this section reported 9.7% and 0 pages and blamed
+`eret` landings. That came from a bug in the analysis: the blob reader took
+the entry and decoded-word bitmaps from header offset 40 instead of 48.)
 
-1. **Don't compile for `eret` landings** (interpret on to the next published
-   entry instead). Entry sets would become close to static, recompiles fewer
-   for the JIT as a whole, and AOT viable. Cost: a short interpreted stretch
-   after each interrupt return. Needs measuring: compile requests by arrival
-   class, and the interpreted instructions per `eret`.
-2. **Profile-guided AOT:** the warm cache already is the record of real entry
-   sets; AOT supplies the code, recorded runs the entries (a shipped base).
-3. **Every instruction an entry** for AOT blobs: measure the code size and
-   speed cost of a switch with up to 1,024 cases.
+So static analysis is enough for AOT on 90% of pages; the open cost is
+compiling about 5 times the entries a run needs. Next: compile pages offline
+with their runtime entries and with the static set, and compare code size,
+compile time and then speed.
