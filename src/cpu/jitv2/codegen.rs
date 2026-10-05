@@ -1372,6 +1372,7 @@ impl Codegen {
         let jit_consts = self.jit_consts;
         let mem_helpers = self.mem_helpers;
         let fr_mode = if compiled_for_fr1 { FrMode::Fr1 } else { FrMode::Fr0 };
+        FLOPS_PENDING.with(|f| f.set(0));
         #[cfg(feature = "developer")]
         { self.last_decline_was_verifier_error = false; }
         // Reject anything this pass doesn't support before touching
@@ -3556,6 +3557,7 @@ fn core_offset_of_cycles() -> i32 {
 fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) {
     let instr = &instrs[word as usize];
     *ctx.cycles_pending += instr.cycles_delta;
+    FLOPS_PENDING.with(|f| f.set(f.get() + crate::osview::flops_of(instr.raw)));
     if !instr.cycles_flush {
         return;
     }
@@ -3565,6 +3567,24 @@ fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_P
     let next = ctx.builder.ins().iadd_imm_s(prev, *ctx.cycles_pending as i64);
     ctx.builder.ins().store(mem, next, ctx.core_ptr, off);
     *ctx.cycles_pending = 0;
+    // The floating-point operations since the last flush point, for the
+    // osview panel; nothing is emitted for a stretch without any.
+    let flops = FLOPS_PENDING.with(|f| f.replace(0));
+    if flops != 0 {
+        let off = ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, flops) as i32);
+        let prev = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
+        let next = ctx.builder.ins().iadd_imm_s(prev, flops as i64);
+        ctx.builder.ins().store(mem, next, ctx.core_ptr, off);
+    }
+}
+
+std::thread_local! {
+    /// Floating-point operations emitted since the last cycle-count flush
+    /// point of the region being compiled (the FP counterpart of
+    /// `EmitCtx::cycles_pending`; a thread-local so `EmitCtx` and its
+    /// construction sites stay as they are). Reset at the start of every
+    /// region.
+    static FLOPS_PENDING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 fn core_offset_of_interrupts() -> i32 {
     (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::cpu::mips_core::Hot, interrupts)) as i32

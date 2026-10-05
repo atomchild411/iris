@@ -2971,6 +2971,12 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         crate::cpu::mips_core::CyclesPtr::new(&self.core.hot.cycles as *const u64)
     }
 
+    /// Address of `MipsCore::flops`, under the same "final address" contract
+    /// as `cycles_ptr`.
+    pub fn flops_ptr(&self) -> *const u64 {
+        &self.core.flops as *const u64
+    }
+
     /// Install the CP0 Status change callback pointing at this executor.
     ///
     /// This exists for exactly one reason: `MipsCore::write_cp0` has only a
@@ -3892,6 +3898,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     pub fn step_int(&mut self) -> ExecStatus {
+        crate::osview::count_interpreted();
         step_preamble!(self);
         let pc = self.core.pc;
 
@@ -3918,6 +3925,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             #[cfg(not(feature = "lightning"))]
             self.traceback.push(pc, d.raw, InstrOrigin::Interp);
+            self.core.flops = self.core.flops.wrapping_add(crate::osview::flops_of(d.raw) as u64);
             self.exec_decoded_int(d)
         } else if fetch.status & EXEC_IS_EXCEPTION != 0 {
             self.handle_exception(fetch.status)
@@ -10411,6 +10419,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         // safe to take raw pointers into it that outlive this constructor.
         let interrupts_ptr = executor_arc.lock().interrupts_ptr();
         let cycles_ptr = executor_arc.lock().cycles_ptr();
+        crate::osview::set_flops_source(executor_arc.lock().flops_ptr());
         let ppmem_bitmap_ptr = executor_arc.lock().ppmem_bitmap_ptr();
         #[cfg(feature = "jitv2")]
         executor_arc.lock().install_jit_hooks();
@@ -11441,6 +11450,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("proc".to_string(), "IRIX kernel introspection: proc info  (requires `loadsym` first)".to_string()),
             ("l1i".to_string(), "L1 Instruction Cache commands: l1i <check|dump> <addr|index>".to_string()),
             ("l1d".to_string(), "L1 Data Cache commands: l1d <check|dump> <addr|index> | l1d wb <vaddr> <size> | l1d pwb <paddr> <size>".to_string()),
+            ("osview".to_string(), "The osview panel's latest numbers as text (MIPS, MFLOPS, compiled share, JIT, cache)".to_string()),
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "LL/SC state: ll (llbit/lladdr) | ll stats | ll clear (histogram needs --features llstats)".to_string()),
             #[cfg(feature = "jitv2")]
@@ -12389,6 +12399,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 }
                 #[cfg(not(feature = "developer"))]
                 Err("undo requires a developer build".to_string())
+            }
+            "osview" => {
+                writeln!(writer, "{}", crate::osview::report()).unwrap();
+                Ok(())
             }
             "ll" => {
                 #[cfg(feature = "llstats")]

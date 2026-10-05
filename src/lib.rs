@@ -175,6 +175,7 @@ pub mod compositor;
 pub mod gl_compositor;
 pub mod headless_gl;
 pub mod debug_overlay;
+pub mod osview;
 pub mod disp;
 pub mod exp;
 pub mod gdb_stub;

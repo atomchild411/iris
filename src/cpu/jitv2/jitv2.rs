@@ -3117,10 +3117,14 @@ impl CompileQueue {
             let barrier = self.barrier.clone();
             let quiesce_in_progress = self.quiesce_in_progress.clone();
             let thread_count = self.thread_count;
+            crate::cpu::jit_feedback::JIT_FEEDBACK.compile_threads.store(thread_count as u32, Ordering::Relaxed);
             self.threads.push(
                 std::thread::Builder::new()
                     .name(format!("jitv2-compile-{i}"))
-                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4))
+                    .spawn(move || {
+                        crate::cpu::jit_feedback::set_worker_index(i);
+                        Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4)
+                    })
                     .expect("jitv2-compile spawn"),
             );
         }
@@ -3599,12 +3603,19 @@ impl CompileQueue {
                     // `j2 batch off` (the `developer`-build default) used
                     // to route here into handle_request instead, which is
                     // what triggered it.
+                    let t_busy = std::time::Instant::now();
                     let ran_out_of_memory = {
                         #[cfg(feature = "developer")]
                         { crate::cpu::jitv2::comp::handle_request_deferred(&req, &bus, &mut analyzer, &mut codegen, &mut pending, &stats) }
                         #[cfg(not(feature = "developer"))]
                         { crate::cpu::jitv2::comp::handle_request_deferred(&req, &bus, &mut analyzer, &mut codegen, &mut pending) }
                     };
+                    let busy = t_busy.elapsed().as_nanos() as u64;
+                    let fb = &crate::cpu::jit_feedback::JIT_FEEDBACK;
+                    fb.busy_ns.fetch_add(busy, Ordering::Relaxed);
+                    if let Some(w) = crate::cpu::jit_feedback::worker_index() {
+                        fb.worker_busy_ns[w].fetch_add(busy, Ordering::Relaxed);
+                    }
                     // Keep CompileQueue::function_count's mirror in sync —
                     // see that field's doc comment for why it exists
                     // (`j2 stats` can't read the real codegen.function_count()

@@ -251,6 +251,15 @@ static RAM_HITS: AtomicU64 = AtomicU64::new(0);
 static INDEX_MISSES: AtomicU64 = AtomicU64::new(0);
 static PRELOADED: AtomicU64 = AtomicU64::new(0);
 
+/// Time spent in lookups that hit, and in those that missed.
+static HIT_NS: AtomicU64 = AtomicU64::new(0);
+static MISS_NS: AtomicU64 = AtomicU64::new(0);
+
+/// (lookups, hits, time in hits, time in misses) so far, for the osview panel.
+pub fn lookup_counts() -> (u64, u64, u64, u64) {
+    (LOOKUPS.load(Relaxed), HITS.load(Relaxed), HIT_NS.load(Relaxed), MISS_NS.load(Relaxed))
+}
+
 /// A compile whose output can't be stored (relocations, or a configuration
 /// that bakes host addresses).
 pub fn note_refused() {
@@ -426,6 +435,22 @@ fn discard_bad(path: &Path) {
 /// Find a stored compile of exactly `words` whose entries cover `want`. When
 /// several do, the one with the most entries wins.
 pub fn lookup(
+    fp: &Fingerprint,
+    ph: &PageHash,
+    fr1: bool,
+    words: &[u32; ENTRIES_PER_PAGE],
+    want: &Entries,
+) -> Option<Arc<Blob>> {
+    // Timed whole (memory, index, directory listing, reads, checks), hits and
+    // misses apart, for the osview panel.
+    let t = std::time::Instant::now();
+    let r = lookup_untimed(fp, ph, fr1, words, want);
+    let ns = t.elapsed().as_nanos() as u64;
+    if r.is_some() { HIT_NS.fetch_add(ns, Relaxed); } else { MISS_NS.fetch_add(ns, Relaxed); }
+    r
+}
+
+fn lookup_untimed(
     fp: &Fingerprint,
     ph: &PageHash,
     fr1: bool,
