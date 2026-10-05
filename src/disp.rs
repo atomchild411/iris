@@ -422,6 +422,16 @@ pub fn decode_vc2_timings(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usiz
 /// Height of the status bar in pixels (one VGA glyph row = 16px)
 pub const STATUS_BAR_HEIGHT: usize = 16;
 
+const STATS_LABEL: &str = " STATS ";
+
+/// Where the STATS button sits on the status bar, in display pixels
+/// [start, end) for a `width`-wide display: the right end. `ui.rs` maps a
+/// click there to `crate::osview::toggle_panel`.
+pub fn stats_button_span(width: usize) -> (usize, usize) {
+    let w = STATS_LABEL.len() * 8;
+    (width.saturating_sub(w + 2), width.saturating_sub(2))
+}
+
 /// A status-bar texture: CPU pixel buffer + backing GL texture.
 /// Owned separately from the display compositor.
 pub struct StatusBarTexture {
@@ -628,6 +638,7 @@ impl StatusBar {
             let dc = stats.cycles.wrapping_sub(self.prev_cycles);
             let df = stats.fasttick.wrapping_sub(self.prev_fasttick);
             self.mips   = (dc as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0;
+            crate::osview::MIPS_X10.store((self.mips * 10.0) as u32, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "developer")] {
                 let total_fetches = stats.l1i_fetches + stats.uncached;
                 self.decode_pct   = if total_fetches > 0 { stats.decoded_delta as f64 / total_fetches as f64 * 100.0 } else { 0.0 };
@@ -675,7 +686,14 @@ impl StatusBar {
         }
         cursor_x = self.draw_text(rgba, " G:", cursor_x, bar_y, width, BAR_FG);
         cursor_x = self.draw_gfifo_rect(rgba, cursor_x + 2, bar_y, width, stats.gfifo_pending);
-        let _ = cursor_x;
+
+        // The osview panel's button, at the right end (`crate::osview`).
+        let (bx0, bx1) = stats_button_span(width);
+        if bx0 > cursor_x {
+            let open = crate::osview::panel_open();
+            self.fill_rect(rgba, bx0, bar_y, bx1 - bx0, STATUS_BAR_HEIGHT, width, if open { BAR_FG } else { BAR_DIM });
+            self.draw_text(rgba, STATS_LABEL, bx0, bar_y, width, if open { BAR_BG } else { BAR_FG });
+        }
     }
 
     /// 32x16 jitv2 feedback rectangle: top 32x8 is arena (page-pool) fill,
@@ -765,7 +783,6 @@ impl StatusBar {
         }
     }
 
-    #[cfg(feature = "jitv2")]
     fn fill_rect(&self, rgba: &mut Vec<u32>, x: usize, y: usize, w: usize, h: usize, width: usize, color: u32) {
         for row in 0..h {
             let py = y + row;

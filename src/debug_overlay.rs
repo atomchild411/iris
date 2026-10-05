@@ -72,7 +72,7 @@ impl DebugOverlay {
 
     /// True if any overlay is enabled (caller can skip render() if false).
     pub fn active(&self) -> bool {
-        self.show_cmap || self.show_disp_debug || self.show_draw_debug
+        self.show_cmap || self.show_disp_debug || self.show_draw_debug || crate::osview::panel_open()
     }
 
     /// Record a DID→mode observation. Called from render()'s did[]/xmap_mode scan
@@ -382,6 +382,10 @@ impl DebugOverlay {
                     self.draw_text_line(width, y0, height, line, fg, bg);
                 }
             }
+        }
+
+        if crate::osview::panel_open() {
+            crate::osview::draw(&mut self.buf, 2048, width, height, &self.font);
         }
 
         // Upload to GL texture and return handle

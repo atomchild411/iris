@@ -724,6 +724,9 @@ pub fn handle_request_deferred(
         let t_compile = std::time::Instant::now();
         func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, analyzer.has_fpu(), req.page);
         crate::cpu::jitv2::hashstats::note_compile_time(t_compile.elapsed());
+        let fb = &crate::cpu::jit_feedback::JIT_FEEDBACK;
+        fb.compiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        fb.compile_ns.fetch_add(t_compile.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         if let (Some(_), Some((fp, ph))) = (func_id, cache_key) {
             match codegen.take_last_blob() {
                 Some((code, align)) => crate::cpu::jitv2::pcache::store(fp, ph, req.compiled_for_fr1, crate::cpu::jitv2::pcache::Blob {

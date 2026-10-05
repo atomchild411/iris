@@ -930,7 +930,7 @@ impl Ui {
         let mut app = UiApp {
             ps2, display, scsi, window, window_size, resize_request, display_res, mouse_delta,
             scale, scroll_pixels_per_line, lock_aspect_ratio,
-            mouse_grabbed: false, rctrl_held: false, last_win_size,
+            mouse_grabbed: false, rctrl_held: false, last_win_size, cursor_pos: None,
         };
         event_loop.run_app(&mut app).unwrap();
     }
@@ -1058,6 +1058,12 @@ impl Ui {
                 return;
             }
 
+            // RCtrl+O: the osview panel (`crate::osview`).
+            if keycode == KeyCode::KeyO && pressed && !input.repeat && *rctrl_held {
+                crate::osview::toggle_panel();
+                return;
+            }
+
             // RCtrl+1 / RCtrl+2: snap window to 1x or 2x scale.
             if pressed && !input.repeat && *rctrl_held {
                 let snap = match keycode {
@@ -1097,6 +1103,26 @@ struct UiApp {
     rctrl_held: bool,
     // Last accepted window size: tells which edge is being dragged when locking the aspect ratio.
     last_win_size: (u32, u32),
+    // Where the pointer is while the guest doesn't have it (physical pixels),
+    // so a click can land on the status bar's STATS button.
+    cursor_pos: Option<(f64, f64)>,
+}
+
+impl UiApp {
+    /// Whether the pointer is over the status bar's STATS button
+    /// (`disp::stats_button_span`), using the same letterbox as the renderer.
+    fn over_stats_button(&self) -> bool {
+        let Some((cx, cy)) = self.cursor_pos else { return false };
+        let size = self.window.inner_size();
+        let (dw, dh) = *self.display_res.lock();
+        if dw == 0 || dh == 0 || size.width == 0 { return false; }
+        let (qx0, _qy0, _qx1, qy1, scale) =
+            GlRenderer::letterbox(dw as f32, dh as f32, size.width as f32, size.height as f32);
+        let (bx0, bx1) = crate::disp::stats_button_span(dw as usize);
+        let (x0, x1) = (qx0 + bx0 as f32 * scale, qx0 + bx1 as f32 * scale);
+        let (y0, y1) = (qy1, qy1 + STATUS_BAR_HEIGHT as f32 * scale);
+        (cx as f32) >= x0 && (cx as f32) < x1 && (cy as f32) >= y0 && (cy as f32) < y1
+    }
 }
 
 impl ApplicationHandler for UiApp {
@@ -1154,6 +1180,10 @@ impl ApplicationHandler for UiApp {
                         drop(md);
                         Ui::flush_mouse_delta(&self.ps2, &self.mouse_delta, false);
                     }
+                } else if state == ElementState::Pressed && button == MouseButton::Left
+                    && self.over_stats_button()
+                {
+                    crate::osview::toggle_panel();
                 } else if state == ElementState::Pressed && button == MouseButton::Left {
                     self.mouse_grabbed = true;
                     if self.window.set_cursor_grab(winit::window::CursorGrabMode::Locked).is_err() {
@@ -1162,6 +1192,12 @@ impl ApplicationHandler for UiApp {
                     self.window.set_cursor_visible(false);
                     self.mouse_delta.lock().accum = (0.0, 0.0);
                 }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = Some((position.x, position.y));
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_pos = None;
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.mouse_grabbed {

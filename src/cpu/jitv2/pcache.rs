@@ -171,6 +171,11 @@ static REFUSED: AtomicU64 = AtomicU64::new(0);
 static UNION_ADDED: AtomicU64 = AtomicU64::new(0);
 static LOAD_NS: AtomicU64 = AtomicU64::new(0);
 
+/// (lookups, hits) so far, for the osview panel.
+pub fn lookup_counts() -> (u64, u64) {
+    (LOOKUPS.load(Relaxed), HITS.load(Relaxed))
+}
+
 /// A compile whose output can't be stored (relocations, or a configuration
 /// that bakes host addresses).
 pub fn note_refused() {
