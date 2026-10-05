@@ -388,6 +388,12 @@ fn blend(dst: u32, src: u32, alpha: u32) -> u32 {
     0xFF00_0000 | mix(16) | mix(8) | mix(0)
 }
 
+/// Microseconds for a header: one decimal under 10 (a lookup served from
+/// memory takes well under one), none above.
+fn us(v: f32) -> String {
+    if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") }
+}
+
 /// A round number at or above `v` for an auto-scaled bar: 1, 2 or 5 times a
 /// power of ten.
 fn nice_scale(v: f32) -> f32 {
@@ -408,9 +414,9 @@ pub fn report() -> String {
     let Some(s) = st.history.back() else { return "osview: no sample yet (try again in a second)".to_string() };
     format!(
         "MIPS {:.1}  MFLOPS {:.2}  compiled {:.1}%  queue {:.0}%  code area {:.0}%  flushes {}\n\
-         compile threads {:.2} of {} busy  compiles/s {:.0}  cache lookups/s {:.0} hits {:.0}%  hit {:.0}us miss {:.0}us",
+         compile threads {:.2} of {} busy  compiles/s {:.0}  cache lookups/s {:.0} hits {:.0}%  hit {}us miss {}us",
         s.mips, s.mflops, s.compiled_frac * 100.0, s.queue * 100.0, s.arena * 100.0, s.flushes,
-        s.busy, s.threads, s.compiles_s, s.lookups_s, s.hit_frac * 100.0, s.hit_us, s.miss_us,
+        s.busy, s.threads, s.compiles_s, s.lookups_s, s.hit_frac * 100.0, us(s.hit_us), us(s.miss_us),
     )
 }
 
@@ -535,7 +541,7 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     let misses: Vec<f32> = hist.iter().map(|s| (s.lookups_s - s.loads_s).max(0.0)).collect();
     let scale = nice_scale(hits.iter().chain(misses.iter()).copied().fold(0.0, f32::max));
     let note = if lookups > 0.0 {
-        format!("{:.0}% of {:.0}/s  hit {:.0}us miss {:.0}us  scale {}", hit * 100.0, lookups, hit_us, miss_us, scale)
+        format!("{:.0}% of {:.0}/s  hit {}us miss {}us  scale {}", hit * 100.0, lookups, us(hit_us), us(miss_us), scale)
     } else {
         format!("idle  scale {}", scale)
     };
