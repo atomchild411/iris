@@ -14,13 +14,26 @@
 //! second and keeps a minute of history.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 static PANEL_OPEN: AtomicBool = AtomicBool::new(false);
 /// MIPS x10, published by the status bar each time it recomputes it.
 pub static MIPS_X10: AtomicU32 = AtomicU32::new(0);
+/// Guest instructions retired (`hot.cycles`), published by the status bar
+/// every frame.
+pub static INSTRS: AtomicU64 = AtomicU64::new(0);
+/// Instructions the interpreter executed (`MipsExecutor::step_int`). Written
+/// only by the CPU thread, so a plain load and store, no atomic
+/// read-modify-write on the interpreter's path.
+static INTERPRETED: AtomicU64 = AtomicU64::new(0);
+
+/// One interpreted instruction (from `step_int`).
+#[inline(always)]
+pub fn count_interpreted() {
+    INTERPRETED.store(INTERPRETED.load(Relaxed).wrapping_add(1), Relaxed);
+}
 
 pub fn panel_open() -> bool {
     PANEL_OPEN.load(Relaxed)
@@ -42,12 +55,18 @@ struct Counters {
     cache_lookups: u64,
     cache_hits: u64,
     flushes: u32,
+    instrs: u64,
+    interpreted: u64,
 }
 
 impl Counters {
     fn now() -> Self {
         #[allow(unused_mut)]
-        let mut c = Counters::default();
+        let mut c = Counters {
+            instrs: INSTRS.load(Relaxed),
+            interpreted: INTERPRETED.load(Relaxed),
+            ..Default::default()
+        };
         #[cfg(feature = "jitv2")]
         {
             let f = &crate::cpu::jit_feedback::JIT_FEEDBACK;
@@ -77,6 +96,8 @@ struct Sample {
     hit_frac: f32,
     lookups_s: f32,
     flushes: u32,
+    /// Share of the interval's instructions that ran compiled.
+    compiled_frac: f32,
 }
 
 struct State {
@@ -108,6 +129,11 @@ fn sample(st: &mut State) {
         hit_frac: if lookups > 0.0 { hits / lookups } else { 0.0 },
         lookups_s: lookups / dt,
         flushes: c.flushes,
+        compiled_frac: {
+            let all = c.instrs.saturating_sub(c0.instrs) as f32;
+            let int = c.interpreted.saturating_sub(c0.interpreted) as f32;
+            if all > 0.0 { (1.0 - int / all).clamp(0.0, 1.0) } else { 0.0 }
+        },
         ..Default::default()
     };
     #[cfg(feature = "jitv2")]
@@ -139,6 +165,8 @@ const YELLOW: u32 = rgb(0xFF, 0xFF, 0x00);
 const RED: u32 = rgb(0xFF, 0x30, 0x30);
 const CYAN: u32 = rgb(0x00, 0xE0, 0xE0);
 const MAGENTA: u32 = rgb(0xFF, 0x40, 0xFF);
+const BLUE: u32 = rgb(0x50, 0x80, 0xFF);
+const ORANGE: u32 = rgb(0xFF, 0xA0, 0x00);
 
 const PANEL_W: usize = 520;
 const MARGIN: usize = 8;
@@ -255,8 +283,8 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     let x0 = width.saturating_sub(PANEL_W + MARGIN);
     let y0 = MARGIN;
     let inner_w = PANEL_W - 2 * MARGIN;
-    // the MIPS strip and five bars, each with its header
-    let panel_h = 2 * MARGIN + (LINE + 2 + STRIP_H + 10) + 5 * (LINE + 2 + BAR_H + 10) - 8;
+    // the MIPS strip and six bars, each with its header
+    let panel_h = 2 * MARGIN + (LINE + 2 + STRIP_H + 10) + 6 * (LINE + 2 + BAR_H + 10) - 8;
     cv.fill(x0, y0, PANEL_W, panel_h, BG);
     let x = x0 + MARGIN;
     let mut y = y0 + MARGIN;
@@ -277,6 +305,14 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     y += LINE + 2;
     cv.strip(x, y, inner_w, STRIP_H, &mips, scale, GREEN);
     y += STRIP_H + 10;
+
+    // How the guest's instructions ran: compiled code or the interpreter.
+    let compiled = avg(&|s| s.compiled_frac);
+    cv.header(x, y, "instructions", &[("compiled", BLUE), ("interpreted", ORANGE)],
+        &format!("{:.0}% compiled", compiled * 100.0));
+    y += LINE + 2;
+    cv.bar(x, y, inner_w, &[(compiled, BLUE), (1.0 - compiled, ORANGE)]);
+    y += BAR_H + 10;
 
     // Compile threads: busy and idle, as a share of the pool.
     let threads = last.threads.max(1) as f32;
@@ -349,6 +385,7 @@ mod tests {
                     hit_frac: 0.4 + 0.5 * t,
                     lookups_s: 250.0,
                     flushes: 2,
+                    compiled_frac: 0.3 + 0.65 * t,
                 });
             }
             st.mips_max = 60.0;

@@ -633,6 +633,7 @@ impl StatusBar {
     }
 
     pub fn render(&mut self, rgba: &mut Vec<u32>, width: usize, bar_y: usize, stats: &BarStats) {
+        crate::osview::INSTRS.store(stats.cycles, std::sync::atomic::Ordering::Relaxed);
         let dt = stats.now.duration_since(self.prev_time).as_secs_f64();
         if dt >= 0.1 {
             let dc = stats.cycles.wrapping_sub(self.prev_cycles);

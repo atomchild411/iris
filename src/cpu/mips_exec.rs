@@ -3892,6 +3892,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     pub fn step_int(&mut self) -> ExecStatus {
+        crate::osview::count_interpreted();
         step_preamble!(self);
         let pc = self.core.pc;
 
