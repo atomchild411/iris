@@ -62,8 +62,9 @@ pub const DEFAULT_MAX_MB: u64 = 1024;
 pub const DEFAULT_KEEP_BUILDS: usize = 3;
 /// `[jitv2] cache_ram_mb`'s default: the in-memory copy of recently used blobs.
 pub const DEFAULT_RAM_MB: u64 = 256;
-/// The startup preload fills the in-memory copy to this share of its cap.
-const PRELOAD_PERCENT: usize = 75;
+/// The startup preload fills the in-memory copy to this share of its cap
+/// (the rest is room for the session; eviction is least recently used anyway).
+const PRELOAD_PERCENT: usize = 90;
 /// A collection pass deletes down to this share of the cap, so the next
 /// write doesn't start another one.
 const TARGET_PERCENT: u64 = 80;
@@ -676,13 +677,15 @@ fn key_of(path: &Path, build: &Path) -> Option<Key> {
     Some((fp, unhex16(ph)?, fr == "1"))
 }
 
-/// Read blobs into memory at startup, protected (reused) ones first and the
-/// most recently used of each first, until `budget` bytes. Runs on the
+/// Read blobs into memory at startup, most recently used first (a hit sets a
+/// file's mtime, a store writes it), protected before probation only as a
+/// tie-break: the pages reused most lately and the ones the last session
+/// first compiled come first either way. Up to `budget` bytes. Runs on the
 /// collector thread, before anything else it does, so it competes with
 /// nothing but the guest's own early boot.
 fn preload(mut files: Vec<FileInfo>, budget: usize) {
     let Some(d) = dirs() else { return };
-    files.sort_by_key(|f| (std::cmp::Reverse(f.protected), std::cmp::Reverse(f.mtime)));
+    files.sort_by_key(|f| (std::cmp::Reverse(f.mtime), std::cmp::Reverse(f.protected)));
     let mut loaded = 0usize;
     for f in files {
         if loaded >= budget {

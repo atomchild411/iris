@@ -315,6 +315,45 @@ Unit tests (`pcache::tests`) cover the eviction order and the 80% target, a
 build in use surviving both the count and the cap, measuring without deleting,
 stale temp files, promotion on a hit, inheritance, and the variant limit.
 
+## In memory (2026-10-04)
+
+Until now every lookup went to the disk: a page-directory listing, then
+every variant read and checked, with only the OS file cache to make that
+cheap. On a slow disk or with the file cache cold it isn't.
+
+- **Blobs in memory.** Every blob stored or loaded is kept in memory as well,
+  up to `[jitv2] cache_ram_mb` (`IRIS_JIT_CACHE_RAM_MB`, default 256; 0 = off),
+  least recently used out first; a covering variant replaces those it covers,
+  as on disk. Lookups and union-on-miss try memory first; a memory hit still
+  promotes and refreshes the file. `lookup` returns `Arc<Blob>`.
+- **An index of what is on disk.** Built from a scan of this build's
+  directory at startup, rebuilt after every collection pass, updated on every
+  store: a page it doesn't list is a miss with no filesystem call.
+- **Preload.** After the startup pass, the collector thread reads blobs into
+  memory, most recently used or written first (protected before probation
+  only as a tie-break), up to 90% of the cap
+  (`[jitv2] cache_preload`, `IRIS_JIT_CACHE_PRELOAD`, default on).
+
+Both are hints: a blob from memory is still checked against the live page
+words, and a page the index lists that has gone from disk is an ordinary miss.
+
+Measured on the IP28 clone (same workload, same cache directory; lookup times
+from the osview panel's timers):
+
+| session | boot | `cc` 1st run | hits | from memory | misses answered by the index | average hit |
+|---|---|---|---|---|---|---|
+| cold (fills the cache) | 18.4 s | 13.3 s | 17.6% | 1,407 of 1,407 | 4,237 | < 1 us |
+| memory on, 3,593 blobs preloaded | 16.4 s | 6.9 s | 81.3% | 5,883 of 7,723 | 591 | < 1 us |
+| memory off (disk only) | 17.4 s | 7.0 s | 88.1% | 0 | 499 | 91 us |
+
+A hit from memory takes under a microsecond against 91 us from a fast external
+SSD; lookups cost ~0.17 s a session instead of ~0.85 s. The difference grows
+with slower disks. A quarter of the hits still came from disk: that first version preloaded
+protected blobs first, to 75% of the cap, and ran out of room before the
+probation pages the previous session had added; it now goes by recency, to
+90%. A full working set here is ~300 MB (5,400 blobs of ~60 KB), more than
+the 256 MB default holds: `cache_ram_mb = 512` covers it.
+
 ## Risks
 
 - **A hidden input left out of the fingerprint** serves code compiled for a
