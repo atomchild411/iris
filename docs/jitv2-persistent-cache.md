@@ -329,8 +329,9 @@ cheap. On a slow disk or with the file cache cold it isn't.
 - **An index of what is on disk.** Built from a scan of this build's
   directory at startup, rebuilt after every collection pass, updated on every
   store: a page it doesn't list is a miss with no filesystem call.
-- **Preload.** After the startup pass, the collector thread reads protected
-  blobs into memory, most recently used first, up to 75% of the cap
+- **Preload.** After the startup pass, the collector thread reads blobs into
+  memory, most recently used or written first (protected before probation
+  only as a tie-break), up to 90% of the cap
   (`[jitv2] cache_preload`, `IRIS_JIT_CACHE_PRELOAD`, default on).
 
 Both are hints: a blob from memory is still checked against the live page
@@ -347,9 +348,11 @@ from the osview panel's timers):
 
 A hit from memory takes under a microsecond against 91 us from a fast external
 SSD; lookups cost ~0.17 s a session instead of ~0.85 s. The difference grows
-with slower disks. A quarter of the hits still came from disk: the preload
-takes protected blobs, and pages first used in the previous session are still
-on probation.
+with slower disks. A quarter of the hits still came from disk: that first version preloaded
+protected blobs first, to 75% of the cap, and ran out of room before the
+probation pages the previous session had added; it now goes by recency, to
+90%. A full working set here is ~300 MB (5,400 blobs of ~60 KB), more than
+the 256 MB default holds: `cache_ram_mb = 512` covers it.
 
 ## Risks
 
