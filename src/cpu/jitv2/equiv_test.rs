@@ -1291,6 +1291,94 @@ mod tests {
         Some(CoreSnapshot::capture(&exec.core))
     }
 
+    /// A counted loop around `add.d`, compiled as one region so the loop
+    /// runs inside compiled code: `MipsCore::flops` (the osview panel's
+    /// MFLOPS) must count one per iteration, like `hot.cycles` counts
+    /// instructions.
+    fn run_flops_loop(iterations: u16) -> (u64, u64) {
+        let page_words: [(u16, u32); 7] = [
+            (0, (9 << 26) | (8 << 16) | iterations as u32),          // addiu t0, zero, N
+            (1, (0x11 << 26) | (17 << 21) | (2 << 16)),              // add.d f0, f0, f2
+            (2, (9 << 26) | (8 << 21) | (8 << 16) | 0xFFFF),         // addiu t0, t0, -1
+            (3, (5 << 26) | (8 << 21) | 0xFFFD),                     // bne t0, zero, 1
+            (4, 0),                                                  // nop (slot)
+            (5, 0x03E0_0008),                                        // jr ra
+            (6, 0),                                                  // nop (slot)
+        ];
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        for &(w, raw) in &page_words { page[w as usize] = raw; }
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page, 0, (pc & !0xFFF) as u32, 64);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
+            .expect("the loop compiles");
+        let mut fpr = [0u64; 32];
+        fpr[2] = 1.0f64.to_bits();
+        let (exec, _mem) = fpu_seeded_executor([0u64; 32], fpr, pc, true);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        assert_eq!(f64::from_bits(exec.core.fpr[0]), iterations as f64, "the loop ran to the end");
+        (exec.core.flops, exec.core.hot.cycles)
+    }
+
+    /// The shape MIPSpro emits for `for (..) a = a * b + d`: a two-instruction
+    /// loop with the multiply-add in the branch's delay slot. Entered before
+    /// the loop (`entry` 0) or at the loop head itself (`entry` 2, as a
+    /// recompile can make it).
+    fn run_flops_slot_loop(iterations: u16, entry: u16) -> (u64, u64) {
+        let madd_d = (0x13 << 26) | (0 << 21) | (2 << 16) | (0 << 11) | (0 << 6) | 0x21; // madd.d f0, f0, f0, f2
+        let page_words: [(u16, u32); 7] = [
+            (0, (9 << 26) | (8 << 16) | iterations as u32),          // addiu t0, zero, N
+            (1, 0),                                                  // nop
+            (2, (9 << 26) | (9 << 21) | (9 << 16) | 1),              // addiu t1, t1, 1
+            (3, (5 << 26) | (8 << 21) | (9 << 16) | 0xFFFE),         // bne t0, t1, 2
+            (4, madd_d),                                             // madd.d (slot)
+            (5, 0x03E0_0008),                                        // jr ra
+            (6, 0),                                                  // nop (slot)
+        ];
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        for &(w, raw) in &page_words { page[w as usize] = raw; }
+        let pc = 0xFFFF_FFFF_8000_1000u64 + entry as u64 * 4;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page, entry, (pc & !0xFFF) as u32, 64);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, entry, true, false)
+            .expect("the loop compiles");
+        let mut fpr = [0u64; 32];
+        fpr[0] = 1.0f64.to_bits();
+        fpr[2] = 0.0f64.to_bits();
+        let mut gpr = [0u64; 32];
+        gpr[8] = iterations as u64; // t0 when entering at the head
+        let (exec, _mem) = fpu_seeded_executor(gpr, fpr, pc, true);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        assert_eq!(exec.core.gpr[9], iterations as u64, "the loop ran to the end");
+        (exec.core.flops, exec.core.hot.cycles)
+    }
+
+    #[test]
+    fn compiled_slot_loop_counts_its_flops() {
+        for entry in [0u16, 2] {
+            let (flops, cycles) = run_flops_slot_loop(1000, entry);
+            assert_eq!(flops, 2000, "entry {entry}: madd.d (2 flops) per iteration (cycles {cycles})");
+        }
+    }
+
+    #[test]
+    fn compiled_loop_counts_its_flops() {
+        let (flops, cycles) = run_flops_loop(1000);
+        assert_eq!(flops, 1000, "one add.d per iteration (cycles {cycles})");
+    }
+
     fn assert_fpu_matches_interpreter(instr: u32, gpr: [u64; 32], fpr: [u64; 32], fr1: bool) {
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let word_offset = (pc as u16 / 4) & 0x3FF;
