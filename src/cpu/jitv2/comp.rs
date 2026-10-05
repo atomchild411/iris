@@ -727,6 +727,9 @@ pub fn handle_request_deferred(
         let fb = &crate::cpu::jit_feedback::JIT_FEEDBACK;
         fb.compiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         fb.compile_ns.fetch_add(t_compile.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        if let Some(w) = crate::cpu::jit_feedback::worker_index() {
+            fb.worker_compiles[w].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if let (Some(_), Some((fp, ph))) = (func_id, cache_key) {
             match codegen.take_last_blob() {
                 Some((code, align)) => crate::cpu::jitv2::pcache::store(fp, ph, req.compiled_for_fr1, crate::cpu::jitv2::pcache::Blob {

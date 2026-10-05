@@ -49,6 +49,27 @@ pub struct JitFeedback {
     pub busy_ns: AtomicU64,
     /// Size of the compile worker pool.
     pub compile_threads: AtomicU32,
+    /// The same busy time and compile count per worker (index from
+    /// `worker_index`), for the first `MAX_WORKERS` workers.
+    pub worker_busy_ns: [AtomicU64; MAX_WORKERS],
+    pub worker_compiles: [AtomicU64; MAX_WORKERS],
+}
+
+/// Workers tracked individually by the osview panel.
+pub const MAX_WORKERS: usize = 64;
+
+std::thread_local! {
+    static WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Mark the current thread as compile worker `i` (called once as it starts).
+pub fn set_worker_index(i: usize) {
+    WORKER_INDEX.with(|w| w.set(Some(i)));
+}
+
+/// This thread's worker index, if it is a compile worker within `MAX_WORKERS`.
+pub fn worker_index() -> Option<usize> {
+    WORKER_INDEX.with(|w| w.get()).filter(|&i| i < MAX_WORKERS)
 }
 
 pub static JIT_FEEDBACK: JitFeedback = JitFeedback {
@@ -59,6 +80,8 @@ pub static JIT_FEEDBACK: JitFeedback = JitFeedback {
     compile_ns: AtomicU64::new(0),
     busy_ns: AtomicU64::new(0),
     compile_threads: AtomicU32::new(0),
+    worker_busy_ns: [const { AtomicU64::new(0) }; MAX_WORKERS],
+    worker_compiles: [const { AtomicU64::new(0) }; MAX_WORKERS],
 };
 
 impl JitFeedback {

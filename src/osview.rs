@@ -47,7 +47,7 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(500);
 /// A minute of samples.
 const HISTORY: usize = 120;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Counters {
     compiles: u64,
     compile_ns: u64,
@@ -57,6 +57,8 @@ struct Counters {
     flushes: u32,
     instrs: u64,
     interpreted: u64,
+    worker_busy_ns: Vec<u64>,
+    worker_compiles: Vec<u64>,
 }
 
 impl Counters {
@@ -77,12 +79,15 @@ impl Counters {
             let (lookups, hits) = crate::cpu::jitv2::pcache::lookup_counts();
             c.cache_lookups = lookups;
             c.cache_hits = hits;
+            let n = (f.compile_threads.load(Relaxed) as usize).min(crate::cpu::jit_feedback::MAX_WORKERS);
+            c.worker_busy_ns = f.worker_busy_ns[..n].iter().map(|a| a.load(Relaxed)).collect();
+            c.worker_compiles = f.worker_compiles[..n].iter().map(|a| a.load(Relaxed)).collect();
         }
         c
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Sample {
     mips: f32,
     /// Compile threads busy (0..threads), averaged over the interval.
@@ -98,6 +103,9 @@ struct Sample {
     flushes: u32,
     /// Share of the interval's instructions that ran compiled.
     compiled_frac: f32,
+    /// Per compile worker: busy share of the interval, compiles per second.
+    worker_busy: Vec<f32>,
+    worker_cps: Vec<f32>,
 }
 
 struct State {
@@ -110,11 +118,11 @@ static STATE: Mutex<State> = Mutex::new(State { last: None, history: VecDeque::n
 
 fn sample(st: &mut State) {
     let now = Instant::now();
-    if st.last.is_some_and(|(t, _)| now.duration_since(t) < SAMPLE_EVERY) {
+    if st.last.as_ref().is_some_and(|(t, _)| now.duration_since(*t) < SAMPLE_EVERY) {
         return;
     }
     let c = Counters::now();
-    let Some((t0, c0)) = st.last.replace((now, c)) else { return };
+    let Some((t0, c0)) = st.last.replace((now, c.clone())) else { return };
     let dt = now.duration_since(t0).as_secs_f32().max(1e-3);
     let compiles = c.compiles.saturating_sub(c0.compiles) as f32;
     let lookups = c.cache_lookups.saturating_sub(c0.cache_lookups) as f32;
@@ -134,6 +142,12 @@ fn sample(st: &mut State) {
             let int = c.interpreted.saturating_sub(c0.interpreted) as f32;
             if all > 0.0 { (1.0 - int / all).clamp(0.0, 1.0) } else { 0.0 }
         },
+        worker_busy: c.worker_busy_ns.iter().enumerate()
+            .map(|(i, &b)| (b.saturating_sub(c0.worker_busy_ns.get(i).copied().unwrap_or(b)) as f32 / 1e9 / dt).min(1.0))
+            .collect(),
+        worker_cps: c.worker_compiles.iter().enumerate()
+            .map(|(i, &n)| n.saturating_sub(c0.worker_compiles.get(i).copied().unwrap_or(n)) as f32 / dt)
+            .collect(),
         ..Default::default()
     };
     #[cfg(feature = "jitv2")]
@@ -173,6 +187,9 @@ const MARGIN: usize = 8;
 const LINE: usize = 16;
 const BAR_H: usize = 14;
 const STRIP_H: usize = 48;
+/// One compile worker's row: a thin bar beside its number and figures.
+const ROW_H: usize = 16;
+const ROW_BAR_H: usize = 10;
 
 struct Canvas<'a> {
     buf: &'a mut [u32],
@@ -241,6 +258,20 @@ impl Canvas<'_> {
         }
     }
 
+    /// A thin bar for a per-worker row: frame, bands, no heavy border.
+    fn row_bar(&mut self, x: usize, y: usize, w: usize, bands: &[(f32, u32)]) {
+        let y = y + (ROW_H - ROW_BAR_H) / 2 - 1;
+        self.fill(x, y, w, ROW_BAR_H, FRAME);
+        self.fill(x + 1, y + 1, w - 2, ROW_BAR_H - 2, BG);
+        let inner = (w - 2) as f32;
+        let mut bx = x + 1;
+        for &(f, c) in bands {
+            let bw = ((f.clamp(0.0, 1.0) * inner).round() as usize).min(x + w - 1 - bx);
+            self.fill(bx, y + 1, bw, ROW_BAR_H - 2, c);
+            bx += bw;
+        }
+    }
+
     /// A strip chart of `values` (oldest first) against `scale`, newest at
     /// the right edge.
     fn strip(&mut self, x: usize, y: usize, w: usize, h: usize, values: &[f32], scale: f32, c: u32) {
@@ -275,7 +306,7 @@ fn nice_scale(v: f32) -> f32 {
 pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &[u8]) {
     let mut st = STATE.lock().unwrap();
     sample(&mut st);
-    let hist: Vec<Sample> = st.history.iter().copied().collect();
+    let hist: Vec<Sample> = st.history.iter().cloned().collect();
     let mips_max = st.mips_max;
     drop(st);
 
@@ -283,13 +314,15 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     let x0 = width.saturating_sub(PANEL_W + MARGIN);
     let y0 = MARGIN;
     let inner_w = PANEL_W - 2 * MARGIN;
-    // the MIPS strip and six bars, each with its header
-    let panel_h = 2 * MARGIN + (LINE + 2 + STRIP_H + 10) + 6 * (LINE + 2 + BAR_H + 10) - 8;
+    let workers = hist.last().map_or(0, |s| s.worker_busy.len());
+    // the MIPS strip, five bars with headers, the worker header and a row per worker
+    let panel_h = 2 * MARGIN + (LINE + 2 + STRIP_H + 10) + 5 * (LINE + 2 + BAR_H + 10)
+        + (LINE + 2) + workers * ROW_H + 10 - 8;
     cv.fill(x0, y0, PANEL_W, panel_h, BG);
     let x = x0 + MARGIN;
     let mut y = y0 + MARGIN;
 
-    let last = hist.last().copied().unwrap_or_default();
+    let last = hist.last().cloned().unwrap_or_default();
     // gr_osview averages each bar over the last samples so it moves smoothly.
     let avg = |f: &dyn Fn(&Sample) -> f32| -> f32 {
         let n = hist.len().min(4);
@@ -314,21 +347,32 @@ pub fn draw(buf: &mut [u32], stride: usize, width: usize, height: usize, font: &
     cv.bar(x, y, inner_w, &[(compiled, BLUE), (1.0 - compiled, ORANGE)]);
     y += BAR_H + 10;
 
-    // Compile threads: busy and idle, as a share of the pool.
-    let threads = last.threads.max(1) as f32;
-    let busy = avg(&|s| s.busy) / threads;
-    cv.header(x, y, "jit threads", &[("busy", YELLOW), ("idle", DIM)],
-        &format!("{:.1} of {} busy", busy * threads, last.threads));
-    y += LINE + 2;
-    cv.bar(x, y, inner_w, &[(busy, YELLOW), (1.0 - busy, DIM)]);
-    y += BAR_H + 10;
-
-    // The compile queue and the code area (a flush empties it at 100%).
+    // The compile queue, shared by every worker.
     let queue = avg(&|s| s.queue);
     cv.header(x, y, "jit queue", &[("waiting", CYAN)], &format!("{:.0}%", queue * 100.0));
     y += LINE + 2;
     cv.bar(x, y, inner_w, &[(queue, CYAN)]);
     y += BAR_H + 10;
+
+    // The workers draining it: the pool's total, then a row per worker
+    // (busy share of the interval, compiles per second).
+    let threads = last.threads.max(1) as f32;
+    let busy = avg(&|s| s.busy);
+    let cps: f32 = avg(&|s| s.worker_cps.iter().sum());
+    cv.header(x, y, "jit threads", &[("busy", YELLOW), ("idle", DIM)],
+        &format!("{:.1} of {} busy  {:.0} compiles/s", busy.min(threads), last.threads, cps));
+    y += LINE + 2;
+    for i in 0..workers {
+        let wb = avg(&|s| s.worker_busy.get(i).copied().unwrap_or(0.0));
+        let wc = avg(&|s| s.worker_cps.get(i).copied().unwrap_or(0.0));
+        cv.text(x, y - 1, &format!("{i:>2}"), TITLE);
+        let note = format!("{:>3.0}% {:>4.0}/s", wb * 100.0, wc);
+        let bw = inner_w - 24 - note.len() * 8 - 8;
+        cv.row_bar(x + 24, y, bw, &[(wb, YELLOW), (1.0 - wb, DIM)]);
+        cv.text(x + 24 + bw + 8, y - 1, &note, TITLE);
+        y += ROW_H;
+    }
+    y += 10;
 
     let arena = last.arena;
     cv.header(x, y, "code area", &[("used", MAGENTA)],
@@ -386,6 +430,8 @@ mod tests {
                     lookups_s: 250.0,
                     flushes: 2,
                     compiled_frac: 0.3 + 0.65 * t,
+                    worker_busy: vec![0.9 * (1.0 - t), 0.7 * (1.0 - t), 0.4, 0.1],
+                    worker_cps: vec![40.0 * (1.0 - t), 30.0 * (1.0 - t), 18.0, 4.0],
                 });
             }
             st.mips_max = 60.0;
