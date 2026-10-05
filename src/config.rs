@@ -672,11 +672,21 @@ pub struct Jitv2Config {
     /// than this, or the size cap needs the room.
     #[serde(default = "default_jit_cache_keep_builds")]
     pub cache_keep_builds: usize,
+    /// MB of recently used compiled pages kept in memory as well
+    /// (`IRIS_JIT_CACHE_RAM_MB`), so lookups skip the disk; 0 = off.
+    #[serde(default = "default_jit_cache_ram_mb")]
+    pub cache_ram_mb: u64,
+    /// At startup, read recently reused pages from disk into that memory in
+    /// the background (`IRIS_JIT_CACHE_PRELOAD`).
+    #[serde(default = "default_true")]
+    pub cache_preload: bool,
 }
 
 fn default_jitv2_threads() -> usize { 1 }
 fn default_jit_cache_max_mb() -> u64 { 1024 }
 fn default_jit_cache_keep_builds() -> usize { 3 }
+fn default_jit_cache_ram_mb() -> u64 { 256 }
+fn default_true() -> bool { true }
 
 impl Default for Jitv2Config {
     fn default() -> Self {
@@ -686,6 +696,8 @@ impl Default for Jitv2Config {
             cache_dir: String::new(),
             cache_max_mb: default_jit_cache_max_mb(),
             cache_keep_builds: default_jit_cache_keep_builds(),
+            cache_ram_mb: default_jit_cache_ram_mb(),
+            cache_preload: true,
         }
     }
 }
@@ -703,6 +715,8 @@ impl Jitv2Config {
         set_or_remove_env("IRIS_JIT_CACHE_MAX_MB", &non_default(self.cache_max_mb, default_jit_cache_max_mb()));
         set_or_remove_env("IRIS_JIT_CACHE_KEEP_BUILDS",
             &non_default(self.cache_keep_builds as u64, default_jit_cache_keep_builds() as u64));
+        set_or_remove_env("IRIS_JIT_CACHE_RAM_MB", &non_default(self.cache_ram_mb, default_jit_cache_ram_mb()));
+        set_or_remove_env("IRIS_JIT_CACHE_PRELOAD", if self.cache_preload { "" } else { "0" });
     }
 }
 

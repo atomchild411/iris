@@ -43,7 +43,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use crate::cpu::jitv2::{BITMAP_WORDS, ENTRIES_PER_PAGE};
@@ -60,6 +60,10 @@ const FORMAT: u32 = 1;
 pub const DEFAULT_MAX_MB: u64 = 1024;
 /// `[jitv2] cache_keep_builds`'s default.
 pub const DEFAULT_KEEP_BUILDS: usize = 3;
+/// `[jitv2] cache_ram_mb`'s default: the in-memory copy of recently used blobs.
+pub const DEFAULT_RAM_MB: u64 = 256;
+/// The startup preload fills the in-memory copy to this share of its cap.
+const PRELOAD_PERCENT: usize = 75;
 /// A collection pass deletes down to this share of the cap, so the next
 /// write doesn't start another one.
 const TARGET_PERCENT: u64 = 80;
@@ -115,6 +119,10 @@ fn default_base() -> Option<PathBuf> {
 struct Limits {
     max_bytes: u64,
     keep_builds: usize,
+    /// The in-memory copy's cap (`[jitv2] cache_ram_mb`); 0 turns it off.
+    ram_bytes: usize,
+    /// Read recently used blobs into memory at startup (`cache_preload`).
+    preload: bool,
 }
 
 /// The bounds, from `IRIS_JIT_CACHE_MAX_MB` / `IRIS_JIT_CACHE_KEEP_BUILDS`
@@ -126,6 +134,8 @@ fn limits() -> &'static Limits {
         Limits {
             max_bytes: var("IRIS_JIT_CACHE_MAX_MB").unwrap_or(DEFAULT_MAX_MB).max(1) << 20,
             keep_builds: var("IRIS_JIT_CACHE_KEEP_BUILDS").map_or(DEFAULT_KEEP_BUILDS, |n| n as usize).max(1),
+            ram_bytes: (var("IRIS_JIT_CACHE_RAM_MB").unwrap_or(DEFAULT_RAM_MB) as usize) << 20,
+            preload: !matches!(std::env::var("IRIS_JIT_CACHE_PRELOAD").as_deref(), Ok("0") | Ok("off") | Ok("false")),
         }
     })
 }
@@ -155,6 +165,11 @@ fn dirs() -> Option<&'static Dirs> {
         let _ = std::thread::Builder::new().name("jitcache-gc".into()).spawn(move || {
             let l = limits();
             collect(&b, &d, l.max_bytes, l.keep_builds, SystemTime::now(), true);
+            let files = scan_build(&d, SystemTime::now());
+            RAM.lock().unwrap().set_index(&files, &d);
+            if l.preload && l.ram_bytes > 0 {
+                preload(files, l.ram_bytes * PRELOAD_PERCENT / 100);
+            }
             loop {
                 std::thread::sleep(HEARTBEAT);
                 touch_used(&d);
@@ -230,6 +245,11 @@ static EVICTED_FILES: AtomicU64 = AtomicU64::new(0);
 static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Bytes written since the last collection pass.
 static WRITTEN_SINCE_COLLECT: AtomicU64 = AtomicU64::new(0);
+/// Hits served from memory; misses the index answered without touching the
+/// disk; blobs the startup preload read.
+static RAM_HITS: AtomicU64 = AtomicU64::new(0);
+static INDEX_MISSES: AtomicU64 = AtomicU64::new(0);
+static PRELOADED: AtomicU64 = AtomicU64::new(0);
 
 /// A compile whose output can't be stored (relocations, or a configuration
 /// that bakes host addresses).
@@ -255,7 +275,8 @@ pub fn summary() -> String {
         COMPARE_FAILS.load(Relaxed), BAD_FILES.load(Relaxed),
         if h == 0 { 0.0 } else { LOAD_NS.load(Relaxed) as f64 / h as f64 / 1000.0 },
         PROMOTED.load(Relaxed), EVICTED_FILES.load(Relaxed), EVICTED_BYTES.load(Relaxed) >> 20,
-    )
+    ) + &format!(" ram_hits={} index_misses={} preloaded={}",
+        RAM_HITS.load(Relaxed), INDEX_MISSES.load(Relaxed), PRELOADED.load(Relaxed))
 }
 
 // ---- blobs ---------------------------------------------------------------
@@ -410,10 +431,30 @@ pub fn lookup(
     fr1: bool,
     words: &[u32; ENTRIES_PER_PAGE],
     want: &Entries,
-) -> Option<Blob> {
+) -> Option<Arc<Blob>> {
     let n = LOOKUPS.fetch_add(1, Relaxed) + 1;
     if n % REPORT_EVERY == 0 {
         eprintln!("{}", summary());
+    }
+    let key = (*fp, *ph, fr1);
+    // Memory first: no filesystem call at all.
+    {
+        let mut ram = RAM.lock().unwrap();
+        if let Some(blob) = ram.get(&key, words, want) {
+            drop(ram);
+            HITS.fetch_add(1, Relaxed);
+            RAM_HITS.fetch_add(1, Relaxed);
+            if let Some(dir) = page_dir(fp, ph, fr1) {
+                send(Job::Touch(dir.join(format!("{}.{PROBATION}", hex(&entries_hash(&blob.entries))))));
+            }
+            return Some(blob);
+        }
+        // The index knows this build's pages: one it doesn't list was never
+        // stored, so there is nothing to read.
+        if ram.known_absent(&key) {
+            INDEX_MISSES.fetch_add(1, Relaxed);
+            return None;
+        }
     }
     let dir = page_dir(fp, ph, fr1)?;
     let mut best: Option<(Blob, PathBuf)> = None;
@@ -437,6 +478,8 @@ pub fn lookup(
     let (blob, path) = best?;
     HITS.fetch_add(1, Relaxed);
     send(Job::Touch(path));
+    let blob = Arc::new(blob);
+    RAM.lock().unwrap().insert(key, blob.clone(), limits().ram_bytes);
     Some(blob)
 }
 
@@ -444,6 +487,14 @@ pub fn lookup(
 /// headers are read; the walk that follows decides what is really covered.
 pub fn known_entries(fp: &Fingerprint, ph: &PageHash, fr1: bool) -> Entries {
     let mut all = [0u64; BITMAP_WORDS];
+    {
+        let ram = RAM.lock().unwrap();
+        let key = (*fp, *ph, fr1);
+        ram.union_entries(&key, &mut all);
+        if ram.known_absent(&key) {
+            return all;
+        }
+    }
     let Some(dir) = page_dir(fp, ph, fr1) else { return all };
     for path in variant_files(&dir) {
         if let Some(h) = read_header(&path) {
@@ -457,10 +508,179 @@ pub fn known_entries(fp: &Fingerprint, ph: &PageHash, fr1: bool) -> Entries {
     all
 }
 
+// ---- in memory -------------------------------------------------------------
+
+/// A page's key: codegen fingerprint, page hash, FR mode.
+type Key = (Fingerprint, PageHash, bool);
+
+struct RamEntry {
+    blob: Arc<Blob>,
+    bytes: usize,
+    last_use: u64,
+}
+
+/// The in-memory side of the cache: decoded blobs of recently used pages
+/// (bounded by `cache_ram_mb`, least recently used out first), and an index
+/// of which pages this build has on disk. Lookups try it before the disk, so
+/// a page used once this session, or preloaded at startup, never needs the
+/// filesystem again, and a page never stored costs no filesystem call once
+/// the index is built. Both are hints: a blob is still checked against the
+/// live page words, and a page the index lists that has gone from disk is an
+/// ordinary miss.
+struct Ram {
+    pages: std::collections::HashMap<Key, Vec<RamEntry>>,
+    bytes: usize,
+    clock: u64,
+    /// `None` until the first scan of this build's directory.
+    on_disk: Option<std::collections::HashSet<Key>>,
+}
+
+static RAM: std::sync::LazyLock<Mutex<Ram>> = std::sync::LazyLock::new(|| Mutex::new(Ram::new()));
+
+fn blob_bytes(b: &Blob) -> usize {
+    b.code.len() + WORDS_LEN + HEADER_LEN
+}
+
+impl Ram {
+    fn new() -> Self {
+        Ram { pages: Default::default(), bytes: 0, clock: 0, on_disk: None }
+    }
+
+    /// The variant of `key` that covers `want` with the most entries, if its
+    /// stored words are these.
+    fn get(&mut self, key: &Key, words: &[u32; ENTRIES_PER_PAGE], want: &Entries) -> Option<Arc<Blob>> {
+        self.clock += 1;
+        let clock = self.clock;
+        let vs = self.pages.get_mut(key)?;
+        let best = vs.iter_mut()
+            .filter(|e| covers(&e.blob.entries, want) && *e.blob.words == *words)
+            .max_by_key(|e| count(&e.blob.entries))?;
+        best.last_use = clock;
+        Some(best.blob.clone())
+    }
+
+    /// Add a variant: like the disk, it replaces those it covers. Then the
+    /// least recently used variants go until the total is under `cap`.
+    fn insert(&mut self, key: Key, blob: Arc<Blob>, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        self.clock += 1;
+        let bytes = blob_bytes(&blob);
+        let vs = self.pages.entry(key).or_default();
+        let before: usize = vs.iter().map(|e| e.bytes).sum();
+        vs.retain(|e| !covers(&blob.entries, &e.blob.entries));
+        let after: usize = vs.iter().map(|e| e.bytes).sum();
+        vs.push(RamEntry { blob, bytes, last_use: self.clock });
+        self.bytes = self.bytes + after + bytes - before;
+        if self.bytes > cap {
+            self.evict_to(cap * 9 / 10);
+        }
+    }
+
+    fn evict_to(&mut self, target: usize) {
+        let mut all: Vec<(u64, Key, usize)> = self.pages.iter()
+            .flat_map(|(k, vs)| vs.iter().enumerate().map(move |(i, e)| (e.last_use, *k, i)))
+            .collect();
+        all.sort_by_key(|(t, _, _)| *t);
+        let mut gone: std::collections::HashMap<Key, Vec<usize>> = Default::default();
+        let mut bytes = self.bytes;
+        for (_, k, i) in all {
+            if bytes <= target {
+                break;
+            }
+            bytes -= self.pages[&k][i].bytes;
+            gone.entry(k).or_default().push(i);
+        }
+        for (k, mut idx) in gone {
+            idx.sort_unstable_by(|a, b| b.cmp(a));
+            if let Some(vs) = self.pages.get_mut(&k) {
+                for i in idx {
+                    vs.swap_remove(i);
+                }
+                if vs.is_empty() {
+                    self.pages.remove(&k);
+                }
+            }
+        }
+        self.bytes = bytes;
+    }
+
+    fn union_entries(&self, key: &Key, all: &mut Entries) {
+        for e in self.pages.get(key).into_iter().flatten() {
+            for (a, x) in all.iter_mut().zip(&e.blob.entries) {
+                *a |= x;
+            }
+        }
+    }
+
+    /// The index exists and doesn't list `key`.
+    fn known_absent(&self, key: &Key) -> bool {
+        self.on_disk.as_ref().is_some_and(|set| !set.contains(key))
+    }
+
+    fn note_on_disk(&mut self, key: Key) {
+        if let Some(set) = self.on_disk.as_mut() {
+            set.insert(key);
+        }
+    }
+
+    /// Rebuild the index from a scan of this build's directory.
+    fn set_index(&mut self, files: &[FileInfo], build: &Path) {
+        self.on_disk = Some(files.iter().filter_map(|f| key_of(&f.path, build)).collect());
+    }
+}
+
+fn unhex16(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// A blob path's key: `<build>/<fingerprint>/<page hash>-<fr>/<file>`.
+fn key_of(path: &Path, build: &Path) -> Option<Key> {
+    let rel = path.strip_prefix(build).ok()?;
+    let mut parts = rel.iter().map(|c| c.to_str());
+    let fp = unhex16(parts.next()??)?;
+    let (ph, fr) = parts.next()??.rsplit_once('-')?;
+    Some((fp, unhex16(ph)?, fr == "1"))
+}
+
+/// Read blobs into memory at startup, protected (reused) ones first and the
+/// most recently used of each first, until `budget` bytes. Runs on the
+/// collector thread, before anything else it does, so it competes with
+/// nothing but the guest's own early boot.
+fn preload(mut files: Vec<FileInfo>, budget: usize) {
+    let Some(d) = dirs() else { return };
+    files.sort_by_key(|f| (std::cmp::Reverse(f.protected), std::cmp::Reverse(f.mtime)));
+    let mut loaded = 0usize;
+    for f in files {
+        if loaded >= budget {
+            break;
+        }
+        let Some(key) = key_of(&f.path, &d.build) else { continue };
+        let Ok(buf) = std::fs::read(&f.path) else { continue };
+        let Some(blob) = decode(&buf, &key.0, &key.1, key.2) else { continue };
+        loaded += blob_bytes(&blob);
+        RAM.lock().unwrap().insert(key, Arc::new(blob), limits().ram_bytes);
+        PRELOADED.fetch_add(1, Relaxed);
+    }
+}
+
+/// (bytes held, cap) of the in-memory copy, for status.
+pub fn ram_usage() -> (usize, usize) {
+    (RAM.lock().unwrap().bytes, limits().ram_bytes)
+}
+
 // ---- writer --------------------------------------------------------------
 
 enum Job {
-    Store { fp: Fingerprint, ph: PageHash, fr1: bool, blob: Box<Blob> },
+    Store { fp: Fingerprint, ph: PageHash, fr1: bool, blob: Arc<Blob> },
     /// A blob served a lookup: promote it and mark it recently used.
     Touch(PathBuf),
 }
@@ -468,7 +688,9 @@ enum Job {
 /// Queue a successful compile for writing. Returns at once; a background
 /// thread does the filesystem work.
 pub fn store(fp: Fingerprint, ph: PageHash, fr1: bool, blob: Blob) {
-    send(Job::Store { fp, ph, fr1, blob: Box::new(blob) });
+    let blob = Arc::new(blob);
+    RAM.lock().unwrap().insert((fp, ph, fr1), blob.clone(), limits().ram_bytes);
+    send(Job::Store { fp, ph, fr1, blob });
 }
 
 fn send(job: Job) {
@@ -496,6 +718,9 @@ fn send(job: Job) {
 /// is simply gone.
 fn touch(path: &Path) {
     let mut path = path.to_path_buf();
+    if !path.exists() && path.extension().is_some_and(|x| x == PROBATION) {
+        path = path.with_extension(PROTECTED);
+    }
     if path.extension().is_some_and(|x| x == PROBATION) {
         let to = path.with_extension(PROTECTED);
         if std::fs::rename(&path, &to).is_err() {
@@ -513,12 +738,16 @@ fn write_job(fp: Fingerprint, ph: PageHash, fr1: bool, blob: &Blob) {
     let Some(dir) = page_dir(&fp, &ph, fr1) else { return };
     let Some(written) = write_blob(&dir, &fp, &ph, fr1, blob) else { return };
     STORES.fetch_add(1, Relaxed);
+    RAM.lock().unwrap().note_on_disk((fp, ph, fr1));
     let l = limits();
     let since = WRITTEN_SINCE_COLLECT.fetch_add(written, Relaxed) + written;
     if since >= l.max_bytes * COLLECT_EVERY_PERCENT / 100 {
         WRITTEN_SINCE_COLLECT.store(0, Relaxed);
         if let Some(d) = dirs() {
             collect(&d.base, &d.build, l.max_bytes, l.keep_builds, SystemTime::now(), true);
+            // Eviction removed files; the index follows the disk again.
+            let files = scan_build(&d.build, SystemTime::now());
+            RAM.lock().unwrap().set_index(&files, &d.build);
         }
     }
 }
@@ -786,6 +1015,8 @@ fn describe(u: &Usage, max_bytes: u64) -> String {
         "{}\njitcache: {:.1} MB of {:.0} MB ({:.1} MB probation, {:.1} MB protected)",
         summary(), mb(u.total), mb(max_bytes), mb(u.probation), mb(u.protected),
     );
+    let (ram, cap) = ram_usage();
+    s.push_str(&format!("\n  in memory: {:.1} MB of {:.0} MB", mb(ram as u64), mb(cap as u64)));
     for (name, bytes, current) in &u.builds {
         s.push_str(&format!("\n  {name}  {:.1} MB{}", mb(*bytes), if *current { "  (this build)" } else { "" }));
     }
@@ -1048,6 +1279,82 @@ mod tests {
         assert!(left.contains(&names[0]));
         // The fewest-entry others went: variants 1 and 2.
         assert!(!left.contains(&names[1]) && !left.contains(&names[2]));
+    }
+
+    fn ram_blob(entries: Entries, seed: u32, code_len: usize) -> Arc<Blob> {
+        let mut b = blob(entries, seed);
+        b.code = vec![0u8; code_len];
+        Arc::new(b)
+    }
+
+    #[test]
+    fn memory_serves_covering_variants_of_the_same_words() {
+        let mut ram = Ram::new();
+        let key = ([1u8; 16], [2u8; 16], false);
+        let mut e = [0u64; BITMAP_WORDS];
+        e[0] = 0b0110;
+        let b = ram_blob(e, 3, 100);
+        let words = *b.words;
+        ram.insert(key, b, 1 << 30);
+        let mut want = [0u64; BITMAP_WORDS];
+        want[0] = 0b0100;
+        assert!(ram.get(&key, &words, &want).is_some());
+        // Not covered, other words, or another key: no.
+        want[0] = 0b1000;
+        assert!(ram.get(&key, &words, &want).is_none());
+        want[0] = 0b0100;
+        let mut other = words;
+        other[5] ^= 1;
+        assert!(ram.get(&key, &other, &want).is_none());
+        assert!(ram.get(&([9u8; 16], [2u8; 16], false), &words, &want).is_none());
+        // A covering variant replaces the one it covers.
+        e[0] = 0b1110;
+        ram.insert(key, ram_blob(e, 3, 100), 1 << 30);
+        assert_eq!(ram.pages[&key].len(), 1);
+        assert_eq!(ram.bytes, blob_bytes(&ram.pages[&key][0].blob));
+    }
+
+    #[test]
+    fn memory_evicts_least_recently_used() {
+        let mut ram = Ram::new();
+        let size = blob_bytes(&ram_blob([1; BITMAP_WORDS], 0, 1000));
+        let cap = size * 4;
+        let mut e = [0u64; BITMAP_WORDS];
+        e[0] = 1;
+        let keys: Vec<Key> = (0..4u8).map(|i| ([i; 16], [i; 16], false)).collect();
+        let words: Vec<_> = (0..4).map(|i| *ram_blob(e, i, 1000).words).collect();
+        for (i, k) in keys.iter().enumerate() {
+            ram.insert(*k, ram_blob(e, i as u32, 1000), cap);
+        }
+        // Use the first, so the second is now the least recently used.
+        assert!(ram.get(&keys[0], &words[0], &e).is_some());
+        ram.insert(([7; 16], [7; 16], false), ram_blob(e, 7, 1000), cap);
+        assert!(ram.bytes <= cap);
+        assert!(ram.pages.contains_key(&keys[0]), "recently used stays");
+        assert!(!ram.pages.contains_key(&keys[1]), "least recently used goes");
+        // Off: nothing kept.
+        let mut off = Ram::new();
+        off.insert(keys[0], ram_blob(e, 0, 10), 0);
+        assert!(off.pages.is_empty());
+    }
+
+    #[test]
+    fn index_answers_misses_and_keys_parse() {
+        let build = Path::new("/c/build");
+        let fp = [0xabu8; 16];
+        let ph = [0xcdu8; 16];
+        let path = build.join(hex(&fp)).join(format!("{}-1", hex(&ph))).join("0011223344556677.jh");
+        assert_eq!(key_of(&path, build), Some((fp, ph, true)));
+        assert_eq!(key_of(Path::new("/elsewhere/x"), build), None);
+        let mut ram = Ram::new();
+        // No index yet: never "absent".
+        assert!(!ram.known_absent(&(fp, ph, true)));
+        let files = vec![FileInfo { path, size: 1, mtime: SystemTime::UNIX_EPOCH, protected: true }];
+        ram.set_index(&files, build);
+        assert!(!ram.known_absent(&(fp, ph, true)));
+        assert!(ram.known_absent(&(fp, ph, false)));
+        ram.note_on_disk((fp, ph, false));
+        assert!(!ram.known_absent(&(fp, ph, false)));
     }
 
     #[test]

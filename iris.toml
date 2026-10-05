@@ -266,6 +266,8 @@ mode           = "nat"
 #cache_dir         = ""
 #cache_max_mb      = 1024
 #cache_keep_builds = 3
+#cache_ram_mb      = 256     # recently used pages also kept in memory; 0 = off
+#cache_preload     = true    # read recently reused pages into memory at startup
 
 # Debug knobs, applied as environment variables at start.
 #[debug]

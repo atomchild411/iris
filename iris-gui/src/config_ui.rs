@@ -367,6 +367,14 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             ui.add(egui::DragValue::new(&mut cfg.jitv2.cache_keep_builds).range(1..=16).speed(0.1))
                 .on_hover_text("Every rebuild of iris starts a new cache; older builds' caches are kept up to this count.");
             ui.end_row();
+            ui.label("Cache in memory, MB (IRIS_JIT_CACHE_RAM_MB)");
+            ui.add(egui::DragValue::new(&mut cfg.jitv2.cache_ram_mb).range(0..=8192).speed(8.0))
+                .on_hover_text("Recently used compiled pages also kept in memory, so lookups skip the disk. 0 = off.");
+            ui.end_row();
+            ui.label("Preload at startup (IRIS_JIT_CACHE_PRELOAD)");
+            ui.checkbox(&mut cfg.jitv2.cache_preload, "")
+                .on_hover_text("Read recently reused pages into memory in the background when the emulator starts.");
+            ui.end_row();
         });
     }
     ui.separator();
