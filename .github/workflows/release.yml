@@ -1,6 +1,7 @@
 # Build and release pipeline for IRIS.
 #
-# Manual trigger only (workflow_dispatch), in one of two modes:
+# Manual trigger (workflow_dispatch) in one of two modes, plus a fortnightly
+# schedule (see "Scheduled releases" below):
 #
 #   publish_release UNCHECKED (the default)
 #     Builds every artifact on every platform and verifies the release contents,
@@ -16,6 +17,18 @@
 # dispatching from a topic branch tests that branch and dispatching from main
 # builds main. Set build_branch to override; a published tag follows the commit
 # that was actually built.
+#
+# ── Scheduled releases ────────────────────────────────────────────────────────
+#
+# Every other Friday at 15:00 UTC — 10:00 EST, 11:00 EDT (GitHub cron is UTC
+# and ignores DST). The cron fires every Friday; cron has no fortnightly form,
+# so generate-version publishes only on even epoch weeks
+# (floor(epoch / 604800) % 2 == 0 — e.g. 2026-10-09, 2026-10-23). Flip the
+# parity there to shift the cadence by a week. A scheduled run builds and
+# publishes the default branch (main), and skips everything if main has not
+# moved since the latest release. Scheduled runs only fire from the default
+# branch, and GitHub disables schedules on a public repo after 60 days with no
+# commits.
 #
 # ── What ships ────────────────────────────────────────────────────────────────
 #
@@ -45,6 +58,8 @@
 name: Release
 
 on:
+  schedule:
+    - cron: "0 15 * * 5"  # Fridays 15:00 UTC; fortnightly gate in generate-version
   workflow_dispatch:
     inputs:
       publish_release:
@@ -101,6 +116,12 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       sha: ${{ steps.version.outputs.sha }}
+      # "true" when this run publishes: the publish_release checkbox on a
+      # manual run, or the fortnightly gate on a scheduled one.
+      publish: ${{ steps.gate.outputs.publish }}
+      # "true" when a scheduled run is off-week or has nothing new to ship;
+      # every build job and the release job are skipped.
+      skip: ${{ steps.gate.outputs.skip }}
     steps:
       # Resolve the commit the build legs will check out so a published release
       # tags what was actually built. Without this the tag lands on the ref the
@@ -120,12 +141,50 @@ jobs:
           echo "sha=$SHA"         >> $GITHUB_OUTPUT
           echo "Generated version: $VERSION (tag v$VERSION at $SHA)"
 
-      # NOTE: use `inputs.publish_release` (a real boolean), never
-      # `github.event.inputs.publish_release` — that is the STRING "false",
-      # which is truthy in an `if:` and would publish on every run.
-      - name: Announce mode
+      - name: Decide whether to build and publish
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          PUBLISH_INPUT: ${{ inputs.publish_release }}
+          SHA: ${{ steps.version.outputs.sha }}
         run: |
-          if [ "${{ inputs.publish_release }}" = "true" ]; then
+          if [ "$EVENT" != "schedule" ]; then
+            echo "publish=${PUBLISH_INPUT:-false}" >> $GITHUB_OUTPUT
+            echo "skip=false"                      >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          WEEK=$(( $(date -u +%s) / 604800 ))
+          if [ $(( WEEK % 2 )) -ne 0 ]; then
+            echo "Off-week (epoch week $WEEK) - skipping."
+            echo "### Scheduled run: off-week, nothing built" >> $GITHUB_STEP_SUMMARY
+            echo "publish=false" >> $GITHUB_OUTPUT
+            echo "skip=true"     >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          LAST_TAG=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || true)
+          LAST_SHA=""
+          if [ -n "$LAST_TAG" ]; then
+            LAST_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${LAST_TAG}" --jq .sha 2>/dev/null || true)
+          fi
+          if [ "$LAST_SHA" = "$SHA" ]; then
+            echo "main ($SHA) is unchanged since $LAST_TAG - skipping."
+            echo "### Scheduled run: no new commits since \`$LAST_TAG\`, nothing built" >> $GITHUB_STEP_SUMMARY
+            echo "publish=false" >> $GITHUB_OUTPUT
+            echo "skip=true"     >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Scheduled release: $SHA (previous: ${LAST_TAG:-none})"
+          echo "publish=true" >> $GITHUB_OUTPUT
+          echo "skip=false"   >> $GITHUB_OUTPUT
+
+      # Downstream steps test `needs.generate-version.outputs.publish == 'true'`.
+      # Never test `github.event.inputs.publish_release` bare — that is the
+      # STRING "false", which is truthy in an `if:` and would publish every run.
+      - name: Announce mode
+        if: ${{ steps.gate.outputs.skip != 'true' }}
+        run: |
+          if [ "${{ steps.gate.outputs.publish }}" = "true" ]; then
             echo "### Release run - will publish \`v${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "### Build-only run - no tag, no release" >> $GITHUB_STEP_SUMMARY
@@ -144,6 +203,7 @@ jobs:
   build-windows:
     name: Build Windows (${{ matrix.arch }})
     needs: generate-version
+    if: ${{ needs.generate-version.outputs.skip != 'true' }}
     runs-on: ${{ matrix.runs-on }}
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
@@ -274,6 +334,7 @@ jobs:
   build-macos:
     name: Build macOS (${{ matrix.arch }})
     needs: generate-version
+    if: ${{ needs.generate-version.outputs.skip != 'true' }}
     runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
     # Guard against a hung actions/cache step sitting for the 6h default. Three
     # compiles (GUI + iris + iris-ci) and three notarytool submissions per leg
@@ -541,6 +602,7 @@ jobs:
   build-linux-appimage:
     name: Build Linux AppImage (${{ matrix.arch }})
     needs: generate-version
+    if: ${{ needs.generate-version.outputs.skip != 'true' }}
     runs-on: ${{ matrix.runs-on }}
     container: ghcr.io/pkgforge-dev/archlinux:latest
     strategy:
@@ -656,6 +718,7 @@ jobs:
   build-linux-packages:
     name: Build Linux packages (${{ matrix.arch }})
     needs: generate-version
+    if: ${{ needs.generate-version.outputs.skip != 'true' }}
     runs-on: ${{ matrix.runs-on }}
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
@@ -807,6 +870,7 @@ jobs:
   build-linux-riscv64:
     name: Build Linux riscv64 (cross)
     needs: generate-version
+    if: ${{ needs.generate-version.outputs.skip != 'true' }}
     runs-on: ubuntu-24.04
     container: debian:trixie
     env:
@@ -1010,6 +1074,7 @@ jobs:
       - build-linux-appimage
       - build-linux-packages
       - build-linux-riscv64
+    if: ${{ needs.generate-version.outputs.skip != 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Download all artifacts
@@ -1111,7 +1176,7 @@ jobs:
       # softprops would then move the existing tag and rewrite that release.
       # Fail before any of that happens.
       - name: Check the tag is free
-        if: ${{ inputs.publish_release }}
+        if: ${{ needs.generate-version.outputs.publish == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.generate-version.outputs.tag }}
@@ -1123,7 +1188,7 @@ jobs:
           echo "Tag ${TAG} is free."
 
       - name: Create Release
-        if: ${{ inputs.publish_release }}
+        if: ${{ needs.generate-version.outputs.publish == 'true' }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.generate-version.outputs.tag }}
@@ -1138,7 +1203,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build-only notice
-        if: ${{ !inputs.publish_release }}
+        if: ${{ needs.generate-version.outputs.publish != 'true' }}
         run: |
           echo "::notice::Build-only run - artifacts built and verified, no tag or release created. A publish run would have created ${{ needs.generate-version.outputs.tag }}."
 
