@@ -12,6 +12,61 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### UI / input
+
+- **The `iris` window lets go of held keys and buttons when it loses
+  focus.** Cmd-Tab or Alt-Tab is pressed in the window and released in the
+  next one, so the guest kept those keys (and any held mouse button) down: a
+  stuck Shift made Motif scrollbars ignore every click. On focus loss the
+  window now releases everything the guest still sees held.
+- **Right Cmd releases the grab on macOS**, like Right Ctrl, which Mac
+  keyboards lack.
+
+### Build / features
+
+- **Retired the `chd`, `camera`, `ultra64`, `daynaport`, `ip28`, `ppmem`,
+  `mips4` and `r5k` cargo features.** CHD images, the host camera, the
+  Ultra64 dev board, DaynaPort and the IP28 / R10000 machine are always built
+  in and enabled per machine in the config. Physical RAM is always ppmem
+  (host-MMU mapped); RAM banks stay bus devices, so DMA and other bus-path
+  accesses are unchanged. iris-gui drops its matching passthrough features
+  and the "rebuild with --features ..." hints. Old snapshots that recorded
+  `chd`/`camera` in their manifest still restore.
+- **MIPS IV is purely a property of the configured CPU.** The interpreter
+  already monomorphised on `C::MIPS4` (R4400 gets its own MIPS III decoder);
+  jitv2's `Analyzer` carries the same answer as a runtime flag, now defaulting
+  to MIPS IV for tools that have no CPU to ask.
+- **`jitv2` implies `tcache`.** The JIT now always runs over the transparent
+  cache. The compile-time dirty-page probe (`jit_page_has_dirty_lines`,
+  `RejectReason::PageDirtyInCache`) and the non-tcache inline load/store path
+  (`jit_dc_data`) existed only for jitv2 without tcache and are gone.
+  `tcache` can still be enabled alone for an interpreter build.
+
+### iris-gui
+
+- **NVRAM EEPROM gets the same stable-path treatment as NVRAM.** `nveeprom`
+  (Indigo2/IP28's motherboard EEPROM — where `eaddr` and PROM env actually live
+  on those profiles, not in the NVRAM file) used to default to a bare
+  `"nveeprom.bin"` with no anchoring, no migration, and no config-editor field,
+  unlike `nvram`. Since iris-gui never changes its working directory, that bare
+  default resolved against whatever CWD the OS happened to launch it with —
+  often not the same place twice between `cargo run` and a bundled `.app` — so
+  a machine could silently load a different (usually blank) EEPROM each
+  launch, and "Reset NVRAM"'s MAC write (which only ever touched `nvram`) had
+  no effect on Indigo2/IP28's actual `eaddr`. Now: a stable
+  `<config dir>/iris/nveeprom.bin` default (`GuiSettings::default_nveeprom_path`),
+  the same relative-path migration `nvram` gets on load, and a "NVRAM EEPROM
+  file" row on the General tab right below NVRAM file.
+- **"Reset NVRAM" and the no-MAC-yet pre-flight now also patch the NVRAM
+  EEPROM.** Both only ever touched the DS1386 `nvram` file — on Indigo2/IP28,
+  which read `eaddr` from `nveeprom` instead (see above), this had no effect
+  on the guest's actual Ethernet MAC at all: the toast would report a fresh
+  MAC, but IRIX kept reporting the static `config::DEFAULT_MAC` because
+  `nveeprom` stayed blank and core's own blank-EEPROM fallback filled it in
+  with that default on every boot. Added `nveeprom`-side equivalents of every
+  `nvram` MAC helper (`nveeprom_has_mac`, `write_nveeprom_mac`,
+  `ensure_nveeprom_exists`, `reset_nveeprom`) and call them alongside the
+  `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
 - **2026-10-06 — IMPACT OpenGL and texture pipeline** (`862d0fe`): GE11
