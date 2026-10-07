@@ -930,7 +930,7 @@ impl Ui {
         let mut app = UiApp {
             ps2, display, scsi, window, window_size, resize_request, display_res, mouse_delta,
             scale, scroll_pixels_per_line, lock_aspect_ratio,
-            mouse_grabbed: false, rctrl_held: false, last_win_size,
+            mouse_grabbed: false, rctrl_held: false, held_keys: Vec::new(), last_win_size,
         };
         event_loop.run_app(&mut app).unwrap();
     }
@@ -978,7 +978,8 @@ impl Ui {
 
     fn handle_keyboard(ps2: &Ps2Controller, display: &dyn GfxDisplay, scsi: &Arc<Wd33c93a>,
         resize_request: &Mutex<Option<ResizeRequest>>,
-        input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window)
+        input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, held_keys: &mut Vec<KeyCode>,
+        window: &Window)
     {
         use std::sync::atomic::Ordering;
         if let PhysicalKey::Code(keycode) = input.physical_key {
@@ -986,6 +987,19 @@ impl Ui {
 
             if keycode == KeyCode::ControlRight {
                 *rctrl_held = pressed;
+                if pressed && !input.repeat && *grabbed {
+                    *grabbed = false;
+                    let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                    window.set_cursor_visible(true);
+                }
+                return;
+            }
+
+            // Mac keyboards (every MacBook, the Magic Keyboard) have no Right
+            // Ctrl, so on macOS Right Cmd releases the grab as well. It is not
+            // passed to the guest.
+            #[cfg(target_os = "macos")]
+            if keycode == KeyCode::SuperRight {
                 if pressed && !input.repeat && *grabbed {
                     *grabbed = false;
                     let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
@@ -1075,7 +1089,33 @@ impl Ui {
                 }
             }
 
+            // Remember what the guest holds, so a focus loss can let go of it.
+            if pressed {
+                if !held_keys.contains(&keycode) { held_keys.push(keycode); }
+            } else {
+                held_keys.retain(|k| *k != keycode);
+            }
             ps2.push_kb(keycode, pressed);
+        }
+    }
+
+    /// The window lost focus: lift every key and mouse button the guest still
+    /// sees held. Their releases go to whichever window has focus now (Cmd-Tab
+    /// or Alt-Tab is pressed here and released elsewhere), so without this the
+    /// guest keeps them down — a stuck Shift, say, which IRIX then applies to
+    /// every click and key.
+    fn release_held_input(ps2: &Ps2Controller, mouse_delta: &Mutex<MouseDelta>, held_keys: &mut Vec<KeyCode>) {
+        for k in held_keys.drain(..) {
+            ps2.push_kb(k, false);
+        }
+        let had_buttons = {
+            let mut md = mouse_delta.lock();
+            let had = md.buttons != 0;
+            md.buttons = 0;
+            had
+        };
+        if had_buttons {
+            Ui::flush_mouse_delta(ps2, mouse_delta, false);
         }
     }
 }
@@ -1095,6 +1135,8 @@ struct UiApp {
     lock_aspect_ratio: bool,
     mouse_grabbed: bool,
     rctrl_held: bool,
+    // Keys sent to the guest as pressed and not yet released.
+    held_keys: Vec<KeyCode>,
     // Last accepted window size: tells which edge is being dragged when locking the aspect ratio.
     last_win_size: (u32, u32),
 }
@@ -1137,7 +1179,7 @@ impl ApplicationHandler for UiApp {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 Ui::handle_keyboard(&self.ps2, &*self.display, &self.scsi, &self.resize_request, event,
-                    &mut self.mouse_grabbed, &mut self.rctrl_held, &self.window);
+                    &mut self.mouse_grabbed, &mut self.rctrl_held, &mut self.held_keys, &self.window);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if self.mouse_grabbed {
@@ -1173,6 +1215,8 @@ impl ApplicationHandler for UiApp {
                 }
             }
             WindowEvent::Focused(false) => {
+                Ui::release_held_input(&self.ps2, &self.mouse_delta, &mut self.held_keys);
+                self.rctrl_held = false;
                 if self.mouse_grabbed {
                     self.mouse_grabbed = false;
                     let _ = self.window.set_cursor_grab(winit::window::CursorGrabMode::None);

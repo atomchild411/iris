@@ -9,6 +9,16 @@ is easiest to understand by reading the commit.
 
 ## October 2026
 
+### UI / input
+
+- **The `iris` window lets go of held keys and buttons when it loses
+  focus.** Cmd-Tab or Alt-Tab is pressed in the window and released in the
+  next one, so the guest kept those keys (and any held mouse button) down: a
+  stuck Shift made Motif scrollbars ignore every click. On focus loss the
+  window now releases everything the guest still sees held.
+- **Right Cmd releases the grab on macOS**, like Right Ctrl, which Mac
+  keyboards lack.
+
 ### Build / features
 
 - **Retired the `chd`, `camera`, `ultra64`, `daynaport`, `ip28`, `ppmem`,

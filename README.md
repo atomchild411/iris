@@ -525,8 +525,10 @@ Manual/raw paths (if you want to drive `dd` yourself):
 ## Input
 
 Click the window to grab mouse and keyboard. In the `iris` window Right Ctrl
-releases the grab; in `iris-gui` it is Ctrl+Alt (Option+Command on macOS), with
-Ctrl+Alt+Esc as a fallback. Mouse and keyboard use standard PS/2 emulation
+releases the grab (on macOS Right Cmd does too, since Mac keyboards have no
+Right Ctrl); in `iris-gui` it is Ctrl+Alt (Option+Command on macOS), with
+Ctrl+Alt+Esc as a fallback. When the window loses focus, keys and mouse
+buttons still held in the guest are released. Mouse and keyboard use standard PS/2 emulation
 through the IOC, including an IntelliMouse scroll wheel. Keys are sent by
 physical position, so set IRIX's `keybd` to your layout.
 
