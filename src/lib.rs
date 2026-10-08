@@ -155,6 +155,7 @@ pub mod traits;
 pub mod devlog;
 pub mod prombin;
 pub mod prombini2;
+pub mod prombinip28;
 pub mod ppmem;
 pub mod machine;
 pub mod platform;
