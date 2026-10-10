@@ -390,8 +390,12 @@ struct IocTimerCallback {
 
 impl TimerCallback for IocTimerCallback {
     fn callback(&self) {
-        if let Some(t) = self.ticks.get() {
-            t.fetch_add(1, Ordering::Relaxed);
+        // Only timer 1, the fast clock: timer 0's 100 Hz system clock on top
+        // of it read as 1100 Hz.
+        if self.source == IocInterrupt::Mappable1 {
+            if let Some(t) = self.ticks.get() {
+                t.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let mut state = self.state.lock();
         match self.source {
@@ -550,11 +554,12 @@ impl Ioc {
         let _ = self.event_tx.set(tx);
     }
 
-    /// Count the kernel's clock ticks into the status bar's Hz counter. IRIX
-    /// keeps time with the 8254 (timer 0 is the system clock, timer 1 the
-    /// profiling clock) unless the IOC's 8254 is known broken, in which case
-    /// it uses CP0 Compare, which the CPU already counts. Either way the
-    /// counter shows the kernel's tick rate, and never both at once.
+    /// Count the kernel's fast clock into the status bar's Hz counter. IRIX
+    /// keeps time with the 8254 (timer 0 is the 100 Hz system clock, timer 1
+    /// the 1000 Hz fast clock, parked when nothing needs it) unless the IOC's
+    /// 8254 is known broken, in which case the fast clock is CP0 Compare,
+    /// which the CPU already counts. Only timer 1 is counted here, so either
+    /// way the counter shows the fast clock, and never both at once.
     pub fn set_clock_ticks(&self, ticks: Arc<AtomicU64>) {
         let _ = self.clock_ticks.set(ticks);
     }

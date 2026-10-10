@@ -14,6 +14,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### UI / input
 
+- **The status bar's Hz is the fast clock again on Indigo2 and IP28.** It
+  counted both 8254 timers, timer 0 (the 100 Hz system clock) and timer 1
+  (the 1000 Hz fast clock), so a healthy IP28 read 1100 Hz and looked like a
+  mis-calibrated CPU. It now counts timer 1 only, the clock Indy's figure
+  (CP0 Compare) has always shown. IRIX's own calibration was right all along:
+  `timer_freq` is 97500000 (195 MHz) on a live IP28 kernel.
 - **The `iris` window lets go of held keys and buttons when it loses
   focus.** Cmd-Tab or Alt-Tab is pressed in the window and released in the
   next one, so the guest kept those keys (and any held mouse button) down: a

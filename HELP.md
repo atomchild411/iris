@@ -44,8 +44,11 @@ The guest's MHz comes from the CP0 Count rate, which is fixed: Count ticks at
 no calibration or inference. Override it with `[clock] fixed_mhz` or
 `--clock-fixed-mhz` if a guest needs something else.
 
-The status bar **Hz** value counts the guest's clock ticks: CP0 Compare (IP7)
-matches or IOC 8254 timer interrupts, depending on the kernel's timer source.
+The status bar **Hz** value counts the guest kernel's fast clock: CP0 Compare
+(IP7) matches, or IOC 8254 timer 1 interrupts, depending on the kernel's timer
+source. IRIX on Indigo2 and IP28 keeps time with the 8254: timer 0 is the
+100 Hz system clock and timer 1 the 1000 Hz fast clock (parked when nothing
+needs it), so the figure reads 1000 while the fast clock runs.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
