@@ -159,6 +159,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Monitor and serial ports
 
+- **`ioc ticks`**: how the guest keeps up with the 8254 timers. Per timer:
+  ticks fired, ticks the guest acknowledged, ticks that landed on a still
+  pending one (merged, never seen by the guest) and a histogram of
+  fire-to-acknowledge waits, for the window since the previous call. IRIX
+  refills its audio rings from the 1 kHz fast clock, so a host too busy to
+  service it shows here as merged ticks and long waits before it is heard.
 - **2026-10-04 — Configurable monitor port** (`d8b8131`): top-level
   `monitor_port` / `--monitor-port`, default `8888`. The terminal connects
   only to its own machine's bound listener; a failed bind no longer attaches
