@@ -3935,6 +3935,50 @@ mod jit_tests {
         );
     }
 
+    /// `rex jit disable` takes a shape out of dispatch, where prebuilt and
+    /// Cranelift shaders both live, keeps it from being compiled again, and
+    /// `rex jit enable` puts the same shader back. It used to change only the
+    /// JIT's own record, so a "disabled" shader went on drawing.
+    #[test]
+    fn rex_jit_disable_takes_a_shape_out_of_dispatch() {
+        use crate::traits::Device;
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_BLOCK;
+        let rex = make_rex3_jit();
+        rex3init(rex);
+        let draw = |rex: &Rex3| {
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,   0xFF);
+            reg(rex, REX3_COLORI,   0x5A);
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+            reg(rex, REX3_XYENDI,   xy(3, 3));
+            reg_go(rex, REX3_DRAWMODE0, dm0);
+        };
+        draw(rex);
+        let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+        let jit = rex.rex_jit.as_ref().unwrap();
+        assert!(jit.wait_compiled(dm0, dm1, cm), "compile failed");
+        let key = (dm0, dm1, cm);
+        let f = *rex.shaders.read().get(&key).expect("compiled shader not published");
+        let args = |verb: &'static str| -> Vec<String> {
+            vec!["jit".into(), verb.into(), format!("{dm0:x}"), format!("{dm1:x}"), format!("{cm:x}")]
+        };
+        let run = |verb: &'static str| {
+            let a = args(verb);
+            let a: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+            rex.execute_command("rex", &a, Box::new(std::io::sink())).unwrap();
+        };
+        run("disable");
+        assert!(rex.shaders.read().get(&key).is_none(), "disabled shape still dispatched");
+        draw(rex); // generic path; must not compile it back in
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(rex.shaders.read().get(&key).is_none(), "disabled shape was compiled again");
+        assert!(dump_region(rex, 0, 0, 3, 3).iter().all(|&p| p & 0xFF == 0x5A), "generic path did not draw");
+        run("enable");
+        let back = *rex.shaders.read().get(&key).expect("enabled shape not dispatched");
+        assert!(back as usize == f as usize, "enable restored a different shader");
+    }
+
     /// I_LINE CI8 solid line — covers the basic Bresenham loop.
     #[test]
     fn jit_iline_ci8_solid() {

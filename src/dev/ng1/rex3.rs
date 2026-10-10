@@ -1377,6 +1377,19 @@ pub struct Rex3 {
     pub shaders: Arc<RwLock<crate::dev::ng1::rex3_shape::ShapeMap<crate::dev::ng1::rex3_shaders::ShaderFn>>>,
     /// One-entry memo in front of `shaders`, on the GFIFO consumer thread only.
     pub shader_last: std::cell::Cell<(u32, u32, u32, Option<crate::dev::ng1::rex3_shaders::ShaderFn>)>,
+    /// `shader_epoch` when `shader_last` was filled: the memo is trusted only
+    /// while they match. GFIFO consumer thread only.
+    pub shader_last_epoch: std::cell::Cell<u32>,
+    /// Bumped whenever a shape is taken out of `shaders` or put back
+    /// (`rex jit disable|enable`), from the monitor thread, so the consumer
+    /// drops a memo that may hold a disabled shader.
+    pub shader_epoch: AtomicU32,
+    /// Shapes taken out of dispatch by `rex jit disable`, with the shader they
+    /// had (prebuilt or Cranelift), restored by `rex jit enable`. While a shape
+    /// is here it runs on the generic path and is not compiled again.
+    pub disabled_shaders: Mutex<crate::dev::ng1::rex3_shape::ShapeMap<Option<crate::dev::ng1::rex3_shaders::ShaderFn>>>,
+    /// Whether `disabled_shaders` is non-empty: spares the lookup miss path the lock.
+    pub any_disabled: AtomicBool,
     /// Every draw shape this run has dispatched — the corpus the shader
     /// generator consumes.
     ///
@@ -1560,6 +1573,10 @@ impl Rex3 {
             // `rex3_shaders::lookup` directly.
             shaders: Arc::clone(&shaders_shared),
             shader_last: std::cell::Cell::new((0, 0, 0, None)),
+            shader_last_epoch: std::cell::Cell::new(0),
+            shader_epoch: AtomicU32::new(0),
+            disabled_shaders: Mutex::new(crate::dev::ng1::rex3_shape::ShapeMap::default()),
+            any_disabled: AtomicBool::new(false),
             seen_shapes: Mutex::new(crate::dev::ng1::rex3_shape::ShapeSet::default()),
             #[cfg(feature = "rex-jit")]
             jit_last: std::cell::Cell::new((0, 0, 0, None)),
@@ -2773,20 +2790,29 @@ impl Rex3 {
                 let cm = ctx.clipmode & CLIPMODE_JIT_KEY_MASK;
                 // Fast path: same key as the last GO — skip the map lookup.
                 let last = self.shader_last.get();
-                let entry = if last.0 == dm0 && last.1 == dm1 && last.2 == cm && last.3.is_some() {
+                let epoch = self.shader_epoch.load(Ordering::Relaxed);
+                let entry = if last.0 == dm0 && last.1 == dm1 && last.2 == cm && last.3.is_some()
+                    && self.shader_last_epoch.get() == epoch
+                {
                     last.3
                 } else {
                     let e = self.shaders.read().get(&(dm0, dm1, cm)).copied();
                     if e.is_some() {
                         self.shader_last.set((dm0, dm1, cm, e));
+                        self.shader_last_epoch.set(epoch);
                     } else {
                         // Nothing precompiled for this shape. Ask Cranelift to
                         // build one (if it is compiled in) and run the generic
                         // path meanwhile; without rex-jit the generic path is
-                        // simply what always runs for uncovered shapes.
+                        // simply what always runs for uncovered shapes. A shape
+                        // `rex jit disable` took out stays on the generic path.
                         #[cfg(feature = "rex-jit")]
                         if let Some(ref jit) = self.rex_jit {
-                            jit.request_compile(dm0, dm1, cm);
+                            if !(self.any_disabled.load(Ordering::Relaxed)
+                                && self.disabled_shaders.lock().contains_key(&(dm0, dm1, cm)))
+                            {
+                                jit.request_compile(dm0, dm1, cm);
+                            }
                         }
                     }
                     e
@@ -3878,12 +3904,31 @@ impl Device for Rex3 {
                         u32::from_str_radix(cm_s.trim_start_matches("0x"), 16)
                             .map_err(|_| format!("bad cm: {cm_s}"))?
                     } else { 0 };
+                    // Dispatch reads `shaders`, prebuilt and Cranelift entries
+                    // alike, so that is where a shape is taken out and put back;
+                    // the JIT's own record follows.
+                    let key = (dm0, dm1, cm);
+                    let mut disabled = self.disabled_shaders.lock();
+                    let had = if enable {
+                        disabled.remove(&key).map(|f| {
+                            if let Some(f) = f { self.shaders.write().insert(key, f); }
+                        }).is_some()
+                    } else if !disabled.contains_key(&key) {
+                        let f = self.shaders.write().remove(&key);
+                        disabled.insert(key, f);
+                        f.is_some()
+                    } else {
+                        false
+                    };
+                    self.any_disabled.store(!disabled.is_empty(), Ordering::Relaxed);
+                    drop(disabled);
+                    self.shader_epoch.fetch_add(1, Ordering::Relaxed);
                     if let Some(ref jit) = self.rex_jit {
                         if enable { jit.enable_shader(dm0, dm1, cm); } else { jit.disable_shader(dm0, dm1, cm); }
-                        self.jit_last.set((0, 0, 0, None));
-                        writeln!(writer, "Shader dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}: {}",
-                            if enable { "enabled" } else { "disabled" }).unwrap();
                     }
+                    writeln!(writer, "Shader dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}: {}{}",
+                        if enable { "enabled" } else { "disabled" },
+                        if had { "" } else { " (no shader was dispatched for it)" }).unwrap();
                 }
                 _ => return Err("Usage: rex jit <on|off|status|list> | rex jit <disable|enable> <dm0_hex> <dm1_hex> [cm_hex]".to_string()),
             }

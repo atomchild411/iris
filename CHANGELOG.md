@@ -166,6 +166,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Monitor and serial ports
 
+- **`rex jit disable` works again.** Since prebuilt and Cranelift shaders
+  share one dispatch map, disabling a shape only changed the JIT's own record
+  and the shader went on drawing. It now takes the shape out of dispatch
+  (whichever engine built it), keeps it from being compiled again, and
+  `rex jit enable` puts the same shader back.
 - **`ioc ticks`**: how the guest keeps up with the 8254 timers. Per timer:
   ticks fired, ticks the guest acknowledged, ticks that landed on a still
   pending one (merged, never seen by the guest) and a histogram of
