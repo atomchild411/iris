@@ -858,6 +858,7 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `pdma dump <on\|off\|hal\|scsi\|enet\|MASK>` | PDMA trace **[DEV]** |
 | `pdma chain <addr>` | Decode DMA descriptor chain at physical address |
 | `ioc status` | IOC interrupt controller state |
+| `ioc ticks` | 8254 timer service since the last call: ticks fired, acknowledged and merged, fire-to-acknowledge waits |
 | `rtc status` / `rtc dump` | Real-time clock registers (and any `[rtc_offset]`) / NVRAM dump |
 | `rtc save [file]` | Save RTC NVRAM to file |
 | `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
