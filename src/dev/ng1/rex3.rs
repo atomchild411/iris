@@ -380,6 +380,8 @@ bitfield! {
     pub ystride, _: 23;
 }
 
+pub const DRAWMODE0_ENZPATTERN: u32 = 1 << 12;
+
 pub const DRAWMODE0_OPCODE_NOOP: u32 = 0x0;
 pub const DRAWMODE0_OPCODE_READ: u32 = 0x1;
 pub const DRAWMODE0_OPCODE_DRAW: u32 = 0x2;
@@ -2579,7 +2581,11 @@ impl Rex3 {
                 }
 
                 if is_go {
-                    self.execute_go();
+                    if reg_offset == REX3_STEPZ {
+                        self.execute_stepz_go();
+                    } else {
+                        self.execute_go();
+                    }
                 }
 
                 // Advance head and release busy atomically — CPU thread sees all writes
@@ -2624,6 +2630,35 @@ impl Rex3 {
                 #[cfg(not(feature = "idle-pause"))]
                 backoff.snooze();
             }
+        }
+    }
+
+    /// A GO on STEPZ fails the Z pattern test for the current pixel only
+    /// (rex3.pdf: "Enables ZPATTERN (Z test fail) for one iteration"). IRIX's
+    /// software rasteriser on Newport steps over the pixels it must not write
+    /// this way, one GO per pixel (blast's billboards: transparent texels): the
+    /// iterators advance, and the pixel is not written, or is written in
+    /// COLORBACK under ZPOPAQUE. Run as a GO with ENZPATTERN on and only the
+    /// current pattern bit clear; the guest's ZPATTERN, and its bit position
+    /// when it had not enabled the pattern itself, are put back afterwards.
+    pub(crate) fn execute_stepz_go(&self) {
+        let (dm0, zpattern, bit, had) = {
+            let ctx = unsafe { &mut *self.context.get() };
+            let dm0 = ctx.drawmode0;
+            let had = dm0.enzpattern();
+            // execute_go restarts the pattern at bit 31 on DOSETUP
+            let bit = if dm0.dosetup() { 31 } else { ctx.zpat_bit };
+            let zpattern = ctx.zpattern;
+            ctx.zpattern = if had { zpattern } else { !0 } & !(1u32 << bit);
+            ctx.drawmode0 = DrawMode0(dm0.0 | DRAWMODE0_ENZPATTERN);
+            (dm0, zpattern, bit, had)
+        };
+        self.execute_go();
+        let ctx = unsafe { &mut *self.context.get() };
+        ctx.drawmode0 = dm0;
+        ctx.zpattern = zpattern;
+        if !had {
+            ctx.zpat_bit = bit;
         }
     }
 

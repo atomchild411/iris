@@ -7313,3 +7313,56 @@ fn precompiled_shaders_handle_batched_transfers() {
     }
 }
 
+
+/// A GO on STEPZ fails the Z pattern for its one pixel: IRIX's software
+/// rasteriser on Newport draws textured spans one GO per pixel and steps over
+/// transparent texels with STEPZ (blast's billboards drew their transparent
+/// corners, as smeared rows and solid white triangles, when STEPZ was ignored).
+/// The stepped pixel is left alone, or gets COLORBACK under ZPOPAQUE; the
+/// iteration still advances, so the next pixels land in place; and the
+/// guest's ZPATTERN is untouched.
+#[test]
+fn stepz_go_skips_its_pixel() {
+    const Y: i32 = 300;
+    const N: usize = 9;
+    const SENTINEL: u32 = 0x0012_3456;
+    const BACK: u32 = 0x0055_6677;
+    // A span with no STOPONX: one pixel per GO (DOSETUP, as IRIX sends it).
+    let one_px = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_SPAN_SH | DM0_DOSETUP;
+    for zpopaque in [false, true] {
+        let rex = make_rex3();
+        rex3init(rex);
+        {
+            let fb = unsafe { &mut *rex.fb_rgb.get() };
+            for x in 0..N { fb[Y as usize * 2048 + x] = SENTINEL; }
+        }
+        let dm0 = one_px | if zpopaque { 1 << 16 } else { 0 };
+        reg(rex, REX3_DRAWMODE0, dm0);
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0xFFFFFF);
+        reg(rex, REX3_ZPATTERN, 0x1234_5678);
+        reg(rex, REX3_COLORBACK, BACK);
+        reg(rex, REX3_COLORRED, 200u32 << 11);
+        reg(rex, REX3_COLORGRN, 150u32 << 11);
+        reg(rex, REX3_COLORBLUE, 100u32 << 11);
+        reg(rex, REX3_XYENDI, xy(N as i32 - 1, Y));
+        reg_go(rex, REX3_XYSTARTI, xy(0, Y)); // pixel 0, drawn
+        for x in 1..N {
+            if x % 2 == 1 {
+                reg_go(rex, REX3_STEPZ, 0);
+            } else {
+                reg_go(rex, REX3_DRAWMODE0, dm0);
+            }
+        }
+        rex.wait_idle();
+        let fb = unsafe { &*rex.fb_rgb.get() };
+        let drawn = fb[Y as usize * 2048];
+        assert!(drawn != SENTINEL && drawn != BACK, "pixel 0 not drawn: {drawn:#08x}");
+        for x in 0..N {
+            let got = fb[Y as usize * 2048 + x];
+            let want = if x % 2 == 0 { drawn } else if zpopaque { BACK } else { SENTINEL };
+            assert_eq!(got, want, "zpopaque={zpopaque} pixel {x}: {got:#08x}, want {want:#08x}");
+        }
+        assert_eq!(read_reg(rex, REX3_ZPATTERN), 0x1234_5678, "STEPZ changed the guest's ZPATTERN");
+    }
+}

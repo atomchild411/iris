@@ -99,6 +99,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
+- **Newport (REX3) honours STEPZ.** A GO on STEPZ fails the Z pattern test
+  for its one pixel (rex3.pdf): the iteration advances but the pixel is not
+  written (COLORBACK under ZPOPAQUE). IRIX's software rasteriser draws
+  textured, alpha-tested spans one GO per pixel and skips rejected texels
+  this way; the emulator drew them, so `blast -T`'s billboards showed their
+  transparent corners as smeared rows and solid white triangles. See
+  `rules/rex3/stepz-steps-over-one-pixel.md`.
 - **2026-10-09 — Newport (REX3) blends again under IRIX OpenGL.**
   DRAWMODE1's BLENDALPHA bit was applied to every channel, so with it clear
   `BF_SA` was 1.0 for red, green and blue too and nothing was ever
