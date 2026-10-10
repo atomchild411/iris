@@ -99,6 +99,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
+- **Newport glReadPixels from a double-buffered window reads the right
+  buffer with the REX JIT.** The compiled READ shader ignored DBLSRC (and the
+  bit offsets of the overlay, popup and CID planes), so once a 12-bit
+  double-buffered readback shape was compiled, every read after the first
+  returned the other buffer's pixels. Its screen-to-screen copy had the same
+  gap for RGB. Both now take the plane's bits as the interpreter does. See
+  `rules/rex3/jit-reads-take-the-plane-bits.md`.
 - **Newport (REX3) honours STEPZ.** A GO on STEPZ fails the Z pattern test
   for its one pixel (rex3.pdf): the iteration advances but the pixel is not
   written (COLORBACK under ZPOPAQUE). IRIX's software rasteriser draws

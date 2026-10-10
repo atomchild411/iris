@@ -3935,6 +3935,32 @@ mod jit_tests {
         );
     }
 
+    /// SCR2SCR from the second buffer of a 12-bit double-buffered RGB window
+    /// (DBLSRC): the compiled source read took the first buffer.
+    #[test]
+    fn jit_scr2scr_rgb12_dblsrc() {
+        let dm1 = DRAWMODE1_PLANES_RGB | DRAWMODE1_DRAWDEPTH_12 << 3 | 1 << 5 | 1 << 15
+            | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
+        compare_jit_interp(16, 0, 23, 3,
+            |rex| {
+                unsafe {
+                    let fb = &mut *rex.fb_rgb.get();
+                    for y in 0..4u32 {
+                        for x in 0..8u32 {
+                            fb[(y * 2048 + x) as usize] = 0x0012_3456u32.wrapping_mul(y * 8 + x + 3) & 0xFF_FFFF;
+                        }
+                    }
+                }
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                reg(rex, REX3_XYMOVE,   (16u32 << 16) | 0);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 3));
+            },
+            DM0_SCR2SCR, dm1,
+        );
+    }
+
     /// `rex jit disable` takes a shape out of dispatch, where prebuilt and
     /// Cranelift shaders both live, keeps it from being compiled again, and
     /// `rex jit enable` puts the same shader back. It used to change only the
@@ -4427,6 +4453,91 @@ mod jit_tests {
 
         assert_eq!(words_interp, words_jit,
             "RGB24 HOSTR JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
+
+    /// A HOSTR READ of one row, `width` pixels from (0, 0) with RGB and aux
+    /// planes filled with distinct values, must hand back the same words from
+    /// the compiled shader as from the interpreter.
+    fn assert_hostr_jit_matches_interp(dm0_read: u32, dm1: u32, width: i32) {
+        let rgb: Vec<u32> = (0..width as u32).map(|i| 0x0012_3456u32.wrapping_mul(i + 3) & 0xFF_FFFF).collect();
+        let aux: Vec<u32> = (0..width as u32).map(|i| 0x0009_A5C3u32.wrapping_mul(i + 5) & 0xFF_FFFF).collect();
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                (&mut *rex.fb_rgb.get())[..width as usize].copy_from_slice(&rgb);
+                (&mut *rex.fb_aux.get())[..width as usize].copy_from_slice(&aux);
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFFFFFF);
+            reg(rex, REX3_XYENDI,    xy(width - 1, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+        };
+        let host_count = {
+            let m = crate::dev::ng1::rex3_shape::unpack(dm0_read, dm1, 0);
+            match (m.rwpacked != 0, m.hostdepth) {
+                (false, _) => 1,
+                (true, DRAWMODE1_HOSTDEPTH_4) => 8,
+                (true, DRAWMODE1_HOSTDEPTH_8) => 4,
+                (true, DRAWMODE1_HOSTDEPTH_12) => 2,
+                (true, _) => 1,
+            }
+        };
+        let words = (width + host_count - 1) / host_count;
+        let read_words = |rex: &Rex3| -> Vec<u32> {
+            setup_read(rex);
+            reg_go(rex, REX3_DRAWMODE0, dm0_read);
+            (0..words).map(|i| if i < words - 1 { read_hostrw32(rex) } else { read_hostrw32_last(rex) }).collect()
+        };
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        let words_interp = read_words(rex_i);
+        assert!(words_interp.iter().any(|&w| w != 0), "interpreter read nothing: vacuous");
+
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        let _ = read_words(rex_j); // trigger compile
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0_read, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
+                "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
+        }
+        let words_jit = read_words(rex_j);
+        assert_eq!(words_interp, words_jit,
+            "HOSTR JIT/interp mismatch dm0={dm0_read:#010x} dm1={dm1:#010x}:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
+
+    /// IRIX's glReadPixels from a 12-bit double-buffered RGB window: DRAWMODE0
+    /// 0x65 (READ BLOCK DOSETUP COLORHOST), DRAWMODE1 0x3565fbb1 (12-bit RGB,
+    /// 32-bit host words, DBLSRC, RWPACKED, SWAPENDIAN, plus the DITHER and
+    /// BLEND bits a READ ignores) exactly as captured from the guest. The
+    /// compiled shader read the first buffer whatever DBLSRC said, so the
+    /// readback after warm-up was the other buffer's pixels.
+    #[test]
+    fn jit_hostr_rgb12_dblsrc_swapendian_irix_readpixels() {
+        assert_hostr_jit_matches_interp(0x65, 0x3565_fbb1, 8);
+    }
+
+    /// The same read from the first buffer, and from the second buffer of the
+    /// 4- and 8-bit RGB depths.
+    #[test]
+    fn jit_hostr_rgb_depths_and_buffers() {
+        let base = 0x3565_fbb1 & !0x3f; // planes, drawdepth, dblsrc cleared
+        for depth in [DRAWMODE1_DRAWDEPTH_4, DRAWMODE1_DRAWDEPTH_8, DRAWMODE1_DRAWDEPTH_12] {
+            for dblsrc in [0, 1u32] {
+                assert_hostr_jit_matches_interp(0x65, base | DRAWMODE1_PLANES_RGB | depth << 3 | dblsrc << 5, 8);
+            }
+        }
+    }
+
+    /// Overlay, popup and CID planes live in the aux framebuffer at their own
+    /// bit offsets (and DBLSRC picks the second one): the compiled HOSTR read
+    /// took the raw low bits instead.
+    #[test]
+    fn jit_hostr_aux_planes() {
+        let base = 0x3565_fbb1 & !(0x3f | 1 << 15); // CI: rgbmode off
+        for planes in [DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_CID] {
+            for dblsrc in [0, 1u32] {
+                assert_hostr_jit_matches_interp(0x65, base | planes | DRAWMODE1_DRAWDEPTH_8 << 3 | dblsrc << 5, 8);
+            }
+        }
     }
 
     /// Multi-row HOSTR block with STOPONY *not* set — mirrors the real cursor
