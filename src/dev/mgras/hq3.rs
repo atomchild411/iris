@@ -1539,3 +1539,43 @@ pub fn token_name(t: u32) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{BusRead8, BUS_OK};
+
+    /// RAM the bus maps directly (`mem_ptr`), big-endian: byte `a` at `a`.
+    struct Ram(Vec<u8>);
+
+    impl BusDevice for Ram {
+        fn read8(&self, addr: u32) -> BusRead8 {
+            BusRead8::ok(self.0[addr as usize])
+        }
+        fn mem_ptr(&self, addr: u32) -> Option<*const u64> {
+            Some(self.0[addr as usize..].as_ptr() as *const u64)
+        }
+        fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 {
+            for (i, w) in buf.iter_mut().enumerate() {
+                let at = addr as usize + 8 * i;
+                *w = u64::from_be_bytes(self.0[at..at + 8].try_into().unwrap());
+            }
+            BUS_OK
+        }
+    }
+
+    /// `read_host` from directly mapped RAM gives the bytes a byte read
+    /// would, for every alignment and length within a page.
+    #[test]
+    fn read_host_matches_byte_reads() {
+        let ram = Ram((0..0x2000u32).map(|i| (i * 7 + (i >> 8)) as u8).collect());
+        for pa in [0x1000u32, 0x1001, 0x1003, 0x1007, 0x1008, 0x10F5] {
+            for len in [0usize, 1, 5, 7, 8, 9, 16, 23, 64, 0x100] {
+                let mut fast = vec![0u8; len];
+                read_host(&ram, pa, &mut fast);
+                let slow: Vec<u8> = (0..len as u32).map(|i| ram.read8(pa + i).data).collect();
+                assert_eq!(fast, slow, "pa {pa:#x} len {len}");
+            }
+        }
+    }
+}
