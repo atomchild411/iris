@@ -2518,6 +2518,19 @@ impl Gl {
         sink.rss_write(te_reg::TL_T_BOTTOM, t0, false);
         sink.rss_write(re::XFRSIZE, (h as u32) << 16 | w as u32, false);
         sink.rss_write(re::XFRCONTROL, TE_LOAD_START, false);
+        // Four byte components a texel, taken as they come: the row as is.
+        if !float && comp == 1 && bpt == 4 && (raw || (!alpha_class && n_ext == nc)) {
+            let mut line = vec![0u8; w * 4];
+            for row in 0..h {
+                let at = (row * pitch).min(bytes.len());
+                let n = (w * 4).min(bytes.len() - at);
+                line[..n].copy_from_slice(&bytes[at..at + n]);
+                line[n..].fill(0);
+                sink.dma_write_line(row as u32, &line);
+            }
+            sink.rss_write(re::XFRCONTROL, 0, false);
+            return;
+        }
         for row in 0..h {
             let mut line = Vec::with_capacity(w * 4);
             for col in 0..w {
