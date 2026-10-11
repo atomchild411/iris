@@ -2015,6 +2015,27 @@ fn gl_texture_one_component_bytes_are_the_texels() {
     }
 }
 
+/// An RGBA level loaded while TEXMODE1 still holds an alpha texture's
+/// class (the texture drawn before it) keeps its four components: the
+/// class only picks alpha out for one-component textures. It used to store
+/// [alpha, 0, 0, 0], and Dear ImGui's glyphs, added to its RGBA atlas after
+/// Discord Messenger's alpha atlas was drawn, came out invisible.
+#[test]
+fn gl_texture_rgba_load_ignores_a_stale_alpha_class() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    gl_tex_level_tm(&m, 0, 4, 0, &[0x1122_33C4; 16], 1, 0.0, 0x34026, 0x40246);
+    let _sub = m.submit.lock();
+    m.wait_idle();
+    let rss = unsafe { &*m.rss.get() };
+    let off = super::te1::small_offset(4);
+    // One 32-bit cell: R G B A, each 8 bits, low nibble first.
+    let cell: Vec<char> = rss.te.nibbles_hex(off * 8, 8).chars().collect();
+    let comp = |k: usize| u32::from_str_radix(&format!("{}{}", cell[2 * k + 1], cell[2 * k]), 16).unwrap();
+    assert_eq!([comp(0), comp(1), comp(2), comp(3)], [0x11, 0x22, 0x33, 0xC4]);
+    drop(_sub);
+    m.stop_engines();
+}
+
 /// The select bits mean nothing for textures that fill the cell: TyrQuake
 /// draws RGBA textures with TEXMODE1 0x409D9 (bits 8:7 = 3).
 #[test]

@@ -2536,7 +2536,12 @@ impl Gl {
                     // TEXMODE1 after loading it (traced: a GL_LUMINANCE
                     // load following a GL_ALPHA one still saw class 1).
                     (1, 1) => [lum, 0, 0, 0],
-                    _ if alpha_class => [alpha, 0, 0, 0],
+                    // The class picks alpha out of a wider host texel only
+                    // for a one-component texture: an RGBA texture's
+                    // sub-image arriving under a stale alpha class (Dear
+                    // ImGui's atlas updated after an alpha glyph atlas was
+                    // drawn) is RGBA all the same.
+                    _ if alpha_class && nc == 1 => [alpha, 0, 0, 0],
                     (n, c) if n == c => [src(0), src(1), src(2), src(3)],
                     (1 | 2, 4) => [lum, lum, lum, alpha],
                     (1 | 2, 3) => [lum, lum, lum, 0],
