@@ -510,11 +510,19 @@ impl Mgras {
         }
     }
 
-    /// Raster engines for a board: Maximum Impact's two, unless
-    /// `IRIS_MGRAS_ENGINES=1` asks for one thread to draw every scanline.
+    /// Raster engine threads for a board: Maximum Impact's two, the others'
+    /// one, unless `IRIS_MGRAS_ENGINES` (1 or 2) says otherwise. Two threads
+    /// on a one-engine board split its scanlines the same way (row y to
+    /// thread y % 2) without changing anything the guest sees: where a row
+    /// lives in pixel memory follows DRBsize (`Buffer::locate`), not the
+    /// thread count, and the threads share pixel memory and TRAM.
     fn engines_for(board: GraphicsBoard) -> usize {
-        let one = std::env::var("IRIS_MGRAS_ENGINES").is_ok_and(|v| v.trim() == "1");
-        if board == GraphicsBoard::MaxImpact && !one { 2 } else { 1 }
+        match std::env::var("IRIS_MGRAS_ENGINES").ok().as_deref().map(str::trim) {
+            Some("1") => 1,
+            Some("2") => 2,
+            _ if board == GraphicsBoard::MaxImpact => 2,
+            _ => 1,
+        }
     }
 
     /// True when the raster engines have run everything queued to them.
