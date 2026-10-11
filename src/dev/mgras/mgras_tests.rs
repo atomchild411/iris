@@ -639,6 +639,43 @@ fn gl_depth_test_hides_the_farther_triangle() {
     m.stop_engines();
 }
 
+/// A window reaching past the screen's edge has a negative origin half
+/// (traced: Quake III at 1280x1024, its window taller than the screen with
+/// the title bar, origin 0xffe00008: x 8, y -32). Its clears must land in
+/// the visible part. Read unsigned, y was 65504 and the clear was dropped,
+/// so the depth buffer kept the previous window's values and the 3D view
+/// showed only inside that window's old rectangle.
+#[test]
+fn gl_clear_in_a_window_with_a_negative_origin() {
+    let m = live_board();
+    x_server(&m);
+    // 400x300 at (8, -32): its bottom 32 rows are off screen, the screen
+    // mask covers the visible rows 0..267.
+    write(&m, 32, 0x50050, 0x4FC);
+    let mut img = [0u32; 63];
+    img[0] = SLOT_C;
+    img[2] = 8 | (-32i32 as u32 & 0xFFFF) << 16;
+    img[3] = 0x11;
+    img[11] = 8 << 16 | (8 + 400 - 1);
+    img[12] = 267;
+    img[13] = 0x240;
+    (img[16], img[17]) = (1, 1);
+    for wd in img {
+        write(&m, 32, CFIFO, wd as u64);
+    }
+    wait_flag(&m, 1 << 6);
+    gl_setup_window(&m, 400, 300, [1.0, 0.0, 0.0]);
+    // The scissor box over the whole window, scissor test on, as Quake III
+    // has it: clamping the unsigned misread to it left nothing to clear.
+    fifo_token(&m, 0x39, &[0, 399, 0, 299]);
+    fifo_token(&m, 0x6E, &[1]);
+    fifo_token(&m, 0x15, &[]);
+    // Window (100, 100) is screen (108, 68) from the bottom.
+    assert_eq!(m.fb_pixel(108, 1023 - 68) & 0xFF_FFFF, 0x00_00FF, "cleared to red");
+    assert_eq!(m.fb_pixel(108, 1023 - 300) & 0xFF_FFFF, 0, "above the window: untouched");
+    m.stop_engines();
+}
+
 /// Back-face culling: a clockwise triangle (back facing with the default
 /// front face, counter-clockwise) is dropped; with culling off it draws.
 #[test]

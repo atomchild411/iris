@@ -2018,7 +2018,13 @@ impl Gl {
             sink.note("GL clear before the kernel gave the window".into());
             return;
         }
-        let (ox, oy) = ((w.origin & 0xFFFF) as i32, (w.origin >> 16) as i32);
+        // The origin's halves are signed: a window that reaches past the
+        // screen's top or left edge (one taller than the screen with its
+        // title bar) has a negative one (traced: 0xffe00008, x 8, y -32).
+        // Read unsigned, y was 65504, the clear landed off screen and was
+        // dropped: the depth buffer kept the last window's values, and the
+        // 3D view showed only where those let it through.
+        let (ox, oy) = (super::rss::signed16(w.origin), super::rss::signed16(w.origin >> 16));
         let [mx, my] = w.masks[0];
         let (mut x0, mut x1) = ((mx >> 16) as i32 - ox, (mx & 0xFFFF) as i32 - ox);
         let (mut y0, mut y1) = ((my >> 16) as i32 - oy, (my & 0xFFFF) as i32 - oy);
