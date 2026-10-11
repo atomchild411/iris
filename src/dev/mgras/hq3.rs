@@ -909,7 +909,8 @@ impl Hq3Engine {
     }
 
     /// The host DMA engine's start word. Host to board runs now: the raster
-    /// engine was armed first. Board to host waits for the raster engine.
+    /// engine was armed by commands queued ahead. Board to host waits for
+    /// the raster engine.
     fn dma_start(&mut self, word: u32, sink: &mut dyn Hq3Sink) {
         if word & 1 == 0 {
             return;
@@ -938,10 +939,11 @@ impl Hq3Engine {
             }
             return;
         }
-        match sink.transfer() {
-            Some((false, _)) => self.dma(word, DmaPeer::Raster, sink),
-            _ => sink.note(format!("host DMA start {word:#x} with no write transfer armed")),
-        }
+        // No wait for the raster engine: the lines queue behind everything
+        // ahead of them, and the engine checks for an armed write transfer
+        // when they arrive (`Rss::dma_write_line`). Waiting here stalled
+        // the CPU, the HQ and the engines in turn on every texture load.
+        self.dma(word, DmaPeer::Raster, sink);
     }
 
     /// The ERAM pass-through commands (see `cmd::CP_ERAM_*`), on GE0's
@@ -1185,11 +1187,14 @@ impl Hq3Engine {
                     mem.write8(pa, *b);
                 }
             } else {
-                let mut bytes = Vec::with_capacity(len as usize);
-                for k in 0..len {
+                let mut bytes = vec![0u8; len as usize];
+                let mut k = 0;
+                while k < len {
+                    // One page at a time: contiguous in host memory.
+                    let n = (0x1000 - ((a + k) & 0xFFF)).min(len - k);
                     let Some(pa) = phys(a + k) else { return };
-                    let r = mem.read8(pa);
-                    bytes.push(if r.is_ok() { r.data } else { 0 });
+                    read_host(&*mem, pa, &mut bytes[k as usize..(k + n) as usize]);
+                    k += n;
                 }
                 if i == 0 && sink.tracing() {
                     sink.trace(format!("  DMA line 0 from {a:#x}: {:02x?}", &bytes[..bytes.len().min(32)]));
@@ -1203,6 +1208,29 @@ impl Hq3Engine {
                 }
             }
         }
+    }
+}
+
+/// Host memory bytes from `pa` into `out`, all within one page. RAM the bus
+/// maps directly is read a doubleword at a time; anything else (and the
+/// record/replay wrappers, whose recordings are byte reads) a byte at a
+/// time, 0 where a read fails.
+fn read_host(mem: &dyn BusDevice, pa: u32, out: &mut [u8]) {
+    let base = pa & !7;
+    if mem.mem_ptr(base).is_some() {
+        let skip = (pa - base) as usize;
+        let mut buf = vec![0u64; (skip + out.len()).div_ceil(8)];
+        if mem.read_block(base, &mut buf) == crate::traits::BUS_OK {
+            for (i, b) in out.iter_mut().enumerate() {
+                let at = skip + i;
+                *b = (buf[at / 8] >> (56 - 8 * (at % 8))) as u8;
+            }
+            return;
+        }
+    }
+    for (i, b) in out.iter_mut().enumerate() {
+        let r = mem.read8(pa + i as u32);
+        *b = if r.is_ok() { r.data } else { 0 };
     }
 }
 

@@ -787,6 +787,8 @@ pub struct RssStats {
     pub pio_write_dw: u64,
     pub pio_read_dw: u64,
     pub dma_lines_in: u64,
+    /// DMA lines that came with no write transfer armed, dropped.
+    pub dma_lines_dropped: u64,
 }
 
 /// Registers a GL batch leaves as it set them when it ends (`gl_leave`
@@ -2335,9 +2337,15 @@ impl Rss {
             self.te_write(|te, regs| te.load_line(regs, line, bytes));
             return;
         }
-        if let Some(x) = self.xfer.take() {
-            self.put_line(&x, line, bytes);
-            self.xfer.set(Some(x));
+        match self.xfer.take() {
+            Some(x) if !x.read => {
+                self.put_line(&x, line, bytes);
+                self.xfer.set(Some(x));
+            }
+            x => {
+                self.xfer.set(x);
+                self.stats.dma_lines_dropped += 1;
+            }
         }
     }
 

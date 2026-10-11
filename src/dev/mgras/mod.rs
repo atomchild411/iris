@@ -354,10 +354,15 @@ impl Hq3Sink for HqSink<'_> {
         Some((rss.transfer_armed()?, rss.transfer_shape()?))
     }
     fn dma_write_line(&mut self, line: u32, bytes: &[u8]) {
-        let vals: Vec<u64> = bytes
-            .chunks(8)
-            .map(|c| c.iter().enumerate().fold(0u64, |a, (i, &b)| a | (b as u64) << (56 - 8 * i)))
-            .collect();
+        // Eight bytes to a FIFO word, the first in the high byte.
+        let mut vals: Vec<u64> = Vec::with_capacity(bytes.len().div_ceil(8));
+        let mut words = bytes.chunks_exact(8);
+        vals.extend(words.by_ref().map(|c| u64::from_be_bytes(c.try_into().unwrap())));
+        if !words.remainder().is_empty() {
+            let mut last = [0u8; 8];
+            last[..words.remainder().len()].copy_from_slice(words.remainder());
+            vals.push(u64::from_be_bytes(last));
+        }
         self.0.rss_fifo.push_batch(tag::DMA_LINE, line as u64 | (bytes.len() as u64) << 32, &vals);
         self.0.wake_rss();
     }
@@ -1149,6 +1154,7 @@ impl Mgras {
         let mut stale_seen = 0u32;
         let mut advances = 0u64;
         let mut payload: Vec<u64> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
         let cell = if id == 0 { &self.rss } else { &self.rss1 };
         let busy = &self.rss_busy[id];
         let pf_busy = crate::PfLevel::new();
@@ -1204,8 +1210,11 @@ impl Mgras {
                     payload.resize(len.div_ceil(8), 0);
                     let n = payload.len();
                     self.rss_fifo.drain_payload_at(id, n, &mut payload[..]);
-                    let bytes: Vec<u8> = payload.iter().flat_map(|w| w.to_be_bytes()).take(len).collect();
-                    rss.dma_write_line(line, &bytes);
+                    bytes.resize(8 * n, 0);
+                    for (b, w) in bytes.chunks_exact_mut(8).zip(&payload) {
+                        b.copy_from_slice(&w.to_be_bytes());
+                    }
+                    rss.dma_write_line(line, &bytes[..len]);
                     true
                 }
                 _ => false,
