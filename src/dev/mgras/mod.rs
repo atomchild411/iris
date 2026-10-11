@@ -96,6 +96,8 @@ const RSS_FIFO_DEPTH: usize = 1 << 20;
 /// Command FIFO words FIFOSTATUS counts at the top of `hq_fifo`
 /// (`cfifo_level`): room above the kernel's high-water mark of 32.
 const CFIFO_WORDS: usize = 64;
+/// Raster engine threads at most (`IRIS_MGRAS_ENGINES`).
+const MAX_ENGINES: usize = 4;
 
 /// FIFO entry tags. `hq_fifo`: command FIFO words carry their port (0 user,
 /// 1 privileged); `RSS | entry` is a direct raster write for the HQ3 to
@@ -295,6 +297,9 @@ pub struct Mgras {
     /// every `rss_fifo` entry, and each draws only its own scanlines
     /// (engine 0 the even ones), as the board's two RE4s do.
     rss1: UnsafeCell<Rss>,
+    /// Engines 2 and 3: more threads splitting the scanlines
+    /// (`IRIS_MGRAS_ENGINES=4`), row y to thread y % 4.
+    rss_more: [UnsafeCell<Rss>; MAX_ENGINES - 2],
     /// The pixel memory and clip-ID planes the engines draw into.
     planes: UnsafeCell<rss::Planes>,
     /// Raster engines running (2 on Maximum Impact, else 1).
@@ -305,9 +310,9 @@ pub struct Mgras {
     /// System memory, for the board's DMA (it is a GIO bus master).
     mem: SpinLock<Option<Arc<dyn BusDevice>>>,
     hq_fifo: GFifo<HQ_FIFO_DEPTH>,
-    rss_fifo: GFifo<RSS_FIFO_DEPTH, 2>,
+    rss_fifo: GFifo<RSS_FIFO_DEPTH, MAX_ENGINES>,
     hq_busy: AtomicBool,
-    rss_busy: [AtomicBool; 2],
+    rss_busy: [AtomicBool; MAX_ENGINES],
     /// Held by every producer while it pushes, and by anyone who needs the
     /// engines to stay idle (reads of drawing state, checkpoints, monitor).
     /// Holds the recording, so records come out in FIFO order.
@@ -318,12 +323,12 @@ pub struct Mgras {
     engines: AtomicBool,
     threads: SpinLock<Vec<thread::JoinHandle<()>>>,
     hq_thread: SpinLock<Option<thread::Thread>>,
-    rss_thread: [SpinLock<Option<thread::Thread>>; 2],
+    rss_thread: [SpinLock<Option<thread::Thread>>; MAX_ENGINES],
     /// The engine threads parked (`sleep`): producers unpark one only then,
     /// so a push reads a line nobody writes instead of taking the thread's
     /// slot lock. Each on its own cache line.
     hq_asleep: crossbeam_utils::CachePadded<AtomicBool>,
-    rss_asleep: [crossbeam_utils::CachePadded<AtomicBool>; 2],
+    rss_asleep: [crossbeam_utils::CachePadded<AtomicBool>; MAX_ENGINES],
     dirty: AtomicBool,
     running: AtomicBool,
     refresh: SpinLock<Option<thread::JoinHandle<()>>>,
@@ -431,19 +436,25 @@ impl Mgras {
             addr_of_mut!((*p).flags).write(AtomicU32::new(0));
             addr_of_mut!((*p).eng).write(UnsafeCell::new(Hq3Engine::new()));
             let planes = (*p).planes.get();
-            Rss::init((*p).rss.get(), planes);
-            Rss::init((*p).rss1.get(), planes);
             let nrss = Self::engines_for(board);
             addr_of_mut!((*p).nrss).write(nrss);
-            (*(*p).rss.get()).set_engine(0, (nrss > 1) as u32);
-            (*(*p).rss1.get()).set_engine(1, 1);
+            for id in 0..MAX_ENGINES {
+                let e = match id {
+                    0 => (*p).rss.get(),
+                    1 => (*p).rss1.get(),
+                    n => (*p).rss_more[n - 2].get(),
+                };
+                Rss::init(e, planes);
+                // Engine id draws the rows y with y % nrss == id.
+                (*e).set_engine(id as u32, (nrss - 1) as u32);
+            }
             (*p).rss_fifo.set_heads(nrss);
             addr_of_mut!((*p).mem).write(SpinLock::new(None));
             addr_of_mut!((*p).submit).write(SpinLock::new(None));
             addr_of_mut!((*p).mem_rec).write(SpinLock::new(None));
             addr_of_mut!((*p).threads).write(SpinLock::new(Vec::new()));
             addr_of_mut!((*p).hq_thread).write(SpinLock::new(None));
-            addr_of_mut!((*p).rss_thread).write([SpinLock::new(None), SpinLock::new(None)]);
+            addr_of_mut!((*p).rss_thread).write(std::array::from_fn(|_| SpinLock::new(None)));
             addr_of_mut!((*p).dirty).write(AtomicBool::new(true));
             addr_of_mut!((*p).refresh).write(SpinLock::new(None));
             addr_of_mut!((*p).renderer).write(Mutex::new(None));
@@ -485,8 +496,11 @@ impl Mgras {
         if self.nrss == 1 {
             register_spin("mgras::rss_thread", self, |m| &m.rss_thread[0]);
         } else {
-            register_spin("mgras::rss_thread[0]", self, |m| &m.rss_thread[0]);
-            register_spin("mgras::rss_thread[1]", self, |m| &m.rss_thread[1]);
+            let slots: [fn(&Self) -> &SpinLock<Option<thread::Thread>>; MAX_ENGINES] =
+                [|m| &m.rss_thread[0], |m| &m.rss_thread[1], |m| &m.rss_thread[2], |m| &m.rss_thread[3]];
+            for (id, get) in slots.into_iter().enumerate().take(self.nrss) {
+                register_spin(format!("mgras::rss_thread[{id}]"), self, get);
+            }
         }
         register_spin("mgras::refresh", self, |m| &m.refresh);
         register_spin("mgras::cycles", self, |m| &m.cycles);
@@ -547,15 +561,16 @@ impl Mgras {
     }
 
     /// Raster engine threads for a board: Maximum Impact's two, the others'
-    /// one, unless `IRIS_MGRAS_ENGINES` (1 or 2) says otherwise. Two threads
-    /// on a one-engine board split its scanlines the same way (row y to
-    /// thread y % 2) without changing anything the guest sees: where a row
-    /// lives in pixel memory follows DRBsize (`Buffer::locate`), not the
-    /// thread count, and the threads share pixel memory and TRAM.
+    /// one, unless `IRIS_MGRAS_ENGINES` (1, 2 or 4) says otherwise. More
+    /// threads than the board has engines split its scanlines the same way
+    /// (row y to thread y % n) without changing anything the guest sees:
+    /// where a row lives in pixel memory follows DRBsize (`Buffer::locate`),
+    /// not the thread count, and the threads share pixel memory and TRAM.
     fn engines_for(board: GraphicsBoard) -> usize {
         match std::env::var("IRIS_MGRAS_ENGINES").ok().as_deref().map(str::trim) {
             Some("1") => 1,
             Some("2") => 2,
+            Some("4") => 4,
             _ if board == GraphicsBoard::MaxImpact => 2,
             _ => 1,
         }
@@ -571,6 +586,15 @@ impl Mgras {
     /// already in `rss_fifo` when that is checked.
     fn idle(&self) -> bool {
         self.hq_fifo.is_empty() && !self.hq_busy.load(Ordering::Acquire) && self.rss_idle()
+    }
+
+    /// Raster engine `id`'s state.
+    fn engine_cell(&self, id: usize) -> &UnsafeCell<Rss> {
+        match id {
+            0 => &self.rss,
+            1 => &self.rss1,
+            n => &self.rss_more[n - 2],
+        }
     }
 
     /// Wake the raster engine threads.
@@ -1195,7 +1219,7 @@ impl Mgras {
         let mut advances = 0u64;
         let mut payload: Vec<u64> = Vec::new();
         let mut bytes: Vec<u8> = Vec::new();
-        let cell = if id == 0 { &self.rss } else { &self.rss1 };
+        let cell = self.engine_cell(id);
         let busy = &self.rss_busy[id];
         let pf_busy = crate::PfLevel::new();
         // Stored only when it changes (see `hq_loop`).
@@ -1307,8 +1331,9 @@ impl Mgras {
         self.pio_advances.store(0, Ordering::Release);
         // SAFETY: the engine threads are not running yet.
         unsafe {
-            (*self.rss.get()).share_te(self.nrss > 1);
-            (*self.rss1.get()).share_te(self.nrss > 1);
+            for id in 0..self.nrss {
+                (*self.engine_cell(id).get()).share_te(self.nrss as u32);
+            }
         }
         for id in 0..self.nrss {
             let me = Arc::clone(self);

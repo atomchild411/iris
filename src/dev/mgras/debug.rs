@@ -529,8 +529,9 @@ impl Mgras {
             let _sub = self.submit.lock();
             self.wait_idle();
             // SAFETY: the board is idle and `submit` keeps it so.
-            unsafe { &mut *self.rss.get() }.jit.mode = m;
-            unsafe { &mut *self.rss1.get() }.jit.mode = m;
+            for id in 0..super::MAX_ENGINES {
+                unsafe { &mut *self.engine_cell(id).get() }.jit.mode = m;
+            }
         }
         // SAFETY: read-only peek (may tear).
         let j = unsafe { &*self.rss.get() }.jit;

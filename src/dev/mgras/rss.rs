@@ -829,12 +829,12 @@ pub struct Planes {
     pub te_sync: TeSync,
 }
 
-/// Two engines' handshake around a write to their shared `Te1`: engine 1
-/// says how many writes it has reached (`arrived`), engine 0 how many it
-/// has made (`done`). Valid zeroed.
+/// The engines' handshake around a write to their shared `Te1`: each
+/// engine but 0 says how many writes it has reached (`arrived`, one cache
+/// line each), engine 0 how many it has made (`done`). Valid zeroed.
 #[repr(C)]
 pub struct TeSync {
-    pub arrived: std::sync::atomic::AtomicU64,
+    pub arrived: [crossbeam_utils::CachePadded<std::sync::atomic::AtomicU64>; 4],
     pub done: std::sync::atomic::AtomicU64,
 }
 
@@ -885,7 +885,8 @@ pub struct Rss {
     /// The texture engine and TRAM (`Planes::te`, shared by the engines).
     pub te: Plane<Te1>,
     te_sync: Plane<TeSync>,
-    /// With two engines on one `Te1`: 1, and the writes made so far.
+    /// The engines sharing this `Te1` (0 when only one draws), and the
+    /// writes made so far.
     pub te_shared: u32,
     te_writes: u64,
     /// Diagnostic: stale texture samples seen, and the last one's (want,
@@ -1023,23 +1024,25 @@ impl Rss {
         self.jit.invalidate();
     }
 
-    /// Share `Te1` with another engine (`te_write`), counting writes from
-    /// zero. Call with both engines stopped, on both.
-    pub fn share_te(&mut self, shared: bool) {
-        self.te_shared = shared as u32;
+    /// Share `Te1` among `engines` engines (`te_write`), counting writes
+    /// from zero. Call with the engines stopped, on each.
+    pub fn share_te(&mut self, engines: u32) {
+        self.te_shared = if engines > 1 { engines } else { 0 };
         self.te_writes = 0;
-        self.te_sync.arrived.store(0, std::sync::atomic::Ordering::Release);
+        for a in &self.te_sync.arrived {
+            a.store(0, std::sync::atomic::Ordering::Release);
+        }
         self.te_sync.done.store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// Change the texture engine's state (a table write, a texel load).
-    /// With two engines on one `Te1`, engine 0 makes the write once engine
-    /// 1 has reached it too (so engine 1 has finished drawing with what it
-    /// replaces), and engine 1 goes on once it is made; with `defer` (texel
-    /// load lines, hundreds a texture) engine 1 goes on at once and waits
-    /// for the writes it has passed only before its next entry that is not
-    /// a DMA line (`te_settle`). Both meet the same writes in the same
-    /// order: they read one stream.
+    /// With several engines on one `Te1`, engine 0 makes the write once the
+    /// others have reached it too (so they have finished drawing with what
+    /// it replaces), and they go on once it is made; with `defer` (texel
+    /// load lines, hundreds a texture) they go on at once and wait for the
+    /// writes they have passed only before their next entry that is not a
+    /// DMA line (`te_settle`). All meet the same writes in the same order:
+    /// they read one stream.
     fn te_write(&mut self, defer: bool, f: impl FnOnce(&mut Te1, &[u32; 0x400])) {
         use std::sync::atomic::Ordering;
         if self.te_shared == 0 {
@@ -1050,20 +1053,22 @@ impl Rss {
         let n = self.te_writes;
         let wait = crossbeam_utils::Backoff::new();
         if self.engine == 0 {
-            while self.te_sync.arrived.load(Ordering::Acquire) < n {
-                wait.snooze();
+            for a in &self.te_sync.arrived[1..self.te_shared as usize] {
+                while a.load(Ordering::Acquire) < n {
+                    wait.snooze();
+                }
             }
             f(&mut self.te, &self.regs);
             self.te_sync.done.store(n, Ordering::Release);
         } else {
-            self.te_sync.arrived.store(n, Ordering::Release);
+            self.te_sync.arrived[self.engine as usize].store(n, Ordering::Release);
             if !defer {
                 self.te_settle();
             }
         }
     }
 
-    /// Engine 1 on a shared `Te1`: wait until engine 0 has made every
+    /// An engine but 0 on a shared `Te1`: wait until engine 0 has made every
     /// texture engine write this engine has passed. Run before anything
     /// that may read the texture engine.
     #[inline]

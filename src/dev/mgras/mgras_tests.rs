@@ -322,7 +322,9 @@ fn two_raster_engines_draw_what_one_does() {
                 let m = super::record::tests::live_board_of(kind);
                 let rep = replay_recs(&m, &recs, false).unwrap();
                 assert!(!rep.diverged(), "{kind:?}: {rep:?}");
-                assert_eq!(m.nrss, if kind == GraphicsBoard::MaxImpact { 2 } else { 1 });
+                // Maximum Impact's two and the others' one, or what
+                // IRIS_MGRAS_ENGINES asks for.
+                assert_eq!(m.nrss, super::Mgras::engines_for(kind));
                 let h = m.state_hash();
                 m.stop_engines();
                 h

@@ -829,12 +829,18 @@ impl<'a> E<'a> {
         let [bxs, bys, bdx, bdy] = self.blk;
         let fx0 = self.b.ins().iadd(self.ox, bxs);
         // Only this engine's scanlines (`row` still checks): with an odd
-        // row step the rows alternate engines, so take every other one.
+        // row step the rows go round the engines, so take every engines-th
+        // one, from the first that is ours: row r is at fy0 + s r (s =
+        // ysign * bdy, odd, its own inverse modulo 2 and 4), so
+        // r = (engine - fy0) s modulo the engines.
         let odd = self.b.ins().band_imm_s(bdy, 1);
-        let m = self.b.ins().band(self.own_mask, odd);
+        let all = self.b.ins().ineg(odd);
+        let m = self.b.ins().band(self.own_mask, all);
         let sy0 = self.b.ins().imul(self.ysign, bys);
         let fy0 = self.b.ins().iadd(self.oy, sy0);
-        let first = self.b.ins().bxor(fy0, self.engine);
+        let first = self.b.ins().isub(self.engine, fy0);
+        let s = self.b.ins().imul(self.ysign, bdy);
+        let first = self.b.ins().imul(first, s);
         let first = self.b.ins().band(first, m);
         let step = self.b.ins().iadd_imm_s(m, 1);
         self.for_range_step(first, rows, step, |e, row, next_row| {
@@ -1141,11 +1147,13 @@ impl<'a> E<'a> {
         let vis: Vec<Value> = (0..4).map(|n| self.ld(I32, off!(common.vis) + 4 * n)).collect();
         let jlo = self.b.ins().smax(j0, vis[2]);
         let jhi = self.b.ins().smin(j1, vis[3]);
-        // Only this engine's scanlines (`row` still checks): every other
-        // row, from the first one it owns.
+        // Only this engine's scanlines (`row` still checks): every
+        // engines-th row, from the first one it owns, (engine - fy0) ysign
+        // rows on modulo the engines.
         let sy0 = self.b.ins().imul(self.ysign, jlo);
         let fy0 = self.b.ins().iadd(self.oy, sy0);
-        let skip = self.b.ins().bxor(fy0, self.engine);
+        let skip = self.b.ins().isub(self.engine, fy0);
+        let skip = self.b.ins().imul(skip, self.ysign);
         let skip = self.b.ins().band(skip, self.own_mask);
         let jlo = self.b.ins().iadd(jlo, skip);
         let step = self.b.ins().iadd_imm_s(self.own_mask, 1);
