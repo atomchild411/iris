@@ -88,7 +88,11 @@ const MAP_SIZE: u32 = 0x10_0000;
 pub const GIO_ID: u32 = 0x0005_0190;
 
 const HQ_FIFO_DEPTH: usize = 65536;
-const RSS_FIFO_DEPTH: usize = 65536;
+/// Deep enough for most of a frame's texture loads (Quake 3 on High IMPACT
+/// moves ~13 MB a frame, 1.6 M entries), so the HQ finishes a DMA, and the
+/// CPU waiting on DMABUSY goes on, while the engines are still drawing.
+/// At 64 K entries the HQ waited for room on every load.
+const RSS_FIFO_DEPTH: usize = 1 << 20;
 /// Command FIFO words FIFOSTATUS counts at the top of `hq_fifo`
 /// (`cfifo_level`): room above the kernel's high-water mark of 32.
 const CFIFO_WORDS: usize = 64;
