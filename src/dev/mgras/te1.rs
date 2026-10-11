@@ -308,16 +308,28 @@ impl Te1 {
                 self.owner[p] = who;
             }
         }
+        let tn = cell_nibbles(d);
+        let co: [usize; 4] = std::array::from_fn(|c| comp_offset(sel, nc, c, d));
+        // Texel 0 of this row, when the row is inside the level.
+        let row = (0..hi).contains(&t).then(|| texel_addr(page, w, h, 0, t as usize, tn));
         for (k, px) in bytes.chunks_exact(4).enumerate() {
             let s = s0 + k as i64;
             if s < -1 || s > wi {
                 continue;
             }
-            let a = if s < 0 || t < 0 || s >= wi || t >= hi {
-                border_addr(border_page, w, h, s, t, cell_nibbles(d))
-            } else {
-                texel_addr(page, w, h, s as usize, t as usize, cell_nibbles(d))
+            let a = match row {
+                Some(row) if (0..wi).contains(&s) => (row + s as usize * tn) % TRAM_NIBBLES,
+                _ => border_addr(border_page, w, h, s, t, tn),
             };
+            if d == 2 {
+                // Byte components: cells and component offsets are whole
+                // bytes, low nibble first, so each component is one byte.
+                for (c, &v) in px.iter().take(nc).enumerate() {
+                    self.tram[(a + co[c]) % TRAM_NIBBLES / 2] = v;
+                }
+                self.texels_loaded += 1;
+                continue;
+            }
             for (c, &v) in px.iter().take(nc).enumerate() {
                 let v = v as u32;
                 let stored = match d {
@@ -326,7 +338,7 @@ impl Te1 {
                     _ => v,
                 };
                 for i in 0..d {
-                    self.set_nibble((a + comp_offset(sel, nc, c, d) + i) % TRAM_NIBBLES, stored >> (4 * i));
+                    self.set_nibble((a + co[c] + i) % TRAM_NIBBLES, stored >> (4 * i));
                 }
             }
             self.texels_loaded += 1;
@@ -684,5 +696,62 @@ mod tests {
         te.table_write(reg::TXMIPMAP, 0, 1);
         let row = te.read_raw(&regs, 6, 64);
         assert_eq!(&row[..8], &[0, 70, 0xA5, 0, 1, 70, 0xA5, 0]);
+    }
+
+    /// `load_line` stores byte components a byte at a time: the same TRAM
+    /// as storing every component nibble by nibble, for small and large
+    /// levels, borders, and one- and two-component textures in each slot.
+    #[test]
+    fn byte_component_loads_match_nibble_stores() {
+        fn by_nibbles(te: &mut Te1, regs: &[u32], line: u32, bytes: &[u8]) {
+            let mode = regs[reg::TL_MODE as usize];
+            let spec = regs[reg::TL_SPEC as usize];
+            let (nc, sel, d) = (((mode >> 1) & 3) as usize + 1, ((mode >> 3) & 3) as usize, depth_nibbles(mode >> 5));
+            let (w, h) = (1usize << ((spec >> 4) & 0xF), 1usize << ((spec >> 8) & 0xF));
+            let s0 = regs[reg::TL_S_LEFT as usize] as i32 as i64;
+            let t = regs[reg::TL_T_BOTTOM as usize] as i32 as i64 + line as i64;
+            let (page, border) = (regs[reg::TL_MIPMAP as usize] & 0xFF, regs[reg::TL_BORDER as usize] & 0xFF);
+            for (k, px) in bytes.chunks_exact(4).enumerate() {
+                let s = s0 + k as i64;
+                if s < -1 || s > w as i64 || t < -1 || t > h as i64 {
+                    continue;
+                }
+                let a = if s < 0 || t < 0 || s >= w as i64 || t >= h as i64 {
+                    border_addr(border, w, h, s, t, cell_nibbles(d))
+                } else {
+                    texel_addr(page, w, h, s as usize, t as usize, cell_nibbles(d))
+                };
+                for (c, &v) in px.iter().take(nc).enumerate() {
+                    for i in 0..d {
+                        te.set_nibble((a + comp_offset(sel, nc, c, d) + i) % TRAM_NIBBLES, (v as u32) >> (4 * i));
+                    }
+                }
+            }
+        }
+        // SAFETY: Te1 is plain data, valid zeroed.
+        let mut fast = unsafe { Box::<Te1>::new_zeroed().assume_init() };
+        let mut slow = unsafe { Box::<Te1>::new_zeroed().assume_init() };
+        let mut regs = vec![0u32; 0x400];
+        let mut seed = 0x1234_5678u32;
+        for (lw, lh, nc, sel, s0, page) in [(6, 7, 4, 0, 0, 3), (3, 2, 4, 3, -1, 255), (0, 0, 3, 0, -1, 9), (8, 8, 1, 2, 0, 40), (4, 4, 2, 1, -1, 77)] {
+            regs[reg::TL_MODE as usize] = (nc - 1) << 1 | sel << 3 | 1 << 5;
+            regs[reg::TL_SPEC as usize] = lh << 8 | lw << 4;
+            regs[reg::TL_MIPMAP as usize] = page;
+            regs[reg::TL_BORDER as usize] = page + 1;
+            regs[reg::TL_S_LEFT as usize] = s0 as u32;
+            regs[reg::TL_T_BOTTOM as usize] = s0 as u32;
+            let (w, h) = (1usize << lw, 1usize << lh);
+            for line in 0..h as u32 + 2 {
+                let bytes: Vec<u8> = (0..4 * (w + 2))
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        (seed >> 16) as u8
+                    })
+                    .collect();
+                fast.load_line(&regs, line, &bytes);
+                by_nibbles(&mut slow, &regs, line, &bytes);
+            }
+        }
+        assert!(fast.tram == slow.tram);
     }
 }
