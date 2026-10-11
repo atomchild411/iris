@@ -249,6 +249,11 @@ impl Te1 {
         &mut self.tram
     }
 
+    /// `n` nibbles from nibble address `a`, the first leftmost (monitor).
+    pub fn nibbles_hex(&self, a: usize, n: usize) -> String {
+        (0..n).map(|i| char::from_digit(self.nibble((a + i) % TRAM_NIBBLES), 16).unwrap_or('?')).collect()
+    }
+
     fn nibble(&self, a: usize) -> u32 {
         let b = self.tram[a / 2] as u32;
         if a & 1 == 0 { b & 0xF } else { b >> 4 }

@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use super::hq3::host;
 use super::rss::{self, Rss, REG_NAMES};
-use super::{dcb, disp, tag, Mgras, MGRAS_SLOT_GFX_BASE};
+use super::{dcb, disp, tag, te1, Mgras, MGRAS_SLOT_GFX_BASE};
 
 pub const TRACE_HQ: u32 = 1;
 pub const TRACE_RSS: u32 = 2;
@@ -261,6 +261,18 @@ impl Mgras {
             ["stats"] => return e(self.stats(w)),
             #[cfg(feature = "gr4-jit")]
             ["jit", rest @ ..] => return self.cmd_jit(rest, w),
+            ["tram", page, rest @ ..] => {
+                // A row of 32-bit texel cells (8-bit components) of a
+                // level `wd` wide at `page`: nibbles in TRAM order.
+                let num = |s: &str| s.parse::<usize>().map_err(|_| format!("mgras tram: bad number {s}"));
+                let page = num(page)?;
+                let row = rest.first().map(|s| num(s)).transpose()?.unwrap_or(0);
+                let wd = rest.get(1).map(|s| num(s)).transpose()?.unwrap_or(32);
+                let rss = unsafe { &*self.rss.get() };
+                let base = page * te1::PAGE_NIBBLES + row * wd * 8;
+                let cells: Vec<String> = (0..wd).map(|s| rss.te.nibbles_hex(base + s * 8, 8)).collect();
+                return e(writeln!(w, "page {page} row {row}: {}", cells.join(" ")));
+            }
             _ => {}
         }
         let f = self.front();
