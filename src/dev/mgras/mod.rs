@@ -319,6 +319,11 @@ pub struct Mgras {
     threads: SpinLock<Vec<thread::JoinHandle<()>>>,
     hq_thread: SpinLock<Option<thread::Thread>>,
     rss_thread: [SpinLock<Option<thread::Thread>>; 2],
+    /// The engine threads parked (`sleep`): producers unpark one only then,
+    /// so a push reads a line nobody writes instead of taking the thread's
+    /// slot lock. Each on its own cache line.
+    hq_asleep: crossbeam_utils::CachePadded<AtomicBool>,
+    rss_asleep: [crossbeam_utils::CachePadded<AtomicBool>; 2],
     dirty: AtomicBool,
     running: AtomicBool,
     refresh: SpinLock<Option<thread::JoinHandle<()>>>,
@@ -513,10 +518,32 @@ impl Mgras {
         }
     }
 
-    fn wake(slot: &SpinLock<Option<thread::Thread>>) {
-        if let Some(t) = slot.lock().as_ref() {
-            t.unpark();
+    /// After a push: unpark the consumer if it is asleep. The fence pairs
+    /// with `sleep`'s: either this sees the thread asleep, or the thread
+    /// sees the push before it parks.
+    fn wake(asleep: &AtomicBool, slot: &SpinLock<Option<thread::Thread>>) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if asleep.load(Ordering::Relaxed) {
+            if let Some(t) = slot.lock().as_ref() {
+                t.unpark();
+            }
         }
+    }
+
+    /// An engine thread with nothing to do: park for up to 2 ms, unless
+    /// `has_work` finds a push made before `asleep` was raised.
+    fn sleep(asleep: &AtomicBool, has_work: impl FnOnce() -> bool) {
+        asleep.store(true, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !has_work() {
+            thread::park_timeout(std::time::Duration::from_millis(2));
+        }
+        asleep.store(false, Ordering::Relaxed);
+    }
+
+    /// Wake the HQ3 thread.
+    fn wake_hq(&self) {
+        Self::wake(&self.hq_asleep, &self.hq_thread);
     }
 
     /// Raster engine threads for a board: Maximum Impact's two, the others'
@@ -548,8 +575,8 @@ impl Mgras {
 
     /// Wake the raster engine threads.
     fn wake_rss(&self) {
-        for t in &self.rss_thread[..self.nrss] {
-            Self::wake(t);
+        for id in 0..self.nrss {
+            Self::wake(&self.rss_asleep[id], &self.rss_thread[id]);
         }
     }
 
@@ -951,7 +978,7 @@ impl Mgras {
                 // that, in order (the FIFO is empty, so this fits).
                 let v = unsafe { &*self.rss.get() }.pio_peek_hi();
                 self.hq_fifo.push(tag::PIO_ADVANCE, 0);
-                Self::wake(&self.hq_thread);
+                self.wake_hq();
                 v as u64
             }
             host::PIO_READ_LO => unsafe { &*self.rss.get() }.pio_read_lo() as u64,
@@ -991,7 +1018,7 @@ impl Mgras {
                 if !ok {
                     return false;
                 }
-                Self::wake(&self.hq_thread);
+                self.wake_hq();
             }
             host::RASTER..=0x7FFFF => {
                 let r = (off & 0xFFC) >> 2;
@@ -1006,7 +1033,7 @@ impl Mgras {
                 if !ok {
                     return false;
                 }
-                Self::wake(&self.hq_thread);
+                self.wake_hq();
             }
             host::CONTEXT_SWITCH => {
                 // The save phase completes at once; the incoming context
@@ -1015,7 +1042,7 @@ impl Mgras {
                     return false;
                 }
                 self.flags.fetch_or(host::FLAG_CONTEXT_SAVED, Ordering::AcqRel);
-                Self::wake(&self.hq_thread);
+                self.wake_hq();
             }
             host::SET_FLAGS | host::SET_FLAGS_PRIVILEGED => {
                 self.flags.fetch_or(lo, Ordering::AcqRel);
@@ -1116,7 +1143,7 @@ impl Mgras {
                     self.refresh_fifo();
                 }
                 if backoff.is_completed() {
-                    thread::park_timeout(std::time::Duration::from_millis(2));
+                    Self::sleep(&self.hq_asleep, || self.hq_fifo.peek().is_some());
                 } else {
                     backoff.snooze();
                 }
@@ -1188,7 +1215,7 @@ impl Mgras {
                     self.refresh_fifo();
                 }
                 if backoff.is_completed() {
-                    thread::park_timeout(std::time::Duration::from_millis(2));
+                    Self::sleep(&self.rss_asleep[id], || self.rss_fifo.peek_at(id).is_some());
                 } else {
                     backoff.snooze();
                 }
@@ -1298,7 +1325,7 @@ impl Mgras {
         {
             let _sub = self.submit.lock();
             self.hq_fifo.push(tag::EXIT, 0);
-            Self::wake(&self.hq_thread);
+            self.wake_hq();
         }
         let mut threads = self.threads.lock();
         if let Some(h) = (!threads.is_empty()).then(|| threads.remove(0)) {
