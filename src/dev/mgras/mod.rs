@@ -1180,6 +1180,10 @@ impl Mgras {
             crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_RSS_BUSY, true);
             // SAFETY: this engine's thread owns its raster state.
             let rss = unsafe { &mut *cell.get() };
+            // DMA lines never read the texture engine; anything else may.
+            if t != tag::DMA_LINE {
+                rss.te_settle();
+            }
             let changed = match t {
                 tag::EXIT => break,
                 t if t < 0x1000 => rss.write((t & 0x7FF) >> 1, val as u32, t & 1 != 0),

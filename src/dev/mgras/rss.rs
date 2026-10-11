@@ -1035,9 +1035,12 @@ impl Rss {
     /// Change the texture engine's state (a table write, a texel load).
     /// With two engines on one `Te1`, engine 0 makes the write once engine
     /// 1 has reached it too (so engine 1 has finished drawing with what it
-    /// replaces), and engine 1 goes on only once it is made. Both meet the
-    /// same writes in the same order: they read one stream.
-    fn te_write(&mut self, f: impl FnOnce(&mut Te1, &[u32; 0x400])) {
+    /// replaces), and engine 1 goes on once it is made; with `defer` (texel
+    /// load lines, hundreds a texture) engine 1 goes on at once and waits
+    /// for the writes it has passed only before its next entry that is not
+    /// a DMA line (`te_settle`). Both meet the same writes in the same
+    /// order: they read one stream.
+    fn te_write(&mut self, defer: bool, f: impl FnOnce(&mut Te1, &[u32; 0x400])) {
         use std::sync::atomic::Ordering;
         if self.te_shared == 0 {
             f(&mut self.te, &self.regs);
@@ -1054,7 +1057,21 @@ impl Rss {
             self.te_sync.done.store(n, Ordering::Release);
         } else {
             self.te_sync.arrived.store(n, Ordering::Release);
-            while self.te_sync.done.load(Ordering::Acquire) < n {
+            if !defer {
+                self.te_settle();
+            }
+        }
+    }
+
+    /// Engine 1 on a shared `Te1`: wait until engine 0 has made every
+    /// texture engine write this engine has passed. Run before anything
+    /// that may read the texture engine.
+    #[inline]
+    pub fn te_settle(&self) {
+        use std::sync::atomic::Ordering;
+        if self.te_shared != 0 && self.engine != 0 && self.te_sync.done.load(Ordering::Acquire) < self.te_writes {
+            let wait = crossbeam_utils::Backoff::new();
+            while self.te_sync.done.load(Ordering::Acquire) < self.te_writes {
                 wait.snooze();
             }
         }
@@ -1176,7 +1193,7 @@ impl Rss {
             }
             te_reg::TXMIPMAP | te_reg::TXBORDER | te_reg::DETAILSCALE => {
                 let i = self.regs[te_reg::TXADDR as usize];
-                self.te_write(|te, _| te.table_write(r, i, val));
+                self.te_write(false, |te, _| te.table_write(r, i, val));
                 self.regs[te_reg::TXADDR as usize] = i.wrapping_add(1);
             }
             _ => {}
@@ -2334,7 +2351,7 @@ impl Rss {
     pub fn dma_write_line(&mut self, line: u32, bytes: &[u8]) {
         self.stats.dma_lines_in += 1;
         if self.te_load != 0 {
-            self.te_write(|te, regs| te.load_line(regs, line, bytes));
+            self.te_write(true, |te, regs| te.load_line(regs, line, bytes));
             return;
         }
         match self.xfer.take() {
