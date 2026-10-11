@@ -1099,11 +1099,17 @@ impl Mgras {
         let backoff = crossbeam_utils::Backoff::new();
         let pf_busy = crate::PfLevel::new();
         let mut taken = 0u32;
+        // The busy flags share a cache line with the engines': store them
+        // only when they change, not once an entry.
+        let mut busy = false;
         loop {
             let Some((t, val)) = self.hq_fifo.peek() else {
                 self.hq_fifo.flush_head();
-                self.hq_busy.store(false, Ordering::Release);
-                crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_HQ_BUSY, false);
+                if busy {
+                    busy = false;
+                    self.hq_busy.store(false, Ordering::Release);
+                    crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_HQ_BUSY, false);
+                }
                 // Drained: a low-water interrupt may be due (the kernel
                 // sleeps on one until the FIFO empties).
                 if self.fifo_watched() {
@@ -1116,8 +1122,11 @@ impl Mgras {
                 }
                 continue;
             };
-            self.hq_busy.store(true, Ordering::Release);
-            crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_HQ_BUSY, true);
+            if !busy {
+                busy = true;
+                self.hq_busy.store(true, Ordering::Release);
+                crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_HQ_BUSY, true);
+            }
             // SAFETY: the HQ3 thread owns the engine.
             let eng = unsafe { &mut *self.eng.get() };
             match t {
@@ -1162,11 +1171,16 @@ impl Mgras {
         let cell = if id == 0 { &self.rss } else { &self.rss1 };
         let busy = &self.rss_busy[id];
         let pf_busy = crate::PfLevel::new();
+        // Stored only when it changes (see `hq_loop`).
+        let mut is_busy = false;
         loop {
             let Some((t, val)) = self.rss_fifo.peek_at(id) else {
                 self.rss_fifo.flush_head_at(id);
-                busy.store(false, Ordering::Release);
-                crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_RSS_BUSY, false);
+                if is_busy {
+                    is_busy = false;
+                    busy.store(false, Ordering::Release);
+                    crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_RSS_BUSY, false);
+                }
                 // The board may have just gone idle: the command FIFO's
                 // level drops to 0 (`cfifo_level`), which a low-water
                 // interrupt may be waiting for.
@@ -1180,8 +1194,11 @@ impl Mgras {
                 }
                 continue;
             };
-            busy.store(true, Ordering::Release);
-            crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_RSS_BUSY, true);
+            if !is_busy {
+                is_busy = true;
+                busy.store(true, Ordering::Release);
+                crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_RSS_BUSY, true);
+            }
             // SAFETY: this engine's thread owns its raster state.
             let rss = unsafe { &mut *cell.get() };
             // DMA lines never read the texture engine; anything else may.
@@ -1227,7 +1244,9 @@ impl Mgras {
                 }
                 _ => false,
             };
-            if changed {
+            // The refresh thread clears it once a frame; until then a load
+            // keeps the cache line shared instead of taking it each entry.
+            if changed && !self.dirty.load(Ordering::Relaxed) {
                 self.dirty.store(true, Ordering::Release);
             }
             if id == 0 {
