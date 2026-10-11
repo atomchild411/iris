@@ -1807,9 +1807,16 @@ fn gl_tex_level(m: &Mgras, level: u32, n: u32, dest: u32, texels: &[u32]) {
 /// `gl_tex_level` for host elements `elem` (pixel state 0xDBB: 1 bytes, 3
 /// 16-bit, 4 32-bit) with component scale `scale` (0xD0A; 0 leaves it).
 fn gl_tex_level_as(m: &Mgras, level: u32, n: u32, dest: u32, texels: &[u32], elem: u32, scale: f32, tl_mode: u32) {
+    gl_tex_level_tm(m, level, n, dest, texels, elem, scale, tl_mode, 0x40858);
+}
+
+/// `gl_tex_level_as` with TEXMODE1 `texmode1` in the context while the
+/// level loads (libGLcore leaves whatever texture was bound before).
+#[allow(clippy::too_many_arguments)]
+fn gl_tex_level_tm(m: &Mgras, level: u32, n: u32, dest: u32, texels: &[u32], elem: u32, scale: f32, tl_mode: u32, texmode1: u32) {
     let log = n.trailing_zeros();
     fifo_token(m, 0x0C, &[]);
-    rss_shadow_list(m, &[(0x1A0, 0), (0x18B, 0), (0x111, 0x40858)]);
+    rss_shadow_list(m, &[(0x1A0, 0), (0x18B, 0), (0x111, texmode1)]);
     rss_shadow_list(m, &[(0x1A1, tl_mode)]);
     rss_shadow_list(m, &[(0x1A2, log << 8 | log << 4 | level)]);
     fifo_token(m, 0xD2, &[0xFFFF_FFFF, 0x0140_0000, 0, 0, 3]);
@@ -1977,6 +1984,35 @@ fn gl_texture_select_slots_share_a_page() {
         assert_eq!(gl_px(&m, 125, 112), want, "slot {slot}");
     }
     m.stop_engines();
+}
+
+/// One-component host texels (GL_ALPHA, GL_LUMINANCE, GL_INTENSITY data,
+/// one byte each) into a one-component texture are the texels, whatever
+/// TEXMODE1's class says during the load: libGLcore writes the new
+/// texture's TEXMODE1 after loading it, so the class there is often the
+/// previous texture's. An alpha class used to store 0xFF for every texel
+/// (Discord Messenger's glyphs drew as solid boxes), and a luminance load
+/// after an alpha one inherited that.
+#[test]
+fn gl_texture_one_component_bytes_are_the_texels() {
+    // TEXMODE1 at load: alpha, luminance and RGBA classes.
+    for texmode1 in [0x40246, 0x40440, 0x40858] {
+        let m = gl_board([0.0, 0.0, 0.0]);
+        gl_tex_level_tm(&m, 0, 4, 0, &[0x00FF_40C0; 4], 1, 0.0, 0x34020, texmode1);
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &*m.rss.get() };
+        // 8-bit components (TL_MODE 6:5 = 1): 32-bit cells, slot 0 first,
+        // low nibble first.
+        let off = super::te1::small_offset(4);
+        let texel = |s: usize| {
+            let h: Vec<char> = rss.te.nibbles_hex((off + s) * 8, 2).chars().collect();
+            u32::from_str_radix(&format!("{}{}", h[1], h[0]), 16).unwrap()
+        };
+        assert_eq!([texel(0), texel(1), texel(2), texel(3)], [0x00, 0xFF, 0x40, 0xC0], "TEXMODE1 {texmode1:#x} at load");
+        drop(_sub);
+        m.stop_engines();
+    }
 }
 
 /// The select bits mean nothing for textures that fill the cell: TyrQuake

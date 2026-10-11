@@ -2528,6 +2528,14 @@ impl Gl {
                 let (lum, alpha) = (src(0), if n_ext == 2 || n_ext == 4 { src(n_ext - 1) } else { 0xFF });
                 let px = match (n_ext, nc) {
                     _ if raw => [src(0), src(1), src(2), src(3)],
+                    // One host component into a one-component texture is
+                    // the texel, whatever its class: GL_ALPHA data has no
+                    // other byte to take alpha from. This must not hang on
+                    // the class either, which comes from the TEXMODE1
+                    // shadow, and libGLcore writes the new texture's
+                    // TEXMODE1 after loading it (traced: a GL_LUMINANCE
+                    // load following a GL_ALPHA one still saw class 1).
+                    (1, 1) => [lum, 0, 0, 0],
                     _ if alpha_class => [alpha, 0, 0, 0],
                     (n, c) if n == c => [src(0), src(1), src(2), src(3)],
                     (1 | 2, 4) => [lum, lum, lum, alpha],
