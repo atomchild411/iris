@@ -752,6 +752,7 @@ impl Hq3Engine {
                 }
                 if self.bitmap_in.len() >= self.gl.pixel_words_needed() {
                     let rows = std::mem::take(&mut self.bitmap_in);
+                    self.gl.dma_line_bytes = 0;
                     self.gl.bitmap_rows(&rows, sink);
                 }
             } else if self.eram_in.is_none() {
@@ -946,6 +947,7 @@ impl Hq3Engine {
             // image, distort's textures) rather than as FIFO pixel data;
             // possibly in several DMAs.
             let mut buf = std::mem::take(&mut self.bitmap_in);
+            self.gl.dma_line_bytes = self.dma_regs[dma::LINE_BYTES];
             self.dma(word, DmaPeer::EramIn(&mut buf), sink);
             if buf.len() >= self.gl.pixel_words_needed() {
                 self.gl.bitmap_rows(&buf, sink);

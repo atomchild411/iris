@@ -2991,3 +2991,17 @@ fn gl_zoomed_chunk_host_pixel_size() {
         assert_eq!(zoomed_host_bpp(wpr, xs_w, out_w, 4), want, "{wpr} words, transfer {xs_w}, {out_w} wide");
     }
 }
+
+/// Texture rows by host DMA come padded to whole words; the DMA's line
+/// length gives the texel size (traced: a 2 x 2 GL_RGB texture, LINE_BYTES
+/// 6, rows of 8 bytes; 4 x 4 RGB, 12 and 12; 2 x 2 RGBA, one row of 16).
+#[test]
+fn gl_dma_texture_row_texel_size() {
+    use super::gl::dma_row_bpt;
+    assert_eq!(dma_row_bpt(6, 2, 8, true), Some(3), "2 RGB texels in 8 bytes");
+    assert_eq!(dma_row_bpt(3, 1, 4, true), Some(3), "1 RGB texel in 4 bytes");
+    assert_eq!(dma_row_bpt(12, 4, 12, true), None, "4 RGB texels fill their words");
+    assert_eq!(dma_row_bpt(16, 2, 16, true), None, "RGBA rows are whole words");
+    assert_eq!(dma_row_bpt(0, 2, 8, true), None, "rows by FIFO: no DMA line");
+    assert_eq!(dma_row_bpt(6, 2, 8, false), None, "the transfer's rows are not the texture's");
+}

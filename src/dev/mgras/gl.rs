@@ -474,6 +474,11 @@ pub struct Gl {
     send_pixels: [u32; 8],
     send_pixels_pending: u32,
     pub xfrmode: u32,
+    /// The bytes a line of the host DMA that brought the pending
+    /// SEND_PIXELS rows read (its LINE_BYTES), 0 when they came by FIFO.
+    /// The DMA pads each line to whole words: a 2-texel RGB row is 6 bytes
+    /// in memory and 8 here, and only this tells the texture loader so.
+    pub dma_line_bytes: u32,
     /// 1 / the pixel zoom (GE pixel state 0x192); 0 when never set.
     zoom_inv: f32,
     /// The pixel block (block_xystarti / endi, window coordinates) the
@@ -2498,6 +2503,7 @@ impl Gl {
         let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
         let (pitch, bpt) = if hdr_rows == h && wpr >= w { (wpr, wpr / w) } else { (0, bytes.len() / (w * h)) };
         let pitch = if pitch == 0 { w * bpt } else { pitch };
+        let bpt = dma_row_bpt(self.dma_line_bytes as usize, w, pitch, hdr_rows == h).unwrap_or(bpt);
         let scale = f32::from_bits(self.tl_scale);
         // GL_UNSIGNED_SHORT_4_4_4_4_EXT: 16-bit elements with an 8-bit
         // scale. Widen each nibble to a byte (RGBA, R in the top nibble).
@@ -2669,6 +2675,18 @@ fn normalised_q<const N: usize>(q: [[f64; 3]; N]) -> [[f64; 3]; N] {
 }
 
 /// x | y << 16 for the RE4's integer xy registers.
+/// Bytes a texel of a texture row that came by host DMA, `w` texels wide,
+/// when the row's words (`pitch` bytes) hold fewer: the DMA pads each line
+/// to whole words, so a 1- or 2-texel RGB row (3 or 6 bytes) comes as 4 or
+/// 8 and looked like RGBA texels (a 2 x 2 red and white checker drew white
+/// as yellow, f5 f5 00: its blue was a pad byte). `dma_line` is the DMA's
+/// LINE_BYTES, the row as it was in memory (traced: 6 for 2 RGB texels);
+/// `rows_match` that the transfer's rows are the texture's.
+pub(super) fn dma_row_bpt(dma_line: usize, w: usize, pitch: usize, rows_match: bool) -> Option<usize> {
+    (rows_match && dma_line > 0 && w > 0 && dma_line < pitch && dma_line % w == 0 && (1..=4).contains(&(dma_line / w)))
+        .then_some(dma_line / w)
+}
+
 /// The host's bytes a pixel for a zoomed glDrawPixels chunk (`zoomed_chunk`):
 /// rows of `wpr` words, transfer size width `xs_w`, landing `out_w` pixels
 /// wide. Traced from IRIX's driver: the transfer size is the chunk's pixel
