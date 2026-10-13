@@ -26,6 +26,8 @@
 //! - `emul`: the SGI extensions the host has not got, done in the fragment
 //!   stage with shaders over the fixed-function state.
 //! - `draw`: drawables and the swap.
+//! - `threaded`: the service on its own thread, so the emulated CPU is not
+//!   held while a command buffer runs.
 //! - `backend`: what is platform-specific -- contexts, entry point lookup, a
 //!   CPU-addressable render target. Apple's CGL today.
 //! - `calls`, `ext`: generated tables.
@@ -55,6 +57,8 @@ mod present;
 pub mod qos;
 #[cfg(target_os = "macos")]
 mod service;
+#[cfg(target_os = "macos")]
+mod threaded;
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
@@ -65,7 +69,7 @@ use exec::Exec;
 
 #[cfg(target_os = "macos")]
 pub use service::{
-    GlService, OP_BATCH, OP_CREATE, OP_DESTROY, OP_DRAWABLE_GONE, OP_FINISH, OP_GETSTRING, OP_GLX_STRING, OP_GOODBYE, OP_HELLO,
+    GlService, OP_BATCH, OP_BATCH_ASYNC, OP_CREATE, OP_DESTROY, OP_DRAWABLE_GONE, OP_FINISH, OP_GETSTRING, OP_GLX_STRING, OP_GOODBYE, OP_HELLO,
     OP_MAKECURRENT, OP_PBUFFER, OP_RELEASE, OP_SWAP, OP_SWAP_INTERVAL, OP_VIDEO_SYNC, PROTOCOL,
 };
 
@@ -73,15 +77,22 @@ pub use service::{
 ///
 /// Registering again replaces the service, destroying every context the old
 /// one held -- which is what a guest reboot wants, since no process that
-/// made them is left. Call it from the thread that will make the calls (the
-/// CPU thread) or before that thread starts: contexts are made current on the
-/// thread that uses them, whichever it is.
+/// made them is left. The service runs on a thread of its own, which makes
+/// and uses every context (threaded.rs); with `IRIS_HOSTGL_INLINE=1` it runs
+/// on the thread that makes the calls (the CPU thread), so call this from that
+/// thread or before it starts.
 pub fn register() {
     #[cfg(target_os = "macos")]
     {
         let backend = Box::new(backend::cgl::Cgl::new());
-        iris_hostcall::register(iris_hostcall::GL, Box::new(GlService::new(backend)));
-        log::info!("host GL: service registered (CGL backend)");
+        let svc = GlService::new(backend);
+        if std::env::var_os("IRIS_HOSTGL_INLINE").is_some() {
+            iris_hostcall::register(iris_hostcall::GL, Box::new(svc));
+            log::info!("host GL: service registered (CGL backend, on the CPU thread)");
+        } else {
+            iris_hostcall::register(iris_hostcall::GL, Box::new(threaded::Threaded::spawn(svc)));
+            log::info!("host GL: service registered (CGL backend, on its own thread)");
+        }
     }
     #[cfg(not(target_os = "macos"))]
     log::info!("host GL: no backend for this platform; host call {} stays unanswered", iris_hostcall::GL);

@@ -20,6 +20,7 @@
 //! | success   | 0    | result            | second result                |
 //! | error     | 1    | errno             | -                            |
 //! | need page | 1    | [`ENEEDPAGE`]     | page address, bit 0 = write  |
+//! | not yet   | 1    | [`ENOTYET`]       | -                            |
 //!
 //! Arguments are in `$4`..`$11` whatever the program's ABI (the caller's stub
 //! loads them). Callers should use IRIX's **indirect** form -- `v0` = 1000,
@@ -62,6 +63,12 @@ pub const SYS_SYSCALL: u32 = 1000;
 /// Outside IRIX's errno range (its highest is below 1200), so a library that
 /// does not know about it reports an unknown error rather than a wrong one.
 pub const ENEEDPAGE: u64 = 0x3000;
+
+/// `v0` when the call cannot run yet and the caller should make it again
+/// later, letting its machine run meanwhile (yielding, say). A service gives
+/// it only to callers that asked for work it has not finished -- host GL's
+/// unanswered buffers -- so a caller that never does need not know it.
+pub const ENOTYET: u64 = 0x3001;
 
 /// IRIX's page size on the Indy.
 pub const PAGE: u64 = 0x1000;

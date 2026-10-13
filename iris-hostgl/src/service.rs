@@ -72,6 +72,12 @@ pub const OP_SWAP_INTERVAL: u64 = 0x1_000B;
 pub const OP_VIDEO_SYNC: u64 = 0x1_000C;
 pub const OP_GLX_STRING: u64 = 0x1_000D;
 pub const OP_GOODBYE: u64 = 0x1_000E;
+/// A command buffer the program does not wait for: answered as soon as its
+/// bytes are read, run afterwards on the GL thread (threaded.rs), in order
+/// with every later call. The library sends only buffers that read nothing
+/// outside themselves this way. Without the GL thread it is OP_BATCH; a host
+/// without it answers EINVAL, which is how the library finds out.
+pub const OP_BATCH_ASYNC: u64 = 0x1_0010;
 /// What the presenting thread has done: frames presented in v0, frames
 /// replaced before they could be in v1. Global, not per client -- one thread
 /// serves every channel -- and answerable without a context.
@@ -80,8 +86,8 @@ pub const OP_PRESENT_STATS: u64 = 0x1_000F;
 /// The protocol: HELLO's second result, which the library checks.
 pub const PROTOCOL: u64 = 2;
 
-const EINVAL: u64 = 22;
-const EFAULT: u64 = 14;
+pub(crate) const EINVAL: u64 = 22;
+pub(crate) const EFAULT: u64 = 14;
 
 /// A pbuffer's drawable id, which must not collide with an X window's (X ids
 /// keep their top three bits clear) -- and must not have bit 31 set: a 32-bit
@@ -92,7 +98,7 @@ const PBUFFER_ID: u32 = 0x4000_0000;
 /// The largest drawable, either way.
 const MAX_DIM: i32 = 8192;
 /// The largest command buffer (the library's is 128 KB).
-const MAX_BATCH: usize = 16 << 20;
+pub(crate) const MAX_BATCH: usize = 16 << 20;
 /// The frame clock the video-sync counter counts, as a real SGI's display
 /// would (GLX_SGI_video_sync).
 const FRAME_NS: u128 = 1_000_000_000 / 60;
@@ -254,6 +260,25 @@ impl GlService {
             self.resumes.pop_front();
         }
         self.resumes.push_back(Resume { args: *args, stage });
+    }
+
+    /// An OP_BATCH_ASYNC buffer, run on the GL thread after its call was
+    /// answered. Its bytes were read then; nothing else of the program's
+    /// memory can be, since the program has moved on. A command that tries
+    /// (the library should never send one) stops the buffer there.
+    pub fn run_detached(&mut self, client: u32, bytes: Vec<u8>) {
+        if !self.clients.contains_key(&client) {
+            return;
+        }
+        self.select_client(client);
+        // Never a real call's registers: those carry a serial.
+        let args = [OP_BATCH_ASYNC, 0, client as u64, 0, 0, 0, 0, 0];
+        if let Reply::NeedPage(f) = self.run_batch(&mut Detached, &args, client, bytes, 0, 0, Vec::new()) {
+            self.resumes.retain(|r| r.args != args);
+            if self.reported.insert(usize::MAX - 2) {
+                log::warn!("host GL: a batch sent without waiting reached for program memory at {:#x}; it was cut short there", f.page);
+            }
+        }
     }
 
     /// Phase 3: store the call's results in the guest, then answer.
@@ -432,7 +457,7 @@ impl Service for GlService {
             };
         }
         match op {
-            OP_BATCH => {
+            OP_BATCH | OP_BATCH_ASYNC => {
                 let [buf, len] = slots!(2);
                 if len == 0 {
                     return Reply::Ok(0, 0);
@@ -756,8 +781,20 @@ impl Drop for GlService {
     }
 }
 
+/// The program's memory as a detached batch sees it: out of reach.
+struct Detached;
+
+impl GuestMemory for Detached {
+    fn read(&mut self, addr: u64, _buf: &mut [u8]) -> Result<(), Fault> {
+        Err(Fault { page: addr & !(iris_hostcall::PAGE - 1), write: false })
+    }
+    fn write(&mut self, addr: u64, _data: &[u8]) -> Result<(), Fault> {
+        Err(Fault { page: addr & !(iris_hostcall::PAGE - 1), write: true })
+    }
+}
+
 /// `n` 8-byte big-endian argument slots at guest address `at`.
-fn read_slots<const N: usize>(mem: &mut dyn GuestMemory, at: u64) -> Result<[u64; N], Fault> {
+pub(crate) fn read_slots<const N: usize>(mem: &mut dyn GuestMemory, at: u64) -> Result<[u64; N], Fault> {
     let bytes = read_guest(mem, at, N * 8)?;
     let mut out = [0u64; N];
     for (i, v) in out.iter_mut().enumerate() {

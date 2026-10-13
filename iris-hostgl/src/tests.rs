@@ -1441,3 +1441,154 @@ fn accumulation_buffer_operations() {
     assert_eq!(u32::from_be_bytes(g.mem.get(bits, 4).try_into().unwrap()), 16, "GL_ACCUM_RED_BITS");
     near(pixel(g.mem.get(px, 32 * 32 * 4), 32, 2, 2), [0, 255, 0], "the program's colour after a pass");
 }
+
+// ---- the GL thread (threaded.rs) ----
+
+/// One call through a service other than a bare GlService, need-page and
+/// not-yet retries done the library's way.
+fn call_on(svc: &mut dyn Service, mem: &mut Proc, args: [u64; 8]) -> Reply {
+    for _ in 0..1_000_000 {
+        match svc.call(mem, &args) {
+            Reply::NeedPage(f) => mem.touch(f),
+            Reply::Err(iris_hostcall::ENOTYET) => std::thread::yield_now(),
+            r => return r,
+        }
+    }
+    panic!("no progress");
+}
+
+/// A process talking to the GL thread: hello, a context on a 64 x 64 window.
+struct Threads {
+    svc: crate::threaded::Threaded,
+    mem: Proc,
+    client: u64,
+    serial: u64,
+    slots: u64,
+}
+
+impl Threads {
+    fn new() -> Threads {
+        let mut svc = crate::threaded::Threaded::spawn(GlService::new(Box::new(Cgl::new())));
+        let mut mem = Proc::new(512);
+        let slots = mem.alloc(64, 0);
+        let Reply::Ok(client, PROTOCOL) = call_on(&mut svc, &mut mem, [OP_HELLO, PROTOCOL, 0, 0, 0, 0, 0, 0]) else {
+            panic!("hello")
+        };
+        let mut t = Threads { svc, mem, client, serial: 0, slots };
+        let Reply::Ok(ctx, _) = t.call(OP_CREATE, &[0]) else { panic!("create") };
+        assert_eq!(t.call(OP_MAKECURRENT, &[ctx, 0x0040_0002, 0x0040_0002, 64, 64]), Reply::Ok(0, 0));
+        t
+    }
+
+    fn call(&mut self, op: u64, slots: &[u64]) -> Reply {
+        let s: Vec<u8> = slots.iter().flat_map(|v| v.to_be_bytes()).collect();
+        self.mem.put(self.slots, &s);
+        self.serial += 1;
+        call_on(&mut self.svc, &mut self.mem, [op, self.slots, self.client, self.serial, 0, 0, 0, 0])
+    }
+
+    /// `cmds` in fresh memory, every page of it paged out, sent as `op`.
+    fn batch(&mut self, op: u64, cmds: &[u8]) -> Reply {
+        let at = self.mem.alloc(cmds.len(), 0x40);
+        self.mem.put(at, cmds);
+        self.mem.page_out(at, cmds.len());
+        self.call(op, &[at, cmds.len() as u64])
+    }
+}
+
+/// Buffers sent without waiting run on the GL thread, in order, before a
+/// call that waits: the readback sees both draws, the later one on top.
+#[test]
+fn batches_sent_without_waiting_run_in_order_before_a_waiting_call() {
+    let mut t = Threads::new();
+    let mut e = Enc::default();
+    ortho(&mut e, 64, 64);
+    e.cmd("glClearColor", &[V::F(1.0), V::F(0.0), V::F(0.0), V::F(1.0)]).cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)]);
+    let first = e.take();
+    let mut e = Enc::default();
+    e.cmd("glColor3ub", &[V::I(0), V::I(255), V::I(0)])
+        .cmd("glBegin", &[V::I(GL_QUADS)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(32.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(32.0), V::F(64.0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(64.0)])
+        .cmd("glEnd", &[]);
+    let second = e.take();
+    assert_eq!(t.batch(OP_BATCH_ASYNC, &first), Reply::Ok(0, 0));
+    assert_eq!(t.batch(OP_BATCH_ASYNC, &second), Reply::Ok(0, 0));
+
+    let px = t.mem.alloc(64 * 64 * 4, 0);
+    let mut e = Enc::default();
+    e.cmd("glReadPixels", &[V::I(0), V::I(0), V::I(64), V::I(64), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    let read = e.take();
+    assert_eq!(t.batch(OP_BATCH, &read), Reply::Ok(0, 0));
+    let out = t.mem.get(px, 64 * 64 * 4).to_vec();
+    assert_eq!(pixel(&out, 64, 8, 32), [0, 255, 0, 255], "the second buffer's quad");
+    assert_eq!(t.mem.get(px, 4), &pixel(&out, 64, 0, 0), "read back once, whole");
+    assert_eq!(pixel(&out, 64, 56, 32), [255, 0, 0, 255], "the first buffer's clear");
+}
+
+/// A buffer sent without waiting cannot read or write the program's memory:
+/// the program has moved on. One that tries is cut short there, writes
+/// nothing, and the next call is answered as usual.
+#[test]
+fn a_batch_sent_without_waiting_that_reaches_for_memory_is_cut_short() {
+    let mut t = Threads::new();
+    let px = t.mem.alloc(64 * 64 * 4, 0);
+    let mut e = Enc::default();
+    ortho(&mut e, 64, 64);
+    e.cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(1.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glReadPixels", &[V::I(0), V::I(0), V::I(64), V::I(64), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    let cmds = e.take();
+    assert_eq!(t.batch(OP_BATCH_ASYNC, &cmds), Reply::Ok(0, 0));
+    let mut e = Enc::default();
+    e.cmd("glGetError", &[]);
+    let cmds = e.take();
+    assert_eq!(t.batch(OP_BATCH, &cmds), Reply::Ok(0, 0), "the GL thread still answers");
+    assert!(t.mem.get(px, 64 * 64 * 4).iter().all(|&b| b == 0), "nothing was written");
+}
+
+/// Without the GL thread, OP_BATCH_ASYNC is an ordinary batch.
+#[test]
+fn on_the_cpu_thread_a_batch_sent_without_waiting_is_a_batch() {
+    let mut g = Guest::new(256);
+    g.context(0x0040_0003, 64, 64);
+    let px = g.mem.alloc(64 * 64 * 4, 0);
+    let mut e = Enc::default();
+    e.cmd("glClearColor", &[V::F(0.0), V::F(1.0), V::F(0.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glReadPixels", &[V::I(0), V::I(0), V::I(64), V::I(64), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    let cmds = e.take();
+    let at = g.mem.alloc(cmds.len(), 0);
+    g.mem.put(at, &cmds);
+    assert_eq!(g.call(OP_BATCH_ASYNC, &[at, cmds.len() as u64]), Reply::Ok(0, 0));
+    assert_eq!(pixel(g.mem.get(px, 64 * 64 * 4), 64, 10, 10), [0, 255, 0, 255]);
+}
+
+/// While a client's buffers are queued, its next call is not held behind
+/// them -- the emulated CPU would stand still -- but answered ENOTYET; once
+/// they have run, the same call is answered as usual. Another client is
+/// never told ENOTYET for this one's buffers.
+#[test]
+fn a_call_behind_queued_buffers_is_told_to_come_back() {
+    let mut t = Threads::new();
+    let mut e = Enc::default();
+    ortho(&mut e, 64, 64);
+    e.cmd("glBegin", &[V::I(GL_QUADS)]);
+    while e.buf.len() < 120 << 10 {
+        e.cmd("glVertex2f", &[V::F(1.0), V::F(1.0)]);
+    }
+    e.cmd("glEnd", &[]);
+    let big = e.take();
+    for _ in 0..4 {
+        assert_eq!(t.batch(OP_BATCH_ASYNC, &big), Reply::Ok(0, 0));
+    }
+    t.serial += 1;
+    let args = [OP_FINISH, t.slots, t.client, t.serial, 0, 0, 0, 0];
+    assert_eq!(t.svc.call(&mut t.mem, &args), Reply::Err(iris_hostcall::ENOTYET), "four big buffers cannot have run yet");
+    assert_eq!(call_on(&mut t.svc, &mut t.mem, args), Reply::Ok(0, 0), "answered once they have");
+
+    let mut other = Proc::new(16);
+    let Reply::Ok(_, PROTOCOL) = call_on(&mut t.svc, &mut other, [OP_HELLO, PROTOCOL, 0, 0, 0, 0, 0, 0]) else { panic!("hello") };
+}

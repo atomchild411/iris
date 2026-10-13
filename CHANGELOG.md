@@ -135,6 +135,22 @@ hashes are given where a change is easiest to understand by reading the commit.
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
+- **Host GL no longer stops the machine while it draws.** A host call is
+  answered on the emulated CPU's thread, so while host GL replayed a
+  command buffer (2-5 ms for a big one) no instruction ran and no interrupt
+  was taken: IRIX acknowledged its 1 kHz clock late ~15 times a second, its
+  audio driver refilled HAL2's ring late, and sound crackled under any busy
+  GL program. The service now runs on a thread of its own (`threaded.rs`).
+  A new op, `OP_BATCH_ASYNC`, queues a self-contained buffer and answers at
+  once; a call from a program with buffers still queued is answered with
+  the new `ENOTYET` (0x3001) and the library yields and asks again, so IRIX
+  keeps running. Against this tree without it (IP28, Max IMPACT, macOS): a
+  GL demo with synthesized sound went from 19.7 to 3.7 dropouts a second
+  (31 to 4 ms of sound lost a second) and Quake 3's timedemo from 30.4 to
+  33.9 fps; boot, idle CPU, sound without GL and SGI's own libGL on the
+  emulated board are unchanged. Libraries without `OP_BATCH_ASYNC` work
+  unchanged. `IRIS_HOSTGL_INLINE=1` keeps the service on the CPU thread.
+  See `rules/hostgl/host-calls-hold-the-cpu-thread.md`.
 - **Maximum Impact draws correctly, on two raster engines.** Its two RE4s
   each own every other scanline in their own 12MB, so a buffer takes half
   the pages per engine. The model assumed one engine; buffers overlapped,
