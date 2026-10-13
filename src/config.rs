@@ -967,9 +967,27 @@ impl Default for PerfConfig {
     }
 }
 
+/// Which host audio system HAL2 plays through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioHost {
+    /// The platform's usual one: CoreAudio on macOS, WASAPI on Windows, ALSA
+    /// on Linux.
+    #[default]
+    Default,
+    /// ALSA (Linux).
+    Alsa,
+    /// A PulseAudio server, or PipeWire's pipewire-pulse (Linux). Falls back
+    /// to ALSA when none answers.
+    Pulseaudio,
+}
+
 /// HAL2 / cpal audio output tuning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
+    /// Host audio system to play through. Default: the platform's usual one.
+    #[serde(default)]
+    pub host: AudioHost,
     /// Pre-buffer duration (ms) before feeding the cpal ring. Default 20.
     #[serde(default = "default_audio_prebuf_ms")]
     pub prebuf_ms: u64,
@@ -982,7 +1000,7 @@ fn default_audio_prebuf_ms() -> u64 { 20 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None }
+        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None }
     }
 }
 
@@ -1651,6 +1669,10 @@ pub struct Cli {
     #[arg(long = "noaudio", default_value_t = false)]
     pub no_audio: bool,
 
+    /// Host audio system for HAL2: default, alsa or pulseaudio (overrides [audio] host)
+    #[arg(long = "audio-host", value_enum, value_name = "HOST")]
+    pub audio_host: Option<AudioHost>,
+
     /// Enable NFS share: path to the directory to export (enables NFS)
     #[arg(long = "nfs-dir", value_name = "DIR")]
     pub nfs_dir: Option<String>,
@@ -1827,6 +1849,7 @@ impl Cli {
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
         if self.no_audio  { cfg.no_audio  = true; }
+        if let Some(h) = self.audio_host { cfg.audio.host = h; }
 
         if self.no_scsi_deferred_int { cfg.scsi_deferred_int = false; }
         if self.ci         { cfg.ci         = true; }
@@ -1957,6 +1980,22 @@ mod export_tests {
         assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
         assert_eq!(back.scsi[&4].cdrom, true);
         println!("--- exported toml ---\n{s}");
+    }
+
+    #[test]
+    fn audio_host_parses_and_defaults() {
+        let cfg: MachineConfig = toml::from_str("").expect("parse");
+        assert_eq!(cfg.audio.host, AudioHost::Default);
+        let cfg: MachineConfig = toml::from_str(r#"
+            [audio]
+            host = "pulseaudio"
+            cpal_buffer_frames = 256
+        "#).expect("parse");
+        assert_eq!(cfg.audio.host, AudioHost::Pulseaudio);
+        assert_eq!(cfg.audio.cpal_buffer_frames, Some(256));
+        let back: MachineConfig = toml::from_str(&toml::to_string_pretty(&cfg).expect("serialize")).expect("deserialize");
+        assert_eq!(back.audio.host, AudioHost::Pulseaudio);
+        assert!(toml::from_str::<MachineConfig>("[audio]\nhost = \"oss\"").is_err());
     }
 
     #[test]

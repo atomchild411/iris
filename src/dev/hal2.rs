@@ -5,6 +5,7 @@ use crate::devlog::LogModule;
 use std::time::{Duration, Instant};
 use std::io::Write;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient};
+use crate::config::{AudioConfig, AudioHost};
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{RingBuffer, Producer};
@@ -195,6 +196,10 @@ impl Pacer {
 
 // Sample rates to try when opening the persistent output stream, in order.
 const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
+/// The PulseAudio stream's period, in frames, unless `[audio]
+/// cpal_buffer_frames` says otherwise (see `output_buffer`).
+#[cfg(target_os = "linux")]
+const PULSE_FRAMES: u32 = 512;
 
 // ─── Audio output (owned by Codec A, opened once at start, closed at stop) ───
 
@@ -428,6 +433,8 @@ pub struct Hal2 {
     ar_state: Arc<Mutex<AesRxState>>,
     // cpal output-callback underrun count (ring buffer empty when the host pulled samples).
     underruns: Arc<AtomicU64>,
+    // [audio]: which host to play through, and its buffer size.
+    audio: AudioConfig,
 }
 
 // ─── cpal helpers ─────────────────────────────────────────────────────────────
@@ -436,100 +443,147 @@ fn prebuf_samples(rate: u32) -> usize {
     (rate as usize * 2 * PREBUF_MS as usize) / 1000
 }
 
+/// The host `[audio] host` asks for. cpal's `pulseaudio` feature makes its
+/// own `default_host()` prefer PulseAudio whenever a server runs, so the
+/// default is chosen here instead: the platform's usual host (ALSA on Linux).
+fn output_host(want: AudioHost) -> cpal::Host {
+    #[cfg(target_os = "linux")]
+    {
+        if want == AudioHost::Pulseaudio {
+            match cpal::host_from_id(cpal::HostId::PulseAudio) {
+                Ok(h) => return h,
+                Err(e) => eprintln!("HAL2: [audio] host = \"pulseaudio\", but no PulseAudio server answers ({e}); using ALSA"),
+            }
+        }
+        if let Ok(h) = cpal::host_from_id(cpal::HostId::Alsa) {
+            return h;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if want != AudioHost::Default {
+        eprintln!("HAL2: [audio] host = {want:?} is for Linux; using this platform's default");
+    }
+    cpal::default_host()
+}
+
+/// How much the host buffers: `[audio] cpal_buffer_frames` if set, else the
+/// host's default -- except PulseAudio's, a target of about two seconds
+/// (pipewire-pulse's too), which made IRIX's sound that late: there a fixed
+/// period of PULSE_FRAMES asks for 2 x 512 frames, ~21 ms at 48 kHz.
+fn output_buffer(audio: &AudioConfig, host: cpal::HostId) -> cpal::BufferSize {
+    match (audio.cpal_buffer_frames, host) {
+        (Some(frames), _) => cpal::BufferSize::Fixed(frames),
+        #[cfg(target_os = "linux")]
+        (None, cpal::HostId::PulseAudio) => cpal::BufferSize::Fixed(PULSE_FRAMES),
+        _ => cpal::BufferSize::Default,
+    }
+}
+
 /// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in order.
 /// The stream plays silence when the ring buffer is empty.
-fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -> Option<AudioOut> {
-    let host = cpal::default_host();
+fn open_persistent_output(audio: &AudioConfig, underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -> Option<AudioOut> {
+    let host = output_host(audio.host);
     let device = host.default_output_device()?;
+    // A fixed size the device refuses falls back to the host's default.
+    let mut sizes = vec![output_buffer(audio, host.id())];
+    if sizes[0] != cpal::BufferSize::Default {
+        sizes.push(cpal::BufferSize::Default);
+    }
 
-    for &rate in PREFERRED_RATES {
-        let config = cpal::StreamConfig {
-            channels: 2,
-            sample_rate: rate,
-            buffer_size: cpal::BufferSize::Default,
-        };
-        let ring_size = prebuf_samples(rate) * RING_BUF_MULTIPLIER;
-        let err_fn = |err: cpal::Error| { eprintln!("HAL2: cpal stream error: {:?}", err); };
+    for buffer_size in sizes {
+        for &rate in PREFERRED_RATES {
+            let config = cpal::StreamConfig {
+                channels: 2,
+                sample_rate: rate,
+                buffer_size,
+            };
+            let ring_size = prebuf_samples(rate) * RING_BUF_MULTIPLIER;
+            let err_fn = |err: cpal::Error| { eprintln!("HAL2: cpal stream error: {:?}", err); };
 
-        // Try f32 first (macOS CoreAudio native), then i16 (Linux ALSA).
-        let (producer, stream) = {
-            let (p, mut c) = RingBuffer::<i16>::new(ring_size);
-            let underruns_cb = underruns.clone();
-            let playing_cb = playing.clone();
-            // IRIS_HAL2_CAPTURE=<file>: also write what the host plays, raw
-            // interleaved 16-bit little-endian stereo at the stream rate --
-            // the end of the whole chain, to check or listen to offline.
-            let mut capture = std::env::var_os("IRIS_HAL2_CAPTURE")
-                .and_then(|p| std::fs::File::create(p).ok())
-                .map(std::io::BufWriter::new);
-            let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let mut short = false;
-                for sample in data.iter_mut() {
-                    let v = match c.pop() {
-                        Ok(v) => v,
-                        Err(_) => {
-                            if playing_cb.load(Ordering::Relaxed) {
-                                underruns_cb.fetch_add(1, Ordering::Relaxed);
-                                short = true;
+            // Try f32 first (macOS CoreAudio native), then i16 (Linux ALSA).
+            let (producer, stream) = {
+                let (p, mut c) = RingBuffer::<i16>::new(ring_size);
+                let underruns_cb = underruns.clone();
+                let playing_cb = playing.clone();
+                // IRIS_HAL2_CAPTURE=<file>: also write what the host plays, raw
+                // interleaved 16-bit little-endian stereo at the stream rate --
+                // the end of the whole chain, to check or listen to offline.
+                let mut capture = std::env::var_os("IRIS_HAL2_CAPTURE")
+                    .and_then(|p| std::fs::File::create(p).ok())
+                    .map(std::io::BufWriter::new);
+                let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let mut short = false;
+                    for sample in data.iter_mut() {
+                        let v = match c.pop() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                if playing_cb.load(Ordering::Relaxed) {
+                                    underruns_cb.fetch_add(1, Ordering::Relaxed);
+                                    short = true;
+                                }
+                                0
                             }
-                            0
+                        };
+                        if let Some(w) = capture.as_mut() {
+                            use std::io::Write;
+                            let _ = w.write_all(&v.to_le_bytes());
                         }
-                    };
-                    if let Some(w) = capture.as_mut() {
-                        use std::io::Write;
-                        let _ = w.write_all(&v.to_le_bytes());
+                        *sample = v as f32 / 32768.0;
                     }
-                    *sample = v as f32 / 32768.0;
-                }
-                if short {
-                    crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns_cb.load(Ordering::Relaxed));
+                    if short {
+                        crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns_cb.load(Ordering::Relaxed));
+                    }
+                };
+                match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
+                    Ok(s) => (p, s),
+                    Err(_) => {
+                        // f32 failed, try i16
+                        let (p, mut c) = RingBuffer::<i16>::new(ring_size);
+                        let underruns_cb = underruns.clone();
+                        let playing_cb = playing.clone();
+                        let data_fn = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                            let mut short = false;
+                            for sample in data.iter_mut() {
+                                *sample = match c.pop() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if playing_cb.load(Ordering::Relaxed) {
+                                            underruns_cb.fetch_add(1, Ordering::Relaxed);
+                                            short = true;
+                                        }
+                                        0
+                                    }
+                                };
+                            }
+                            if short {
+                                crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns_cb.load(Ordering::Relaxed));
+                            }
+                        };
+                        match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
+                            Ok(s) => (p, s),
+                            Err(e) => {
+                                eprintln!("HAL2: cpal build_output_stream failed at {}Hz: {:?}", rate, e);
+                                continue;
+                            }
+                        }
+                    }
                 }
             };
-            match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
-                Ok(s) => (p, s),
-                Err(_) => {
-                    // f32 failed, try i16
-                    let (p, mut c) = RingBuffer::<i16>::new(ring_size);
-                    let underruns_cb = underruns.clone();
-                    let playing_cb = playing.clone();
-                    let data_fn = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        let mut short = false;
-                        for sample in data.iter_mut() {
-                            *sample = match c.pop() {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    if playing_cb.load(Ordering::Relaxed) {
-                                        underruns_cb.fetch_add(1, Ordering::Relaxed);
-                                        short = true;
-                                    }
-                                    0
-                                }
-                            };
-                        }
-                        if short {
-                            crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns_cb.load(Ordering::Relaxed));
-                        }
-                    };
-                    match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
-                        Ok(s) => (p, s),
-                        Err(e) => {
-                            eprintln!("HAL2: cpal build_output_stream failed at {}Hz: {:?}", rate, e);
-                            continue;
-                        }
-                    }
-                }
-            }
-        };
-        if stream.play().is_err() { continue; }
-        // cpal 0.18 dropped DeviceTrait::name(); a Device's Display impl is its name.
-        println!("HAL2: audio output: {} via {:?} at {}Hz", device, host.id(), rate);
-        return Some(AudioOut {
-            stream_rate: rate,
-            producer,
-            underruns,
-            playing,
-            _stream: stream,
-        });
+            if stream.play().is_err() { continue; }
+            // cpal 0.18 dropped DeviceTrait::name(); a Device's Display impl is its name.
+            println!("HAL2: audio output: {} via {:?} at {}Hz", device, host.id(), rate);
+            return Some(AudioOut {
+                stream_rate: rate,
+                producer,
+                underruns,
+                playing,
+                _stream: stream,
+            });
+        }
+
+        if buffer_size != cpal::BufferSize::Default {
+            eprintln!("HAL2: no output stream with a {:?} buffer; trying the host's default", buffer_size);
+        }
     }
 
     eprintln!("HAL2: failed to open audio output at any rate (tried {:?})", PREFERRED_RATES);
@@ -541,6 +595,11 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
 
 impl Hal2 {
     pub fn new(dma_clients: Vec<Arc<dyn DmaClient>>) -> Self {
+        Self::with_audio(dma_clients, AudioConfig::default())
+    }
+
+    /// HAL2 playing through the host and buffer `[audio]` asks for.
+    pub fn with_audio(dma_clients: Vec<Arc<dyn DmaClient>>, audio: AudioConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(Hal2State {
                 isr: 0,
@@ -567,6 +626,7 @@ impl Hal2 {
             at_state: Arc::new(Mutex::new(AesTxState { timer_id: None })),
             ar_state: Arc::new(Mutex::new(AesRxState { loopback: std::collections::VecDeque::new(), timer_id: None })),
             underruns: Arc::new(AtomicU64::new(0)),
+            audio,
         }
     }
 
@@ -1237,7 +1297,7 @@ impl Device for Hal2 {
 
     fn start(&self) {
         // Open persistent audio output once.  Codec A timer will push into it.
-        let audio = open_persistent_output(self.underruns.clone(), Arc::new(AtomicBool::new(false)));
+        let audio = open_persistent_output(&self.audio, self.underruns.clone(), Arc::new(AtomicBool::new(false)));
         if audio.is_none() {
             eprintln!("HAL2: no audio output available");
         }

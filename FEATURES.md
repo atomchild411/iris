@@ -236,8 +236,9 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `audio.prebuf_ms` | `20` | HAL2 prebuffer duration in milliseconds. |
-| `audio.cpal_buffer_frames` | `host default when unset` | Requested host cpal buffer size in frames. |
+| `audio.host` | `"default"` | Host audio system: `"default"` (CoreAudio on macOS, WASAPI on Windows, ALSA on Linux), `"alsa"`, or `"pulseaudio"` (Linux: a PulseAudio server or PipeWire's pipewire-pulse, through cpal's own client; ALSA if none answers). `--audio-host` overrides. |
+| `audio.prebuf_ms` | `20` | HAL2 prebuffer duration in milliseconds. Not used yet: HAL2 prebuffers 20 ms. |
+| `audio.cpal_buffer_frames` | `host default when unset` | Host buffer size in frames (a period; PulseAudio buffers two). Unset: the host's default, except PulseAudio's (about 2 s), which gets 512. A size the device refuses falls back to the default. |
 
 ### [jitv2]
 
@@ -337,6 +338,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--2x` | 2× window scaling for HiDPI/4K monitors |
 | `--headless` | Run headless: no window, no REX3 graphics (audio unaffected; use --noaudio to disable) |
 | `--noaudio` | Disable audio emulation (no HAL2); graphics still works |
+| `--audio-host <HOST>` | Host audio system for HAL2: `default`, `alsa` or `pulseaudio` (overrides `[audio] host`) |
 | `--nfs-dir` | Enable NFS share: path to the directory to export (enables NFS) |
 | `--nat-subnet` | NAT subnet in CIDR notation (e.g. 192.168.5.0/24). Gateway gets .1, guest (IRIX) gets .2. Default: 192.168.0.0/24. |
 | `--net-mode` | Networking backend: "nat" (default, software gateway) or "pcap" (bridge onto a real host interface; requires --features pcap). |

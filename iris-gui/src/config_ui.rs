@@ -1,7 +1,7 @@
 use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, Ui};
 use iris::build_features;
 use std::path::Path;
-use iris::config::{
+use iris::config::{AudioHost, 
     format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, KeyboardLayout,
     MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
@@ -711,6 +711,22 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 .small(),
         );
         Grid::new("audio_grid").num_columns(2).striped(true).show(ui, |ui| {
+            if cfg!(target_os = "linux") {
+                ui.label("Host audio");
+                let label = |h: AudioHost| match h {
+                    AudioHost::Default => "Default (ALSA)",
+                    AudioHost::Alsa => "ALSA",
+                    AudioHost::Pulseaudio => "PulseAudio / PipeWire",
+                };
+                ComboBox::from_id_salt("audio_host")
+                    .selected_text(label(cfg.audio.host))
+                    .show_ui(ui, |ui| {
+                        for h in [AudioHost::Default, AudioHost::Alsa, AudioHost::Pulseaudio] {
+                            ui.selectable_value(&mut cfg.audio.host, h, label(h));
+                        }
+                    });
+                ui.end_row();
+            }
             ui.label("Pre-buffer (ms)");
             ui.add(DragValue::new(&mut cfg.audio.prebuf_ms).range(5..=200));
             ui.end_row();

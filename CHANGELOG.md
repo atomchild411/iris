@@ -42,6 +42,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Build / features
 
+- **`[audio] host` picks the host audio system; on Linux, PulseAudio on
+  request.** `host = "pulseaudio"` (or `--audio-host pulseaudio`) plays
+  through cpal's own PulseAudio client, which PipeWire answers too through
+  pipewire-pulse; the client is pure Rust, so the build links nothing new.
+  The default is unchanged: ALSA on Linux. On some setups cpal's ALSA
+  backend spins a whole core (a Debian 12 arm64 VM, through PipeWire's ALSA
+  plugin and the card's own device alike: the poll descriptor stays ready
+  while there is no room to write), starving the emulator into a stream of
+  underruns, while the PulseAudio client used 0.01 s of CPU in 5 s. See
+  `rules/testing/cpal-alsa-busy-poll.md`. `[audio] cpal_buffer_frames`,
+  which was parsed but never reached HAL2, now sets the host buffer size; a
+  size the device refuses falls back to the host's default. Unset,
+  PulseAudio gets 512 frames (two of them, ~21 ms at 48 kHz) instead of its
+  own default target of about two seconds, which made IRIX's sound arrive
+  that late.
 - **`gpujit` turns on every graphics JIT** (`rex-jit` and `gr4-jit`) and is
   the recommended build: `--features lightning,gpujit`. The GUI and the
   release binaries now carry it, so IMPACT gets its raster JIT out of the

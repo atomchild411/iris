@@ -537,8 +537,9 @@ standard     = "ntsc"       # or "pal"
 camera_index = 0            # host camera, source = "camera" only
 
 [audio]
+# host = "default"          # Linux: "alsa" (the default) or "pulseaudio" (PulseAudio or PipeWire)
 prebuf_ms = 20
-# cpal_buffer_frames = 512
+# cpal_buffer_frames = 512  # unset: the host's default (PulseAudio: 512)
 
 # [ultra64]                 # N64 dev board
 # enabled = true
@@ -612,6 +613,7 @@ Display and audio
   --2x                        2× window scaling
   --headless                  No window, no REX3 graphics (audio unaffected)
   --noaudio                   Disable HAL2 audio (graphics unaffected)
+  --audio-host HOST           Host audio for HAL2: default, alsa or pulseaudio (Linux)
 
 Networking
   --nat-subnet <CIDR>         NAT subnet, e.g. 192.168.5.0/24

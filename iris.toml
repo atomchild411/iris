@@ -244,8 +244,9 @@ mode           = "nat"
 
 # HAL2 audio output buffering.
 #[audio]
+#host               = "default"   # Linux: "alsa" (default) or "pulseaudio" (PulseAudio or PipeWire)
 #prebuf_ms          = 20
-#cpal_buffer_frames = 512
+#cpal_buffer_frames = 512         # unset: the host's default (PulseAudio: 512)
 
 # Host thread pinning.
 #[perf]

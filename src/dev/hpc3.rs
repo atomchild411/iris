@@ -1242,8 +1242,7 @@ impl Hpc3 {
             None
         };
 
-        let _ = audio;
-        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
+        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::with_audio(dma_clients[0..8].to_vec(), audio))) };
 
         Self {
             state,
