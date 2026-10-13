@@ -2973,3 +2973,21 @@ fn gl_spin_and_return_reads_current_color_for_index_clear() {
     }
     m.stop_engines();
 }
+
+/// glDrawPixels by DMA under a pixel zoom: the host's pixel size comes from
+/// a chunk's row words, transfer size width and on-screen width, as IRIX's
+/// driver sends them (traced: 320 x 240 images, RGBA and RGB).
+#[test]
+fn gl_zoomed_chunk_host_pixel_size() {
+    use super::gl::zoomed_host_bpp;
+    // (row words, transfer size width, rectangle width) -> bytes a pixel
+    for (wpr, xs_w, out_w, want) in [
+        (156, 156, 156, 4), // RGBA, zoom 1
+        (156, 156, 312, 4), // RGBA, zoom 2
+        (96, 0x180, 307, 4), // RGBA, zoom 3.2: 96 pixels, transfer 4 x 96
+        (108, 144, 288, 3), // RGB, zoom 2: 144 pixels in 108 words
+        (72, 0x180, 307, 3), // RGB, zoom 3.2: 96 pixels in 72 words
+    ] {
+        assert_eq!(zoomed_host_bpp(wpr, xs_w, out_w, 4), want, "{wpr} words, transfer {xs_w}, {out_w} wide");
+    }
+}

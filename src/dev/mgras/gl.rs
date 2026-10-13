@@ -1676,7 +1676,10 @@ impl Gl {
         // engine's format: glCopyPixels draws RGB16 back in RGBA16 (the GE's
         // pixel pipeline adds alpha). The image's size (pixel state 0xDA8's
         // transfer size, when its rows match) gives the host's pixel size.
+        // A zoomed chunk's transfer size is its pixel count only at whole
+        // zooms (see `zoomed_host_bpp`).
         let host_bpp = match (xs & 0xFFFF) as usize {
+            _ if let Some(r) = self.zoomed_chunk(rows) => zoomed_host_bpp(wpr, (xs & 0xFFFF) as usize, (r[2] - r[0] + 1) as usize, bpp),
             w if w > 0 && (xs >> 16) as usize == rows && wpr * 4 % w == 0 => wpr * 4 / w,
             _ => bpp,
         };
@@ -1703,26 +1706,58 @@ impl Gl {
         self.draw_pixels_words(&words, wpr, rows, bpp, sink);
     }
 
+    /// The 0xDA8 rectangle (x0, y0, x1, y1, relative to the raster
+    /// position) of a glDrawPixels chunk sent by DMA under a pixel zoom,
+    /// when it is this one's: its height is the `rows` that came times the
+    /// y zoom (0x192 holds 1 / y zoom; the x zoom has no state of its own,
+    /// it is the rectangle's width over the chunk's). Traced from IRIX's
+    /// driver at zoom 1 x 3.2: a 320 x 240 RGBA image in chunks of 156
+    /// columns, each 0xDA8 rectangle 156 x 768 at x 0, 156, 312, each DMA
+    /// 240 lines of 156 pixels; at 3.2 x 1, chunks of 96 columns over
+    /// 307-pixel rectangles at x 0, 307, 614, 921.
+    fn zoomed_chunk(&self, rows: usize) -> Option<[i32; 4]> {
+        let [x0, y0, x1, y1, xs] = [0, 1, 2, 3, 4].map(|i| self.tl_rect[i]);
+        let (x0, y0, x1, y1) = (x0 as i32, y0 as i32, x1 as i32, y1 as i32);
+        if xs == 0 || x1 < x0 || y1 < y0 || (xs >> 16) as i32 != y1 - y0 + 1 || rows == 0 {
+            return None;
+        }
+        let zy = if self.zoom_inv > 0.0 { 1.0 / self.zoom_inv } else { 1.0 };
+        let h = (y1 - y0 + 1) as f32;
+        let zoomed = (h - rows as f32).abs() >= 1.0 || x1 - x0 + 1 != (xs & 0xFFFF) as i32;
+        (zoomed && (h - rows as f32 * zy).abs() <= 1.0).then_some([x0, y0, x1, y1])
+    }
+
     /// glDrawPixels' rows, `wpr` words each, in the raster engine's format
     /// (`bpp` bytes a pixel).
     fn draw_pixels_words(&mut self, words: &[u32], wpr: usize, rows: usize, bpp: usize, sink: &mut dyn Hq3Sink) {
-        // Pixel zoom (same both ways, any factor): output pixel i takes
-        // source pixel floor(i / zoom), as OpenGL's zoomed rectangles do
-        // (the desks overview shrinks its miniatures, snoop magnifies 6x).
+        // Pixel zoom. FIFO images (the desks overview shrinks its
+        // miniatures, snoop magnifies 6x) take 0x192's zoom both ways;
+        // DMA chunks take their 0xDA8 rectangle (`zoomed_chunk`).
         let zoom = if self.zoom_inv > 0.0 { (1.0 / self.zoom_inv).clamp(1.0 / 64.0, 64.0) } else { 1.0 };
-        // A large image comes in chunks (glCopyPixels draws back 80 pixels
-        // wide): pixel state 0xDA8 holds the chunk's place in the image
-        // (x0, y0, x1, y1, transfer size), relative to the raster position.
-        let xs = self.tl_rect[4];
-        let (ox, oy) = if xs != 0 && (xs >> 16) as usize == rows && (xs & 0xFFFF) as usize == wpr * 4 / bpp.max(1) {
-            (self.tl_rect[0] as i32 as f32 * zoom, self.tl_rect[1] as i32 as f32 * zoom)
-        } else {
-            (0.0, 0.0)
-        };
-        let (x0, y0) = ((self.raster[0] + ox).floor() as i32, (self.raster[1] + oy).floor() as i32);
         let src_w = wpr * 4 / bpp;
-        let out_w = ((src_w as f32 * zoom).round() as i32).max(1);
-        let out_h = ((rows as f32 * zoom).round() as i32).max(1);
+        // A large image comes in chunks (glCopyPixels draws back 80 pixels
+        // wide, glDrawPixels by DMA 156): pixel state 0xDA8 holds the
+        // chunk's place (x0, y0, x1, y1, transfer size), relative to the
+        // raster position. A zoomed chunk's rectangle is where it lands,
+        // already zoomed, and its rows come unzoomed: the board stretches
+        // them over it (`zoomed_chunk`).
+        let xs = self.tl_rect[4];
+        let (x0, y0, out_w, out_h) = if let Some([rx0, ry0, rx1, ry1]) = self.zoomed_chunk(rows) {
+            let (x0, y0) = (self.raster[0].floor() as i32 + rx0, self.raster[1].floor() as i32 + ry0);
+            (x0, y0, rx1 - rx0 + 1, ry1 - ry0 + 1)
+        } else {
+            let (ox, oy) = if xs != 0 && (xs >> 16) as usize == rows && (xs & 0xFFFF) as usize == src_w {
+                (self.tl_rect[0] as i32 as f32 * zoom, self.tl_rect[1] as i32 as f32 * zoom)
+            } else {
+                (0.0, 0.0)
+            };
+            let (x0, y0) = ((self.raster[0] + ox).floor() as i32, (self.raster[1] + oy).floor() as i32);
+            (x0, y0, ((src_w as f32 * zoom).round() as i32).max(1), ((rows as f32 * zoom).round() as i32).max(1))
+        };
+        // Output pixel (ox, oy) of the rectangle takes source pixel
+        // (ox * src_w / out_w, oy * rows / out_h): nearest, as OpenGL's
+        // zoomed rectangles do.
+        let (sx_num, sy_num) = (src_w, rows);
         // The scissor box (window coordinates, inclusive) cuts the
         // rectangle, as it does every fragment.
         let (mut cx0, mut cx1, mut cy0, mut cy1) = (x0, x0 + out_w - 1, y0, y0 + out_h - 1);
@@ -1762,10 +1797,10 @@ impl Gl {
             px
         };
         for (line, oy) in (cy0 - y0..=cy1 - y0).enumerate() {
-            let sr = ((oy as f32 / zoom) as usize).min(rows - 1);
+            let sr = (oy as usize * sy_num / out_h as usize).min(rows - 1);
             let mut bytes = Vec::with_capacity(w as usize * bpp);
             for ox in cx0 - x0..=cx1 - x0 {
-                let sc = ((ox as f32 / zoom) as usize).min(src_w - 1);
+                let sc = (ox as usize * sx_num / out_w as usize).min(src_w - 1);
                 bytes.extend_from_slice(&src_px(sr, sc)[..bpp]);
             }
             sink.dma_write_line(line as u32, &bytes);
@@ -2634,6 +2669,31 @@ fn normalised_q<const N: usize>(q: [[f64; 3]; N]) -> [[f64; 3]; N] {
 }
 
 /// x | y << 16 for the RE4's integer xy registers.
+/// The host's bytes a pixel for a zoomed glDrawPixels chunk (`zoomed_chunk`):
+/// rows of `wpr` words, transfer size width `xs_w`, landing `out_w` pixels
+/// wide. Traced from IRIX's driver: the transfer size is the chunk's pixel
+/// count at whole x zooms (144 RGB or 156 RGBA pixels a row at zoom 1 and 2)
+/// and the count times the zoom rounded up otherwise (96 pixels at 3.2:
+/// 0x180), so the pixel size is the one under which a row holds a count of
+/// pixels that fits both. The raster engine's own size first; else bpp.
+pub(super) fn zoomed_host_bpp(wpr: usize, xs_w: usize, out_w: usize, bpp: usize) -> usize {
+    for b in [bpp, 3, 2, 1] {
+        if b == 0 || b > bpp {
+            continue;
+        }
+        let n = wpr * 4 / b;
+        if n == 0 || (n * b).div_ceil(4) != wpr || xs_w % n != 0 {
+            continue;
+        }
+        let (k, zx) = (xs_w / n, out_w as f32 / n as f32);
+        let fits = if k == 1 { zx <= 1.0 || (zx - zx.round()).abs() < 0.01 } else { zx > (k - 1) as f32 && zx <= k as f32 + 0.01 };
+        if fits {
+            return b;
+        }
+    }
+    bpp
+}
+
 fn xy(x: i32, y: i32) -> u32 {
     (x as u32 & 0xFFFF) << 16 | (y as u32 & 0xFFFF)
 }
