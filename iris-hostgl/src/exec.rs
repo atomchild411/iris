@@ -98,6 +98,13 @@ pub struct ClientSide {
     pub emul: emul::Emul,
     /// The accumulation buffers framebuffer objects cannot have (accum.rs).
     pub accum: accum::Accum,
+    /// The library keeps front and back apart (OP_FRONT_BUFFERS).
+    pub fronts: bool,
+    /// What glDrawBuffer and glReadBuffer last named; `None`, the back buffer.
+    /// Framebuffer objects keep these, not contexts, so they are put back
+    /// whenever the context's drawables are bound (draw::bind_with).
+    pub draw_buffer: Option<u32>,
+    pub read_buffer: Option<u32>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1475,26 +1482,20 @@ impl<'a> Exec<'a> {
         unsafe { glGetError() }
     }
 
-    /// glDrawBuffer / glReadBuffer. A GLX window's buffers are, here, the one
-    /// colour attachment of the drawable's framebuffer object: the back buffer
-    /// is what is drawn, and the front is what the last swap showed -- the
-    /// same pixels until the next frame is drawn. Every colour buffer a
-    /// double-buffered window has names that attachment; anything else is the
-    /// host's to refuse.
+    /// glDrawBuffer / glReadBuffer. For a library that keeps front and back
+    /// apart (OP_FRONT_BUFFERS), a window's front buffer is its own colour
+    /// attachment, and FRONT_AND_BACK draws into both. Otherwise, as before,
+    /// a window's buffers are the one colour attachment of its framebuffer
+    /// object: the back buffer is what is drawn, and the front is what the
+    /// last swap showed. Anything else is the host's to refuse
+    /// (draw::apply_buffers).
     pub fn color_buffer(&mut self, draw: bool, mode: u32) {
-        let mapped = match mode {
-            // FRONT_LEFT, FRONT_RIGHT, BACK_LEFT, BACK_RIGHT, FRONT, BACK,
-            // LEFT, RIGHT, FRONT_AND_BACK
-            0x0400..=0x0408 => GL_COLOR_ATTACHMENT0,
-            other => other,
-        };
-        // SAFETY: plain state.
-        unsafe {
-            if draw {
-                glDrawBuffer(mapped)
-            } else {
-                glReadBuffer(mapped)
-            }
+        if draw {
+            self.client.draw_buffer = Some(mode);
+            draw::apply_buffers(self.draws.get(&self.current_draw), None, self.client.fronts, Some(mode), None);
+        } else {
+            self.client.read_buffer = Some(mode);
+            draw::apply_buffers(None, self.draws.get(&self.current_read), self.client.fronts, None, Some(mode));
         }
     }
 

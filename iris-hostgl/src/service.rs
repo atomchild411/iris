@@ -82,6 +82,12 @@ pub const OP_BATCH_ASYNC: u64 = 0x1_0010;
 /// replaced before they could be in v1. Global, not per client -- one thread
 /// serves every channel -- and answerable without a context.
 pub const OP_PRESENT_STATS: u64 = 0x1_000F;
+/// The library keeps a window's front buffer apart from its back: drawing
+/// into GL_FRONT reaches the front buffer, a swap copies the back into it, and
+/// a swap with bit 1 of its seventh slot shows the front as it is. Answered 1;
+/// a host without it answers EINVAL, and the library keeps the one buffer.
+/// For this client from now on, its contexts made before as well.
+pub const OP_FRONT_BUFFERS: u64 = 0x1_0011;
 
 /// The protocol: HELLO's second result, which the library checks.
 pub const PROTOCOL: u64 = 2;
@@ -94,7 +100,7 @@ pub(crate) const EFAULT: u64 = 14;
 /// value travels to the guest in a 64-bit register, where the MIPS rules keep
 /// it sign-extended, and one that arrives zero-extended compares equal to
 /// nothing the guest loads from memory.
-const PBUFFER_ID: u32 = 0x4000_0000;
+pub(crate) const PBUFFER_ID: u32 = 0x4000_0000;
 /// The largest drawable, either way.
 const MAX_DIM: i32 = 8192;
 /// The largest command buffer (the library's is 128 KB).
@@ -148,6 +154,8 @@ struct Client {
     swap_async: bool,
     /// When the client said hello, for forgetting idle ones oldest first.
     since: u64,
+    /// It said OP_FRONT_BUFFERS.
+    fronts: bool,
 }
 
 /// Where a call stopped, to be carried on by its retry.
@@ -235,7 +243,7 @@ impl GlService {
         if self.backend.current() != Some(ctx.handle) {
             self.backend.make_current(Some(ctx.handle));
             if let Some(g) = self.groups.get(&ctx.group) {
-                draw::bind(&g.draws, c.draw, c.read);
+                draw::bind_with(&g.draws, c.draw, c.read, ctx.client.fronts, ctx.client.draw_buffer, ctx.client.read_buffer);
             }
         }
     }
@@ -251,7 +259,7 @@ impl GlService {
         let Some(c) = self.clients.get(&client) else { return };
         let Some(ctx) = c.current.and_then(|id| self.ctxs.get(&id)) else { return };
         if let Some(g) = self.groups.get(&ctx.group) {
-            draw::bind(&g.draws, c.draw, c.read);
+            draw::bind_with(&g.draws, c.draw, c.read, ctx.client.fronts, ctx.client.draw_buffer, ctx.client.read_buffer);
         }
     }
 
@@ -486,7 +494,8 @@ impl Service for GlService {
                 };
                 let g = self.groups.entry(group).or_insert_with(|| Group { owner: client, members: 0, draws: HashMap::new() });
                 g.members += 1;
-                self.ctxs.insert(id, Ctx { handle, owner: client, group, viewport_set: false, client: ClientSide::default() });
+                let fronts = self.clients.get(&client).is_some_and(|c| c.fronts);
+                self.ctxs.insert(id, Ctx { handle, owner: client, group, viewport_set: false, client: ClientSide { fronts, ..Default::default() } });
                 Reply::Ok(id as u64, 0)
             }
             OP_MAKECURRENT => {
@@ -497,6 +506,7 @@ impl Service for GlService {
                 let first = !c.viewport_set;
                 c.viewport_set = true;
                 let (handle, group) = (c.handle, c.group);
+                let (fronts, draw_mode, read_mode) = (c.client.fronts, c.client.draw_buffer, c.client.read_buffer);
                 if !self.backend.make_current(Some(handle)) {
                     return Reply::Err(EINVAL);
                 }
@@ -512,7 +522,7 @@ impl Service for GlService {
                 if !g.draws.contains_key(&read) {
                     draw::ensure(&mut g.draws, self.backend.as_mut(), read, w, h, 0);
                 }
-                draw::bind(&g.draws, draw, read);
+                draw::bind_with(&g.draws, draw, read, fronts, draw_mode, read_mode);
                 let samples = g.draws[&draw].samples;
                 // SAFETY: plain state in the context just made current.
                 unsafe {
@@ -618,9 +628,10 @@ impl Service for GlService {
                 // of the seventh is set, for a display that composites.
                 let [buf, w, h, abgr, x, y, place] = slots!(7);
                 let at = (place & 1 != 0).then_some((x as i32, y as i32));
+                let front = place & 2 != 0;
                 let (buf, w, h) = (buf, (w as i32).clamp(0, MAX_DIM), (h as i32).clamp(0, MAX_DIM));
                 let c = &self.clients[&client];
-                let (window, interval, last_swap) = (c.draw, c.swap_interval, c.last_swap);
+                let (window, interval, last_swap, keep_front) = (c.draw, c.swap_interval, c.last_swap, c.fronts);
                 // A frame with a screen position goes to a display that
                 // composites it: it is queued whatever the swap interval, so
                 // the wait for the GPU and the present happen off the CPU
@@ -644,11 +655,15 @@ impl Service for GlService {
                 }
                 self.clients.get_mut(&client).unwrap().last_swap = Some(now + wait);
                 let (dw, dh, samples) = (d.w, d.h, d.samples);
-                let frame = draw::swap(d, window, at, w, h, sink, abgr != 0);
+                let frame = draw::swap(d, window, at, w, h, sink, abgr != 0, front, keep_front);
                 // The window is a different size from the drawable, so the
                 // next frame is drawn at the new one. After the read, not
-                // before: the pixels presented are in the old buffer.
-                if (w, h) != (dw, dh) && w > 0 && h > 0 {
+                // before: the pixels presented are in the old buffer. Not on
+                // showing the front: that is a flush, after which the program
+                // still has its back buffer (gltest's window, sized by the
+                // window manager after its context was made current, lost
+                // what it had drawn).
+                if !front && (w, h) != (dw, dh) && w > 0 && h > 0 {
                     if let Some(g) = self.groups.get_mut(&group) {
                         draw::ensure(&mut g.draws, self.backend.as_mut(), window, w, h, samples);
                     }
@@ -661,6 +676,15 @@ impl Service for GlService {
                     Some(_) if buf == 0 => Reply::Err(EFAULT),
                     Some(frame) => self.finish(mem, args, vec![(buf, frame)], Reply::Ok(0, wait)),
                 }
+            }
+            OP_FRONT_BUFFERS => {
+                if let Some(c) = self.clients.get_mut(&client) {
+                    c.fronts = true;
+                }
+                for ctx in self.ctxs.values_mut().filter(|c| c.owner == client) {
+                    ctx.client.fronts = true;
+                }
+                Reply::Ok(1, 0)
             }
             OP_DESTROY => {
                 let [id] = slots!(1);

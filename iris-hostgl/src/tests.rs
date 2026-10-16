@@ -673,6 +673,74 @@ fn swap_hands_the_frame_back() {
     assert_eq!(pixel(&f, 120, 110, 55)[1..], [0, 0, 0], "outside the old drawable nothing is read");
 }
 
+/// A library that keeps the front buffer apart (OP_FRONT_BUFFERS), drawn as
+/// mview's IRIS GL panel draws it: a frame shown, the back cleared, a button
+/// drawn into front and back (glDrawBuffer(GL_FRONT_AND_BACK)), then the
+/// front shown. The screen keeps the frame with the button on it; with the
+/// one buffer it showed the cleared back (iris#227).
+#[test]
+fn front_buffer_drawing_keeps_the_frame_on_the_screen() {
+    let mut g = Guest::new(512);
+    assert_eq!(g.call(OP_FRONT_BUFFERS, &[0]), Reply::Ok(1, 0));
+    let window = 0x0040_0007;
+    g.context(window, 100, 50);
+    let mut e = Enc::default();
+    ortho(&mut e, 100, 50);
+    e.cmd("glClearColor", &[V::F(0.2), V::F(0.4), V::F(0.6), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    let frame = |g: &mut Guest, place: u64| {
+        let buf = g.mem.alloc(100 * 50 * 4, 0);
+        assert!(matches!(g.call(OP_SWAP, &[buf, 100, 50, 0, 0, 0, place]), Reply::Ok(0, _)));
+        g.mem.get(buf, 100 * 50 * 4).to_vec()
+    };
+    let f = frame(&mut g, 0);
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [51, 102, 153], "the first frame");
+
+    e.cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(0.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glDrawBuffer", &[V::I(0x0408)]) // GL_FRONT_AND_BACK
+        .cmd("glBegin", &[V::I(GL_QUADS)])
+        .cmd("glColor3ub", &[V::I(255), V::I(0), V::I(0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(40.0)])
+        .cmd("glVertex2f", &[V::F(10.0), V::F(40.0)])
+        .cmd("glVertex2f", &[V::F(10.0), V::F(50.0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(50.0)])
+        .cmd("glEnd", &[])
+        .cmd("glDrawBuffer", &[V::I(0x0405)]); // GL_BACK
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+
+    // The front, shown as it is: the first frame, with the button.
+    let f = frame(&mut g, 2);
+    assert_eq!(pixel(&f, 100, 5, 5)[1..], [255, 0, 0], "the button, in the front buffer");
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [51, 102, 153], "the rest is still the first frame");
+    // A swap shows the back: cleared, with the button.
+    let f = frame(&mut g, 0);
+    assert_eq!(pixel(&f, 100, 5, 5)[1..], [255, 0, 0], "the button, in the back buffer too");
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 0, 0], "the cleared back");
+    // ... which is the front from then on.
+    let f = frame(&mut g, 2);
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 0, 0], "the swap made it the front");
+    // GL_FRONT alone: the front buffer, and not the back.
+    e.cmd("glDrawBuffer", &[V::I(0x0404)]) // GL_FRONT
+        .cmd("glClearColor", &[V::F(0.0), V::F(1.0), V::F(0.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glDrawBuffer", &[V::I(0x0405)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    let f = frame(&mut g, 2);
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 255, 0], "drawn into the front alone");
+    let f = frame(&mut g, 0);
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 0, 0], "the back did not see it");
+
+    // Showing the front of a window grown since is a flush, not a swap: the
+    // drawable keeps its size and its pixels.
+    let big = g.mem.alloc(120 * 60 * 4, 0);
+    assert!(matches!(g.call(OP_SWAP, &[big, 120, 60, 0, 0, 0, 2]), Reply::Ok(0, _)));
+    let f = frame(&mut g, 0);
+    assert_eq!(pixel(&f, 100, 5, 5)[1..], [255, 0, 0], "the back kept its button");
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 0, 0], "and its clear");
+}
+
 /// What a program reads from glGetString is IRIS's answer, not the Mac's: a
 /// guest that switched on the renderer string would otherwise be deciding what
 /// to do from the wrong machine, and anything logging them would record a
