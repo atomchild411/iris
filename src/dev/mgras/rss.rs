@@ -808,6 +808,13 @@ pub(crate) fn jit_xfer_ok(f: (u32, u32)) -> bool {
     !generic_format(f) || f == (8, 0x11)
 }
 
+/// Whether a transfer format gives its pixels an alpha (RGBA or alpha
+/// alone; the packed 4:4:4:4 and 5:5:5:1 types arrive without it, see
+/// `from_host`).
+fn transfer_alpha(f: (u32, u32)) -> bool {
+    matches!(f.0, 6 | 8) && !matches!(f, (8, 8) | (8, 10))
+}
+
 /// Framebuffer components (0 red .. 3 alpha) of a generic format, in host
 /// order.
 fn format_comps(f: (u32, u32)) -> &'static [usize] {
@@ -2467,8 +2474,9 @@ impl Rss {
             self.put_stencil_line(x, line, bytes);
             return;
         }
+        let frag = self.transfer_fragments();
         #[cfg(feature = "gr4-jit")]
-        if super::rss_jit::xfer_line(self, x, line, bytes) {
+        if !frag && super::rss_jit::xfer_line(self, x, line, bytes) {
             self.stats.dma_lines_jit += 1;
             return;
         }
@@ -2481,10 +2489,16 @@ impl Rss {
                 self.stats.dma_px_clipped += 1;
             }
         }
+        let alpha = transfer_alpha(x.format);
         if generic_format(x.format) {
             for (k, px) in bytes.chunks(bpp).enumerate().take(x.width as usize) {
                 let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
-                self.put(fx, fy, fb_pixel(x.format, px));
+                let v = fb_pixel(x.format, px);
+                if frag {
+                    self.put_fragment(fx, fy, v, alpha);
+                } else {
+                    self.put(fx, fy, v);
+                }
             }
             return;
         }
@@ -2501,7 +2515,53 @@ impl Rss {
                 }
                 continue;
             }
-            self.put(fx, fy, from_host(x.format, v));
+            if frag {
+                self.put_fragment(fx, fy, from_host(x.format, v), alpha);
+            } else {
+                self.put(fx, fy, from_host(x.format, v));
+            }
+        }
+    }
+
+    /// Whether transferred pixels go through the per-fragment stage, as
+    /// glDrawPixels' fragments do: RGB drawing with the alpha test or
+    /// blending on. Harbingers of Destiny draws its dialogue layer as a
+    /// window-sized RGBA image, transparent outside the box, under
+    /// glAlphaFunc(GL_GEQUAL, 0.9); written straight, the transparent
+    /// pixels covered the 3D scene in black. The depth and stencil tests
+    /// are not applied here: a transfer carries no depth.
+    fn transfer_fragments(&self) -> bool {
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        self.rgb_mode()
+            && draw_buffer(pp1) != DRAW_CID
+            && (self.reg(reg::AFUNCMODE) & TEST_ENABLE != 0 || self.reg(reg::BLENDFACTOR) & BLEND_ENABLE != 0)
+    }
+
+    /// Transferred pixel `v` (a framebuffer value) at framebuffer `(fx,
+    /// fy)` through the alpha test and blending (`fragment_color`), into
+    /// the buffer or buffers drawing goes to. Without `alpha` the format
+    /// has none and the fragment's alpha is 1, as OpenGL gives it.
+    fn put_fragment(&mut self, fx: i32, fy: i32, v: u32, alpha: bool) {
+        if !self.visible(fx, fy) {
+            return;
+        }
+        let v = if alpha { v } else { v | 0xFF << 24 };
+        let rgba = [0, 8, 16, 24].map(|s| (fixed::widen((v >> s) & 0xFF, 2) << 16) as i32);
+        let af = self.reg(reg::AFUNCMODE);
+        if af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3] as f64, (((af >> 4) & 0xFFF) << 16) as f64) {
+            return;
+        }
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let (ux, uy) = (fx as u32, fy as u32);
+        let b = self.target();
+        self.fragment_color(b, ux, uy, rgba, pp1, draws_b(draw_buffer(pp1)));
+        if draws_a_and_b(draw_buffer(pp1)) && !rgb12_pair(pp1) && !ci_pixtype(pp1) {
+            if let Some(p) = self.second_buffer() {
+                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
+                if b2 != b {
+                    self.fragment_color(b2, ux, uy, rgba, pp1, true);
+                }
+            }
         }
     }
 
@@ -3246,6 +3306,37 @@ mod tests {
         block(&mut r, 7, 7, 7, 7);
         r.dma_write_line(0, &[0x00, 0x50, 0x50, 0x50]);
         assert_eq!(px(&r, 7, 7), 0x50_5050);
+    }
+
+    /// glDrawPixels under the alpha test: a transparent pixel leaves the
+    /// framebuffer alone, an opaque one is written (Harbingers of
+    /// Destiny's dialogue layer over its 3D scene). Blending applies too.
+    #[test]
+    fn transfers_pass_the_alpha_test_and_blend() {
+        let mut r = x_server();
+        r.write(reg::PP1FILLMODE, 0x0C00_6204, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFFF_FFFF, false);
+        r.write(reg::FILLMODE, 5 << 22, false);
+        r.write(reg::XFRMODE, 0x80, false);
+        r.write(reg::XFRSIZE, 1 << 16 | 2, false);
+        block(&mut r, 7, 7, 8, 7);
+        r.dma_write_line(0, &[0xFF, 0x50, 0x50, 0x50, 0xFF, 0x50, 0x50, 0x50]);
+        assert_eq!(px(&r, 7, 7) & 0xFF_FFFF, 0x50_5050);
+        // glAlphaFunc(GL_GEQUAL, 0.9): ref 0.9 of 4095.
+        r.write(reg::AFUNCMODE, 0xE66 << 4 | TEST_ENABLE | 6, false);
+        block(&mut r, 7, 7, 8, 7);
+        r.dma_write_line(0, &[0x00, 0x11, 0x11, 0x11, 0xFF, 0x22, 0x22, 0x22]);
+        assert_eq!(px(&r, 7, 7) & 0xFF_FFFF, 0x50_5050, "transparent pixel written");
+        assert_eq!(px(&r, 8, 7) & 0xFF_FFFF, 0x22_2222, "opaque pixel dropped");
+        // Alpha test off, blending on (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA):
+        // half alpha mixes 0xD0 into 0x50.
+        r.write(reg::AFUNCMODE, 7, false);
+        r.write(reg::BLENDFACTOR, BLEND_ENABLE | 5 << 4 | 4, false);
+        r.write(reg::XFRSIZE, 1 << 16 | 1, false);
+        block(&mut r, 7, 7, 7, 7);
+        r.dma_write_line(0, &[0x80, 0xD0, 0xD0, 0xD0]);
+        let c = px(&r, 7, 7) & 0xFF;
+        assert!((0x8C..=0x94).contains(&c), "blend gave {c:#x}, want about 0x90");
     }
 
     #[test]
