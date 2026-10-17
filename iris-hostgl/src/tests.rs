@@ -1665,3 +1665,47 @@ fn a_call_behind_queued_buffers_is_told_to_come_back() {
     let mut other = Proc::new(16);
     let Reply::Ok(_, PROTOCOL) = call_on(&mut t.svc, &mut other, [OP_HELLO, PROTOCOL, 0, 0, 0, 0, 0, 0]) else { panic!("hello") };
 }
+
+/// macOS's OpenGL drew nothing lit after a clip plane was switched off, until
+/// lighting was switched (see exec.rs's relight_after_clip_plane): UroMan's
+/// organs, drawn after its cutting plane went off, were not there.
+#[test]
+fn lit_drawing_after_a_clip_plane_goes_off_is_drawn() {
+    let mut g = Guest::new(512);
+    g.context(0x0040_000b, 32, 32);
+    let px = g.mem.alloc(4, 0);
+    let plane: Vec<u8> = [0.0f64, 0.0, -1.0, 0.0].iter().flat_map(|v| v.to_be_bytes()).collect();
+    let light: Vec<u8> = [0.0f32, 0.0, 1.0, 0.0].iter().flat_map(|v| v.to_be_bytes()).collect();
+    let mut e = Enc::default();
+    ortho(&mut e, 32, 32);
+    e.cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(1.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glEnable", &[V::I(0x0B50)]) // GL_LIGHTING
+        .cmd("glEnable", &[V::I(0x4000)]) // GL_LIGHT0
+        .cmd("glLightfv", &[V::I(0x4000), V::I(0x1203), V::Inline(4, light)]) // GL_POSITION
+        .cmd("glColorMaterial", &[V::I(0x0408), V::I(0x1201)]) // GL_FRONT_AND_BACK, GL_DIFFUSE
+        .cmd("glEnable", &[V::I(0x0B57)]) // GL_COLOR_MATERIAL
+        .cmd("glClipPlane", &[V::I(0x3000), V::Inline(4, plane)])
+        .cmd("glEnable", &[V::I(0x3000)])
+        // Something drawn while it is on: the driver settles its state at a draw.
+        .cmd("glColor3f", &[V::F(1.0), V::F(0.0), V::F(0.0)])
+        .cmd("glBegin", &[V::I(GL_QUADS)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(4.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(4.0), V::F(4.0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(4.0)])
+        .cmd("glEnd", &[])
+        .cmd("glDisable", &[V::I(0x3000)])
+        .cmd("glColor3f", &[V::F(0.0), V::F(1.0), V::F(0.0)])
+        .cmd("glNormal3f", &[V::F(0.0), V::F(0.0), V::F(1.0)])
+        .cmd("glBegin", &[V::I(GL_QUADS)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(32.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(32.0), V::F(32.0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(32.0)])
+        .cmd("glEnd", &[])
+        .cmd("glReadPixels", &[V::I(16), V::I(16), V::I(1), V::I(1), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    let p = g.mem.get(px, 4).to_vec();
+    assert!(p[1] > 200 && p[2] < 50, "the quad drawn lit after the plane went off: {p:?}");
+}

@@ -327,6 +327,22 @@ macro_rules! get_value {
 }
 get_value!(u8, i32, u32, f32, f64);
 
+/// macOS's OpenGL (2.1 Metal, seen on an M4 Pro): with lighting on, once a
+/// clip plane is switched off nothing more is drawn -- not until lighting is
+/// itself switched, which this does. UroMan (IRIX 6.5's O2 demos) cuts the
+/// body open with a clip plane and draws the organs after switching it off:
+/// they were not there.
+fn relight_after_clip_plane() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: plain state, put back as it was.
+    unsafe {
+        if glIsEnabled(GL_LIGHTING) != 0 {
+            glDisable(GL_LIGHTING);
+            glEnable(GL_LIGHTING);
+        }
+    }
+}
+
 impl<'a> Exec<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1195,6 +1211,9 @@ impl<'a> Exec<'a> {
                     glDisable(cap)
                 }
             }
+        }
+        if !on && (GL_CLIP_PLANE0..GL_CLIP_PLANE0 + 6).contains(&cap) {
+            relight_after_clip_plane();
         }
         if self.client.emul.set_enable(cap, on) {
             self.client.emul.update();
