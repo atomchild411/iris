@@ -25,6 +25,10 @@
 //!   frame's swap. Only a library that sends OP_BATCH_ASYNC ever has buffers
 //!   queued, so only one that knows ENOTYET is ever told it.
 //!
+//! - OP_PRESENT_LATER is the same: its slots are read here and it is answered
+//!   at once, and the GL thread shows it in its turn, or when FLUSH_GAP is up
+//!   (service.rs) -- waking for that when nothing else comes.
+//!
 //! The queue is bounded: a program that sends faster than the host can run
 //! waits for room, rather than piling up frames. Each side spins a few
 //! microseconds before it sleeps: most answers come sooner than a thread
@@ -34,14 +38,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iris_hostcall::{GuestMemory, Reply, Service, ENOTYET};
 
 use crate::exec::read_guest;
-use crate::service::{read_slots, GlService, EFAULT, EINVAL, MAX_BATCH, OP_BATCH_ASYNC};
+use crate::service::{read_slots, GlService, EFAULT, EINVAL, MAX_BATCH, OP_BATCH_ASYNC, OP_PRESENT_LATER};
 
 /// Buffers queued at most: 16 of the library's 128 KB ones.
 const QUEUE: usize = 16;
@@ -63,6 +67,41 @@ enum Work {
     Call([u64; 8], Lent),
     /// An OP_BATCH_ASYNC buffer, already answered.
     Detached { client: u32, bytes: Vec<u8>, left: Arc<AtomicUsize> },
+    /// An OP_PRESENT_LATER, already answered.
+    Present { client: u32, slots: [u64; 7] },
+}
+
+/// What `next_until` found.
+enum Next<T> {
+    Got(T),
+    /// `until` came first.
+    Due,
+    Gone,
+}
+
+/// `rx`'s next message, or `Due` at `until`: `next` with a deadline.
+fn next_until<T>(rx: &Receiver<T>, until: Instant) -> Next<T> {
+    let spin = Instant::now() + SPIN;
+    loop {
+        match rx.try_recv() {
+            Ok(m) => return Next::Got(m),
+            Err(TryRecvError::Disconnected) => return Next::Gone,
+            Err(TryRecvError::Empty) => {}
+        }
+        let now = Instant::now();
+        if now >= until {
+            return Next::Due;
+        }
+        if now < spin {
+            std::hint::spin_loop();
+            continue;
+        }
+        return match rx.recv_timeout(until - now) {
+            Ok(m) => Next::Got(m),
+            Err(RecvTimeoutError::Timeout) => Next::Due,
+            Err(RecvTimeoutError::Disconnected) => Next::Gone,
+        };
+    }
 }
 
 /// `rx`'s next message: spin for `SPIN`, then sleep. `None` once the other
@@ -97,7 +136,21 @@ impl Threaded {
                 crate::qos::latency_critical("host GL");
                 // Ends when the proxy goes (the service is registered again),
                 // dropping the service -- and its contexts -- on this thread.
-                while let Some(w) = next(&work_rx) {
+                loop {
+                    let w = match svc.next_due() {
+                        None => match next(&work_rx) {
+                            Some(w) => w,
+                            None => break,
+                        },
+                        Some(due) => match next_until(&work_rx, due) {
+                            Next::Got(w) => w,
+                            Next::Due => {
+                                svc.show_due();
+                                continue;
+                            }
+                            Next::Gone => break,
+                        },
+                    };
                     match w {
                         Work::Call(args, Lent(mem)) => {
                             // SAFETY: the CPU thread lent this for the call and
@@ -111,7 +164,10 @@ impl Threaded {
                             svc.run_detached(client, bytes);
                             left.fetch_sub(1, Ordering::Release);
                         }
+                        Work::Present { client, slots } => svc.present_later(client, slots),
                     }
+                    // A program that never stops sending still gets its due ones.
+                    svc.show_due();
                 }
             })
             .expect("host GL: no thread for the GL service");
@@ -151,6 +207,17 @@ impl Service for Threaded {
     fn call(&mut self, mem: &mut dyn GuestMemory, args: &[u64; 8]) -> Reply {
         if args[0] == OP_BATCH_ASYNC {
             return self.queue_batch(mem, args);
+        }
+        if args[0] == OP_PRESENT_LATER {
+            // Not held back by the client's buffers: it is queued behind them.
+            let slots = match read_slots::<7>(mem, args[1]) {
+                Ok(s) => s,
+                Err(f) => return Reply::NeedPage(f),
+            };
+            return match self.work.send(Work::Present { client: args[2] as u32, slots }) {
+                Ok(()) => Reply::Ok(1, 0),
+                Err(_) => Reply::Err(EINVAL),
+            };
         }
         if self.queued.get(&(args[2] as u32)).is_some_and(|n| n.load(Ordering::Acquire) > 0) {
             return Reply::Err(ENOTYET);

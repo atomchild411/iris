@@ -94,6 +94,20 @@ pub const OP_FRONT_BUFFERS: u64 = 0x1_0011;
 /// RGBA as colours -- so the library asks first, and without it has the
 /// frame handed back and puts it up itself.
 pub const OP_INDEX_FRAMES: u64 = 0x1_0013;
+/// OP_SWAP's slots for a flush's present (a front buffer, a colour-index
+/// window) the library knows the display composites: nothing comes back, so
+/// on the GL thread it is answered 1 at once and queued behind the buffers
+/// sent before it (threaded.rs), and a client's window is shown at most once
+/// a `FLUSH_GAP` -- the rest when the gap is up (see present_later). SGI's
+/// IRIS GL flushes after every primitive it draws into the front buffer, two
+/// thousand a second in flight's cockpit; each a whole frame on the screen
+/// made the cockpit draw itself over a second where the board takes a few
+/// hundred milliseconds. Without the GL thread it is OP_SWAP; a host without
+/// it answers EINVAL, and the library uses OP_SWAP.
+pub const OP_PRESENT_LATER: u64 = 0x1_0012;
+
+/// How often a client's flushes reach the screen at most: a display's frame.
+pub const FLUSH_GAP: Duration = Duration::from_micros(16_667);
 
 /// The protocol: HELLO's second result, which the library checks.
 pub const PROTOCOL: u64 = 2;
@@ -162,6 +176,10 @@ struct Client {
     since: u64,
     /// It said OP_FRONT_BUFFERS.
     fronts: bool,
+    /// When an OP_PRESENT_LATER of its was last shown, and the one waiting
+    /// for FLUSH_GAP to be up since, with when it is due.
+    flush_shown: Option<Instant>,
+    flush_waiting: Option<([u64; 7], Instant)>,
 }
 
 /// Where a call stopped, to be carried on by its retry.
@@ -192,6 +210,9 @@ pub struct GlService {
     /// Command buffers run, and calls in them: how much batching is saving.
     batches: u64,
     commands: u64,
+    /// FLUSH_GAP; a test sets its own, so as not to depend on how fast the
+    /// host draws.
+    pub(crate) flush_gap: Duration,
 }
 
 impl GlService {
@@ -210,6 +231,7 @@ impl GlService {
             started: Instant::now(),
             batches: 0,
             commands: 0,
+            flush_gap: FLUSH_GAP,
         }
     }
 
@@ -274,6 +296,122 @@ impl GlService {
             self.resumes.pop_front();
         }
         self.resumes.push_back(Resume { args: *args, stage });
+    }
+
+    /// OP_SWAP for the client's current context and drawable, `slots` its
+    /// seven: the frame to hand back (None: it is on the screen), and how long
+    /// the library is to wait (GLX_SGI_swap_control), or an errno.
+    fn swap(&mut self, client: u32, slots: [u64; 7]) -> Result<(Option<Vec<u8>>, u64), u64> {
+        // The fourth slot: nonzero when the program's visual has red
+        // in the low byte, so the frame comes back in that order.
+        // Then the window's top-left on the screen, valid when bit 0
+        // of the seventh is set, for a display that composites.
+        let [_, w, h, abgr, x, y, place] = slots;
+        let at = (place & 1 != 0).then_some((x as i32, y as i32));
+        let front = place & 2 != 0;
+        // Bit 2: a colour-index window's frame, its indices for a
+        // display that keeps them (bit 3: in the overlay planes).
+        let index = (place & 4 != 0).then_some(place & 8 != 0);
+        let (w, h) = ((w as i32).clamp(0, MAX_DIM), (h as i32).clamp(0, MAX_DIM));
+        let c = &self.clients[&client];
+        let (window, interval, last_swap, keep_front) = (c.draw, c.swap_interval, c.last_swap, c.fronts);
+        // A frame with a screen position goes to a display that
+        // composites it: it is queued whatever the swap interval, so
+        // the wait for the GPU and the present happen off the CPU
+        // thread (the first swap of each drawable is still inline:
+        // see present::presents). Pacing is the `wait` below, slept
+        // in the guest.
+        // A colour-index frame takes the same way as an RGBA one: the
+        // first of each drawable now, to learn whether the display
+        // takes it, then queued.
+        let sink = if c.swap_async || at.is_some() { draw::Sink::Queued } else { draw::Sink::Now };
+        // Shown because the program flushed (front buffer, or a
+        // colour-index window, bit 4), not swapped: never waits.
+        let flush = front || place & 16 != 0;
+        let Some(group) = c.current.and_then(|id| self.ctxs.get(&id)).map(|c| c.group) else {
+            return Err(EINVAL);
+        };
+        let Some(d) = self.groups.get(&group).and_then(|g| g.draws.get(&window)) else { return Err(EINVAL) };
+        // GLX_SGI_swap_control: this swap is due `interval` frames
+        // after the last. The program is told how long that is. Only
+        // swaps are paced: showing the front buffer (bit 1), or a
+        // colour-index window, after a flush (bit 4) is not a swap,
+        // and neither waits nor moves the next swap's due time.
+        // Paced, SGI's IRIS GL drew flight at a few primitives a
+        // second: it flushes after each one it draws into the front
+        // buffer, and asks for swapinterval(2).
+        let now = Instant::now();
+        let mut wait = Duration::ZERO;
+        if !front && place & 16 == 0 {
+            if interval > 1 {
+                if let Some(last) = last_swap {
+                    let due = last + Duration::from_nanos((FRAME_NS * interval as u128).min(MAX_WAIT_NS) as u64);
+                    wait = due.saturating_duration_since(now);
+                }
+            }
+            self.clients.get_mut(&client).unwrap().last_swap = Some(now + wait);
+        }
+        let (dw, dh, samples) = (d.w, d.h, d.samples);
+        let frame = draw::swap(d, window, at, w, h, sink, abgr != 0, front, keep_front, index, flush);
+        // The window is a different size from the drawable, so the
+        // next frame is drawn at the new one. After the read, not
+        // before: the pixels presented are in the old buffer. Not on
+        // showing the front: that is a flush, after which the program
+        // still has its back buffer (gltest's window, sized by the
+        // window manager after its context was made current, lost
+        // what it had drawn).
+        if !front && (w, h) != (dw, dh) && w > 0 && h > 0 {
+            if let Some(g) = self.groups.get_mut(&group) {
+                draw::ensure(&mut g.draws, self.backend.as_mut(), window, w, h, samples);
+            }
+        }
+        self.rebind(client);
+        Ok((frame, wait.as_nanos() as u64))
+    }
+
+    /// OP_PRESENT_LATER, on the GL thread: shown now when the client's last
+    /// was shown at least FLUSH_GAP ago, otherwise when the gap is up -- this
+    /// one replacing any still waiting, since what it shows is the drawable as
+    /// it is then.
+    pub fn present_later(&mut self, client: u32, slots: [u64; 7]) {
+        let gap = self.flush_gap;
+        let Some(c) = self.clients.get_mut(&client) else { return };
+        let now = Instant::now();
+        match c.flush_shown {
+            Some(t) if now < t + gap => c.flush_waiting = Some((slots, t + gap)),
+            _ => self.show_later(client, slots, now),
+        }
+    }
+
+    fn show_later(&mut self, client: u32, slots: [u64; 7], now: Instant) {
+        let Some(c) = self.clients.get_mut(&client) else { return };
+        c.flush_shown = Some(now);
+        c.flush_waiting = None;
+        self.select_client(client);
+        // Composited, so nothing comes back; a display that did not take it
+        // has nobody to hand it to.
+        let _ = self.swap(client, slots);
+    }
+
+    /// The client's present still waiting for FLUSH_GAP, shown now.
+    fn show_waiting(&mut self, client: u32) {
+        if let Some((slots, _)) = self.clients.get_mut(&client).and_then(|c| c.flush_waiting.take()) {
+            self.show_later(client, slots, Instant::now());
+        }
+    }
+
+    /// When the next waiting present is due, if one is.
+    pub fn next_due(&self) -> Option<Instant> {
+        self.clients.values().filter_map(|c| c.flush_waiting.map(|(_, due)| due)).min()
+    }
+
+    /// Shows every waiting present that is due.
+    pub fn show_due(&mut self) {
+        let now = Instant::now();
+        let due: Vec<u32> = self.clients.iter().filter(|(_, c)| c.flush_waiting.is_some_and(|(_, d)| d <= now)).map(|(&id, _)| id).collect();
+        for client in due {
+            self.show_waiting(client);
+        }
     }
 
     /// An OP_BATCH_ASYNC buffer, run on the GL thread after its call was
@@ -449,6 +587,11 @@ impl Service for GlService {
             return Reply::Err(EINVAL);
         }
         self.select_client(client);
+        // A present still waiting is of the drawable the client is drawing
+        // to now. Only a call changes that, so it is shown first.
+        if op != OP_BATCH && op != OP_BATCH_ASYNC {
+            self.show_waiting(client);
+        }
 
         // The retry of a call that stopped part-way.
         if let Some(i) = self.resumes.iter().position(|r| r.args == *args) {
@@ -627,77 +770,15 @@ impl Service for GlService {
                 self.backend.make_current(None);
                 Reply::Ok(0, 0)
             }
-            OP_SWAP => {
-                // The fourth slot: nonzero when the program's visual has red
-                // in the low byte, so the frame comes back in that order.
-                // Then the window's top-left on the screen, valid when bit 0
-                // of the seventh is set, for a display that composites.
-                let [buf, w, h, abgr, x, y, place] = slots!(7);
-                let at = (place & 1 != 0).then_some((x as i32, y as i32));
-                let front = place & 2 != 0;
-                // Bit 2: a colour-index window's frame, its indices for a
-                // display that keeps them (bit 3: in the overlay planes).
-                let index = (place & 4 != 0).then_some(place & 8 != 0);
-                let (buf, w, h) = (buf, (w as i32).clamp(0, MAX_DIM), (h as i32).clamp(0, MAX_DIM));
-                let c = &self.clients[&client];
-                let (window, interval, last_swap, keep_front) = (c.draw, c.swap_interval, c.last_swap, c.fronts);
-                // A frame with a screen position goes to a display that
-                // composites it: it is queued whatever the swap interval, so
-                // the wait for the GPU and the present happen off the CPU
-                // thread (the first swap of each drawable is still inline:
-                // see present::presents). Pacing is the `wait` below, slept
-                // in the guest.
-                // A colour-index frame takes the same way as an RGBA one: the
-                // first of each drawable now, to learn whether the display
-                // takes it, then queued.
-                let sink = if c.swap_async || at.is_some() { draw::Sink::Queued } else { draw::Sink::Now };
-                // Shown because the program flushed (front buffer, or a
-                // colour-index window, bit 4), not swapped: never waits.
-                let flush = front || place & 16 != 0;
-                let Some(group) = c.current.and_then(|id| self.ctxs.get(&id)).map(|c| c.group) else {
-                    return Reply::Err(EINVAL);
-                };
-                let Some(d) = self.groups.get(&group).and_then(|g| g.draws.get(&window)) else { return Reply::Err(EINVAL) };
-                // GLX_SGI_swap_control: this swap is due `interval` frames
-                // after the last. The program is told how long that is. Only
-                // swaps are paced: showing the front buffer (bit 1), or a
-                // colour-index window, after a flush (bit 4) is not a swap,
-                // and neither waits nor moves the next swap's due time.
-                // Paced, SGI's IRIS GL drew flight at a few primitives a
-                // second: it flushes after each one it draws into the front
-                // buffer, and asks for swapinterval(2).
-                let now = Instant::now();
-                let mut wait = Duration::ZERO;
-                if !front && place & 16 == 0 {
-                    if interval > 1 {
-                        if let Some(last) = last_swap {
-                            let due = last + Duration::from_nanos((FRAME_NS * interval as u128).min(MAX_WAIT_NS) as u64);
-                            wait = due.saturating_duration_since(now);
-                        }
-                    }
-                    self.clients.get_mut(&client).unwrap().last_swap = Some(now + wait);
-                }
-                let (dw, dh, samples) = (d.w, d.h, d.samples);
-                let frame = draw::swap(d, window, at, w, h, sink, abgr != 0, front, keep_front, index, flush);
-                // The window is a different size from the drawable, so the
-                // next frame is drawn at the new one. After the read, not
-                // before: the pixels presented are in the old buffer. Not on
-                // showing the front: that is a flush, after which the program
-                // still has its back buffer (gltest's window, sized by the
-                // window manager after its context was made current, lost
-                // what it had drawn).
-                if !front && (w, h) != (dw, dh) && w > 0 && h > 0 {
-                    if let Some(g) = self.groups.get_mut(&group) {
-                        draw::ensure(&mut g.draws, self.backend.as_mut(), window, w, h, samples);
-                    }
-                }
-                self.rebind(client);
-                let wait = wait.as_nanos() as u64;
-                match frame {
+            OP_SWAP | OP_PRESENT_LATER => {
+                let slots = slots!(7);
+                let buf = slots[0];
+                match self.swap(client, slots) {
+                    Err(e) => Reply::Err(e),
                     // 1 tells the library the frame is already on screen.
-                    None => Reply::Ok(1, wait),
-                    Some(_) if buf == 0 => Reply::Err(EFAULT),
-                    Some(frame) => self.finish(mem, args, vec![(buf, frame)], Reply::Ok(0, wait)),
+                    Ok((None, wait)) => Reply::Ok(1, wait),
+                    Ok((Some(_), _)) if buf == 0 => Reply::Err(EFAULT),
+                    Ok((Some(frame), wait)) => self.finish(mem, args, vec![(buf, frame)], Reply::Ok(0, wait)),
                 }
             }
             OP_INDEX_FRAMES => Reply::Ok(1, 0),

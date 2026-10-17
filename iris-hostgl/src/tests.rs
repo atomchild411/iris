@@ -1760,3 +1760,68 @@ fn index_frames_are_asked_for() {
     let mut g = Guest::new(64);
     assert_eq!(g.call(OP_INDEX_FRAMES, &[0]), Reply::Ok(1, 0));
 }
+
+/// OP_PRESENT_LATER shows a client's flushes at most once a FLUSH_GAP: the
+/// first at once, a second inside the gap waits -- for the gap to be up, or
+/// for the client's next call that is not a buffer, whichever comes first.
+#[test]
+fn flush_presents_wait_out_the_gap() {
+    let mut g = Guest::new(512);
+    assert_eq!(g.call(OP_FRONT_BUFFERS, &[0]), Reply::Ok(1, 0));
+    g.context(0x0040_0009, 40, 30);
+    let client = g.client as u32;
+    let slots = [0, 40, 30, 0, 0, 0, 2];
+    // A gap far longer than a present takes, however slow the host's GL: a
+    // virtual machine's took longer than a real frame, and the second
+    // present came after the gap.
+    let gap = std::time::Duration::from_secs(60);
+    g.svc.borrow_mut().flush_gap = gap;
+    g.svc.borrow_mut().present_later(client, slots);
+    assert_eq!(g.svc.borrow().next_due(), None, "the first is shown at once");
+    g.svc.borrow_mut().present_later(client, slots);
+    let due = g.svc.borrow().next_due().expect("the second waits");
+    assert!(due > std::time::Instant::now() && due <= std::time::Instant::now() + gap);
+    // A buffer does not change what the client draws to: it still waits.
+    let mut e = Enc::default();
+    e.cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    assert!(g.svc.borrow().next_due().is_some(), "still waiting after a buffer");
+    // Any other call shows it first.
+    assert_eq!(g.call(OP_FINISH, &[0]), Reply::Ok(0, 0));
+    assert_eq!(g.svc.borrow().next_due(), None, "shown before the call");
+    // And with nothing else to do, the gap -- a short one, still well over
+    // what the last present took.
+    let gap = std::time::Duration::from_millis(200);
+    g.svc.borrow_mut().flush_gap = gap;
+    g.svc.borrow_mut().present_later(client, slots);
+    assert!(g.svc.borrow().next_due().is_some());
+    g.svc.borrow_mut().show_due();
+    assert!(g.svc.borrow().next_due().is_some(), "not due yet");
+    std::thread::sleep(gap);
+    g.svc.borrow_mut().show_due();
+    assert_eq!(g.svc.borrow().next_due(), None, "shown when the gap was up");
+}
+
+/// On the GL thread OP_PRESENT_LATER is answered at once, even with the
+/// client's buffers still queued, and runs in order with them.
+#[test]
+fn present_later_is_answered_at_once_and_runs_in_order() {
+    let mut t = Threads::new();
+    let mut e = Enc::default();
+    ortho(&mut e, 64, 64);
+    e.cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(1.0), V::F(1.0)]).cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)]);
+    let clear = e.take();
+    for _ in 0..4 {
+        assert_eq!(t.batch(OP_BATCH_ASYNC, &clear), Reply::Ok(0, 0));
+        let s: Vec<u8> = [0u64, 64, 64, 0, 0, 0, 0].iter().flat_map(|v| v.to_be_bytes()).collect();
+        t.mem.put(t.slots, &s);
+        t.serial += 1;
+        let r = t.svc.call(&mut t.mem, &[OP_PRESENT_LATER, t.slots, t.client, t.serial, 0, 0, 0, 0]);
+        assert_eq!(r, Reply::Ok(1, 0), "answered without waiting for the buffers");
+    }
+    let px = t.mem.alloc(64 * 64 * 4, 0);
+    let mut e = Enc::default();
+    e.cmd("glReadPixels", &[V::I(0), V::I(0), V::I(64), V::I(64), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    assert_eq!(t.batch(OP_BATCH, &e.take()), Reply::Ok(0, 0));
+    assert_eq!(pixel(t.mem.get(px, 64 * 64 * 4), 64, 8, 8), [0, 0, 255, 255], "the buffers ran");
+}

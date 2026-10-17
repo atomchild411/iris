@@ -72,7 +72,7 @@ use exec::Exec;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use service::{
     GlService, OP_BATCH, OP_BATCH_ASYNC, OP_CREATE, OP_DESTROY, OP_DRAWABLE_GONE, OP_FINISH, OP_GETSTRING, OP_GLX_STRING, OP_GOODBYE, OP_HELLO,
-    OP_MAKECURRENT, OP_PBUFFER, OP_RELEASE, OP_SWAP, OP_SWAP_INTERVAL, OP_VIDEO_SYNC, PROTOCOL,
+    OP_MAKECURRENT, OP_PBUFFER, OP_PRESENT_LATER, OP_RELEASE, OP_SWAP, OP_SWAP_INTERVAL, OP_VIDEO_SYNC, PROTOCOL,
 };
 
 /// Answer host call [`iris_hostcall::GL`] with a new host GL service.
