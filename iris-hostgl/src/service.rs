@@ -647,9 +647,13 @@ impl Service for GlService {
                 // thread (the first swap of each drawable is still inline:
                 // see present::presents). Pacing is the `wait` below, slept
                 // in the guest.
-                // Colour-index frames go now: the display takes them or hands
-                // them back to the program, which waits for the answer.
-                let sink = if index.is_none() && (c.swap_async || at.is_some()) { draw::Sink::Queued } else { draw::Sink::Now };
+                // A colour-index frame takes the same way as an RGBA one: the
+                // first of each drawable now, to learn whether the display
+                // takes it, then queued.
+                let sink = if c.swap_async || at.is_some() { draw::Sink::Queued } else { draw::Sink::Now };
+                // Shown because the program flushed (front buffer, or a
+                // colour-index window, bit 4), not swapped: never waits.
+                let flush = front || place & 16 != 0;
                 let Some(group) = c.current.and_then(|id| self.ctxs.get(&id)).map(|c| c.group) else {
                     return Reply::Err(EINVAL);
                 };
@@ -674,7 +678,7 @@ impl Service for GlService {
                     self.clients.get_mut(&client).unwrap().last_swap = Some(now + wait);
                 }
                 let (dw, dh, samples) = (d.w, d.h, d.samples);
-                let frame = draw::swap(d, window, at, w, h, sink, abgr != 0, front, keep_front, index);
+                let frame = draw::swap(d, window, at, w, h, sink, abgr != 0, front, keep_front, index, flush);
                 // The window is a different size from the drawable, so the
                 // next frame is drawn at the new one. After the read, not
                 // before: the pixels presented are in the old buffer. Not on

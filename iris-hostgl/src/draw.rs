@@ -365,7 +365,10 @@ pub enum Sink {
     Queued,
 }
 
-/// Hand a frame to `d`: at a screen position when the program gave one.
+/// Hand a frame to `d`: at a screen position when the program gave one. A
+/// colour-index window's frame (`index`: Some(overlay)) goes as indices, and
+/// only with a position (see iris_hostcall::Display::present_index_at).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn present_to(
     d: &dyn iris_hostcall::Display,
     window: u32,
@@ -374,35 +377,31 @@ pub(crate) fn present_to(
     stride: usize,
     w: usize,
     h: usize,
+    index: Option<bool>,
 ) -> bool {
-    match at {
-        Some((x, y)) => d.present_at(window, x, y, bgra, stride, w, h),
-        None => d.present(window, bgra, stride, w, h),
+    match (index, at) {
+        (Some(overlay), Some((x, y))) => d.present_index_at(window, x, y, bgra, stride, w, h, overlay),
+        (Some(_), None) => false,
+        (None, Some((x, y))) => d.present_at(window, x, y, bgra, stride, w, h),
+        (None, None) => d.present(window, bgra, stride, w, h),
     }
 }
 
 impl Sink {
     /// True if the frame has been dealt with and the program needs no pixels.
-    fn deliver(self, window: u32, at: Option<(i32, i32)>, bgra: &[u8], stride: usize, w: usize, h: usize, index: Option<bool>) -> bool {
-        // A colour-index frame goes to the display now, as indices (see
-        // iris_hostcall::Display::present_index_at), or back to the program.
-        if let Some(overlay) = index {
-            return match (iris_hostcall::display(), at) {
-                (Some(d), Some((x, y))) => d.present_index_at(window, x, y, bgra, stride, w, h, overlay),
-                _ => false,
-            };
-        }
+    #[allow(clippy::too_many_arguments)]
+    fn deliver(self, window: u32, at: Option<(i32, i32)>, bgra: &[u8], stride: usize, w: usize, h: usize, index: Option<bool>, flush: bool) -> bool {
         match self {
             Sink::Now => {
                 let ok = match iris_hostcall::display() {
-                    Some(d) => present_to(d.as_ref(), window, at, bgra, stride, w, h),
+                    Some(d) => present_to(d.as_ref(), window, at, bgra, stride, w, h, index),
                     None => false,
                 };
                 crate::present::note(window, ok);
                 ok
             }
             Sink::Queued if crate::present::presents(window) => {
-                crate::present::queue(window, at, bgra, stride, w, h);
+                crate::present::queue(window, at, bgra, stride, w, h, index, flush);
                 true
             }
             // Not a drawable we have seen present. Whether presenting works is
@@ -411,7 +410,7 @@ impl Sink {
             // let the next swap of this drawable be the fast one. A drawable
             // that cannot be presented into stays here for ever and behaves
             // exactly as it did before any of this.
-            Sink::Queued => Sink::Now.deliver(window, at, bgra, stride, w, h, None),
+            Sink::Queued => Sink::Now.deliver(window, at, bgra, stride, w, h, index, flush),
         }
     }
 }
@@ -420,8 +419,11 @@ impl Sink {
 /// rather than swap. `keep_front`: the front buffer is kept, so a swap copies
 /// the back into it.
 #[allow(clippy::too_many_arguments)]
+/// `flush`: the frame is shown because the program flushed, not swapped (a
+/// front buffer, a colour-index window): it never waits for the presenter,
+/// and replaces a frame still waiting (see present::queue).
 #[allow(clippy::too_many_arguments)]
-pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink: Sink, abgr: bool, front: bool, keep_front: bool, index: Option<bool>) -> Option<Vec<u8>> {
+pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink: Sink, abgr: bool, front: bool, keep_front: bool, index: Option<bool>, flush: bool) -> Option<Vec<u8>> {
     let (w, h) = (w.max(0), h.max(0));
     let (rw, rh) = (w.min(d.w), h.min(d.h));
     let mut frame = vec![0u8; w as usize * h as usize * 4];
@@ -489,11 +491,11 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
         // returns now. Mapping it here stopped the whole emulated machine for
         // that wait on every frame (powerflip: over half the CPU thread's
         // time in IOSurfaceLock).
-        if let (Some(sf), Sink::Queued, None) = (&flip.surface, sink, index) {
+        if let (Some(sf), Sink::Queued) = (&flip.surface, sink) {
             if crate::present::presents(window) {
                 glFlush();
                 flip.busy.store(true, Ordering::Release);
-                crate::present::queue_surface(window, at, sf.clone(), flip.busy.clone(), rw, rh);
+                crate::present::queue_surface(window, at, sf.clone(), flip.busy.clone(), rw, rh, index, flush);
                 for (&n, &v) in names.iter().zip(pack.iter()) {
                     glPixelStorei(n, v);
                 }
@@ -532,7 +534,7 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
                 glFlush();
                 let mut done = false;
                 let mapped = sf.with_pixels(&mut |px, stride| {
-                    presented = sink.deliver(window, at, px, stride, rw, rh, index);
+                    presented = sink.deliver(window, at, px, stride, rw, rh, index, flush);
                     if !presented && px.len() >= stride * rh && stride >= rw * 4 {
                         hand_back(px, stride);
                     }
@@ -547,7 +549,7 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
                 glReadBuffer(GL_COLOR_ATTACHMENT0);
                 let mut bgra = vec![0u8; rw * rh * 4];
                 glReadPixels(0, 0, rw as i32, rh as i32, GL_BGRA, GL_UNSIGNED_BYTE, bgra.as_mut_ptr() as *mut c_void);
-                presented = sink.deliver(window, at, &bgra, rw * 4, rw, rh, index);
+                presented = sink.deliver(window, at, &bgra, rw * 4, rw, rh, index, flush);
                 if !presented {
                     hand_back(&bgra, rw * 4);
                 }

@@ -98,6 +98,8 @@ struct Frame {
     src: Src,
     w: usize,
     h: usize,
+    /// A colour-index window's frame (Some(overlay)), shown as indices.
+    index: Option<bool>,
 }
 
 /// A frame's pixels: a copy, or the surface the GPU is rendering them into,
@@ -123,7 +125,10 @@ impl Src {
 
 #[derive(Default)]
 struct State {
-    queued: Option<Frame>,
+    /// Frames waiting, oldest first: at most one a window (a newer frame of
+    /// the same window replaces it), so one window's flushes never drop
+    /// another window's frame.
+    queued: Vec<Frame>,
     /// A frame is being presented right now.
     busy: bool,
     /// Buffers of frames already presented or replaced.
@@ -180,25 +185,37 @@ pub fn forget(window: u32) {
 ///
 /// `bgra` is `h` rows of `stride` bytes, `w` pixels each, as
 /// `Display::present` wants them.
-pub fn queue(window: u32, at: Option<(i32, i32)>, bgra: &[u8], stride: usize, w: usize, h: usize) {
-    let mut st = admit();
+///
+/// `flush`: the program flushed rather than swapped (front-buffer or
+/// colour-index drawing). Such a frame never waits: it replaces the one
+/// still waiting, so the screen gets the newest drawing as fast as this
+/// thread can put it there, and the last one always. SGI's IRIS GL flushes
+/// after every primitive it draws into the front buffer -- flight drew its
+/// cockpit with 550 flushes a second -- and waiting for the presenter on
+/// each made the drawing crawl.
+#[allow(clippy::too_many_arguments)]
+pub fn queue(window: u32, at: Option<(i32, i32)>, bgra: &[u8], stride: usize, w: usize, h: usize, index: Option<bool>, flush: bool) {
+    let mut st = admit(flush);
     let mut buf = st.spare.pop().unwrap_or_default();
     buf.clear();
     buf.extend_from_slice(bgra);
-    put(st, Frame { window, at, src: Src::Bytes { bgra: buf, stride }, w, h });
+    put(st, Frame { window, at, src: Src::Bytes { bgra: buf, stride }, w, h, index });
 }
 
 /// Queue a frame still being rendered into `sf`: this thread maps it (waiting
 /// for the GPU there, not in the swap) and presents `w` x `h` of it, then
-/// clears `busy` so its drawable may draw into it again.
-pub fn queue_surface(window: u32, at: Option<(i32, i32)>, sf: Arc<dyn Surface>, busy: Arc<AtomicBool>, w: usize, h: usize) {
-    let st = admit();
-    put(st, Frame { window, at, src: Src::Surface { sf, busy }, w, h });
+/// clears `busy` so its drawable may draw into it again. `index`, `flush`:
+/// as [`queue`].
+#[allow(clippy::too_many_arguments)]
+pub fn queue_surface(window: u32, at: Option<(i32, i32)>, sf: Arc<dyn Surface>, busy: Arc<AtomicBool>, w: usize, h: usize, index: Option<bool>, flush: bool) {
+    let st = admit(flush);
+    put(st, Frame { window, at, src: Src::Surface { sf, busy }, w, h, index });
 }
 
 /// The state, once there is room for another frame: starts the thread, and
-/// waits while [`MAX_IN_FLIGHT`] frames are already in flight.
-fn admit() -> MutexGuard<'static, State> {
+/// waits while [`MAX_IN_FLIGHT`] frames are already in flight -- unless the
+/// frame is a flush's, which replaces the waiting one instead.
+fn admit(flush: bool) -> MutexGuard<'static, State> {
     let p = presenter();
     let mut st = lock(p);
     if !st.started {
@@ -210,7 +227,7 @@ fn admit() -> MutexGuard<'static, State> {
     // One being presented and one already waiting: wait for the first to
     // finish rather than let the guest run further ahead.
     let mut waited = false;
-    while st.queued.is_some() as usize + st.busy as usize >= MAX_IN_FLIGHT {
+    while !flush && st.queued.len() + st.busy as usize >= MAX_IN_FLIGHT {
         waited = true;
         st = wait(&p.idle, st);
     }
@@ -220,18 +237,21 @@ fn admit() -> MutexGuard<'static, State> {
     st
 }
 
-/// Put `f` in the queue, replacing whatever is waiting there: it is older.
+/// Put `f` in the queue, replacing a frame of its window still waiting there:
+/// that one is older.
 fn put(mut st: MutexGuard<'static, State>, f: Frame) {
-    if let Some(old) = st.queued.take() {
+    if let Some(at) = st.queued.iter().position(|q| q.window == f.window) {
+        let old = std::mem::replace(&mut st.queued[at], f);
         REPLACED.fetch_add(1, Ordering::Relaxed);
         if let Some(buf) = old.src.release() {
             if st.spare.len() < SPARE_BUFFERS {
                 st.spare.push(buf);
             }
         }
+    } else {
+        st.queued.push(f);
     }
     QUEUED.fetch_add(1, Ordering::Relaxed);
-    st.queued = Some(f);
     drop(st);
     presenter().work.notify_one();
 }
@@ -240,7 +260,7 @@ fn put(mut st: MutexGuard<'static, State>, f: Frame) {
 pub fn drain() {
     let p = presenter();
     let mut st = lock(p);
-    while st.queued.is_some() || st.busy {
+    while !st.queued.is_empty() || st.busy {
         st = wait(&p.idle, st);
     }
 }
@@ -252,7 +272,7 @@ fn run() {
         let frame = {
             let mut st = lock(p);
             loop {
-                match st.queued.take() {
+                match (!st.queued.is_empty()).then(|| st.queued.remove(0)) {
                     Some(f) => {
                         st.busy = true;
                         break f;
@@ -265,12 +285,12 @@ fn run() {
         // queuer must not be held up by it.
         let ok = match iris_hostcall::display() {
             Some(d) => match &frame.src {
-                Src::Bytes { bgra, stride } => crate::draw::present_to(d.as_ref(), frame.window, frame.at, bgra, *stride, frame.w, frame.h),
+                Src::Bytes { bgra, stride } => crate::draw::present_to(d.as_ref(), frame.window, frame.at, bgra, *stride, frame.w, frame.h, frame.index),
                 Src::Surface { sf, .. } => {
                     let mut ok = false;
                     let mapped = sf.with_pixels(&mut |px, stride| {
                         if px.len() >= stride * frame.h && stride >= frame.w * 4 {
-                            ok = crate::draw::present_to(d.as_ref(), frame.window, frame.at, px, stride, frame.w, frame.h);
+                            ok = crate::draw::present_to(d.as_ref(), frame.window, frame.at, px, stride, frame.w, frame.h, frame.index);
                         }
                     });
                     mapped && ok
