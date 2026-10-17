@@ -655,16 +655,24 @@ impl Service for GlService {
                 };
                 let Some(d) = self.groups.get(&group).and_then(|g| g.draws.get(&window)) else { return Reply::Err(EINVAL) };
                 // GLX_SGI_swap_control: this swap is due `interval` frames
-                // after the last. The program is told how long that is.
+                // after the last. The program is told how long that is. Only
+                // swaps are paced: showing the front buffer (bit 1), or a
+                // colour-index window, after a flush (bit 4) is not a swap,
+                // and neither waits nor moves the next swap's due time.
+                // Paced, SGI's IRIS GL drew flight at a few primitives a
+                // second: it flushes after each one it draws into the front
+                // buffer, and asks for swapinterval(2).
                 let now = Instant::now();
                 let mut wait = Duration::ZERO;
-                if interval > 1 {
-                    if let Some(last) = last_swap {
-                        let due = last + Duration::from_nanos((FRAME_NS * interval as u128).min(MAX_WAIT_NS) as u64);
-                        wait = due.saturating_duration_since(now);
+                if !front && place & 16 == 0 {
+                    if interval > 1 {
+                        if let Some(last) = last_swap {
+                            let due = last + Duration::from_nanos((FRAME_NS * interval as u128).min(MAX_WAIT_NS) as u64);
+                            wait = due.saturating_duration_since(now);
+                        }
                     }
+                    self.clients.get_mut(&client).unwrap().last_swap = Some(now + wait);
                 }
-                self.clients.get_mut(&client).unwrap().last_swap = Some(now + wait);
                 let (dw, dh, samples) = (d.w, d.h, d.samples);
                 let frame = draw::swap(d, window, at, w, h, sink, abgr != 0, front, keep_front, index);
                 // The window is a different size from the drawable, so the
