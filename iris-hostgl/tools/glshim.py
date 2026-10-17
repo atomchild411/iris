@@ -115,13 +115,9 @@ INDEX_HOOKS = {
 }
 
 # lmcolor(LMC_COLOR) for SGI's IRIS GL (hgl_lmc in the guest's glshim_rt.c):
-# which of a colour and a normal came last, the program's GL_LIGHTING, and a
-# glBegin held until its first vertex while the mode is on.
+# the program's GL_LIGHTING, and a glBegin held until its first vertex while
+# the mode is on. Which of a colour and a normal came last, IGLOO says itself.
 GUEST_HOOKS.update({
-    **{f"glColor{n}{t}{v}": "hgl_lmc_colour_last = 1;"
-       for n in ("3", "4") for t in ("b", "d", "f", "i", "s", "ub", "ui", "us") for v in ("", "v")},
-    **{f"glNormal3{t}{v}": "hgl_lmc_colour_last = 0;"
-       for t in ("b", "d", "f", "i", "s") for v in ("", "v")},
     **{f"glVertex{n}{t}{v}": "if (hgl_lmc_pending) hgl_lmc_vertex();"
        for n in ("2", "3", "4") for t in ("d", "f", "i", "s") for v in ("", "v")},
     "glBegin": "if (hgl_lmc && hgl_lmc_begin(mode)) return;",
