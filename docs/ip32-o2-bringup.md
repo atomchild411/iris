@@ -1576,6 +1576,10 @@ The machine it builds: an R5000 (rev 2.1, 48 TLB entries, 32 KB/32 KB L1),
 an AIC-7880 with the disk at target 1 (a second, empty, as on a real O2). Not
 there yet: Ethernet (NetBSD's `mec0` times out), audio, graphics output, and a
 real-time clock time. It is a test harness, not a machine profile: the console
-goes to a file (`IRIS_IP32_CONSOLE`) and input is scripted.
+goes to a file (`IRIS_IP32_CONSOLE`), input can be scripted, and
+`IRIS_IP32_SERIAL=port` puts com0 on a live TCP console as well -- `telnet
+127.0.0.1 port`, the same telnet character mode as the other machines' serial
+ports. With `IRIS_IP32_STEPS` large the machine runs until stopped: log in, use
+it, `shutdown -p now`, then stop the test.
 
 Related: [`virtio-mmio-design.md`](virtio-mmio-design.md).

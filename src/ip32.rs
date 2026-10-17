@@ -738,8 +738,11 @@ pub struct Com16550 {
     /// Characters waiting to be read by the guest. The PROM polls LSR for
     /// data-ready and then reads the receive register, so an empty queue simply
     /// means "nobody has typed anything".
-    input: Mutex<std::collections::VecDeque<u8>>,
+    input: std::sync::Arc<Mutex<std::collections::VecDeque<u8>>>,
     regs: Mutex<[u8; 8]>,
+    /// The client of a TCP console (`serve_tcp`), which gets every byte
+    /// transmitted and whose keystrokes are queued as input.
+    tcp: std::sync::Arc<Mutex<Option<std::net::TcpStream>>>,
 }
 
 pub mod com_reg {
@@ -797,9 +800,57 @@ impl Com16550 {
         Self {
             out: Mutex::new(Vec::new()),
             log: Mutex::new(None),
-            input: Mutex::new(Default::default()),
+            input: Default::default(),
             regs: Mutex::new([0u8; 8]),
+            tcp: Default::default(),
         }
+    }
+
+    /// A live console on `127.0.0.1:port`, as IRIS's other machines have on
+    /// their serial ports: one client at a time (a new one replaces it), in
+    /// telnet character mode -- the same handshake and filter the Z85C30's
+    /// TCP backend uses, so `telnet` and `nc` both work. Everything the guest
+    /// transmits from now on goes to the client too; what the client types is
+    /// queued for the guest, as `feed` queues a script's input.
+    /// Port 0 takes any free port; the one bound is returned.
+    pub fn serve_tcp(&self, port: u16) -> std::io::Result<u16> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+        let bound = listener.local_addr()?.port();
+        let input = self.input.clone();
+        let client = self.tcp.clone();
+        std::thread::Builder::new().name(format!("ip32-com0-tcp-{port}")).spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_nodelay(true);
+                if stream.write_all(&crate::net::telnet::TelnetFilter::initial_handshake()).is_err() {
+                    continue;
+                }
+                let Ok(writer) = stream.try_clone() else { continue };
+                *client.lock().unwrap() = Some(writer);
+                let mut telnet = crate::net::telnet::TelnetFilter::new();
+                let mut buf = [0u8; 256];
+                loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let mut reply = Vec::new();
+                    let mut typed = Vec::new();
+                    for &b in &buf[..n] {
+                        if let Some(d) = telnet.feed(b, &mut reply) {
+                            typed.push(d);
+                        }
+                    }
+                    if !reply.is_empty() && stream.write_all(&reply).is_err() {
+                        break;
+                    }
+                    input.lock().unwrap().extend(typed);
+                }
+                *client.lock().unwrap() = None;
+            }
+        })?;
+        Ok(bound)
     }
 
     /// Mirror everything transmitted to a file as it happens.
@@ -932,6 +983,15 @@ impl Com16550 {
                     use std::io::Write;
                     let _ = f.write_all(&[val]);
                     let _ = f.flush();
+                }
+                let mut tcp = self.tcp.lock().unwrap();
+                if let Some(t) = tcp.as_mut() {
+                    use std::io::Write;
+                    let mut buf = Vec::with_capacity(2);
+                    crate::net::telnet::escape_byte(val, &mut buf);
+                    if t.write_all(&buf).is_err() {
+                        *tcp = None;
+                    }
                 }
             }
             return;
@@ -2782,6 +2842,42 @@ mod tests {
         assert_eq!(c.read8(lsr).data & com_reg::LSR_DR, 0, "queue drained");
     }
 
+    /// The TCP console: a client gets the telnet handshake, then every byte
+    /// the guest transmits, and what it types becomes the guest's input --
+    /// with telnet's own commands taken out on the way.
+    #[test]
+    fn a_tcp_console_carries_both_directions() {
+        use std::io::{Read, Write};
+        let c = Com16550::new();
+        let port = c.serve_tcp(0).expect("bind");
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut hs = [0u8; 12];
+        client.read_exact(&mut hs).expect("handshake");
+        assert_eq!(hs, crate::net::telnet::TelnetFilter::initial_handshake());
+        // Typed, with a telnet command (IAC DO SGA, which it already offered) in between.
+        client.write_all(&[b'l', 0xff, 0xfd, 0x03, b's', b'\r']).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while c.pending_input() < 3 && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(c.read8(MACE_COM0 + 7).data, b'l');
+        assert_eq!(c.read8(MACE_COM0 + 7).data, b's');
+        assert_eq!(c.read8(MACE_COM0 + 7).data, b'\r');
+        assert_eq!(c.pending_input(), 0, "the telnet command is not input");
+        // Transmitted: reaches the client (once it is registered as the client).
+        while c.tcp.lock().unwrap().is_none() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for &b in b"ok" {
+            c.write8(MACE_COM0 + 7, b);
+        }
+        let mut got = [0u8; 2];
+        client.read_exact(&mut got).expect("output");
+        assert_eq!(&got, b"ok");
+        assert_eq!(c.output(), "ok", "the console buffer still has it too");
+    }
+
     /// The CRC is how firmware decides the chip is real. Maxim's published
     /// example ROM is the standard check.
     #[test]
@@ -3213,6 +3309,14 @@ mod bringup {
         if let Ok(path) = std::env::var("IRIS_IP32_CONSOLE") {
             if let Err(e) = bus.com0.log_to(std::path::Path::new(&path)) {
                 eprintln!("ip32: console log {path}: {e}");
+            }
+        }
+        // IRIS_IP32_SERIAL=port: com0 as a live console on 127.0.0.1:port
+        // (telnet or nc), alongside the log and any script.
+        if let Some(port) = std::env::var("IRIS_IP32_SERIAL").ok().and_then(|v| v.parse::<u16>().ok()) {
+            match bus.com0.serve_tcp(port) {
+                Ok(port) => eprintln!("ip32: com0 console on 127.0.0.1:{port} (telnet 127.0.0.1 {port})"),
+                Err(e) => eprintln!("ip32: com0 console on port {port}: {e}"),
             }
         }
         let expect = std::env::var("IRIS_IP32_EXPECT")
