@@ -130,6 +130,58 @@ GUEST_HOOKS.update({
     "glDisable": "hgl_lmc_lighting(cap, 0);",
 })
 
+# swaptmesh for SGI's IRIS GL (hgl_tm in the guest's glshim_rt.c): inside one
+# of its triangle meshes, each vertex and the normal, colour and texture
+# coordinate it was sent with are kept, so that a swap can send the older of
+# the last two again. Values as floats: an integer colour or normal is
+# normalized as OpenGL does it.
+_TM_NORM = {"b": "127.0", "s": "32767.0", "i": "2147483647.0"}
+_TM_UNORM = {"ub": "255.0", "us": "65535.0", "ui": "4294967295.0"}
+
+
+def _tm_args(names, n, t, v, norm):
+    """C expressions for n values of type t, scalar names or v[i], as doubles."""
+    vals = [f"v[{i}]" if v else names[i] for i in range(n)]
+    if norm and t in _TM_NORM:
+        # OpenGL 1.1: (2c + 1) / (2^b - 1)
+        return [f"(2.0 * {x} + 1.0) / (2.0 * {_TM_NORM[t]} + 1.0)" for x in vals]
+    if norm and t in _TM_UNORM:
+        return [f"{x} / {_TM_UNORM[t]}" for x in vals]
+    return [f"(double){x}" for x in vals]
+
+
+def _tm_hook(kind, names, n, t, v, norm, fill):
+    a = _tm_args(names, n, t, v, norm) + fill[n:]
+    return f"if (hgl_tm && !hgl_tm_internal) hgl_tm_attr({kind}, {', '.join(a)});"
+
+
+def _add_hook(name, code, first=False):
+    old = GUEST_HOOKS.get(name)
+    GUEST_HOOKS[name] = code if old is None else (f"{code} {old}" if first else f"{old} {code}")
+
+
+for n in ("3", "4"):
+    for t in ("b", "d", "f", "i", "s", "ub", "ui", "us"):
+        for v in ("", "v"):
+            _add_hook(f"glColor{n}{t}{v}", _tm_hook("HGL_TM_COLOUR", ["red", "green", "blue", "alpha"], int(n), t, v, True,
+                                                   ["0", "0", "0", "1.0"]))
+for t in ("b", "d", "f", "i", "s"):
+    for v in ("", "v"):
+        _add_hook(f"glNormal3{t}{v}", _tm_hook("HGL_TM_NORMAL", ["nx", "ny", "nz"], 3, t, v, True, ["0", "0", "0", "0"]))
+for n in ("1", "2", "3", "4"):
+    for t in ("d", "f", "i", "s"):
+        for v in ("", "v"):
+            _add_hook(f"glTexCoord{n}{t}{v}", _tm_hook("HGL_TM_TEXCOORD", ["s", "t", "r", "q"], int(n), t, v, False,
+                                                      ["0", "0", "0", "1.0"]))
+for n in ("2", "3", "4"):
+    for t in ("d", "f", "i", "s"):
+        for v in ("", "v"):
+            # After lmcolor's: the vertex is sent after its held glBegin.
+            _add_hook(f"glVertex{n}{t}{v}", _tm_hook("HGL_TM_VERTEX", ["x", "y", "z", "w"], int(n), t, v, False,
+                                                    ["0", "0", "0", "1.0"]))
+# Before lmcolor's, which may return: a new strip starts with no vertices kept.
+_add_hook("glBegin", "if (hgl_tm) hgl_tm_begin();", first=True)
+
 # ... and these after a state query has its answer: an index context answers
 # for its index state, which the host does not have.
 GUEST_AFTER = {
