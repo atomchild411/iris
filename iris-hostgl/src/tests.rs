@@ -1752,3 +1752,11 @@ fn color_matrix_limits_are_answered_and_raise_no_error() {
     assert!(v(0) >= 2, "a colour matrix stack of at least 2, as IMPACT's: {}", v(0));
     assert_eq!(v(4), 1, "one deep");
 }
+
+/// A library asks before it sends a colour-index frame as indices: a host
+/// that cannot take them answers EINVAL (see OP_INDEX_FRAMES).
+#[test]
+fn index_frames_are_asked_for() {
+    let mut g = Guest::new(64);
+    assert_eq!(g.call(OP_INDEX_FRAMES, &[0]), Reply::Ok(1, 0));
+}

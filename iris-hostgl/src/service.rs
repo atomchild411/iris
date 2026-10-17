@@ -88,6 +88,12 @@ pub const OP_PRESENT_STATS: u64 = 0x1_000F;
 /// a host without it answers EINVAL, and the library keeps the one buffer.
 /// For this client from now on, its contexts made before as well.
 pub const OP_FRONT_BUFFERS: u64 = 0x1_0011;
+/// Answered 1: OP_SWAP takes a colour-index window's frame as indices (bits
+/// 2 and 3 of the seventh slot) for a display that keeps them. A host
+/// without it answers EINVAL, and would composite such a frame's encoded
+/// RGBA as colours -- so the library asks first, and without it has the
+/// frame handed back and puts it up itself.
+pub const OP_INDEX_FRAMES: u64 = 0x1_0013;
 
 /// The protocol: HELLO's second result, which the library checks.
 pub const PROTOCOL: u64 = 2;
@@ -682,6 +688,7 @@ impl Service for GlService {
                     Some(frame) => self.finish(mem, args, vec![(buf, frame)], Reply::Ok(0, wait)),
                 }
             }
+            OP_INDEX_FRAMES => Reply::Ok(1, 0),
             OP_FRONT_BUFFERS => {
                 if let Some(c) = self.clients.get_mut(&client) {
                     c.fronts = true;
