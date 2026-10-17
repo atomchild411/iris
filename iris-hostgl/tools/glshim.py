@@ -103,7 +103,29 @@ INDEX_HOOKS = {
     "glEnable": "if (hgl_index_mode && cap == GL_LOGIC_OP) cap = GL_COLOR_LOGIC_OP;",
     "glDisable": "if (hgl_index_mode && cap == GL_LOGIC_OP) cap = GL_COLOR_LOGIC_OP;",
     "glIsEnabled": "if (hgl_index_mode && cap == GL_LOGIC_OP) cap = GL_COLOR_LOGIC_OP;",
+    # GL_TEXTURE_MULTI_BUFFER_HINT_SGIX (GL_SGIX_texture_multi_buffer): a
+    # hint about IMPACT's texture memory, which the host has no use for and
+    # would refuse; taken here.
+    "glHint": "if (target == 0x812E) return;",
+    # Reading indices back: the host has only the RGBA they were drawn as.
+    "glReadPixels": "if (hgl_index_mode && format == GL_COLOR_INDEX) { hgl_read_index(x, y, width, height, type, pixels); return; }",
 }
+
+# lmcolor(LMC_COLOR) for SGI's IRIS GL (hgl_lmc in the guest's glshim_rt.c):
+# which of a colour and a normal came last, the program's GL_LIGHTING, and a
+# glBegin held until its first vertex while the mode is on.
+GUEST_HOOKS.update({
+    **{f"glColor{n}{t}{v}": "hgl_lmc_colour_last = 1;"
+       for n in ("3", "4") for t in ("b", "d", "f", "i", "s", "ub", "ui", "us") for v in ("", "v")},
+    **{f"glNormal3{t}{v}": "hgl_lmc_colour_last = 0;"
+       for t in ("b", "d", "f", "i", "s") for v in ("", "v")},
+    **{f"glVertex{n}{t}{v}": "if (hgl_lmc_pending) hgl_lmc_vertex();"
+       for n in ("2", "3", "4") for t in ("d", "f", "i", "s") for v in ("", "v")},
+    "glBegin": "if (hgl_lmc && hgl_lmc_begin(mode)) return;",
+    "glEnd": "if (hgl_lmc_pending && hgl_lmc_end()) return;",
+    "glEnable": "hgl_lmc_lighting(cap, 1);",
+    "glDisable": "hgl_lmc_lighting(cap, 0);",
+})
 
 # ... and these after a state query has its answer: an index context answers
 # for its index state, which the host does not have.
@@ -112,6 +134,8 @@ GUEST_AFTER = {
     "glGetIntegerv": "if (hgl_index_mode) hgl_index_geti(pname, data);",
     "glGetFloatv": "if (hgl_index_mode) hgl_index_getf(pname, data);",
     "glGetDoublev": "if (hgl_index_mode) hgl_index_getd(pname, data);",
+    # The program's lighting back on after a primitive drawn unlit (hgl_lmc).
+    "glEnd": "if (hgl_lmc_off) hgl_lmc_after_end();",
 }
 
 # The encoders also report what memory the host will read: hgl_ref for a
