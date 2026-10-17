@@ -503,6 +503,16 @@ def gen_rust(api):
                 lines.append(f"g({', '.join(call_args)});")
                 if guard:
                     lines.append("}")
+                # The internal format a texture image was given, as the
+                # program named it, for glGetTexLevelParameter to answer
+                # with (Exec::texture_internal_answer).
+                if internal_params and "target" in local and "level" in local:
+                    ik = next(k for k, p in enumerate(params) if p["name"] in internal_params)
+                    lines.append(f"x.note_internal({local['target']} as u32, {local['level']} as i32, a{ik} as i32);")
+                if name == "glGetTexLevelParameteriv":
+                    lines.append("x.texture_internal_answer(a0, a1, a2, &mut o3);")
+                if name == "glGetTexLevelParameterfv":
+                    lines.append("x.texture_internal_answer_f(a0, a1, a2, &mut o3);")
                 # The state queries go past the executor on the way back, so
                 # that a limit the host reports but this library cannot stand
                 # behind is answered with one it can (Exec::get_limit).

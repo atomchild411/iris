@@ -1709,3 +1709,28 @@ fn lit_drawing_after_a_clip_plane_goes_off_is_drawn() {
     let p = g.mem.get(px, 4).to_vec();
     assert!(p[1] > 200 && p[2] < 50, "the quad drawn lit after the plane went off: {p:?}");
 }
+
+/// glGetTexLevelParameteriv(GL_TEXTURE_INTERNAL_FORMAT) answers with the
+/// internal format the program gave, as IRIX's libGL does, not the sized one
+/// the host chose: Cosmo Player compares a proxy's answer with what it asked
+/// for, and on GL_RGBA8 for GL_RGBA shrank every texture to 1x1 (LivingO2).
+#[test]
+fn texture_internal_format_is_answered_as_the_program_gave_it() {
+    let mut g = Guest::new(512);
+    g.context(0x0040_000d, 16, 16);
+    let out = g.mem.alloc(16, 0);
+    let px = g.mem.alloc(4 * 4 * 4, 0);
+    g.mem.put(px, &[0x80u8; 4 * 4 * 4]);
+    let mut e = Enc::default();
+    // A proxy, as Cosmo probes: GL_PROXY_TEXTURE_2D, GL_RGBA.
+    e.cmd("glTexImage2D", &[V::I(0x8064), V::I(0), V::I(0x1908), V::I(64), V::I(64), V::I(0), V::I(0x1908), V::I(0x1401), V::A(0)])
+        .cmd("glGetTexLevelParameteriv", &[V::I(0x8064), V::I(0), V::I(0x1003), V::A(out)])
+        // A real texture with GL 1.0's "3 components".
+        .cmd("glBindTexture", &[V::I(0x0DE1), V::I(5)])
+        .cmd("glTexImage2D", &[V::I(0x0DE1), V::I(0), V::I(3), V::I(4), V::I(4), V::I(0), V::I(0x1908), V::I(0x1401), V::A(px)])
+        .cmd("glGetTexLevelParameteriv", &[V::I(0x0DE1), V::I(0), V::I(0x1003), V::A(out + 4)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    let v = |i: u64| u32::from_be_bytes(g.mem.get(out + i, 4).try_into().unwrap());
+    assert_eq!(v(0), 0x1908, "the proxy: GL_RGBA, as asked");
+    assert_eq!(v(4), 3, "the texture: 3, as given");
+}

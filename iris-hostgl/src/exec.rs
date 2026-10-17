@@ -105,6 +105,10 @@ pub struct ClientSide {
     /// whenever the context's drawables are bound (draw::bind_with).
     pub draw_buffer: Option<u32>,
     pub read_buffer: Option<u32>,
+    /// The internal format each texture image was given, as the program
+    /// named it, by (texture, target, level); a proxy target's under texture
+    /// 0. See `texture_internal_answer`.
+    pub asked_internal: HashMap<(u32, u32, i32), i32>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -341,6 +345,22 @@ fn relight_after_clip_plane() {
             glEnable(GL_LIGHTING);
         }
     }
+}
+
+/// The texture bound to `target` on the host, 0 for a proxy target, or None
+/// for a target not kept (see Exec::note_internal).
+fn texture_of(target: u32) -> Option<u32> {
+    let binding = match target {
+        0x0DE0 => 0x8068,           // GL_TEXTURE_1D: GL_TEXTURE_BINDING_1D
+        0x0DE1 => 0x8069,           // GL_TEXTURE_2D
+        0x806F => 0x806A,           // GL_TEXTURE_3D
+        0x8063 | 0x8064 | 0x8070 => return Some(0), // the proxies
+        _ => return None,
+    };
+    let mut name = 0i32;
+    // SAFETY: a query of one integer.
+    unsafe { glGetIntegerv(binding, &mut name) };
+    Some(name as u32)
 }
 
 impl<'a> Exec<'a> {
@@ -760,6 +780,39 @@ impl<'a> Exec<'a> {
     pub fn gl_internal(&mut self, internal: i32) -> i32 {
         let tex = self.client.emul.bound_texture();
         self.client.emul.select_format(tex, internal).unwrap_or(internal)
+    }
+
+    /// A texture image was given `internal` by the program (glTexImage*,
+    /// glCopyTexImage*): kept for glGetTexLevelParameter's answer.
+    pub fn note_internal(&mut self, target: u32, level: i32, internal: i32) {
+        let Some(tex) = texture_of(target) else { return };
+        self.client.asked_internal.insert((tex, target, level), internal);
+    }
+
+    /// GL_TEXTURE_INTERNAL_FORMAT (GL_TEXTURE_COMPONENTS) is answered with
+    /// the internal format the program asked for, as IRIX's libGL answers it
+    /// (and Mesa's), not the sized one the Mac picked: GL_RGBA, not GL_RGBA8.
+    /// Cosmo Player checks a proxy texture's answer against what it asked
+    /// for, and on the Mac's took every texture size to be refused: LivingO2
+    /// (the O2 demos) drew each texture as one texel. A level the host has no
+    /// image for (a refused proxy: 0) is left as it answered.
+    pub fn texture_internal_answer(&self, target: u32, level: i32, pname: u32, answer: &mut [i32]) {
+        const GL_TEXTURE_INTERNAL_FORMAT: u32 = 0x1003;
+        if pname != GL_TEXTURE_INTERNAL_FORMAT || answer.first().is_none_or(|&a| a == 0) {
+            return;
+        }
+        let Some(tex) = texture_of(target) else { return };
+        if let Some(&asked) = self.client.asked_internal.get(&(tex, target, level)) {
+            answer[0] = asked;
+        }
+    }
+
+    pub fn texture_internal_answer_f(&self, target: u32, level: i32, pname: u32, answer: &mut [f32]) {
+        let mut i = [answer.first().map_or(0, |&a| a as i32)];
+        self.texture_internal_answer(target, level, pname, &mut i);
+        if let Some(a) = answer.first_mut() {
+            *a = i[0] as f32;
+        }
     }
 
     /// The pixel format to give the host for the one the guest named.
