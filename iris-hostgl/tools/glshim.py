@@ -553,6 +553,13 @@ GUARDED = {
     "glFogf": "x.fog(a0, &[a1])",
     "glFogi": "x.fog(a0, &[a1 as f32])",
     "glFogfv": "x.fog(a0, &v1)",
+    # SGI_color_matrix's state on a host without a colour matrix (Mesa's
+    # compatibility profile has no ARB_imaging): answered here, as IMPACT
+    # answers it, rather than refused (Exec::color_matrix_query).
+    "glGetBooleanv": "x.color_matrix_query(a0, &mut o1)",
+    "glGetIntegerv": "x.color_matrix_query(a0, &mut o1)",
+    "glGetFloatv": "x.color_matrix_query(a0, &mut o1)",
+    "glGetDoublev": "x.color_matrix_query(a0, &mut o1)",
 }
 
 # Calls that read the framebuffer: a multisampled drawable is resolved first.

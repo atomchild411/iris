@@ -2416,9 +2416,11 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let c1 = get_count(a0 as u32);
             let n1 = x.count(c1)?;
             let mut o1 = vec![0 as u8; n1.max(1) + 16];
+            if !x.color_matrix_query(a0, &mut o1) {
             let f = x.func(151)?;
             let g: extern "C" fn(u32, *mut u8) = unsafe { std::mem::transmute(f) };
             g(a0, o1.as_mut_ptr());
+            }
             x.get_limit(a0, &mut o1);
             x.put::<u8>(a1, &o1[..n1])?;
             x.image_done();
@@ -2620,9 +2622,11 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let c1 = get_count(a0 as u32);
             let n1 = x.count(c1)?;
             let mut o1 = vec![0 as f64; n1.max(1) + 16];
+            if !x.color_matrix_query(a0, &mut o1) {
             let f = x.func(166)?;
             let g: extern "C" fn(u32, *mut f64) = unsafe { std::mem::transmute(f) };
             g(a0, o1.as_mut_ptr());
+            }
             x.get_limit(a0, &mut o1);
             x.put::<f64>(a1, &o1[..n1])?;
             x.image_done();
@@ -2637,9 +2641,11 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let c1 = get_count(a0 as u32);
             let n1 = x.count(c1)?;
             let mut o1 = vec![0 as f32; n1.max(1) + 16];
+            if !x.color_matrix_query(a0, &mut o1) {
             let f = x.func(168)?;
             let g: extern "C" fn(u32, *mut f32) = unsafe { std::mem::transmute(f) };
             g(a0, o1.as_mut_ptr());
+            }
             x.get_limit(a0, &mut o1);
             x.put::<f32>(a1, &o1[..n1])?;
             x.image_done();
@@ -2742,9 +2748,11 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let c1 = get_count(a0 as u32);
             let n1 = x.count(c1)?;
             let mut o1 = vec![0 as i32; n1.max(1) + 16];
+            if !x.color_matrix_query(a0, &mut o1) {
             let f = x.func(176)?;
             let g: extern "C" fn(u32, *mut i32) = unsafe { std::mem::transmute(f) };
             g(a0, o1.as_mut_ptr());
+            }
             x.get_limit(a0, &mut o1);
             x.put::<i32>(a1, &o1[..n1])?;
             x.image_done();

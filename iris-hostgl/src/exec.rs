@@ -1315,6 +1315,43 @@ impl<'a> Exec<'a> {
     /// fixed-function emulation (`emul`) is written for the units we exercise;
     /// 8 is far above what IRIX-era software asks for (Quake III wants 2), and
     /// a ceiling is easier to raise later than a wrong answer is to find.
+    /// SGI_color_matrix's state, answered here when the host GL has no
+    /// colour matrix: Mesa's compatibility profile has no ARB_imaging, so it
+    /// refused these queries with GL_INVALID_ENUM and left the answer 0.
+    /// SGI's IRIS GL (IGLOO) asks for GL_MAX_COLOR_MATRIX_STACK_DEPTH when it
+    /// sets up a window, sizes a stack from it, and crashed on 0: on a Linux
+    /// host every IRIS GL program that asked for a stencil buffer died in
+    /// gconfig(). The answers are IMPACT's -- a stack of 2, 1 deep, holding
+    /// the identity -- and no error is raised. True when answered here.
+    pub fn color_matrix_query<T: GetValue>(&mut self, pname: u32, out: &mut [T]) -> bool {
+        const GL_COLOR_MATRIX: u32 = 0x80B1;
+        const GL_COLOR_MATRIX_STACK_DEPTH: u32 = 0x80B2;
+        const GL_MAX_COLOR_MATRIX_STACK_DEPTH: u32 = 0x80B3;
+        if !(GL_COLOR_MATRIX..=GL_MAX_COLOR_MATRIX_STACK_DEPTH).contains(&pname)
+            || !self.backend.lookup("glColorTable").is_null()
+        {
+            return false;
+        }
+        match pname {
+            GL_COLOR_MATRIX => {
+                for (i, v) in out.iter_mut().take(16).enumerate() {
+                    *v = T::from_i64((i % 5 == 0) as i64);
+                }
+            }
+            GL_COLOR_MATRIX_STACK_DEPTH => {
+                if let Some(v) = out.first_mut() {
+                    *v = T::from_i64(1);
+                }
+            }
+            _ => {
+                if let Some(v) = out.first_mut() {
+                    *v = T::from_i64(2);
+                }
+            }
+        }
+        true
+    }
+
     pub fn get_limit<T: GetValue>(&mut self, pname: u32, out: &mut [T]) {
         // The accumulation buffer is this library's (accum.rs), not the
         // host's, which has none to report.

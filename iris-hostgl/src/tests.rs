@@ -1734,3 +1734,21 @@ fn texture_internal_format_is_answered_as_the_program_gave_it() {
     assert_eq!(v(0), 0x1908, "the proxy: GL_RGBA, as asked");
     assert_eq!(v(4), 3, "the texture: 3, as given");
 }
+
+/// SGI_color_matrix's limits answer as IMPACT's do on any host, and asking
+/// raises no error: on a host without a colour matrix (Mesa) the answer was
+/// 0 with GL_INVALID_ENUM, and SGI's IRIS GL crashed sizing its stack from it.
+#[test]
+fn color_matrix_limits_are_answered_and_raise_no_error() {
+    let mut g = Guest::new(512);
+    g.context(0x0040_000f, 16, 16);
+    let out = g.mem.alloc(16 * 4, 0);
+    let mut e = Enc::default();
+    e.cmd("glGetIntegerv", &[V::I(0x80B3), V::A(out)]) // GL_MAX_COLOR_MATRIX_STACK_DEPTH
+        .cmd("glGetIntegerv", &[V::I(0x80B2), V::A(out + 4)]) // GL_COLOR_MATRIX_STACK_DEPTH
+        .cmd("glGetError", &[]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0), "no GL error from the queries");
+    let v = |i: u64| i32::from_be_bytes(g.mem.get(out + i, 4).try_into().unwrap());
+    assert!(v(0) >= 2, "a colour matrix stack of at least 2, as IMPACT's: {}", v(0));
+    assert_eq!(v(4), 1, "one deep");
+}
