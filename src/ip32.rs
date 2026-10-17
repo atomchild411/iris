@@ -1642,7 +1642,7 @@ pub struct Ip32Bus {
     watch_log: Mutex<Vec<(u32, bool, u64, u32, u64)>>,
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
-    pub scsi: Mutex<Vec<(std::sync::Arc<crate::aic7880::Aic7880>, u32)>>,
+    pub scsi: Mutex<Vec<(std::sync::Arc<crate::dev::aic7880::Aic7880>, u32)>>,
 }
 
 impl Ip32Bus {
@@ -1691,11 +1691,11 @@ impl Ip32Bus {
             // The controller fetches its work from host memory, so it
             // needs to reach RAM directly rather than through the bus that
             // owns it.
-            let scsi = std::sync::Arc::new(crate::aic7880::Aic7880::new(ram.clone()));
+            let scsi = std::sync::Arc::new(crate::dev::aic7880::Aic7880::new(ram.clone()));
             // The second controller. Real hardware has it whether or not
             // anything is plugged into it, and a kernel that expects two
             // waits on the one that is missing.
-            let scsi_b = std::sync::Arc::new(crate::aic7880::Aic7880::new(ram.clone()));
+            let scsi_b = std::sync::Arc::new(crate::dev::aic7880::Aic7880::new(ram.clone()));
             bus.macepci.attach(
                 IP32_SCSI_SLOT_B,
                 std::sync::Arc::new(
@@ -3072,9 +3072,9 @@ mod bringup {
         v
     }
 
-    use crate::mips_cache_v2::R5000Cache;
-    use crate::mips_exec::{MipsCpuConfig, MipsExecutor};
-    use crate::mips_tlb::MipsTlb;
+    use crate::cpu::mips_cache_v2::R5000Cache;
+    use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
+    use crate::cpu::mips_tlb::MipsTlb;
     use std::sync::Arc;
 
     fn prom_image() -> Option<Vec<u8>> {
@@ -3508,7 +3508,7 @@ mod bringup {
                 bus.crime.set_int(IP32_ISA_CRIME_INT, isa != 0);
                 let bits = &exec.core.hot.interrupts;
                 let cur = bits.load(std::sync::atomic::Ordering::Relaxed);
-                let ip2 = crate::mips_core::CAUSE_IP2 as u64;
+                let ip2 = crate::cpu::mips_core::CAUSE_IP2 as u64;
                 let want = if bus.crime.interrupting() { cur | ip2 } else { cur & !ip2 };
                 if want != cur {
                     bits.store(want, std::sync::atomic::Ordering::Relaxed);
@@ -3522,9 +3522,9 @@ mod bringup {
                 let bits = &exec.core.hot.interrupts;
                 let cur = bits.load(std::sync::atomic::Ordering::Relaxed);
                 let want = if compare != 0 && fired {
-                    cur | crate::mips_core::CAUSE_IP7 as u64
+                    cur | crate::cpu::mips_core::CAUSE_IP7 as u64
                 } else {
-                    cur & !(crate::mips_core::CAUSE_IP7 as u64)
+                    cur & !(crate::cpu::mips_core::CAUSE_IP7 as u64)
                 };
                 if want != cur {
                     bits.store(want, std::sync::atomic::Ordering::Relaxed);
@@ -3602,7 +3602,7 @@ mod bringup {
                         [("first", fs, fg, fp), ("last", ls, lg, lp)]
                     {
                         let line: Vec<String> = named.iter()
-                            .map(|&r| format!("{}=0x{:x}", crate::mips_dis::reg_name(r as u32), g[r]))
+                            .map(|&r| format!("{}=0x{:x}", crate::cpu::mips_dis::reg_name(r as u32), g[r]))
                             .collect();
                         eprintln!("      {label} entry @{at}: {}", line.join("  "));
                         eprint!("      {label} path:");
@@ -3643,7 +3643,7 @@ mod bringup {
                 while p < b {
                     let w = bus.read32(p & 0x1fff_ffff).data;
                     eprintln!("   0x{p:08x}  {w:08x}  {}",
-                              crate::mips_dis::disassemble(w, p as u64, None));
+                              crate::cpu::mips_dis::disassemble(w, p as u64, None));
                     p += 4;
                 }
             }
@@ -3684,7 +3684,7 @@ mod bringup {
                 for &p in body {
                     let w = bus.read32(p & 0x1fff_ffff).data;
                     eprintln!("      0x{p:08x}  {:08x}  {}", w,
-                              crate::mips_dis::disassemble(w, p as u64, None));
+                              crate::cpu::mips_dis::disassemble(w, p as u64, None));
                 }
                 // The registers are what say *which* counter a poll is
                 // waiting on, and for what value. Only the ones the loop
@@ -3698,7 +3698,7 @@ mod bringup {
                 }
                 named.sort_unstable();
                 let line: Vec<String> = named.iter()
-                    .map(|&r| format!("{}=0x{:016x}", crate::mips_dis::reg_name(r as u32), gpr[r]))
+                    .map(|&r| format!("{}=0x{:016x}", crate::cpu::mips_dis::reg_name(r as u32), gpr[r]))
                     .collect();
                 eprintln!("      {}", line.join("  "));
             }

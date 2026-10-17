@@ -1,6 +1,7 @@
 //! Emulated hardware. Graphics boards get a directory each (GR2, Newport,
 //! IMPACT); the rest of the system's devices sit here as single files.
 
+pub mod aic7880;
 pub mod gl;
 pub mod gr2;
 pub mod mgras;

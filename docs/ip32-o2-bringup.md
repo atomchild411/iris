@@ -795,7 +795,7 @@ which is exactly the contract option 2 needs.
 
 ## Emulating above the sequencer
 
-2026-09-20. `src/aic7880.rs`. The decision was to implement what the driver
+2026-09-20. `src/aic7880.rs` (now `src/dev/aic7880.rs`). The decision was to implement what the driver
 *observes* rather than the sequencer's instruction set, and the first half of
 that works.
 
@@ -1552,5 +1552,30 @@ top to bottom. In rough order of how much time each saved:
 - CPU: O2 shipped R5000/RM5200/RM7000/R10000/R12000. We have R5000, which is
   the cheapest target. RM7000 would need extra CP0 state, and the decompiled
   PROM branches on `CP0_PRID`, so it will notice.
+
+## Carried onto upstream main (2026-10-17)
+
+The bring-up was done on a branch from 2026-09-21. On 2026-10-17 its 33 commits
+were replayed onto upstream main (b615195), limited to the IP32 files -- the
+three that also changed the CPU side say so; those changes (Index_Store_Tag
+without a writeback, a JTLB as big as the CPU model) are upstream in their own
+form -- and one commit moved it onto upstream's layout:
+
+- `src/aic7880.rs` is now `src/dev/aic7880.rs`, with the other devices.
+- Imports name `crate::cpu::...`, where upstream keeps the CPU now.
+
+Nothing else had to change: the executor, TLB, cache and `BusDevice` the
+bring-up drives are the same interfaces. On upstream main, `cargo test --lib
+ip32` passes 21 (the PROM traced from reset among them) and `aic7880` 10, and
+NetBSD 11 boots to multi-user and a root login with the command in "Reproducing
+it" above, plus `IRIS_IP32_PROM=<path to ip32prom.rev4.18.bin>` when the PROM
+is not at `ip32/` beside the working directory.
+
+The machine it builds: an R5000 (rev 2.1, 48 TLB entries, 32 KB/32 KB L1),
+128 MB at `0x40000000`, the real PROM, CRIME and MACE, com0 as the console, and
+an AIC-7880 with the disk at target 1 (a second, empty, as on a real O2). Not
+there yet: Ethernet (NetBSD's `mec0` times out), audio, graphics output, and a
+real-time clock time. It is a test harness, not a machine profile: the console
+goes to a file (`IRIS_IP32_CONSOLE`) and input is scripted.
 
 Related: [`virtio-mmio-design.md`](virtio-mmio-design.md).
