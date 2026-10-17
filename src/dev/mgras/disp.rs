@@ -86,8 +86,13 @@ pub fn composite(rss: &mut Rss, dcb: &Dcb, x: i32, y: i32, bgra: &[u8], stride: 
 /// The window ID a colour-index frame's window has, in the main planes (a
 /// colour-index display mode) or the overlay planes (one that is on): the
 /// commonest such ID over a grid of samples inside the window, as
-/// `window_did`. None if no sampled pixel has one.
+/// `window_did` -- and only when it covers three quarters of the samples on
+/// the screen. A window just mapped may not have its ID in the tables yet,
+/// and the commonest ID around it is then someone else's: the frame went
+/// there, the program was told it was shown, and gltest's overlay read back
+/// 0s now and then. None, and the program puts the frame up itself.
 fn index_window_did(dcb: &Dcb, x: i32, y: i32, w: usize, h: usize, overlay: bool) -> Option<u8> {
+    let mut total = 0u32;
     let mut counts = [0u32; 32];
     let mut runs = Vec::new();
     let (screen_w, screen_h) = frame::display_size(dcb);
@@ -108,13 +113,14 @@ fn index_window_did(dcb: &Dcb, x: i32, y: i32, w: usize, h: usize, overlay: bool
             }
             let did = runs.iter().rev().find(|r| r.0 as i32 <= px).map_or(0, |r| r.1) as u32;
             let index = if overlay { dcb.xmap.overlay_mode(did) != 0 } else { dcb.xmap.main_mode(did) & 0x1F < 4 };
+            total += 1;
             if index {
                 counts[did as usize & 31] += 1;
             }
         }
     }
     let (did, n) = counts.iter().enumerate().max_by_key(|&(_, n)| *n)?;
-    (*n > 0).then_some(did as u8)
+    (*n > 0 && *n * 4 >= total * 3).then_some(did as u8)
 }
 
 /// Paint a colour-index window's host GL frame into the framebuffer, as
