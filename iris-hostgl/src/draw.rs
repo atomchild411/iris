@@ -383,7 +383,15 @@ pub(crate) fn present_to(
 
 impl Sink {
     /// True if the frame has been dealt with and the program needs no pixels.
-    fn deliver(self, window: u32, at: Option<(i32, i32)>, bgra: &[u8], stride: usize, w: usize, h: usize) -> bool {
+    fn deliver(self, window: u32, at: Option<(i32, i32)>, bgra: &[u8], stride: usize, w: usize, h: usize, index: Option<bool>) -> bool {
+        // A colour-index frame goes to the display now, as indices (see
+        // iris_hostcall::Display::present_index_at), or back to the program.
+        if let Some(overlay) = index {
+            return match (iris_hostcall::display(), at) {
+                (Some(d), Some((x, y))) => d.present_index_at(window, x, y, bgra, stride, w, h, overlay),
+                _ => false,
+            };
+        }
         match self {
             Sink::Now => {
                 let ok = match iris_hostcall::display() {
@@ -403,7 +411,7 @@ impl Sink {
             // let the next swap of this drawable be the fast one. A drawable
             // that cannot be presented into stays here for ever and behaves
             // exactly as it did before any of this.
-            Sink::Queued => Sink::Now.deliver(window, at, bgra, stride, w, h),
+            Sink::Queued => Sink::Now.deliver(window, at, bgra, stride, w, h, None),
         }
     }
 }
@@ -412,7 +420,8 @@ impl Sink {
 /// rather than swap. `keep_front`: the front buffer is kept, so a swap copies
 /// the back into it.
 #[allow(clippy::too_many_arguments)]
-pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink: Sink, abgr: bool, front: bool, keep_front: bool) -> Option<Vec<u8>> {
+#[allow(clippy::too_many_arguments)]
+pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink: Sink, abgr: bool, front: bool, keep_front: bool, index: Option<bool>) -> Option<Vec<u8>> {
     let (w, h) = (w.max(0), h.max(0));
     let (rw, rh) = (w.min(d.w), h.min(d.h));
     let mut frame = vec![0u8; w as usize * h as usize * 4];
@@ -480,7 +489,7 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
         // returns now. Mapping it here stopped the whole emulated machine for
         // that wait on every frame (powerflip: over half the CPU thread's
         // time in IOSurfaceLock).
-        if let (Some(sf), Sink::Queued) = (&flip.surface, sink) {
+        if let (Some(sf), Sink::Queued, None) = (&flip.surface, sink, index) {
             if crate::present::presents(window) {
                 glFlush();
                 flip.busy.store(true, Ordering::Release);
@@ -523,7 +532,7 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
                 glFlush();
                 let mut done = false;
                 let mapped = sf.with_pixels(&mut |px, stride| {
-                    presented = sink.deliver(window, at, px, stride, rw, rh);
+                    presented = sink.deliver(window, at, px, stride, rw, rh, index);
                     if !presented && px.len() >= stride * rh && stride >= rw * 4 {
                         hand_back(px, stride);
                     }
@@ -538,7 +547,7 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
                 glReadBuffer(GL_COLOR_ATTACHMENT0);
                 let mut bgra = vec![0u8; rw * rh * 4];
                 glReadPixels(0, 0, rw as i32, rh as i32, GL_BGRA, GL_UNSIGNED_BYTE, bgra.as_mut_ptr() as *mut c_void);
-                presented = sink.deliver(window, at, &bgra, rw * 4, rw, rh);
+                presented = sink.deliver(window, at, &bgra, rw * 4, rw, rh, index);
                 if !presented {
                     hand_back(&bgra, rw * 4);
                 }

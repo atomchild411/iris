@@ -277,6 +277,19 @@ pub trait Display: Send + Sync {
         let _ = (x, y);
         self.present(window, bgra, stride, width, height)
     }
+
+    /// A colour-index window's frame, for a window at `x`, `y` as above: each
+    /// pixel's index is its red byte (the low 8 bits) and the low nibble of
+    /// its green (the next 4), as the host draws for an index context.
+    /// `overlay`: the window is in the overlay planes. A display that keeps
+    /// colour-index pixels and shows them through a colour map (an emulated
+    /// board) puts the indices into the window and returns true; the default
+    /// takes none, and the program puts the frame up itself.
+    #[allow(clippy::too_many_arguments)]
+    fn present_index_at(&self, window: u32, x: i32, y: i32, bgra: &[u8], stride: usize, width: usize, height: usize, overlay: bool) -> bool {
+        let _ = (window, x, y, bgra, stride, width, height, overlay);
+        false
+    }
 }
 
 static DISPLAY: parking_lot::RwLock<Option<std::sync::Arc<dyn Display>>> = parking_lot::RwLock::new(None);

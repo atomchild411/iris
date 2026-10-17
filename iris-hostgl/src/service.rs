@@ -629,6 +629,9 @@ impl Service for GlService {
                 let [buf, w, h, abgr, x, y, place] = slots!(7);
                 let at = (place & 1 != 0).then_some((x as i32, y as i32));
                 let front = place & 2 != 0;
+                // Bit 2: a colour-index window's frame, its indices for a
+                // display that keeps them (bit 3: in the overlay planes).
+                let index = (place & 4 != 0).then_some(place & 8 != 0);
                 let (buf, w, h) = (buf, (w as i32).clamp(0, MAX_DIM), (h as i32).clamp(0, MAX_DIM));
                 let c = &self.clients[&client];
                 let (window, interval, last_swap, keep_front) = (c.draw, c.swap_interval, c.last_swap, c.fronts);
@@ -638,7 +641,9 @@ impl Service for GlService {
                 // thread (the first swap of each drawable is still inline:
                 // see present::presents). Pacing is the `wait` below, slept
                 // in the guest.
-                let sink = if c.swap_async || at.is_some() { draw::Sink::Queued } else { draw::Sink::Now };
+                // Colour-index frames go now: the display takes them or hands
+                // them back to the program, which waits for the answer.
+                let sink = if index.is_none() && (c.swap_async || at.is_some()) { draw::Sink::Queued } else { draw::Sink::Now };
                 let Some(group) = c.current.and_then(|id| self.ctxs.get(&id)).map(|c| c.group) else {
                     return Reply::Err(EINVAL);
                 };
@@ -655,7 +660,7 @@ impl Service for GlService {
                 }
                 self.clients.get_mut(&client).unwrap().last_swap = Some(now + wait);
                 let (dw, dh, samples) = (d.w, d.h, d.samples);
-                let frame = draw::swap(d, window, at, w, h, sink, abgr != 0, front, keep_front);
+                let frame = draw::swap(d, window, at, w, h, sink, abgr != 0, front, keep_front, index);
                 // The window is a different size from the drawable, so the
                 // next frame is drawn at the new one. After the read, not
                 // before: the pixels presented are in the old buffer. Not on

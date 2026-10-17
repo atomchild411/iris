@@ -783,6 +783,23 @@ impl Mgras {
         ok
     }
 
+    /// A colour-index window's host GL frame, as indices (`disp::composite_index`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_index(&self, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize, overlay: bool) -> bool {
+        let sub = self.submit.lock();
+        self.wait_idle();
+        // SAFETY: idle with `submit` held.
+        let rss = unsafe { &mut *self.rss.get() };
+        let ok = disp::composite_index(rss, &self.front().dcb, x, y, bgra, stride, w, h, overlay);
+        if ok {
+            if let Some(rec) = sub.as_ref() {
+                rec.lock().put(record::Rec::Composite);
+            }
+            self.dirty.store(true, Ordering::Release);
+        }
+        ok
+    }
+
 
     /// Framebuffer pixel (its 24 colour planes) at display (`x`, `y`), y = 0
     /// the top row, once the board has run everything queued (tests).
@@ -1491,5 +1508,9 @@ impl iris_hostcall::Display for ImpactScreen {
 
     fn present_at(&self, _window: u32, x: i32, y: i32, bgra: &[u8], stride: usize, width: usize, height: usize) -> bool {
         self.0.composite(x, y, bgra, stride, width, height)
+    }
+
+    fn present_index_at(&self, _window: u32, x: i32, y: i32, bgra: &[u8], stride: usize, width: usize, height: usize, overlay: bool) -> bool {
+        self.0.composite_index(x, y, bgra, stride, width, height, overlay)
     }
 }
