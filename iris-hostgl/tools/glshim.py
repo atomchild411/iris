@@ -107,6 +107,9 @@ INDEX_HOOKS = {
     # hint about IMPACT's texture memory, which the host has no use for and
     # would refuse; taken here.
     "glHint": "if (target == 0x812E) return;",
+    # Drawing indices: the host's RGBA GL turns them into colours through its
+    # pixel maps (all 0), so they are encoded here as an index context draws.
+    "glDrawPixels": "if (hgl_index_mode && format == GL_COLOR_INDEX) { hgl_draw_index(width, height, type, pixels); return; }",
     # Reading indices back: the host has only the RGBA they were drawn as.
     "glReadPixels": "if (hgl_index_mode && format == GL_COLOR_INDEX) { hgl_read_index(x, y, width, height, type, pixels); return; }",
 }
