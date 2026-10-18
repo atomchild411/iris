@@ -137,7 +137,7 @@ impl O2Machine {
         if let Some(port) = o2.control_port {
             match std::net::TcpListener::bind(("127.0.0.1", port)) {
                 Ok(l) => {
-                    eprintln!("iris: O2 control on 127.0.0.1:{port} (shot, type, key, mouse, click, status, pc, scsi)");
+                    eprintln!("iris: O2 control on 127.0.0.1:{port} (shot, type, key, mouse, click, status, pc, regs, peek, scsi)");
                     let bus = bus.clone();
                     std::thread::Builder::new().name("O2-Control".into()).spawn(move || control_server(l, bus)).unwrap();
                 }
@@ -167,6 +167,13 @@ impl O2Machine {
             let pc = exec.core.pc as u32;
             LAST_PC.store(pc, Ordering::Relaxed);
             BATCHES.fetch_add(1, Ordering::Relaxed);
+            for (slot, v) in LAST_REGS.iter().zip(exec.core.gpr.iter()) {
+                slot.store(*v, Ordering::Relaxed);
+            }
+            LAST_REGS[32].store(exec.core.cp0_status as u64, Ordering::Relaxed);
+            LAST_REGS[33].store(exec.core.cp0_cause as u64, Ordering::Relaxed);
+            LAST_REGS[34].store(exec.core.cp0_epc, Ordering::Relaxed);
+            LAST_REGS[35].store(exec.core.cp0_badvaddr, Ordering::Relaxed);
             if !post_done {
                 // POST is over once the firmware it loaded into RAM runs.
                 if (FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN).contains(&pc) {
@@ -447,6 +454,10 @@ impl crate::gfx_display::GfxDisplay for O2Display {
 /// still moving, without stopping it.
 static LAST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The general registers at the same moment, then Status, Cause, EPC and
+/// BadVAddr: what a polling loop is polling.
+static LAST_REGS: [std::sync::atomic::AtomicU64; 36] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 36];
 
 fn control_server(listener: std::net::TcpListener, bus: Arc<Ip32Bus>) {
     use std::io::{BufRead, BufReader, Write};
@@ -484,6 +495,36 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
             LAST_PC.load(Ordering::Relaxed),
             BATCHES.load(Ordering::Relaxed)
         ),
+        "regs" => {
+            let r: Vec<u64> = LAST_REGS.iter().map(|v| v.load(Ordering::Relaxed)).collect();
+            let mut s = format!("ok pc 0x{:08x}", LAST_PC.load(Ordering::Relaxed));
+            for (i, v) in r[..32].iter().enumerate() {
+                s.push_str(&format!(" r{i}=0x{v:x}"));
+            }
+            s.push_str(&format!(" sr=0x{:x} cause=0x{:x} epc=0x{:x} badva=0x{:x}", r[32], r[33], r[34], r[35]));
+            s
+        }
+        // `peek ADDR LEN PATH`: LEN bytes of the physical address space from
+        // ADDR (hex), read as the CPU would, written to PATH as raw big-endian
+        // bytes.
+        "peek" => {
+            let mut it = arg.split_whitespace();
+            let addr = it.next().and_then(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+            let len = it.next().and_then(|l| l.parse::<u32>().ok());
+            match (addr, len, it.next()) {
+                (Some(a), Some(n), Some(path)) => {
+                    let mut out = Vec::with_capacity(n as usize);
+                    for i in (0..n.min(1 << 20)).step_by(4) {
+                        out.extend_from_slice(&bus.read32(a.wrapping_add(i)).data.to_be_bytes());
+                    }
+                    match std::fs::write(path, out) {
+                        Ok(()) => "ok".into(),
+                        Err(e) => format!("err {e}"),
+                    }
+                }
+                _ => "err usage: peek ADDR LEN PATH".into(),
+            }
+        }
         "scsi" => {
             let mut text = String::new();
             for (n, (c, _)) in bus.scsi.lock().unwrap().iter().enumerate() {

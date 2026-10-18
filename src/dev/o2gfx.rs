@@ -68,6 +68,9 @@ struct GbeState {
     reads: u64,
     /// Beam position (in dots since t0) when vt_crossings last looked.
     seen_dots: u64,
+    /// Shadow writes waiting for vertical blanking: (live offset, value,
+    /// frame number when written).
+    pending: Vec<(u32, u32, u64)>,
 }
 
 pub struct Gbe {
@@ -84,7 +87,7 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0 }), hot: Mutex::new(BTreeMap::new()), now }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now }
     }
 
     fn get(r: &[u32], off: u32) -> u32 {
@@ -116,6 +119,40 @@ impl Gbe {
         let x = dots % (maxx + 1);
         let y = (dots / (maxx + 1)) % (maxy + 1);
         ((y as u32) << 12) | x as u32
+    }
+
+    /// Frames the beam has completed since t0, or None while the timing
+    /// generator is stopped (frozen, no dot clock, or no timing set).
+    fn frame(&self, s: &GbeState) -> Option<u64> {
+        if Self::get(&s.r, VT_XY) & VT_FREEZE != 0 || Self::get(&s.r, DOTCLOCK) & DOTCLOCK_RUN == 0 {
+            return None;
+        }
+        let max = Self::get(&s.r, VT_XYMAX);
+        let (maxx, maxy) = ((max & 0xfff) as u64, ((max >> 12) & 0xfff) as u64);
+        if maxx == 0 || maxy == 0 {
+            return None;
+        }
+        let us = (self.now)().saturating_sub(s.t0);
+        let dots = us * Self::dot_hz(&s.r) / 1_000_000 + s.reads * DOTS_PER_READ;
+        Some(dots / ((maxx + 1) * (maxy + 1)))
+    }
+
+    /// Copy every shadow written before the current frame into its live
+    /// register, as the start of vertical blanking does; all of them at once
+    /// if the timing generator has stopped.
+    fn latch(&self, s: &mut GbeState) {
+        if s.pending.is_empty() {
+            return;
+        }
+        let now = self.frame(s);
+        let pending = std::mem::take(&mut s.pending);
+        for (live, val, at) in pending {
+            if now.is_none_or(|f| f > at) {
+                s.r[(live / 4) as usize] = val;
+            } else {
+                s.pending.push((live, val, at));
+            }
+        }
     }
 
     /// Which of the four vertical-timing interrupts fired since the last call:
@@ -159,6 +196,7 @@ impl Gbe {
     fn read_reg(&self, off: u32) -> u32 {
         *self.hot.lock().unwrap().entry(off).or_insert(0) += 1;
         let mut s = self.s.lock().unwrap();
+        self.latch(&mut s);
         match off {
             CTRLSTAT => {
                 let v = Self::get(&s.r, CTRLSTAT);
@@ -185,14 +223,24 @@ impl Gbe {
             return;
         }
         if off == VT_XY && val & VT_FREEZE == 0 && s.r[i] & VT_FREEZE != 0 {
+            // Frame numbers restart with the beam: nothing pending may wait
+            // on the old count.
+            for (live, v, _) in std::mem::take(&mut s.pending) {
+                s.r[(live / 4) as usize] = v;
+            }
             s.t0 = (self.now)();
             s.reads = 0;
             s.seen_dots = 0;
         }
         s.r[i] = val;
         // The hardware copies each DMA control's shadow into the live
-        // register at the start of vertical blanking; doing it at once
-        // satisfies every poll that waits for it.
+        // register at the start of vertical blanking, so until then the live
+        // one still reads what it held. IRIX depends on that: its mode set
+        // writes the overlay shadow with DMA on and then waits for the live
+        // bit to read the old state, which it would never see if the copy
+        // were immediate. Pollers that wait for the new value get it a frame
+        // later. With the timing generator stopped there is no blanking to
+        // wait for, and the copy is immediate.
         let live = match off {
             OVR_CONTROL_SHADOW => Some(OVR_CONTROL),
             FRM_CONTROL_SHADOW => Some(FRM_CONTROL),
@@ -200,7 +248,14 @@ impl Gbe {
             _ => None,
         };
         if let Some(l) = live {
-            s.r[(l / 4) as usize] = val;
+            self.latch(&mut s);
+            match self.frame(&s) {
+                Some(f) => {
+                    s.pending.retain(|p| p.0 != l);
+                    s.pending.push((l, val, f));
+                }
+                None => s.r[(l / 4) as usize] = val,
+            }
         }
     }
 
@@ -220,7 +275,11 @@ impl Gbe {
     /// top), as GBE would. Returns the size drawn, or None when the display
     /// is off. `out` must hold the largest mode (2048 x 2048 pixels).
     pub fn render(&self, mem: &O2Memory, out: &mut [u8]) -> Option<(u32, u32)> {
-        let r = self.s.lock().unwrap().r.clone();
+        let r = {
+            let mut s = self.s.lock().unwrap();
+            self.latch(&mut s);
+            s.r.clone()
+        };
         let g = |off: u32| Self::get(&r, off);
         let w = (g(VT_HCMAP) >> 12) & 0xfff;
         let h = (g(VT_VCMAP) >> 12) & 0xfff;
@@ -846,6 +905,25 @@ mod tests {
 
     const GBE_CTRLSTAT_ADDR: u32 = 0x1600_0000;
 
+    /// IRIX's mode set writes the overlay shadow with DMA on and then waits
+    /// for the live register to read the old state; it must see it until
+    /// vertical blanking, and the new value after.
+    #[test]
+    fn a_running_beam_latches_shadow_controls_at_the_next_frame() {
+        let t = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tc = t.clone();
+        let g = Gbe::new(Arc::new(move || tc.load(std::sync::atomic::Ordering::Relaxed)));
+        let base = 0x1600_0000;
+        g.write32(base + DOTCLOCK, 0x0010_020f);
+        g.write32(base + VT_XYMAX, 0x0042_9690);
+        g.write32(base + VT_XY, 0);
+        g.write32(base + OVR_CONTROL_SHADOW, 0x0035_b9c1);
+        assert_eq!(g.read32(base + OVR_CONTROL).data & 1, 0, "the old state until blanking");
+        // A frame at 108 MHz is about 15 ms of guest time.
+        t.store(40_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(g.read32(base + OVR_CONTROL).data, 0x0035_b9c1, "the new value after it");
+    }
+
     /// Fill a rectangle through TLB A, then scan it out through a tile list.
     #[test]
     fn a_filled_rectangle_comes_out_of_scanout_in_its_cmap_colour() {
@@ -875,12 +953,14 @@ mod tests {
             (CTRLSTAT, 0x300a_a000u32),
             (DOTCLOCK, 0x0010_020f),
             (VT_XYMAX, 0x0042_9690),
+            // Before the beam runs, so the copy to live is immediate: guest
+            // time stands still here and no blanking would come.
+            (FRM_CONTROL_SHADOW, list | 1),
             (VT_XY, 0),
             (VT_HCMAP, 512 << 12),
             (VT_VCMAP, 128 << 12),
             (FRM_SIZE_TILE, 1 << 5),
             (FRM_SIZE_PIXEL, 128 << 16),
-            (FRM_CONTROL_SHADOW, list | 1),
             (MODE, 0x403),
             (CMAP + 4 * 5, 0x11223300),
         ] {
