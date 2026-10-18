@@ -289,7 +289,7 @@ impl Mec {
         let mut r = self.ram.lock().unwrap();
         for (k, &b) in data.iter().enumerate() {
             if let Some(i) = r.dma_offset((addr + k as u64) as u32) {
-                r[i] = b;
+                r.write(i, &[b]);
             }
         }
     }
@@ -573,7 +573,7 @@ mod tests {
     }
 
     fn put(ram: &Arc<Mutex<crate::dev::crime_mem::O2Memory>>, off: usize, b: &[u8]) {
-        ram.lock().unwrap()[off..off + b.len()].copy_from_slice(b);
+        ram.lock().unwrap().write(off, b);
     }
 
     fn get(ram: &Arc<Mutex<crate::dev::crime_mem::O2Memory>>, off: usize, n: usize) -> Vec<u8> {

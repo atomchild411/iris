@@ -47,6 +47,8 @@ const SLOT: u32 = 32 << 20;
 /// The 128 MB bank size; bit 8 of a bank control selects it.
 const BIG: u32 = 128 << 20;
 const CTRL_128M: u64 = 0x100;
+/// The page jitv2 tracks code by.
+const PAGE: usize = 4096;
 const CTRL_BASE: u64 = 0x1f;
 /// The window in 32 MB slots.
 const SLOTS: usize = (RAM_WINDOW_SIZE / SLOT) as usize;
@@ -88,6 +90,11 @@ pub struct O2Memory {
     /// The bank controls as last written.
     ctrl: [u64; 8],
     slots: [Slot; SLOTS],
+    /// One generation counter per 4 KB page of `bytes`, bumped by every write
+    /// that goes through [`Self::write`]: what jitv2 checks compiled code
+    /// against (`BusDevice::gen_ptr`). Boxed, so a pointer to one stays valid
+    /// for as long as the memory does.
+    gens: Box<[std::sync::atomic::AtomicU64]>,
 }
 
 impl O2Memory {
@@ -132,11 +139,29 @@ impl O2Memory {
             start[i] = total;
             total += size[i];
         }
-        let mut m = Self { bytes: vec![0u8; total as usize], size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS] };
+        let gens = (0..(total as usize).div_ceil(PAGE)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let mut m = Self { bytes: vec![0u8; total as usize], size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS], gens };
         // At reset every control is zero: all eight banks at the bottom of
         // the window, 32 MB each, so bank 0 answers there.
         m.rebuild();
         m
+    }
+
+    /// Write `data` at byte offset `off` (from [`Self::offset`] or
+    /// [`Self::dma_offset`]) and bump the generation of every page it touches.
+    /// CPU stores and DMA both come here, so compiled code never outlives the
+    /// bytes it was compiled from.
+    pub fn write(&mut self, off: usize, data: &[u8]) {
+        self.bytes[off..off + data.len()].copy_from_slice(data);
+        let last = (off + data.len().max(1) - 1) / PAGE;
+        for g in &self.gens[off / PAGE..=last] {
+            g.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The generation counter for the page holding byte offset `off`.
+    pub fn gen_ptr(&self, off: usize) -> *const std::sync::atomic::AtomicU64 {
+        &self.gens[off / PAGE]
     }
 
     /// Total memory fitted, in bytes.
@@ -223,6 +248,11 @@ impl std::ops::Deref for O2Memory {
     }
 }
 
+
+/// Device tests set memory up by hand. Everything else writes through
+/// [`O2Memory::write`], which keeps the page generations honest; the lib
+/// built without `cfg(test)` has no other way in.
+#[cfg(test)]
 impl std::ops::DerefMut for O2Memory {
     fn deref_mut(&mut self) -> &mut [u8] {
         &mut self.bytes

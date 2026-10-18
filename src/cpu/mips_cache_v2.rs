@@ -15,6 +15,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::cell::{Cell, UnsafeCell};
 use bitfield::bitfield;
 
+/// tcache, switchable at run time: `$tc` while the cache is transparent,
+/// `$real` (the cache holds the data) otherwise. Without the `tcache` feature
+/// this is `$real` alone, so such a build compiles exactly as before.
+macro_rules! tc_or {
+    ($s:expr, $tc:expr, $real:expr) => {{
+        #[cfg(feature = "tcache")]
+        { if $s.tc_live() { $tc } else { $real } }
+        #[cfg(not(feature = "tcache"))]
+        { $real }
+    }};
+}
+
 /// Result of a cache instruction fetch, shared by `MipsCache::fetch` and `fetch_instr_impl`.
 /// `status == EXEC_COMPLETE` means hit; `instr` points to the DecodedInstr slot (valid for
 /// the lifetime of the cache). Any other status is an exception/retry; `instr` is null.
@@ -561,6 +573,11 @@ pub trait MipsCache: Send + Sync {
     /// instruction (jitv2 entering compiled code) may leave the fetch out.
     /// Default `false`: a model that keeps instruction-cache state does.
     fn fetch_is_pure(&self) -> bool { false }
+
+    /// tcache: make the cache transparent (`true`) or hold line data
+    /// (`false`) from now on. Default no-op: a cache without tcache, or a
+    /// build without the feature, always holds its data.
+    fn set_tcache_live(&self, _on: bool) {}
 
     /// tcache: pointer to this cache's inline mapped-region bitmap, for
     /// `MappedMemory::set_bitmap_sink2`. Null when the cache has no such field.
@@ -1277,6 +1294,12 @@ pub struct CpuCache<
     /// is directly mapped" and sends every access to the bus.
     #[cfg(feature = "tcache")]
     tc_bitmap: UnsafeCell<u64>,
+    /// tcache: whether the cache is transparent right now. On from
+    /// construction; a machine whose firmware keeps data in the cache with
+    /// nothing behind it (the O2 PROM's cache-as-RAM stack) turns it off for
+    /// the firmware and back on once the OS runs ([`Self::set_tcache_live`]).
+    #[cfg(feature = "tcache")]
+    tc_on: UnsafeCell<bool>,
     /// tcache + jitv2: base of ppmem's generation window, one `AtomicU64` per
     /// 4KB page (`gen_base + (phys >> 12)`).
     ///
@@ -1511,6 +1534,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "tcache")]
             tc_bitmap: UnsafeCell::new(0),
+            #[cfg(feature = "tcache")]
+            tc_on: UnsafeCell::new(true),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "r5ksc_triton")]
@@ -1681,6 +1706,52 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     #[cfg(feature = "jitv2")]
     pub unsafe fn set_tcache_gen_window_impl(&self, gen_base: *mut AtomicU64) {
         unsafe { *self.tc_gen.get() = gen_base };
+    }
+
+    /// tcache: is the cache transparent right now? Always false without the
+    /// feature, so every `tc_live()` branch folds away in such a build.
+    #[inline(always)]
+    fn tc_live(&self) -> bool {
+        #[cfg(feature = "tcache")]
+        { unsafe { *self.tc_on.get() } }
+        #[cfg(not(feature = "tcache"))]
+        { false }
+    }
+
+    /// tcache: switch transparency at run time. Off, the cache holds line data
+    /// as a build without tcache does; on, RAM is the store.
+    ///
+    /// Turning it on writes every dirty line back first (primary data into
+    /// the secondary, then the secondary to memory), after which RAM holds
+    /// everything and the data arrays are never read again. The tags stay, so
+    /// the guest sees no change. Turning it off invalidates every line, since
+    /// the data arrays went stale while RAM was the store; it is meant for
+    /// power-on, when the cache is empty anyway.
+    ///
+    /// Call between instructions, from the CPU thread, before any jitv2
+    /// region is compiled for the new state (`install_jit_mem_ptrs` reads it).
+    #[cfg(feature = "tcache")]
+    pub fn set_tcache_live_impl(&self, on: bool) {
+        if on == self.tc_live() {
+            return;
+        }
+        if on {
+            for eidx in 0..DC_WAYS * Self::DC_NUM_LINES {
+                if self.dc.get_tag(eidx).is_valid() {
+                    self.writeback_l1d_line(eidx, false);
+                }
+            }
+            if HAS_L2 {
+                for idx in 0..Self::L2_NUM_LINES {
+                    self.writeback_l2_line(idx);
+                }
+            }
+        } else {
+            self.ic.tags_mut().fill(L1ITag::default());
+            self.dc.tags_mut().fill(L1DTag::default());
+            self.l2.tags_mut().fill(L2Tag::default());
+        }
+        unsafe { *self.tc_on.get() = on };
     }
 
     /// tcache + jitv2: bump the generation counter for `phys_addr`'s 4KB page.
@@ -2148,10 +2219,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
         // tcache: the cache arrays are not storage — RAM is, so there is
         // nothing to copy out on a writeback. Both models.
-        #[cfg(feature = "tcache")]
-        let transparent = true;
-        #[cfg(not(feature = "tcache"))]
-        let transparent = false;
+        let transparent = self.tc_live();
 
         #[cfg(feature = "debug_cache")]
         {
@@ -2351,10 +2419,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // so there is nothing to flush. Unconditional: the bitmap decides *how*
         // to reach RAM (window vs bus), never whether L2 holds data. The state
         // transition below still runs exactly as it always does.
-        #[cfg(feature = "tcache")]
-        let tc_line = true;
-        #[cfg(not(feature = "tcache"))]
-        let tc_line = false;
+        let tc_line = self.tc_live();
 
         #[cfg(feature = "debug_cache")]
         if self.is_tracking_l2_idx(idx) {
@@ -2441,10 +2506,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // which a transparent line can never become. An instruction-origin fill
         // still reads, because R4400's decode slots live in `l2.instrs` and
         // cannot be reconstructed from a pointer.
-        #[cfg(feature = "tcache")]
-        let skip_data = !fill_instructions;
-        #[cfg(not(feature = "tcache"))]
-        let skip_data = false;
+        let skip_data = self.tc_live() && !fill_instructions;
 
         let l2_data = self.l2.data_mut();
         let start_chunk = l2_idx << Self::L2_CHUNKS_PER_LINE_SHIFT;
@@ -2614,7 +2676,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             // fall through and do a real instruction fill below.
             let l2_hit = l2_tag.cs() != L2_CS_INVALID
                 && l2_tag.ptag() == l2_ptag
-                && (cfg!(not(feature = "tcache")) || l2_tag.has_code());
+                && (!self.tc_live() || l2_tag.has_code());
 
             if l2_hit {
                 // R4K only: check for Virtual Coherency Exception (VCEI).
@@ -2649,10 +2711,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let ic_instrs = self.ic_instrs.get_mut();
             // tcache: `l2.data` holds nothing — instruction words come from RAM,
             // the same place the L2-disabled branch below reads them from.
-            #[cfg(feature = "tcache")]
-            let l2_has_data = false;
-            #[cfg(not(feature = "tcache"))]
-            let l2_has_data = self.l2_active();
+            let l2_has_data = !self.tc_live() && self.l2_active();
             if l2_has_data {
                 let l2_sub_offset = ((phys_addr as usize) & (Self::L2_LINE_MASK & !Self::IC_LINE_MASK)) >> 3;
                 let l2_chunk_base = (self.l2.get_index(phys_addr) << Self::L2_CHUNKS_PER_LINE_SHIFT)
@@ -2931,10 +2990,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// The whole doubleword at `virt_addr` in resolved line `eidx`.
     fn l1d_dword(&self, eidx: usize, virt_addr: u64, phys_addr: u64) -> u64 {
         let _ = (eidx, virt_addr);
-        #[cfg(feature = "tcache")]
-        { self.tc_read::<8>(phys_addr & !7) }
-        #[cfg(not(feature = "tcache"))]
-        { let _ = phys_addr; self.dc.dc_read::<8>(Self::dc_data_addr(eidx, virt_addr & !7)) }
+        let _ = phys_addr;
+        tc_or!(self, self.tc_read::<8>(phys_addr & !7),
+            self.dc.dc_read::<8>(Self::dc_data_addr(eidx, virt_addr & !7)))
     }
 
     /// Check a load of the `lanes` of the doubleword at `virt_addr` against its
@@ -2985,10 +3043,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         if let Some(status) = self.l1d_parity_check(eidx, virt_addr, phys_addr, lane_mask(virt_addr, SIZE)) {
             return BusRead64 { status, data: 0 };
         }
-        #[cfg(feature = "tcache")]
-        let result = self.tc_read::<SIZE>(phys_addr);
-        #[cfg(not(feature = "tcache"))]
-        let result = self.dc.dc_read::<SIZE>(Self::dc_data_addr(eidx, virt_addr));
+        let result = tc_or!(self, self.tc_read::<SIZE>(phys_addr),
+            self.dc.dc_read::<SIZE>(Self::dc_data_addr(eidx, virt_addr)));
         BusRead64::ok(result)
     }
 
@@ -2997,13 +3053,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         let eidx = self.dc.get_index(virt_addr) | (self.perr().way as usize) << Self::DC_NUM_LINES_SHIFT;
         let before = self.l1d_dword(eidx, virt_addr, phys_addr);
         let merged = (before & !mask) | (val & mask);
-        #[cfg(feature = "tcache")]
-        {
+        tc_or!(self, {
             self.tc_write::<8>(phys_addr & !7, merged);
             self.tc_invalidate_l2_code(phys_addr);
-        }
-        #[cfg(not(feature = "tcache"))]
-        self.dc.dc_write::<8>(Self::dc_data_addr(eidx, virt_addr & !7), merged);
+        }, self.dc.dc_write::<8>(Self::dc_data_addr(eidx, virt_addr & !7), merged));
         self.mark_l1d_dirty(eidx);
         let lanes = (0..8).fold(0u8, |l, i| if (mask >> (8 * i)) & 0xff != 0 { l | 1 << i } else { l });
         self.l1d_parity_store(eidx, virt_addr, phys_addr, before, lanes);
@@ -3029,10 +3082,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let tag: L2Tag = self.l2.get_tag(idx);
             let off = virt_addr as usize & Self::L2_LINE_MASK & !7;
             let phys = l2_tag_to_phys(tag, ((idx << Self::L2_LINE_SHIFT) | off) as u64);
-            #[cfg(feature = "tcache")]
-            let data = self.downstream.read64(phys as u32).data;
-            #[cfg(not(feature = "tcache"))]
-            let data = self.l2.data()[(idx << Self::L2_CHUNKS_PER_LINE_SHIFT) + (off >> 3)];
+            let data = tc_or!(self, self.downstream.read64(phys as u32).data,
+                self.l2.data()[(idx << Self::L2_CHUNKS_PER_LINE_SHIFT) + (off >> 3)]);
             return (l2_data_ecc(data) ^ self.l2_xor(phys)) as u32;
         }
         if is_icache {
@@ -3126,10 +3177,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn fill_l1d_line_raw(&self, virt_addr: u64, phys_addr: u64) -> u32 {
-        #[cfg(feature = "tcache")]
-        let transparent = true;
-        #[cfg(not(feature = "tcache"))]
-        let transparent = false;
+        let transparent = self.tc_live();
         // For R5K: pick victim way via LRU and encode into dc_idx via shift.
         // dc_ext_idx = set | (way << Self::DC_NUM_LINES_SHIFT)
         let (victim_way, dc_idx) = if Self::IS_R5K {
@@ -3149,17 +3197,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // coherency bug. The only difference is inside `fill_l2_line_for`,
         // which skips populating `l2.data` for a transparent line (`skip_data`)
         // because nothing will ever read it back out.
-        #[cfg(feature = "tcache")]
-        let l2_hit = if self.l2_active() {
+        let l2_hit = tc_or!(self, if self.l2_active() {
             match self.l2_probe_for_data(virt_addr, phys_addr) {
                 Ok(hit) => hit,
                 Err(status) => return status,
             }
         } else {
             false
-        };
-        #[cfg(not(feature = "tcache"))]
-        let l2_hit = if self.l2_active() {
+        }, if self.l2_active() {
             let l2_idx = self.l2.get_index(phys_addr);
             let l2_tag: L2Tag = self.l2.get_tag(l2_idx);
             let l2_ptag = self.l2_ptag(phys_addr);
@@ -3181,7 +3226,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             }
         } else {
             false // L2 disabled: copy direct from memory below
-        };
+        });
         #[cfg(not(feature = "lightning"))]
         if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_MISS != 0 {
             crate::dlog!(LogModule::L1d, "fill virt={:#x} phys={:#x} eidx={}", virt_addr, phys_addr, dc_idx);
@@ -3372,13 +3417,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         };
         // tcache: RAM is the store, so the words go there; dropping
         // `has_code` makes the next L1-I fill re-read them.
-        #[cfg(feature = "tcache")]
-        {
+        tc_or!(self, {
             self.downstream.write_block(line_base as u32, chunks);
             self.tc_invalidate_l2_code(line_base);
-        }
-        #[cfg(not(feature = "tcache"))]
-        {
+        }, {
             let off = ((line_base as usize) & Self::L2_LINE_MASK) >> 3;
             let base = (l2_idx << Self::L2_CHUNKS_PER_LINE_SHIFT) + off;
             self.l2.data_mut()[base..base + chunks.len()].copy_from_slice(chunks);
@@ -3395,7 +3437,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     slot.flags = FLAG_NOT_DECODED;
                 }
             }
-        }
+        });
         self.clear_l2_xor(line_base, n * 4);
         let mut tag: L2Tag = self.l2.get_tag(l2_idx);
         let cs = match tag.cs() {
@@ -3424,7 +3466,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             // tcache, where only an instruction-origin fill (`has_code`)
             // populates them.
             let l2_has_words = self.hit_l2(line_base).is_some_and(|l2_idx| {
-                cfg!(not(feature = "tcache")) || self.l2.get_tag(l2_idx).has_code()
+                !self.tc_live() || self.l2.get_tag(l2_idx).has_code()
             });
             if !Self::IS_R5K && l2_has_words {
                 self.snapshot_l1i_line(eidx, line_base);
@@ -3591,6 +3633,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     #[cfg(feature = "tcache")]
+    fn set_tcache_live(&self, on: bool) {
+        self.set_tcache_live_impl(on)
+    }
+
+    #[cfg(feature = "tcache")]
     unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { self.set_tcache_window_impl(base) }
     }
@@ -3631,6 +3678,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // every emitted access) is what lets the emitted code assume them.
         #[cfg(feature = "jitv2")]
         {
+            // The inline path is the transparent one; while the cache holds
+            // data (`set_tcache_live(false)`) compiled code must go through it.
+            if !self.tc_live() {
+                return JitDcGeometry::unsupported();
+            }
             if unsafe { *self.tc_base.get() }.is_null()
                 || unsafe { *self.tc_gen.get() }.is_null()
             {
@@ -3806,10 +3858,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // tcache: data comes from the ppmem window, so the region must be
         // mapped. Without tcache the resident line itself is authoritative
         // and no bitmap test is needed.
-        #[cfg(feature = "tcache")]
-        { self.tc_transparent(phys_addr) }
-        #[cfg(not(feature = "tcache"))]
-        { true }
+        tc_or!(self, self.tc_transparent(phys_addr), true)
     }
 
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
@@ -3848,10 +3897,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_idx);
             }
             // tcache: the cache stores no data — read RAM (window or bus).
-            #[cfg(feature = "tcache")]
-            let result = self.tc_read::<SIZE>(phys_addr);
-            #[cfg(not(feature = "tcache"))]
-            let result = self.dc.dc_read::<SIZE>(virt_addr);
+            let result = tc_or!(self, self.tc_read::<SIZE>(phys_addr), self.dc.dc_read::<SIZE>(virt_addr));
             #[cfg(feature = "debug_cache")]
             if self.is_tracking_addr(virt_addr, phys_addr) {
                 println!("[CACHE DEBUG] read{} result: {} virt 0x{:016x} phys 0x{:016x} val=0x{:016x}",
@@ -3873,13 +3919,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_eidx);
             }
             // tcache: the cache stores no data — read RAM (window or bus).
-            #[cfg(feature = "tcache")]
-            let result = self.tc_read::<SIZE>(phys_addr);
-            #[cfg(not(feature = "tcache"))]
-            let result = {
+            let result = tc_or!(self, self.tc_read::<SIZE>(phys_addr), {
                 let da = Self::dc_data_addr(dc_eidx, virt_addr);
                 self.dc.dc_read::<SIZE>(da)
-            };
+            });
             #[cfg(feature = "debug_cache")]
             if self.is_tracking_addr(virt_addr, phys_addr) {
                 println!("[CACHE DEBUG] read{} result: {} virt 0x{:016x} phys 0x{:016x} val=0x{:016x}",
@@ -3918,15 +3961,12 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_idx, val);
             }
-            #[cfg(feature = "tcache")]
-            {
+            tc_or!(self, {
                 // The cache stores no data — the write goes to RAM.
                 self.tc_write::<SIZE>(phys_addr, val);
                 // Writing the line makes L2's decoded slots for it stale.
                 self.tc_invalidate_l2_code(phys_addr);
-            }
-            #[cfg(not(feature = "tcache"))]
-            self.dc.dc_write::<SIZE>(virt_addr, val);
+            }, self.dc.dc_write::<SIZE>(virt_addr, val));
             self.mark_l1d_dirty(dc_idx);
             return BUS_OK;
         }
@@ -3959,16 +3999,13 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_eidx, val);
             }
-            #[cfg(feature = "tcache")]
-            {
+            tc_or!(self, {
                 self.tc_write::<SIZE>(phys_addr, val);
                 self.tc_invalidate_l2_code(phys_addr);
-            }
-            #[cfg(not(feature = "tcache"))]
-            {
+            }, {
                 let da = Self::dc_data_addr(dc_eidx, virt_addr);
                 self.dc.dc_write::<SIZE>(da, val);
-            }
+            });
             self.mark_l1d_dirty(dc_eidx);
             BUS_OK
         }
@@ -3995,17 +4032,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     return r;
                 }
             }
-            #[cfg(feature = "tcache")]
-            {
+            tc_or!(self, {
                 let current = self.tc_read::<8>(phys_addr);
                 self.tc_write::<8>(phys_addr, (current & !mask) | (val & mask));
                 self.tc_invalidate_l2_code(phys_addr);
-            }
-            #[cfg(not(feature = "tcache"))]
-            {
+            }, {
                 let current = self.dc.dc_read::<8>(virt_addr);
                 self.dc.dc_write::<8>(virt_addr, (current & !mask) | (val & mask));
-            }
+            });
             self.mark_l1d_dirty(dc_idx);
             return BUS_OK;
         }
@@ -4018,18 +4052,15 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 return way;
             }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
-            #[cfg(feature = "tcache")]
-            {
+            tc_or!(self, {
                 let current = self.tc_read::<8>(phys_addr);
                 self.tc_write::<8>(phys_addr, (current & !mask) | (val & mask));
                 self.tc_invalidate_l2_code(phys_addr);
-            }
-            #[cfg(not(feature = "tcache"))]
-            {
+            }, {
                 let da = Self::dc_data_addr(dc_eidx, virt_addr);
                 let current = self.dc.dc_read::<8>(da);
                 self.dc.dc_write::<8>(da, (current & !mask) | (val & mask));
-            }
+            });
             self.mark_l1d_dirty(dc_eidx);
             BUS_OK
         }
@@ -5424,6 +5455,41 @@ mod tests {
         assert_eq!(<crate::cpu::mips_cache_shadow::R10000ShadowCache as CpuModel>::VA_BITS, 44);
         assert_eq!(<R4400Cache as CpuModel>::VA_BITS, 40);
         assert_eq!(<R5000Cache as CpuModel>::VA_BITS, 40);
+    }
+
+    /// With tcache switched off the cache holds its data, as a build without
+    /// tcache does: a line written through it survives an uncached write
+    /// behind it (the O2 PROM keeps its stack that way while it tests RAM).
+    /// Switching tcache on writes the line back, and RAM is the store after.
+    #[test]
+    fn tcache_switched_off_holds_data_until_switched_on() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let check = |name: &str, live: &dyn Fn(bool), write: &dyn Fn(u64, u32), read: &dyn Fn(u64, u32) -> u32| {
+            let pa = 0x4040u32;
+            live(false);
+            write(kseg0(pa), 0x1234_5678);
+            mem_write(&mem, pa, 0xdead_beef);
+            assert_eq!(read(kseg0(pa), pa), 0x1234_5678, "{name}: the cache lost its line");
+            live(true);
+            if cfg!(feature = "tcache") {
+                assert_eq!(mem_read(&mem, pa), 0x1234_5678, "{name}: not written back on switching on");
+                write(kseg0(pa), 0x0bad_f00d);
+                assert_eq!(mem_read(&mem, pa), 0x0bad_f00d, "{name}: RAM is not the store once on");
+                assert_eq!(read(kseg0(pa), pa), 0x0bad_f00d, "{name}");
+            }
+        };
+        let r10k: R10000O2Cache = make_cache_of(mem.clone());
+        check("R10000", &|on| r10k.set_tcache_live(on),
+            &|va, v| { let _ = r10k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
+            &|va, pa| r10k.read::<4>(va, pa as u64).data as u32);
+        let r5k: R5000Cache = make_cache_of(mem.clone());
+        check("R5000", &|on| r5k.set_tcache_live(on),
+            &|va, v| { let _ = r5k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
+            &|va, pa| r5k.read::<4>(va, pa as u64).data as u32);
+        let r4k: R4400Cache = make_cache_of(mem.clone());
+        check("R4400", &|on| r4k.set_tcache_live(on),
+            &|va, v| { let _ = r4k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
+            &|va, pa| r4k.read::<4>(va, pa as u64).data as u32);
     }
 
     fn flush_l2_to_mem(cache: &R4400Cache, phys: u32) {

@@ -184,6 +184,9 @@ impl MipsCache for HandoverCache {
         self.shadow.power_on();
         self.on_shadow.store(false, Ordering::Relaxed);
     }
+    fn set_tcache_live(&self, on: bool) {
+        self.full.set_tcache_live(on)
+    }
     fn jit_dc_geometry(&self) -> JitDcGeometry {
         JitDcGeometry::unsupported()
     }

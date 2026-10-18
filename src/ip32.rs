@@ -2344,9 +2344,7 @@ impl Ip32Bus {
                 // Writes into an empty bank are swallowed by the memory controller.
                 Decode::Empty => return true,
                 Decode::Ram(i) => {
-                    for k in 0..n {
-                        r[i + k] = (val >> (8 * (n - 1 - k))) as u8;
-                    }
+                    r.write(i, &val.to_be_bytes()[8 - n..]);
                     return true;
                 }
                 Decode::None => {}
@@ -2392,6 +2390,18 @@ macro_rules! bus_read {
 }
 
 impl BusDevice for Ip32Bus {
+    /// Memory pages have generations jitv2 can compile against; the PROM and
+    /// devices have none, so nothing there is compiled.
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
+        let addr = self.resolve(addr);
+        let r = self.ram.lock().unwrap();
+        match r.decode(addr) {
+            Decode::Ram(i) => r.gen_ptr(i),
+            _ => std::ptr::null(),
+        }
+    }
+
     fn read8(&self, addr: u32) -> BusRead8 {
         if self.in_gbe(addr) {
             return BusRead8::ok(self.gbe.read32(addr & !3).data as u8);
@@ -3465,6 +3475,63 @@ mod bringup {
     use crate::cpu::mips_tlb::MipsTlb;
     use std::sync::Arc;
 
+    /// What jitv2's compile threads stop and start when one of them flushes
+    /// the code arena: on a machine, the CPU thread. Here the CPU is this
+    /// test's own loop, so `stop` asks it to park between instructions and
+    /// waits until it has, and `start` lets it go.
+    #[cfg(feature = "jitv2")]
+    #[derive(Default)]
+    struct JitPause {
+        want: std::sync::atomic::AtomicBool,
+        /// (parked, the loop has finished for good)
+        state: std::sync::Mutex<(bool, bool)>,
+        cv: std::sync::Condvar,
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl JitPause {
+        /// Called by the loop between instructions.
+        #[inline(always)]
+        fn check(&self) {
+            if self.want.load(std::sync::atomic::Ordering::Acquire) {
+                let mut st = self.state.lock().unwrap();
+                st.0 = true;
+                self.cv.notify_all();
+                while self.want.load(std::sync::atomic::Ordering::Acquire) {
+                    st = self.cv.wait(st).unwrap();
+                }
+                st.0 = false;
+            }
+        }
+
+        /// The loop is over: nothing will park again, so `stop` must not wait.
+        fn finish(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.cv.notify_all();
+        }
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl crate::traits::Device for JitPause {
+        fn step(&self, _cycles: u64) {}
+        fn stop(&self) {
+            self.want.store(true, std::sync::atomic::Ordering::Release);
+            let mut st = self.state.lock().unwrap();
+            while !st.0 && !st.1 {
+                st = self.cv.wait(st).unwrap();
+            }
+        }
+        fn start(&self) {
+            let _st = self.state.lock().unwrap();
+            self.want.store(false, std::sync::atomic::Ordering::Release);
+            self.cv.notify_all();
+        }
+        fn is_running(&self) -> bool {
+            !self.want.load(std::sync::atomic::Ordering::Acquire)
+        }
+        fn get_clock(&self) -> u64 { 0 }
+    }
+
     fn prom_image() -> Option<Vec<u8>> {
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
         if let Some(p) = std::env::var_os("IRIS_IP32_PROM") {
@@ -3760,6 +3827,26 @@ mod bringup {
         // the TLB and fault (OpenBSD's first device access). Installed here,
         // where `exec` has stopped moving, since the callback keeps a pointer.
         exec.install_status_cb();
+        // A build with tcache (jitv2 implies it) would run the PROM on a cache
+        // that holds no data, and POST's cache-held stack would go with it. So
+        // the cache holds its data until a kernel starts, then turns
+        // transparent. A no-op without the feature.
+        exec.cache.set_tcache_live(false);
+        // jitv2 takes over from the interpreter once a kernel runs, compiling
+        // on a pool of IRIS_IP32_JIT_THREADS threads (4 by default, as every
+        // machine here runs). IRIS_IP32_JIT=0 keeps the interpreter throughout.
+        #[cfg(feature = "jitv2")]
+        let mut jit_on = false;
+        #[cfg(feature = "jitv2")]
+        let jit_pause = Arc::new(JitPause::default());
+        #[cfg(feature = "jitv2")]
+        let jit_pause_dev: Arc<dyn crate::traits::Device> = jit_pause.clone();
+        // A kernel calls back into the firmware (ARCS PowerDown, Reboot), and
+        // that path sets the caches up again and keeps data in them the way
+        // POST does. So while the PC is in the PROM or its copy in RAM the
+        // cache holds data again, and the interpreter runs it.
+        let mut in_firmware = false;
+        let mut firmware_calls = 0u64;
         while steps < LIMIT {
             let pc = exec.core.pc as u32;
             if pc == POST1_ENTRY {
@@ -3778,7 +3865,28 @@ mod bringup {
                 if kernel_entered == 0 {
                     kernel_entered = steps;
                     kernel_first = pc;
+                    exec.cache.set_tcache_live(true);
+                    if cfg!(feature = "tcache") {
+                        eprintln!("ip32: the kernel started at step {steps}; caches written back, now transparent (tcache)");
+                    }
                     on_kernel(&mut exec, steps);
+                    #[cfg(feature = "jitv2")]
+                    if std::env::var("IRIS_IP32_JIT").as_deref() != Ok("0") {
+                        let threads: usize = std::env::var("IRIS_IP32_JIT_THREADS").ok()
+                            .and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
+                        exec.install_jit_hooks();
+                        let jit = exec.jitv2.clone();
+                        {
+                            let mut g = jit.lock();
+                            g.compile_queue.set_thread_count(threads);
+                            g.compile_queue.set_cpu(Arc::downgrade(&jit_pause_dev));
+                            g.compile_queue.set_owner(Arc::downgrade(&jit));
+                            let stats = g.stats.clone();
+                            g.compile_queue.start(bus.clone() as Arc<dyn crate::traits::BusDevice>, stats);
+                        }
+                        jit_on = true;
+                        eprintln!("ip32: jitv2 on from here, {threads} compile threads");
+                    }
                 }
                 // The opening moves, which is where a kernel that runs away
                 // decides to.
@@ -4037,6 +4145,27 @@ mod bringup {
             if (0xbfc0_0000..0xbfc8_0000).contains(&pc) && pc > max_prom_pc {
                 max_prom_pc = pc;
             }
+            if kernel_entered != 0 {
+                let fw = (0xbfc0_0000..0xbfc8_0000).contains(&pc)
+                    || (FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN).contains(&pc);
+                if fw != in_firmware {
+                    in_firmware = fw;
+                    exec.cache.set_tcache_live(!fw);
+                    if fw {
+                        firmware_calls += 1;
+                        if firmware_calls <= 8 {
+                            eprintln!("ip32: into the firmware at 0x{pc:08x}, step {steps}");
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "jitv2")]
+            if jit_on {
+                jit_pause.check();
+            }
+            #[cfg(feature = "jitv2")]
+            if jit_on && !in_firmware { exec.step_jit(); } else { exec.step_int(); }
+            #[cfg(not(feature = "jitv2"))]
             exec.step_int();
             steps += 1;
 
@@ -4099,6 +4228,8 @@ mod bringup {
                 arm_call = Some((pc.wrapping_add(8), steps, 1));
             }
         }
+        #[cfg(feature = "jitv2")]
+        jit_pause.finish();
 
         let pc = exec.core.pc as u32;
         eprintln!("ip32: stopped after {steps} steps at PC 0x{pc:08x}{}",

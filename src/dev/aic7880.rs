@@ -426,7 +426,7 @@ impl Aic7880 {
         }
         let mut r = self.ram.lock().unwrap();
         if let Some(i) = r.dma_offset(addr) {
-            r[i] = val;
+            r.write(i, &[val]);
         } else {
             drop(r);
             self.dma_miss(addr, true);
@@ -1435,7 +1435,7 @@ mod tests {
     #[test]
     fn dma_resolves_the_low_memory_alias() {
         let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 16)));
-        ram.lock().unwrap()[0x40] = 0xa5;
+        ram.lock().unwrap().write(0x40, &[0xa5]);
         let c = Aic7880::new(ram);
         assert_eq!(c.dma_read8(0x40), 0xa5, "the low alias");
         assert_eq!(c.dma_read8(crate::ip32::RAM_BASE + 0x40), 0xa5, "and memory's own base");
