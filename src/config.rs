@@ -729,6 +729,13 @@ pub struct O2Section {
     /// A keyboard and the PROM's graphics console. Off: serial console.
     #[serde(default = "o2_on")]
     pub graphics: bool,
+    /// A PS/2 mouse on the second port (with `graphics`).
+    #[serde(default = "o2_on")]
+    pub mouse: bool,
+    /// A TCP port on 127.0.0.1 for driving the machine from a script: screen
+    /// shots, keys, the mouse (see `src/ip32_machine.rs`).
+    #[serde(default)]
+    pub control_port: Option<u16>,
     /// Test aid, not hardware behaviour: lend a kernel the FPU while it is
     /// inside the PROM (NetBSD prints through the PROM's graphics console
     /// with CU1 clear, and the PROM scrolls with FPU loads).
@@ -774,6 +781,8 @@ impl Default for O2Section {
             serial_log: None,
             graphics: true,
             arcs_fpu: false,
+            mouse: true,
+            control_port: None,
             net: true,
             forwards: Vec::new(),
         }

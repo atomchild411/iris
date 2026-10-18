@@ -16,6 +16,14 @@
 //! The SCB layout in particular is defined by whichever sequencer program was
 //! downloaded, not by the silicon, so it is discovered by watching what the
 //! driver writes before it queues — see `docs/ip32-o2-bringup.md`.
+//!
+//! Three contracts are known. SGI's PROM and the IRIX kernel both carry
+//! Adaptec's "HIM" and its sequencer program, which hand the chip a tag
+//! through `QINFIFO` and take completions from a byte array in host memory;
+//! errors come back as pausing interrupts the HIM then sorts out itself.
+//! NetBSD and OpenBSD ring a doorbell in scratch RAM instead. Which one is
+//! in force is read from scratch RAM at each doorbell, never latched,
+//! because one boot can hand the chip from one driver to the next.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -24,7 +32,11 @@ use std::sync::Mutex;
 /// swap is applied before we get here, so these are device offsets.
 pub mod reg {
     pub const SCSISEQ: u32 = 0x00;
+    /// The bus's control lines. Bit 1 is REQ.
+    pub const SCSISIG: u32 = 0x03;
     pub const SCSIID: u32 = 0x05;
+    /// Status that latches until cleared: reads are SSTAT0/SSTAT1, writes
+    /// to the same addresses are CLRSINT0/CLRSINT1.
     pub const SSTAT0: u32 = 0x0b;
     pub const SSTAT1: u32 = 0x0c;
     pub const SIMODE0: u32 = 0x10;
@@ -74,6 +86,23 @@ pub mod intstat {
     pub const CMDCMPLT: u8 = 0x02;
     pub const SCSIINT: u8 = 0x04;
     pub const BRKADRINT: u8 = 0x08;
+    /// The interrupts that stop the sequencer until the host restarts it.
+    /// A completion is the one that does not.
+    pub const PAUSING: u8 = SEQINT | SCSIINT | BRKADRINT;
+    /// What a `SEQINT` is about. Only meaningful while `SEQINT` is set.
+    pub const INTCODE: u8 = 0xf0;
+}
+
+pub mod sstat1 {
+    /// Selection timed out: nobody answered at that id.
+    pub const SELTO: u8 = 0x80;
+}
+
+/// Bus control lines, as `SCSISIG` reads them.
+pub mod scsisig {
+    /// The target is asking for a byte. Nothing here ever does, and the HIM
+    /// waits for this to drop before it carries on after an error.
+    pub const REQ: u8 = 0x02;
 }
 
 pub mod seqctl {
@@ -89,16 +118,41 @@ pub mod seqctl {
 pub mod sram {
     /// Bus address of an array of SCB bus addresses, indexed by tag.
     pub const SCB_ARRAY: u32 = 0x3d;
-    /// Bus address of the queue-out FIFO in host memory.
+    /// Bus address of the queue-out array in host memory. Under the HIM its
+    /// low byte is also the sequencer's write cursor into that array.
     pub const QOUTFIFO: u32 = 0x56;
+}
+
+/// The HIM's side of scratch RAM, shared by SGI's PROM and the IRIX kernel.
+pub mod him {
+    /// Two placeholder pointers the HIM writes and neither of its sequencer
+    /// programs ever reads, little end first. Nothing else puts these
+    /// values there, so finding both is how we know the HIM is driving.
+    pub const SIGNATURE: [(u32, u32); 2] = [(0x42, 0x0bad_0001), (0x5a, 0x0bad_0003)];
+    /// The tag being selected, which is the one a selection timeout is for.
+    pub const WAITING_SCB: u32 = 0x3a;
+    /// The tag connected, which is the one a check condition is for.
+    pub const ACTIVE_SCB: u32 = 0x3b;
+    /// The SCSI status a check-condition interrupt hands over.
+    pub const STATUS: u32 = 0x3c;
+    /// `SEQINT` code: the target ended with a status other than GOOD.
+    pub const BAD_STATUS: u8 = 0x50;
+    /// Length of the PROM's build of the sequencer program. The kernel's is
+    /// 1708 bytes. The PROM boots disks and CD-ROMs here with every error
+    /// answered as success, so it keeps those answers, and the selection
+    /// timeout and check-condition interrupts go only to other programs.
+    /// That holds until a PROM boot has been seen to take them.
+    pub const PROM_PROGRAM_LEN: usize = 1696;
 }
 
 /// SCSI block size. Everything SGI boots from uses this.
 pub const BLOCK_SIZE: usize = 512;
 
 /// A scatter-gather entry: a bus address and a length. The top byte of the
-/// length carries flags we do not need, so it is masked off.
+/// length carries flags, so it is masked off.
 pub const SG_LEN_MASK: u32 = 0x00ff_ffff;
+/// The one flag in that byte we use: this entry is the last.
+pub const SG_LAST: u32 = 0x8000_0000;
 /// How many entries to follow before deciding the list is not a list.
 ///
 /// This was 32, which is a plausible-looking number and was wrong. A single
@@ -250,9 +304,12 @@ pub mod nb {
 pub const QOUTFIFO_LEN: u32 = 256;
 pub const QOUTFIFO_EMPTY: u8 = 0xff;
 
-/// Offsets within the 32-byte SCB that are known. The rest are still unread.
+/// Offsets within the 32-byte SCB, as host memory holds it. The HIM builds it
+/// with 32-bit stores, so each word's bytes are the chip's in reverse.
 pub mod scb {
-    pub const CONTROL: usize = 0;
+    /// How many scatter-gather entries follow. Never zero: a command with
+    /// no data still lists one empty entry.
+    pub const SEG_COUNT: usize = 0;
     /// The length of the CDB, in bytes.
     ///
     /// This was first read as a target/lun byte, on the strength of the
@@ -261,22 +318,26 @@ pub mod scb {
     /// START STOP UNIT — every six-byte command — and `0x0a` for READ(10).
     /// Header names again, observed behaviour again, and the behaviour wins.
     pub const CDB_LEN: usize = 1;
+    /// Control flags: disconnect allowed, tagged, and the like. Belongs to
+    /// the driver; nothing here writes it.
+    pub const CONTROL: usize = 2;
     /// Bus address of the scatter-gather list.
     pub const SG_PTR: usize = 4;
     /// Bus address of the CDB.
     pub const CMD_PTR: usize = 8;
-    /// Target in the high nibble, LUN in the low -- the same shape as
-    /// aic7xxx's `SCB_TCL`.
+    /// Target in bits 7..4, channel in bit 3, LUN in bits 2..0 -- the same
+    /// shape as aic7xxx's `SCB_TCL`.
     ///
     /// Read as `tag << 4` at first, which fitted perfectly while the PROM was
     /// scanning targets 1, 2 and 3 with tags 1, 2 and 3. Two disks at
     /// different ids in one session separate them: asking for `dksc(0,1,8)`
     /// and then `dksc(0,4,8)` produces `0x10` and `0x40` with the same tag.
     pub const TCL: usize = 3;
-    /// Where the SCSI status is handed back. The driver pre-fills this with
-    /// 0x40, which is not a valid status, so it is reading it expecting
-    /// somebody to overwrite it.
-    pub const TARGET_STATUS: usize = 2;
+    /// The target's SCSI status. The host writes zero and the HIM fills it
+    /// in itself after a check-condition interrupt; the sequencer never
+    /// writes the SCB back. Byte 2 was taken for this once, because the
+    /// driver leaves 0x40 there, but that is "disconnect allowed".
+    pub const TARGET_STATUS: usize = 15;
 }
 
 /// How many SCBs the chip has, and how big the window onto one is.
@@ -289,9 +350,19 @@ struct State {
     scb: [[u8; SCB_SIZE]; SCB_COUNT],
     seqram: Vec<u8>,
     seqaddr: u16,
+    /// Tags waiting for the sequencer. It takes them only while running, so
+    /// a tag written while paused stays here, where the host can still
+    /// count, pop and rotate it.
     qin: VecDeque<u8>,
     qout: VecDeque<u8>,
     intstat: u8,
+    /// SCSI status that latches until the host clears it, as SSTAT0 and
+    /// SSTAT1 read. Kept apart from `regs` because the same addresses
+    /// written are CLRSINT0 and CLRSINT1: storing the write there made a
+    /// channel reset's "clear everything" read back as "everything
+    /// happened", external bus reset included.
+    sstat0: u8,
+    sstat1: u8,
     /// SCBs handed to the queue-in FIFO, with their contents as queued. This
     /// is the evidence for what the SCB layout actually is.
     queued: Vec<(u8, [u8; SCB_SIZE])>,
@@ -324,6 +395,8 @@ impl Default for State {
             qin: VecDeque::new(),
             qout: VecDeque::new(),
             intstat: 0,
+            sstat0: 0,
+            sstat1: 0,
             queued: Vec::new(),
             executed: Vec::new(),
             qoutpos: 0,
@@ -489,9 +562,11 @@ impl Aic7880 {
         (st.total_cmds, st.total_in, st.total_out)
     }
 
-    /// True while the chip is asserting its interrupt line.
+    /// True while the chip is asserting its interrupt line. Only the four
+    /// interrupt bits count: the code bits above them say what a `SEQINT`
+    /// is about and are not an interrupt of their own.
     pub fn interrupting(&self) -> bool {
-        self.st.lock().unwrap().intstat != 0
+        self.st.lock().unwrap().intstat & 0x0f != 0
     }
 
     /// How many times the driver paused or restarted the sequencer.
@@ -520,6 +595,40 @@ impl Aic7880 {
     fn scratch_le32(st: &State, off: u32) -> u32 {
         let b = |i: u32| st.regs[(off + i) as usize] as u32;
         b(0) | (b(1) << 8) | (b(2) << 16) | (b(3) << 24)
+    }
+
+    /// Whether the HIM is driving: its placeholder pointers are where it
+    /// leaves them. Read fresh each time, because a NetBSD boot after the
+    /// PROM rewrites the same scratch bytes and must fall out of it.
+    fn him(st: &State) -> bool {
+        him::SIGNATURE.iter().all(|(off, v)| Self::scratch_le32(st, *off) == *v)
+    }
+
+    /// Whether errors go back the way the HIM's own sequencer reports them:
+    /// as pausing interrupts, with nothing on the queue-out. Everything but
+    /// the PROM's build of the program; see `him::PROM_PROGRAM_LEN`.
+    fn him_errors(st: &State) -> bool {
+        Self::him(st) && st.seqram.len() != him::PROM_PROGRAM_LEN
+    }
+
+    /// Whether the sequencer is stopped. The host can stop it, and so does
+    /// any interrupt that needs the host to look before it goes on.
+    fn paused(st: &State) -> bool {
+        st.regs[reg::HCNTRL as usize] & hcntrl::PAUSE != 0 || st.intstat & intstat::PAUSING != 0
+    }
+
+    /// Raise an interrupt that stops the sequencer. `HCNTRL` reads back as
+    /// paused, as the real one does, since that is what the HIM polls.
+    fn raise_pausing(st: &mut State, bits: u8) {
+        st.intstat |= bits;
+        st.regs[reg::HCNTRL as usize] |= hcntrl::PAUSE;
+    }
+
+    /// Whether an address is host memory. NetBSD's doorbell address lives in
+    /// bytes the HIM also uses, so a doorbell whose rings are not memory is
+    /// somebody else's bytes and not a doorbell.
+    fn is_memory(&self, addr: u32) -> bool {
+        self.ram.lock().unwrap().dma_offset(addr).is_some()
     }
 
     /// A CDB's length follows from its opcode group. Taking it from the
@@ -600,6 +709,14 @@ impl Aic7880 {
                 d[4] = 31;
                 d.truncate((cdb[4] as usize).min(36));
                 return (d, 0x00);
+            }
+            // A target that is there but has no such LUN says so, so the
+            // REQUEST SENSE that follows explains the failure.
+            if let Some((t, l)) = who {
+                if l != 0 && self.disks.lock().unwrap().contains_key(&t) {
+                    // ILLEGAL REQUEST, logical unit not supported.
+                    *self.sense.lock().unwrap() = Some((0x05, 0x25, 0x00));
+                }
             }
             return (Vec::new(), 0x02);
         }
@@ -755,13 +872,18 @@ impl Aic7880 {
                 break;
             }
             let a = self.dma_read32(sg_ptr + i as u32 * 8);
-            let l = self.dma_read32(sg_ptr + i as u32 * 8 + 4) & SG_LEN_MASK;
+            let raw = self.dma_read32(sg_ptr + i as u32 * 8 + 4);
+            let l = raw & SG_LEN_MASK;
             if a == 0 || l == 0 {
                 break;
             }
             entries.push((a, l));
             let n = (l as usize).min(want - out.len());
             out.extend(self.dma_read_bytes(a, n));
+            // Whatever follows the last entry is not part of the list.
+            if raw & SG_LAST != 0 {
+                break;
+            }
         }
         (out, entries)
     }
@@ -776,7 +898,8 @@ impl Aic7880 {
                 break;
             }
             let a = self.dma_read32(sg_ptr + i as u32 * 8);
-            let l = self.dma_read32(sg_ptr + i as u32 * 8 + 4) & SG_LEN_MASK;
+            let raw = self.dma_read32(sg_ptr + i as u32 * 8 + 4);
+            let l = raw & SG_LEN_MASK;
             if a == 0 || l == 0 {
                 break;
             }
@@ -786,6 +909,9 @@ impl Aic7880 {
                 self.dma_write8(a + k as u32, data[done + k]);
             }
             done += n;
+            if raw & SG_LAST != 0 {
+                break;
+            }
         }
         (done, entries)
     }
@@ -846,7 +972,23 @@ impl Aic7880 {
                     | ((cdb[4] as u64) << 8) | cdb[5] as u64
             }
         };
-        if disk.write_blocks(lba, data) { GOOD } else { CHECK_CONDITION }
+        if disk.write_blocks(lba, data) {
+            return GOOD;
+        }
+        // Say why, so the REQUEST SENSE that follows explains the failure
+        // instead of reporting that nothing went wrong.
+        let sense = if disk.cdrom {
+            // DATA PROTECT, write protected.
+            (0x07, 0x27, 0x00)
+        } else if lba + (data.len() / BLOCK_SIZE) as u64 > disk.blocks {
+            // ILLEGAL REQUEST, logical block address out of range.
+            (0x05, 0x21, 0x00)
+        } else {
+            // MEDIUM ERROR, write error: the image itself refused it.
+            (0x03, 0x0c, 0x00)
+        };
+        *self.sense.lock().unwrap() = Some(sense);
+        CHECK_CONDITION
     }
 
     /// Consume everything the host has added to its queue-in ring.
@@ -997,7 +1139,7 @@ impl Aic7880 {
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
         Self::note(st, format!(
             "tag {tag}: SCB at 0x{scb_addr:08x} control 0x{:02x} target {} lun {} cdblen {}",
-            scb[scb::CONTROL], scb[scb::TCL] >> 4, scb[scb::TCL] & 0x0f, len));
+            scb[scb::CONTROL], scb[scb::TCL] >> 4, scb[scb::TCL] & 0x07, len));
         Self::note(st, format!("   CDB {}", hex(&cdb)));
         Self::note(st, format!("   SCB {}", hex(&scb)));
         let sg_ptr = u32::from_be_bytes([
@@ -1005,7 +1147,22 @@ impl Aic7880 {
             scb[scb::SG_PTR + 2], scb[scb::SG_PTR + 3],
         ]);
         let tcl = scb[scb::TCL];
-        let who = Some((tcl >> 4, tcl & 0x0f));
+        let target = tcl >> 4;
+        let who = Some((target, tcl & 0x07));
+        let errors = Self::him_errors(st);
+
+        // Nobody at that id, or our own: the selection times out. The HIM
+        // finds the tag in the waiting-SCB byte and gives up on the id at
+        // once, where an INQUIRY answered "no device" with GOOD status made
+        // it look for a device that never comes.
+        let own = st.regs[reg::SCSIID as usize] & 0x0f;
+        if errors && (target == own || !self.disks.lock().unwrap().contains_key(&target)) {
+            st.regs[him::WAITING_SCB as usize] = tag;
+            st.sstat1 |= sstat1::SELTO;
+            Self::raise_pausing(st, intstat::SCSIINT);
+            Self::note(st, format!("   -> selection timeout at id {target}"));
+            return;
+        }
         let (status, moved, sg, dir) = match Self::data_out_len(&cdb) {
             Some(want) => {
                 let (data, sg) = self.gather(sg_ptr, want);
@@ -1025,18 +1182,68 @@ impl Aic7880 {
         };
         let sgtxt: Vec<String> = sg.iter()
             .map(|(a, l)| format!("0x{a:08x}+{l}")).collect();
-        // Hand the status back where the driver left room for it.
-        self.dma_write8(scb_addr + scb::TARGET_STATUS as u32, status);
+        // Nothing is written back to the SCB. GOOD status means the zeros
+        // the host left in it stand, and anything else is reported below.
         st.total_cmds += 1;
         if dir == "into" { st.total_in += moved as u64 } else { st.total_out += moved as u64 }
         Self::note(st, format!(
             "   -> status {status}, {moved} bytes {dir} [{}]", sgtxt.join(" ")));
         st.executed.push((tag, scb_addr, cdb));
 
-        self.complete(st, tag);
+        // Any status but GOOD stops the sequencer with the status in
+        // scratch RAM for the HIM to collect. It rewrites the same SCB as a
+        // REQUEST SENSE and queues the tag again at the head, and that one
+        // completes normally with the sense `self.sense` is holding.
+        if errors && status != 0x00 {
+            st.regs[him::ACTIVE_SCB as usize] = tag;
+            st.regs[him::STATUS as usize] = status;
+            st.regs[reg::SCBPTR as usize] = tag;
+            st.intstat = (st.intstat & !intstat::INTCODE) | him::BAD_STATUS;
+            Self::raise_pausing(st, intstat::SEQINT);
+            return;
+        }
+
+        if Self::him(st) {
+            self.complete_him(st, tag, target);
+        } else {
+            self.complete(st, tag);
+        }
     }
 
-    /// Post a finished tag where the driver looks for it.
+    /// Post a finished tag the way the HIM's sequencer does: two single
+    /// bytes into the queue-out array, with the cursor in scratch RAM.
+    ///
+    /// The HIM reads exactly one byte for each completion, at its own
+    /// cursor (starting at 4, moving down by 4) with the low two bits
+    /// flipped, because the array is in the view of memory that keeps
+    /// 32-bit words whole and so turns single bytes around. The sequencer
+    /// keeps its cursor four behind: it marks the slot the host will look
+    /// at next as empty and puts the tag one slot ahead of that, which is
+    /// where the host is looking now. Writing tags at 0, 1, 2, ... instead
+    /// put every one where the kernel never looked, and each command timed
+    /// out after ten seconds. The PROM scans the whole array, so this
+    /// serves it too.
+    fn complete_him(&self, st: &mut State, tag: u8, target: u8) {
+        let ptr = Self::scratch_le32(st, sram::QOUTFIFO);
+        let base = ptr & !0xff;
+        let p = ptr & 0xff;
+        // The low alias maps address zero to memory, so an array that was
+        // never configured must not be written through it.
+        if base != 0 {
+            self.dma_write8(base + (p ^ 3), QOUTFIFO_EMPTY);
+            self.dma_write8(base + (((p + 4) & 0xff) ^ 3), tag);
+        }
+        // Add 4 and then 0xf8, with no carry into the next byte: the
+        // cursor wraps inside the array.
+        st.regs[sram::QOUTFIFO as usize] = (p.wrapping_sub(4) & 0xff) as u8;
+        st.regs[him::ACTIVE_SCB as usize] = 0xff;
+        // The target is no longer busy. The busy table is byte 31 of the
+        // on-chip SCB with the target's number.
+        st.scb[target as usize % SCB_COUNT][SCB_SIZE - 1] = 0xff;
+        st.intstat |= intstat::CMDCMPLT;
+    }
+
+    /// Post a finished tag where a driver without the HIM looks for it.
     fn complete(&self, st: &mut State, tag: u8) {
         let fifo = Self::scratch_le32(st, sram::QOUTFIFO);
         if fifo != 0 {
@@ -1047,6 +1254,16 @@ impl Aic7880 {
         st.intstat |= intstat::CMDCMPLT;
     }
 
+    /// Run queued tags until the queue is empty or the sequencer stops.
+    /// A command that ends in a pausing interrupt stops it, and the rest
+    /// wait until the host has dealt with that one and restarts it.
+    fn run_queue(&self, st: &mut State) {
+        while !Self::paused(st) {
+            let Some(tag) = st.qin.pop_front() else { break };
+            self.submit(st, tag);
+        }
+    }
+
     fn scb_index(st: &State) -> usize {
         (st.regs[reg::SCBPTR as usize] as usize) % SCB_COUNT
     }
@@ -1055,6 +1272,14 @@ impl Aic7880 {
         let mut st = self.st.lock().unwrap();
         match off {
             reg::INTSTAT => st.intstat,
+            reg::SSTAT0 => st.sstat0,
+            reg::SSTAT1 => st.sstat1,
+            // No target ever asks for a byte, and the HIM waits for REQ to
+            // drop after an error, so it must never read as set.
+            reg::SCSISIG => st.regs[off as usize] & !scsisig::REQ,
+            // A real FIFO: reading takes the head. Only the low four bits
+            // exist with no external SCB RAM, and an empty one reads zero.
+            reg::QINFIFO => st.qin.pop_front().unwrap_or(0) & 0x0f,
             reg::QINCNT => st.qin.len() as u8,
             reg::QOUTCNT => st.qout.len() as u8,
             reg::QOUTFIFO => st.qout.pop_front().unwrap_or(0xff),
@@ -1104,12 +1329,26 @@ impl Aic7880 {
                     return;
                 }
                 let was = st.regs[reg::HCNTRL as usize];
+                // An interrupt that stopped the sequencer keeps it stopped
+                // until the host has cleared it; only then does a restart
+                // take. The HIM checks for exactly this and retries.
+                let val = if st.intstat & intstat::PAUSING != 0 { val | hcntrl::PAUSE } else { val };
                 st.regs[reg::HCNTRL as usize] = val;
                 // The driver pauses and restarts the sequencer around every
                 // shared-state access, thousands of times. Counting them says
                 // as much as logging them and leaves room for the commands.
                 if was & hcntrl::PAUSE != val & hcntrl::PAUSE {
                     st.pauses += 1;
+                }
+                if val & hcntrl::PAUSE == 0 {
+                    // The HIM's sequencer goes back to its idle loop, where
+                    // nothing is being selected and nothing is connected.
+                    if Self::him(&st) {
+                        st.regs[him::WAITING_SCB as usize] = 0xff;
+                        st.regs[him::ACTIVE_SCB as usize] = 0xff;
+                    }
+                    // And picks up whatever was queued while it was stopped.
+                    self.run_queue(&mut st);
                 }
             }
             reg::SEQCTL => {
@@ -1146,19 +1385,42 @@ impl Aic7880 {
             }
             nb::KERNEL_QINPOS => {
                 st.regs[off as usize] = val;
-                self.drain_netbsd(&mut st, val);
+                // The HIM's next-SCB table covers this byte, and filling it
+                // at init used to ring the doorbell with its placeholder
+                // pointer standing in for NetBSD's rings: 127 commands from
+                // nowhere, and completions nobody had asked for. A doorbell
+                // is only one when the HIM is not driving and both rings
+                // are in memory.
+                let rings = [nb::HSCB_ADDR, nb::SHARED_DATA_ADDR]
+                    .iter()
+                    .all(|r| self.is_memory(Self::scratch_le32(&st, *r)));
+                if !Self::him(&st) && rings {
+                    self.drain_netbsd(&mut st, val);
+                }
             }
             reg::ERROR_CLRINT => {
                 // Write-one-to-clear, sharing an address with the sequencer
-                // error register that reads back.
-                st.intstat &= !val;
+                // error register that reads back. Clearing SEQINT clears
+                // its code with it.
+                let clr = val & 0x0f;
+                st.intstat &= !clr;
+                if clr & intstat::SEQINT != 0 {
+                    st.intstat &= !intstat::INTCODE;
+                }
             }
+            // CLRSINT0 and CLRSINT1: clear what is written, store nothing.
+            reg::SSTAT0 => st.sstat0 &= !val,
+            reg::SSTAT1 => st.sstat1 &= !val,
             reg::QINFIFO => {
-                let i = (val as usize) % SCB_COUNT;
-                let scb = st.scb[i];
+                let tag = val & 0x0f;
+                let scb = st.scb[tag as usize];
                 st.queued.push((val, scb));
-                st.qin.push_back(val);
-                self.submit(&mut st, val);
+                // Sixteen deep; a write to a full FIFO is lost, as on the
+                // chip.
+                if st.qin.len() < SCB_COUNT {
+                    st.qin.push_back(tag);
+                }
+                self.run_queue(&mut st);
             }
             reg::SCBARRAY_FIRST..=reg::SCBARRAY_LAST => {
                 let i = Self::scb_index(&st);
@@ -1246,10 +1508,12 @@ mod tests {
     }
 
     /// Queueing captures the SCB as it stood, which is the evidence the
-    /// layout is read off.
+    /// layout is read off. The sequencer is paused so the tag stays queued
+    /// long enough to be counted.
     #[test]
     fn queueing_an_scb_records_it() {
         let c = chip();
+        c.write(reg::HCNTRL, hcntrl::PAUSE as u32, 1);
         c.write(reg::SCBPTR, 2, 1);
         c.write(reg::SCBARRAY_FIRST, 0x12, 1);
         c.write(reg::QINFIFO, 2, 1);
@@ -1289,8 +1553,8 @@ mod tests {
             // SCB: pointers to the scatter-gather list and the CDB
             put32(&mut m, scb_addr + scb::SG_PTR as u32, base + sg_addr);
             put32(&mut m, scb_addr + scb::CMD_PTR as u32, base + cdb_addr);
-            // The driver leaves this filled with a value that is not a status.
-            m[(scb_addr + scb::TARGET_STATUS as u32) as usize] = 0x40;
+            // The driver's control flags: disconnect allowed.
+            m[(scb_addr + scb::CONTROL as u32) as usize] = 0x40;
             // Address the id the disk was attached at.
             m[(scb_addr + scb::TCL as u32) as usize] = 1 << 4;
             // INQUIRY, 64 bytes
@@ -1315,8 +1579,8 @@ mod tests {
         assert_eq!(m[buf as usize], 0x00, "a direct access device");
         assert_eq!(&m[buf as usize + 8..buf as usize + 11], b"SGI",
                    "the inquiry data must land in the buffer the driver listed");
-        assert_eq!(m[(scb_addr + scb::TARGET_STATUS as u32) as usize], 0,
-                   "and the status must replace the value the driver left");
+        assert_eq!(m[(scb_addr + scb::CONTROL as u32) as usize], 0x40,
+                   "and the SCB is the driver's: nothing is written back into it");
         assert_eq!(m[qout as usize], 1, "the tag goes into the host completion FIFO");
         drop(m);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8 & intstat::CMDCMPLT, intstat::CMDCMPLT,
@@ -1361,10 +1625,11 @@ mod tests {
         for (i, b) in (base + qout).to_le_bytes().iter().enumerate() {
             c.write(sram::QOUTFIFO + i as u32, *b as u32, 1);
         }
+        sign(&c);
         c.write(reg::QINFIFO, 1, 1);
 
-        assert_eq!(ram.lock().unwrap()[(scb + scb::TARGET_STATUS as u32) as usize], 0,
-                   "the write must report success");
+        assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT,
+                   "the write must report success, which is a plain completion");
         let on_disk = std::fs::read(&img).expect("read back");
         assert_eq!(&on_disk[5 * BLOCK_SIZE..6 * BLOCK_SIZE], &pattern[..],
                    "the block must land at the address the CDB named");
@@ -1456,5 +1721,312 @@ mod tests {
         c.write(reg::ERROR_CLRINT, intstat::CMDCMPLT as u32, 1);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::SEQINT,
                    "clearing one interrupt must not clear the others");
+    }
+
+    type Ram = std::sync::Arc<std::sync::Mutex<crate::dev::crime_mem::O2Memory>>;
+
+    /// Where the HIM rig keeps things in host memory.
+    const ARRAY: u32 = 0x1000;
+    const QOUT: u32 = 0x4000;
+    fn scb_at(tag: u8) -> u32 { 0x2000 + tag as u32 * 0x40 }
+    fn cdb_at(tag: u8) -> u32 { 0x5000 + tag as u32 * 0x20 }
+    fn sg_at(tag: u8) -> u32 { 0x6000 + tag as u32 * 0x10 }
+    fn buf_at(tag: u8) -> u32 { 0x8000 + tag as u32 * 0x200 }
+
+    fn put32(ram: &Ram, at: u32, v: u32) {
+        ram.lock().unwrap()[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
+    }
+
+    /// The HIM's signature, as it writes it: a byte at a time, little end
+    /// first.
+    fn sign(c: &Aic7880) {
+        for (off, v) in him::SIGNATURE {
+            for (i, b) in v.to_le_bytes().iter().enumerate() {
+                c.write(off + i as u32, *b as u32, 1);
+            }
+        }
+    }
+
+    /// A controller set up the way the kernel's HIM leaves it after init:
+    /// both arrays configured, the signature in place, the next-SCB table
+    /// full of 0x7f, the queue-out array full of 0xff, and its own id 0, as
+    /// on an O2. One disk, at id 1.
+    fn him_rig(name: &str) -> (Aic7880, Ram) {
+        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let c = Aic7880::new(ram.clone());
+        let img = std::env::temp_dir().join(format!("iris-aic7880-{name}.img"));
+        std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
+        c.attach_disk_at(1, &img).expect("attach");
+        let base = crate::ip32::RAM_BASE;
+        for (off, v) in [(sram::SCB_ARRAY, base + ARRAY), (sram::QOUTFIFO, base + QOUT)] {
+            for (i, b) in v.to_le_bytes().iter().enumerate() {
+                c.write(off + i as u32, *b as u32, 1);
+            }
+        }
+        c.write(him::WAITING_SCB, 0xff, 1);
+        c.write(him::ACTIVE_SCB, 0xff, 1);
+        sign(&c);
+        for off in 0x46..=0x55 {
+            c.write(off, 0x7f, 1);
+        }
+        c.write(reg::SCSIID, 0, 1);
+        ram.lock().unwrap()[QOUT as usize..QOUT as usize + 256].fill(QOUTFIFO_EMPTY);
+        (c, ram)
+    }
+
+    /// Build a command for `tag` in host memory, the way the HIM does: the
+    /// SCB's address in the array, one scatter-gather entry marked last.
+    fn put_cmd(ram: &Ram, tag: u8, target: u8, cdb: &[u8], len: u32) {
+        let base = crate::ip32::RAM_BASE;
+        let scb = scb_at(tag);
+        put32(ram, ARRAY + tag as u32 * 4, base + scb);
+        {
+            let mut m = ram.lock().unwrap();
+            m[scb as usize..scb as usize + 32].fill(0);
+            m[(scb + scb::SEG_COUNT as u32) as usize] = 1;
+            m[(scb + scb::CDB_LEN as u32) as usize] = cdb.len() as u8;
+            m[(scb + scb::CONTROL as u32) as usize] = 0x40;
+            m[(scb + scb::TCL as u32) as usize] = target << 4;
+            m[cdb_at(tag) as usize..cdb_at(tag) as usize + cdb.len()].copy_from_slice(cdb);
+        }
+        put32(ram, scb + scb::SG_PTR as u32, base + sg_at(tag));
+        // The CDB is in the low view, as the HIM points at it.
+        put32(ram, scb + scb::CMD_PTR as u32, cdb_at(tag));
+        put32(ram, sg_at(tag), buf_at(tag));
+        put32(ram, sg_at(tag) + 4, len | SG_LAST);
+    }
+
+    fn qout(ram: &Ram) -> Vec<u8> {
+        ram.lock().unwrap()[QOUT as usize..QOUT as usize + 256].to_vec()
+    }
+
+    const TUR: [u8; 6] = [0x00, 0, 0, 0, 0, 0];
+
+    /// The HIM reads one byte per completion, at its cursor (4, then down by
+    /// 4) with the low bits flipped. Tags written anywhere else are never
+    /// found, and every command times out.
+    #[test]
+    fn him_completions_land_where_the_kernel_looks() {
+        let (c, ram) = him_rig("him-qout");
+        put_cmd(&ram, 0, 1, &TUR, 0);
+        put_cmd(&ram, 1, 1, &TUR, 0);
+        c.write(reg::QINFIFO, 0, 1);
+        c.write(reg::QINFIFO, 1, 1);
+
+        let q = qout(&ram);
+        assert_eq!(q[7], 0, "the first completion is at the HIM's cursor 4, flipped");
+        assert_eq!(q[3], 1, "the second at cursor 0, flipped");
+        assert_eq!(q[0xff], QOUTFIFO_EMPTY, "the slot after that is marked empty");
+        assert!(q.iter().enumerate().all(|(i, b)| i == 3 || i == 7 || *b == QOUTFIFO_EMPTY),
+                "and nothing else is touched");
+        assert_eq!(c.read(sram::QOUTFIFO, 1), 0xf8, "the cursor moved down by 4 twice, wrapping");
+        assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
+        assert_eq!(c.read(reg::QINCNT, 1), 0, "both were taken");
+        assert_eq!(ram.lock().unwrap()[(scb_at(0) + scb::CONTROL as u32) as usize], 0x40,
+                   "and the SCB's control flags are left alone");
+    }
+
+    /// The HIM fills its next-SCB table with 0x7f, and one of those bytes
+    /// is NetBSD's doorbell. It must not ring.
+    #[test]
+    fn the_him_filling_its_tables_rings_no_doorbell() {
+        let c = chip();
+        sign(&c);
+        for off in 0x46..=0x55 {
+            c.write(off, 0x7f, 1);
+        }
+        assert_eq!(c.read(reg::INTSTAT, 1), 0, "nothing completed");
+        assert!(c.executed().is_empty());
+        assert!(!c.notes().iter().any(|n| n.starts_with("nb tag")), "nothing ran");
+        assert!(c.dma_misses.lock().unwrap().is_empty(), "and nothing was fetched");
+    }
+
+    /// NetBSD's doorbell, with its rings in memory and no HIM, still runs
+    /// a command.
+    #[test]
+    fn the_netbsd_doorbell_still_runs_commands() {
+        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let c = Aic7880::new(ram.clone());
+        let img = std::env::temp_dir().join("iris-aic7880-nb.img");
+        std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
+        c.attach_disk_at(1, &img).expect("attach");
+        let (hscbs, shared) = (0x2000u32, 0x4000u32);
+        let tag = 3u8;
+        {
+            let mut m = ram.lock().unwrap();
+            m[(shared + nb::FIFO_LEN) as usize] = tag;
+            let h = (hscbs + tag as u32 * nb::HSCB_STRIDE) as usize;
+            m[h + nb::CDB_LEN as usize] = 6; // TEST UNIT READY
+            m[h + nb::SCSIID as usize] = 0x17;
+            m[h + nb::STATUS as usize] = 0xaa;
+        }
+        for (off, v) in [(nb::HSCB_ADDR, hscbs), (nb::SHARED_DATA_ADDR, shared)] {
+            for (i, b) in v.to_le_bytes().iter().enumerate() {
+                c.write(off + i as u32, *b as u32, 1);
+            }
+        }
+        c.write(nb::KERNEL_QINPOS, 1, 1);
+        let m = ram.lock().unwrap();
+        assert_eq!(m[shared as usize], tag, "the tag comes back on the queue-out ring");
+        assert_eq!(m[(hscbs + tag as u32 * nb::HSCB_STRIDE + nb::STATUS) as usize], 0, "with GOOD status");
+        drop(m);
+        assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
+    }
+
+    /// While paused, the queue-in FIFO holds what it is given, and the host
+    /// can pop and push to reorder it: that is how the HIM puts a REQUEST
+    /// SENSE at the head. Restarting runs them in the new order.
+    #[test]
+    fn a_paused_queue_holds_and_rotates() {
+        let (c, ram) = him_rig("him-rotate");
+        put_cmd(&ram, 0, 1, &TUR, 0);
+        put_cmd(&ram, 1, 1, &TUR, 0);
+        c.write(reg::HCNTRL, hcntrl::PAUSE as u32, 1);
+        c.write(reg::QINFIFO, 0, 1);
+        c.write(reg::QINFIFO, 1, 1);
+        assert_eq!(c.read(reg::QINCNT, 1), 2, "nothing runs while paused");
+        assert!(c.executed().is_empty());
+
+        let head = c.read(reg::QINFIFO, 1);
+        assert_eq!(head, 0, "reading takes the head");
+        assert_eq!(c.read(reg::QINCNT, 1), 1);
+        c.write(reg::QINFIFO, head, 1);
+        assert_eq!(c.read(reg::QINCNT, 1), 2, "and writing puts it at the back");
+
+        c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
+        let order: Vec<u8> = c.executed().iter().map(|e| e.0).collect();
+        assert_eq!(order, vec![1, 0], "restarting runs them in the new order");
+        assert_eq!(c.read(reg::QINCNT, 1), 0);
+    }
+
+    /// Nobody at an id: the selection times out, the way the HIM expects,
+    /// and nothing goes to the queue-out.
+    #[test]
+    fn an_empty_id_times_out_its_selection() {
+        let (c, ram) = him_rig("him-selto");
+        let inquiry = [0x12, 0, 0, 0, 36, 0];
+        put_cmd(&ram, 2, 3, &inquiry, 36);
+        c.write(reg::QINFIFO, 2, 1);
+
+        assert_eq!(c.read(reg::INTSTAT, 1), intstat::SCSIINT as u32);
+        assert_ne!(c.read(reg::SSTAT1, 1) as u8 & sstat1::SELTO, 0, "SSTAT1 says selection timeout");
+        assert_eq!(c.read(him::WAITING_SCB, 1), 2, "for the tag being selected");
+        assert_ne!(c.read(reg::HCNTRL, 1) as u8 & hcntrl::PAUSE, 0, "and the sequencer has stopped");
+        assert!(c.interrupting());
+        assert!(qout(&ram).iter().all(|b| *b == QOUTFIFO_EMPTY), "nothing completed");
+        assert!(ram.lock().unwrap()[buf_at(2) as usize..buf_at(2) as usize + 36].iter().all(|b| *b == 0),
+                "and no data moved");
+
+        // A restart before the interrupt is cleared does not take.
+        c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
+        assert_ne!(c.read(reg::HCNTRL, 1) as u8 & hcntrl::PAUSE, 0);
+
+        c.write(reg::SSTAT1, 0x88, 1);
+        c.write(reg::ERROR_CLRINT, intstat::SCSIINT as u32, 1);
+        c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
+        assert_eq!(c.read(reg::INTSTAT, 1), 0);
+        assert_eq!(c.read(reg::SSTAT1, 1), 0);
+        assert_eq!(c.read(reg::HCNTRL, 1) as u8 & hcntrl::PAUSE, 0, "and it runs again");
+        assert!(!c.interrupting());
+    }
+
+    /// A failed command stops the sequencer with its status in scratch RAM.
+    /// The HIM turns the same SCB into a REQUEST SENSE and queues it at the
+    /// head; that one completes normally, carrying the reason.
+    #[test]
+    fn a_check_condition_goes_through_the_hims_auto_sense() {
+        let (c, ram) = him_rig("him-sense");
+        let tag = 5u8;
+        put_cmd(&ram, tag, 1, &[0xc0, 0, 0, 0, 0, 0], 0);
+        c.write(reg::QINFIFO, tag as u32, 1);
+
+        assert_eq!(c.read(reg::INTSTAT, 1), 0x51, "SEQINT with the bad-status code");
+        assert_eq!(c.read(him::ACTIVE_SCB, 1), tag as u32, "for the tag connected");
+        assert_eq!(c.read(him::STATUS, 1), 0x02, "with CHECK CONDITION handed over");
+        assert_ne!(c.read(reg::HCNTRL, 1) as u8 & hcntrl::PAUSE, 0);
+        assert!(qout(&ram).iter().all(|b| *b == QOUTFIFO_EMPTY), "nothing completed");
+
+        // The HIM rewrites the SCB as REQUEST SENSE, pointed at its own
+        // sense list just after the SCB, and queues the tag again.
+        let sense_list = scb_at(tag) + 32;
+        let sense_buf = 0x9000u32;
+        put32(&ram, sense_list, sense_buf);
+        put32(&ram, sense_list + 4, 18 | SG_LAST);
+        put32(&ram, scb_at(tag) + scb::SG_PTR as u32, crate::ip32::RAM_BASE + sense_list);
+        ram.lock().unwrap()[cdb_at(tag) as usize..cdb_at(tag) as usize + 6]
+            .copy_from_slice(&[0x03, 0, 0, 0, 18, 0]);
+        c.write(reg::QINFIFO, tag as u32, 1);
+        assert_eq!(c.read(reg::QINCNT, 1), 1, "held while the sequencer is stopped");
+
+        c.write(reg::ERROR_CLRINT, intstat::SEQINT as u32, 1);
+        assert_eq!(c.read(reg::INTSTAT, 1), 0, "clearing SEQINT clears its code too");
+        c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
+
+        let m = ram.lock().unwrap();
+        assert_eq!(m[sense_buf as usize + 2], 0x05, "ILLEGAL REQUEST");
+        assert_eq!(m[sense_buf as usize + 12], 0x20, "invalid command operation code");
+        drop(m);
+        assert_eq!(qout(&ram)[7], tag, "and the tag completes through the queue-out");
+        assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
+        assert_eq!(c.read(reg::QINCNT, 1), 0);
+    }
+
+    /// The PROM's build of the program keeps the answers it boots with
+    /// today: an empty id is "no device" with GOOD status, and completes.
+    #[test]
+    fn the_proms_program_keeps_its_old_answers() {
+        let (c, ram) = him_rig("him-prom");
+        c.write(reg::SEQCTL, seqctl::LOADRAM as u32, 1);
+        for _ in 0..him::PROM_PROGRAM_LEN {
+            c.write(reg::SEQRAM, 0, 1);
+        }
+        c.write(reg::SEQCTL, 0, 1);
+        put_cmd(&ram, 1, 3, &[0x12, 0, 0, 0, 36, 0], 36);
+        c.write(reg::QINFIFO, 1, 1);
+        assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
+        assert_eq!(ram.lock().unwrap()[buf_at(1) as usize], 0x7f, "nothing here");
+        assert_eq!(qout(&ram)[7], 1, "completed where the HIM looks");
+    }
+
+    /// CLRSINT0 and CLRSINT1 share addresses with SSTAT0 and SSTAT1. A
+    /// channel reset writes 0xff to both, and reading that back said an
+    /// external bus reset had happened.
+    #[test]
+    fn clearing_scsi_status_leaves_it_clear() {
+        let c = chip();
+        c.write(reg::SSTAT1, 0xff, 1);
+        assert_eq!(c.read(reg::SSTAT1, 1), 0);
+        c.write(reg::SSTAT0, 0xff, 1);
+        assert_eq!(c.read(reg::SSTAT0, 1), 0);
+        {
+            let mut st = c.st.lock().unwrap();
+            st.sstat0 = 0xff;
+            st.sstat1 = 0xff;
+        }
+        c.write(reg::SSTAT1, 0xff, 1);
+        assert_eq!(c.read(reg::SSTAT1, 1), 0, "a clear clears");
+        c.write(reg::SSTAT0, 0xff, 1);
+        assert_eq!(c.read(reg::SSTAT0, 1), 0);
+
+        c.write(reg::SCSISIG, 0xff, 1);
+        assert_eq!(c.read(reg::SCSISIG, 1) as u8 & scsisig::REQ, 0, "REQ never reads as set");
+    }
+
+    /// Failed writes say why, so the REQUEST SENSE after them is not "no
+    /// sense".
+    #[test]
+    fn failed_writes_carry_sense() {
+        let c = chip();
+        let img = std::env::temp_dir().join("iris-aic7880-wsense.img");
+        std::fs::write(&img, vec![0u8; 8 * BLOCK_SIZE]).expect("test image");
+        c.attach_at(1, &img, false).expect("attach");
+        c.attach_at(4, &img, true).expect("attach CD");
+        let write10 = |lba: u8| [0x2a, 0, 0, 0, 0, lba, 0, 0, 1, 0];
+        let block = vec![0u8; BLOCK_SIZE];
+
+        assert_eq!(c.execute_write_on(&write10(0), &block, 4), 0x02);
+        assert_eq!(*c.sense.lock().unwrap(), Some((0x07, 0x27, 0x00)), "a CD is write protected");
+        assert_eq!(c.execute_write_on(&write10(8), &block, 1), 0x02);
+        assert_eq!(*c.sense.lock().unwrap(), Some((0x05, 0x21, 0x00)), "past the end is out of range");
     }
 }

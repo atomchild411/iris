@@ -1,4 +1,6 @@
-//! ip32-view FBFILE [KBDPORT]: a window onto the O2 bring-up harness's screen.
+//! ip32-view FBFILE [KBDPORT [PID]]: a window onto the O2 bring-up harness's
+//! screen. With PID, the window closes once that process (the emulator) has
+//! gone.
 //!
 //! The harness (`ip32::bringup`, run as a cargo test) has no main thread to
 //! open a window on, so it scans GBE's framebuffer out into a shared file
@@ -117,6 +119,11 @@ struct App {
     kbd_retry: Instant,
     gl: Option<Gl>,
     shown: Option<(u32, u32, u64)>,
+    /// Close when this process exits.
+    owner: Option<i32>,
+    owner_check: Instant,
+    /// Redraw only for a new frame, a resize, or an expose.
+    dirty: bool,
 }
 
 impl App {
@@ -139,6 +146,13 @@ impl App {
     fn draw(&mut self) {
         let Some(g) = self.gl.as_mut() else { return };
         let frame = self.shared.frame();
+        // Nothing new: leave the last picture up rather than redrawing it
+        // sixty times a second.
+        let id = frame.as_ref().map(|(w, h, n, _)| (*w, *h, *n));
+        if !self.dirty && id == self.shown {
+            return;
+        }
+        self.dirty = false;
         let size = g.window.inner_size();
         unsafe {
             let gl = &g.gl;
@@ -233,6 +247,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(sz) => {
+                self.dirty = true;
                 if let Some(g) = self.gl.as_ref() {
                     g.surface.resize(&g.context, NonZeroU32::new(sz.width.max(1)).unwrap(),
                         NonZeroU32::new(sz.height.max(1)).unwrap());
@@ -244,25 +259,39 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::Focused(_) | WindowEvent::Occluded(false) => self.dirty = true,
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(pid) = self.owner {
+            if self.owner_check.elapsed() >= Duration::from_secs(1) {
+                self.owner_check = Instant::now();
+                // Signal 0 checks the process is there without touching it.
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
         if let Some(g) = self.gl.as_ref() {
             g.window.request_redraw();
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
+        // About 60 polls a second while there is a picture, 4 while there is not.
+        let wait = if self.shown.is_some() { 16 } else { 250 };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(wait)));
     }
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: ip32-view FBFILE [KBDPORT]");
+        eprintln!("usage: ip32-view FBFILE [KBDPORT [PID]]");
         std::process::exit(2);
     };
     let kbd_port = args.next().and_then(|p| p.parse().ok());
+    let owner = args.next().and_then(|p| p.parse().ok());
     let event_loop = EventLoop::new().expect("ip32-view: no event loop");
     let mut app = App {
         shared: Shared::new(path),
@@ -271,6 +300,9 @@ fn main() {
         kbd_retry: Instant::now(),
         gl: None,
         shown: None,
+        owner,
+        owner_check: Instant::now(),
+        dirty: true,
     };
     event_loop.run_app(&mut app).expect("ip32-view: event loop");
 }

@@ -72,7 +72,7 @@ impl O2Machine {
         };
         let mut bus = Ip32Bus::with_options(mem, prom, opts);
         if o2.graphics {
-            bus.enable_graphics();
+            bus.enable_graphics_with_mouse(o2.mouse);
         }
         let bus = Arc::new(bus);
         eprintln!(
@@ -131,6 +131,16 @@ impl O2Machine {
 
         let running = Arc::new(AtomicBool::new(false));
         let display = Arc::new(O2Display::new(bus.clone(), cpu.cycles_ptr(), running.clone()));
+        if let Some(port) = o2.control_port {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(l) => {
+                    eprintln!("iris: O2 control on 127.0.0.1:{port} (shot, type, key, mouse, click, status)");
+                    let bus = bus.clone();
+                    std::thread::Builder::new().name("O2-Control".into()).spawn(move || control_server(l, bus)).unwrap();
+                }
+                Err(e) => eprintln!("iris: O2 control port {port}: {e}"),
+            }
+        }
         Ok(Self { bus, cpu, timer_manager, display, running, threads: Vec::new() })
     }
 
@@ -409,6 +419,114 @@ impl crate::gfx_display::GfxDisplay for O2Display {
     }
     fn cycles(&self) -> CyclesPtr {
         self.cycles.clone()
+    }
+}
+
+/// The control port: one command per line, one reply line each (`ok ...` or
+/// `err ...`). For scripts and for an assistant driving the machine while a
+/// person watches its window.
+///
+/// - `shot PATH`: the screen as a PNG.
+/// - `type TEXT`: type it on the PS/2 keyboard (`\r` Enter, `\e` Escape,
+///   `\b` Backspace, `\t` Tab).
+/// - `key NAME`, `keydown NAME`, `keyup NAME`: a key by its winit name
+///   (`Enter`, `KeyA`, `F1`, `ShiftLeft`, `ArrowUp`...).
+/// - `mouse DX DY [BUTTONS]`: move by DX, DY (screen pixels, y down) with
+///   BUTTONS held (1 left, 2 right, 4 middle).
+/// - `click [BUTTON]`: press and release (default 1, left).
+/// - `status`: what the display is showing, and the GBE registers behind it.
+fn control_server(listener: std::net::TcpListener, bus: Arc<Ip32Bus>) {
+    use std::io::{BufRead, BufReader, Write};
+    for conn in listener.incoming().flatten() {
+        let bus = bus.clone();
+        let _ = std::thread::Builder::new().name("O2-Control-Client".into()).spawn(move || {
+            let mut out = match conn.try_clone() {
+                Ok(o) => o,
+                Err(_) => return,
+            };
+            let mut rgba = vec![0u8; 2048 * 2048 * 4];
+            for line in BufReader::new(conn).lines().map_while(Result::ok) {
+                let (cmd, arg) = line.trim_end().split_once(' ').unwrap_or((line.trim_end(), ""));
+                let reply = control_command(&bus, cmd, arg, &mut rgba);
+                if writeln!(out, "{reply}").is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> String {
+    let kb = bus.ps2.devices();
+    match cmd {
+        "shot" => match bus.render_screen(rgba) {
+            Some((w, h)) => match crate::ip32_screen::save_png(arg, &rgba[..(w * h * 4) as usize], w, h) {
+                Ok(()) => format!("ok {w}x{h}"),
+                Err(e) => format!("err {e}"),
+            },
+            None => "err display off".into(),
+        },
+        "status" => {
+            let shown = bus.render_screen(rgba);
+            format!("ok display {shown:?}; {}", bus.gbe.summary())
+        }
+        _ if kb.is_none() => "err no keyboard or mouse (graphics = false)".into(),
+        "type" => {
+            let kb = kb.unwrap();
+            let text = arg.replace("\\r", "\r").replace("\\e", "\x1b").replace("\\b", "\x08").replace("\\t", "\t");
+            let mut n = 0;
+            for c in text.chars() {
+                if c == '\t' {
+                    kb.push_kb(winit::keyboard::KeyCode::Tab, true);
+                    kb.push_kb(winit::keyboard::KeyCode::Tab, false);
+                    n += 1;
+                } else if kb.type_char(c) {
+                    n += 1;
+                }
+            }
+            format!("ok {n}")
+        }
+        "key" | "keydown" | "keyup" => match crate::ip32_screen::keycode(arg.trim()) {
+            Some(k) => {
+                let kb = kb.unwrap();
+                if cmd != "keyup" {
+                    kb.push_kb(k, true);
+                }
+                if cmd != "keydown" {
+                    kb.push_kb(k, false);
+                }
+                "ok".into()
+            }
+            None => format!("err no key {arg:?}"),
+        },
+        "mouse" => {
+            let v: Vec<i32> = arg.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            if v.len() < 2 {
+                return "err mouse DX DY [BUTTONS]".into();
+            }
+            let buttons = v.get(2).copied().unwrap_or(0) as u8;
+            let kb = kb.unwrap();
+            // A PS/2 packet carries at most 255 either way: send big moves in steps.
+            let (mut dx, mut dy) = (v[0], v[1]);
+            loop {
+                let (sx, sy) = (dx.clamp(-200, 200), dy.clamp(-200, 200));
+                kb.push_mouse_input(buttons, sx, sy, 0);
+                dx -= sx;
+                dy -= sy;
+                if dx == 0 && dy == 0 {
+                    break;
+                }
+            }
+            "ok".into()
+        }
+        "click" => {
+            let b: u8 = arg.trim().parse().unwrap_or(1);
+            let kb = kb.unwrap();
+            kb.push_mouse_input(b, 0, 0, 0);
+            kb.push_mouse_input(0, 0, 0, 0);
+            "ok".into()
+        }
+        _ => format!("err unknown command {cmd:?}"),
     }
 }
 

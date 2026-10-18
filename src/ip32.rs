@@ -1101,6 +1101,9 @@ pub struct MacePs2 {
     /// Keyboard STATUS reads with nothing to read since a byte last arrived:
     /// a guest sitting at a prompt runs this up fast.
     idle_polls: AtomicU32,
+    /// The last bytes through either port, `(port, to the device?, byte)`,
+    /// for working out a conversation that stalled.
+    traffic: Mutex<std::collections::VecDeque<(u8, bool, u8)>>,
 }
 
 struct Ps2Port {
@@ -1138,6 +1141,7 @@ impl MacePs2 {
             dev: None,
             mouse: false,
             idle_polls: AtomicU32::new(0),
+            traffic: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -1175,6 +1179,7 @@ impl MacePs2 {
         }
         if let Some(b) = self.attached(p).and_then(|d| d.pop_from(p == 1)) {
             port.rx = b;
+            self.note(p, false, b);
             port.rx_full = true;
         }
     }
@@ -1185,6 +1190,7 @@ impl MacePs2 {
             return;
         }
         if let Some(b) = port.tx.take() {
+            self.note(p, true, b);
             if let Some(d) = self.attached(p) {
                 d.write_to(b, p == 1);
             }
@@ -1251,6 +1257,25 @@ impl MacePs2 {
             }
             _ => {}
         }
+    }
+
+    fn note(&self, p: usize, out: bool, b: u8) {
+        let mut t = self.traffic.lock().unwrap();
+        if t.len() >= 400 {
+            t.pop_front();
+        }
+        t.push_back((p as u8, out, b));
+    }
+
+    /// The recent traffic as text: `>` to a device, `<` from it, per port.
+    pub fn traffic(&self) -> String {
+        self.traffic
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|&(p, out, b)| format!("{p}{}{b:02x}", if out { '>' } else { '<' }))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Keyboard status reads with nothing waiting, since the last byte.
@@ -2458,7 +2483,12 @@ impl Ip32Bus {
     /// CRIME that reads as revision 1.1 (ID 0xa1, the value the PROM requires
     /// before it adds the graphics component) and MACE revision 2.
     pub fn enable_graphics(&mut self) {
-        self.ps2 = MacePs2::with_devices(false);
+        self.enable_graphics_with_mouse(false);
+    }
+
+    /// The same, with a PS/2 mouse on port 1 as well.
+    pub fn enable_graphics_with_mouse(&mut self, mouse: bool) {
+        self.ps2 = MacePs2::with_devices(mouse);
         self.crime.revision = CRIME_REV_GBE;
         let v = self.mace.cell_pub(MACE_ISA_RING_BASE);
         self.mace.set_cell_pub(MACE_ISA_RING_BASE, v | MACE_REV2_BIT);
@@ -3454,6 +3484,22 @@ mod tests {
         assert_eq!(ps2_recv(&k, 1), None);
     }
 
+    /// OpenBSD's pms probes for a touchpad with E8 00 four times and E9, and
+    /// waits for all three status bytes after the ACK.
+    #[test]
+    fn the_mouse_answers_a_status_request_in_full() {
+        let k = MacePs2::with_devices(true);
+        for _ in 0..4 {
+            ps2_send(&k, 1, 0xe8);
+            ps2_send(&k, 1, 0x00);
+        }
+        let acks: Vec<_> = std::iter::from_fn(|| ps2_recv(&k, 1)).collect();
+        assert_eq!(acks, [0xfa; 8]);
+        ps2_send(&k, 1, 0xe9);
+        let st: Vec<_> = std::iter::from_fn(|| ps2_recv(&k, 1)).collect();
+        assert_eq!(st, [0xfa, 0x00, 0x00, 100], "ACK, status, resolution 0, rate 100");
+    }
+
     #[test]
     fn a_waiting_byte_raises_the_keyboard_interrupt_only_when_enabled() {
         let k = MacePs2::with_devices(false);
@@ -4139,7 +4185,8 @@ mod bringup {
         let gfx = std::env::var("IRIS_IP32_GFX").as_deref() == Ok("1");
         let mut bus = Ip32Bus::with_memory(mem, prom);
         if gfx {
-            bus.enable_graphics();
+            // IRIS_IP32_MOUSE=1 adds the PS/2 mouse on port 1.
+            bus.enable_graphics_with_mouse(std::env::var("IRIS_IP32_MOUSE").as_deref() == Ok("1"));
         }
         let bus = Arc::new(bus);
         // Keys from ip32-view (IRIS_IP32_KBD, a TCP port on 127.0.0.1).
@@ -4266,6 +4313,10 @@ mod bringup {
         let stop_after: u64 = std::env::var("IRIS_IP32_STOP_AFTER").ok()
             .and_then(|v| v.parse().ok()).unwrap_or(0);
         let mut stop_at: Option<u64> = None;
+        // IRIS_IP32_PROFILE_FROM=step starts the same profile at a step count,
+        // for a hang on the graphics console, where STOP_ON (which reads
+        // serial) never sees the text.
+        let profile_from: Option<u64> = std::env::var("IRIS_IP32_PROFILE_FROM").ok().and_then(|v| v.parse().ok());
         let mut hot: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         // IRIS_IP32_BREAK_AFTER_STOP arms the breakpoints only once
         // IRIS_IP32_STOP_ON has matched, to look at a hang rather than a boot.
@@ -4513,6 +4564,10 @@ mod bringup {
             // instruction is about to make.
             bus.pc.set(pc);
             bus.pc.set_ra(exec.core.gpr[31] as u32);
+            if stop_at.is_none() && profile_from == Some(steps) {
+                eprintln!("ip32: profiling from step {steps} for {stop_after} steps");
+                stop_at = Some(steps + stop_after);
+            }
             if let Some(at) = stop_at {
                 *hot.entry(pc).or_insert(0) += 1;
                 if steps >= at {
@@ -4854,6 +4909,7 @@ mod bringup {
         }
         eprintln!("ip32: crime-re primitives run: {}", bus.crime_re.drawn.load(Ordering::Relaxed));
         eprintln!("ip32: gbe {}", bus.gbe.summary());
+        eprintln!("ip32: ps2 traffic (port>to device, port<from device): {}", bus.ps2.traffic());
         let shown = bus.gbe.render(&bus.ram.lock().unwrap(), &mut frame);
         eprintln!("ip32: gbe would show {shown:?}");
         if let (Some(p), Some((w, h))) = (png_path.as_ref(), shown) {
