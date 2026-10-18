@@ -28,6 +28,8 @@ pub mod gbe_reg {
     pub const VT_XY: u32 = 0x10000;
     pub const VT_XYMAX: u32 = 0x10004;
     pub const VT_FLAGS: u32 = 0x10018;
+    pub const VT_INTR01: u32 = 0x10020;
+    pub const VT_INTR23: u32 = 0x10024;
     pub const VT_HCMAP: u32 = 0x1003c;
     pub const VT_VCMAP: u32 = 0x10040;
     pub const OVR_CONTROL: u32 = 0x20004;
@@ -64,6 +66,8 @@ struct GbeState {
     t0: u64,
     /// VT_XY reads since then.
     reads: u64,
+    /// Beam position (in dots since t0) when vt_crossings last looked.
+    seen_dots: u64,
 }
 
 pub struct Gbe {
@@ -80,7 +84,7 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0 }), hot: Mutex::new(BTreeMap::new()), now }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0 }), hot: Mutex::new(BTreeMap::new()), now }
     }
 
     fn get(r: &[u32], off: u32) -> u32 {
@@ -114,6 +118,44 @@ impl Gbe {
         ((y as u32) << 12) | x as u32
     }
 
+    /// Which of the four vertical-timing interrupts fired since the last call:
+    /// bit n when the beam reached line VT_INTRn (CRIME latches them as its
+    /// bits 16..19). A line beyond the frame never fires.
+    pub fn vt_crossings(&self) -> u32 {
+        let mut s = self.s.lock().unwrap();
+        if Self::get(&s.r, VT_XY) & VT_FREEZE != 0 || Self::get(&s.r, DOTCLOCK) & DOTCLOCK_RUN == 0 {
+            return 0;
+        }
+        let max = Self::get(&s.r, VT_XYMAX);
+        let (maxx, maxy) = ((max & 0xfff) as u64, ((max >> 12) & 0xfff) as u64);
+        if maxx == 0 || maxy == 0 {
+            return 0;
+        }
+        let us = (self.now)().saturating_sub(s.t0);
+        let now = us * Self::dot_hz(&s.r) / 1_000_000 + s.reads * DOTS_PER_READ;
+        let last = std::mem::replace(&mut s.seen_dots, now);
+        if now <= last {
+            return 0;
+        }
+        let (i01, i23) = (Self::get(&s.r, VT_INTR01), Self::get(&s.r, VT_INTR23));
+        let lines = [(i01 >> 12) & 0xfff, i01 & 0xfff, (i23 >> 12) & 0xfff, i23 & 0xfff];
+        let period = (maxx + 1) * (maxy + 1);
+        // Crossings of `off` (mod period) at or before `p`.
+        let count = |p: u64, off: u64| if p < off { 0 } else { (p - off) / period + 1 };
+        let mut fired = 0;
+        for (n, &line) in lines.iter().enumerate() {
+            let line = line as u64;
+            if line > maxy {
+                continue;
+            }
+            let off = line * (maxx + 1);
+            if count(now, off) != count(last, off) {
+                fired |= 1 << n;
+            }
+        }
+        fired
+    }
+
     fn read_reg(&self, off: u32) -> u32 {
         *self.hot.lock().unwrap().entry(off).or_insert(0) += 1;
         let mut s = self.s.lock().unwrap();
@@ -145,6 +187,7 @@ impl Gbe {
         if off == VT_XY && val & VT_FREEZE == 0 && s.r[i] & VT_FREEZE != 0 {
             s.t0 = (self.now)();
             s.reads = 0;
+            s.seen_dots = 0;
         }
         s.r[i] = val;
         // The hardware copies each DMA control's shadow into the live

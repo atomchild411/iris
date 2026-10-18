@@ -211,7 +211,19 @@ impl O2Machine {
         let mut typing = false;
         let mut last_seg: Option<Instant> = None;
         let mut next_key = Instant::now();
+        // The PROM's environment lives in its flash: save it once the guest
+        // has written there (setenv) and the writing has stopped.
+        let mut flash_seen = bus.flash_writes();
+        let mut flash_check = Instant::now();
         while running.load(Ordering::Relaxed) {
+            if flash_check.elapsed() >= Duration::from_secs(2) {
+                flash_check = Instant::now();
+                let n = bus.flash_writes();
+                if n != flash_seen {
+                    flash_seen = n;
+                    bus.save_flash();
+                }
+            }
             if let Some(kb) = bus.ps2.devices() {
                 if !typing && !script.is_empty() && kb.scanning()
                     && (bus.ps2.idle_polls() >= 20_000 || last_seg.is_some_and(|t| t.elapsed() > Duration::from_secs(30)))
@@ -239,6 +251,7 @@ impl O2Machine {
             if bus.rtc.powered_off() {
                 eprintln!("iris: the O2 switched itself off");
                 dev.stop();
+                bus.save_flash();
                 running.store(false, Ordering::SeqCst);
                 std::process::exit(0);
             }
@@ -248,6 +261,7 @@ impl O2Machine {
 
     pub fn stop(&mut self) {
         self.cpu.clone().as_device().stop();
+        self.bus.save_flash();
         self.running.store(false, Ordering::SeqCst);
         for t in self.threads.drain(..) {
             let _ = t.join();

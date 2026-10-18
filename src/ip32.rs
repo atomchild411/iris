@@ -172,6 +172,10 @@ pub mod crime_reg {
     /// arrives at the CPU as IP2.
     pub const INTSTAT: u32 = 0x0010;
     pub const INTMASK: u32 = 0x0018;
+    /// Software interrupts: bits 31:28 and 24:0 can be set from here.
+    pub const SOFTINT: u32 = 0x0020;
+    /// The hardware sources; writing 0 to a latched bit clears it.
+    pub const HARDINT: u32 = 0x0028;
     pub const CPU_ERROR_ADDR: u32 = 0x0040;
     pub const CPU_ERROR_STAT: u32 = 0x0048;
     pub const CPU_ERROR_ENA: u32 = 0x0050;
@@ -193,6 +197,9 @@ pub mod crime_reg {
 /// number here. Which value the PROM demands is one of the things the first
 /// run is meant to discover, so it is a field rather than a constant.
 pub const CRIME_REV_DEFAULT: u64 = 0x0000_0000_0000_0011;
+/// CRIME interrupt bits that latch (CRIME 1.5 spec): 30, 24:22, 19:16.
+pub const CRIME_LATCHED_BITS: u64 = 0x41cf_0000;
+
 /// CRIME 1.1 as the PROM wants to see it before it offers a graphics console.
 pub const CRIME_REV_GBE: u64 = 0x0000_0000_0000_00a1;
 
@@ -207,6 +214,10 @@ pub struct Crime {
     /// Values written, in order, as `(offset, value)` — the bank programming
     /// is only meaningful if you can see what it was told.
     writes: Mutex<Vec<(u32, u64)>>,
+    /// Edge-triggered sources CRIME holds until software writes a 0 to the
+    /// bit in HARDINT: GBE's four timing lines (16..19), the rendering
+    /// engine's empty/full/idle edges (22..24) and bit 30.
+    latched: Mutex<u64>,
     revision: u64,
     /// The clock CRIME's free-running counter is derived from, so the PROM's
     /// delays take the time they ask for rather than a number of reads.
@@ -226,6 +237,7 @@ impl Crime {
             regs: Mutex::new(vec![0u64; (CRIME_SIZE / 8) as usize]),
             trace: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
+            latched: Mutex::new(0),
             revision: CRIME_REV_DEFAULT,
             ust,
             time_base: Mutex::new(0),
@@ -247,12 +259,21 @@ impl Crime {
         }
     }
 
+    /// Latch an edge-triggered source until software clears it in HARDINT.
+    pub fn latch_int(&self, bit: u32) {
+        *self.latched.lock().unwrap() |= (1u64 << bit) & CRIME_LATCHED_BITS;
+    }
+
+    /// INTSTAT: the level sources, the latched ones and the software ones.
+    fn intstat(&self) -> u64 {
+        let r = self.regs.lock().unwrap();
+        r[(crime_reg::INTSTAT / 8) as usize] | r[(crime_reg::SOFTINT / 8) as usize] | *self.latched.lock().unwrap()
+    }
+
     /// True when something is pending that the mask lets through.
     pub fn interrupting(&self) -> bool {
-        let r = self.regs.lock().unwrap();
-        let stat = r[(crime_reg::INTSTAT / 8) as usize];
-        let mask = r[(crime_reg::INTMASK / 8) as usize];
-        stat & mask != 0
+        let mask = self.regs.lock().unwrap()[(crime_reg::INTMASK / 8) as usize];
+        self.intstat() & mask != 0
     }
 
     /// The raw counter, before the offset a write installs.
@@ -277,6 +298,8 @@ impl Crime {
             // Identity. Returning zero here is the one thing guaranteed to make
             // a PROM decide it is running on hardware it does not recognise.
             crime_reg::REVISION => self.revision,
+            crime_reg::INTSTAT => self.intstat(),
+            crime_reg::HARDINT => self.regs.lock().unwrap()[(crime_reg::INTSTAT / 8) as usize] | *self.latched.lock().unwrap(),
             // A free-running microsecond-ish counter. POST loops on this to time
             // out, so a constant would hang it forever.
             crime_reg::TIME => {
@@ -288,6 +311,20 @@ impl Crime {
     }
 
     fn store(&self, off: u32, val: u64) {
+        match off {
+            // Read-only: the sources set it, not the CPU.
+            crime_reg::INTSTAT => return,
+            crime_reg::HARDINT => {
+                let mut l = self.latched.lock().unwrap();
+                *l &= val | !CRIME_LATCHED_BITS;
+                return;
+            }
+            crime_reg::SOFTINT => {
+                self.regs.lock().unwrap()[(off / 8) as usize] = val & 0xf1ff_ffff;
+                return;
+            }
+            _ => {}
+        }
         if off == crime_reg::TIME {
             // The PROM zeroes the counter and then waits for it to reach a
             // deadline, so a write has to set where it counts from.
@@ -2358,6 +2395,13 @@ impl Ip32Bus {
     /// The SCSI controllers, the Ethernet, com0 and the PS/2 ports, into
     /// their CRIME inputs.
     fn update_lines(&self) {
+        // GBE's vertical-timing interrupts: the beam crossed a VT_INTRn line.
+        let crossed = self.gbe.vt_crossings();
+        for n in 0..4 {
+            if crossed & (1 << n) != 0 {
+                self.crime.latch_int(16 + n);
+            }
+        }
         for (scsi, line) in self.scsi.lock().unwrap().iter() {
             self.crime.set_int(*line, scsi.interrupting());
         }
@@ -2449,6 +2493,11 @@ impl Ip32Bus {
             Ok(()) => eprintln!("ip32: flash saved to {}", path.display()),
             Err(e) => eprintln!("ip32: flash {}: {e}", path.display()),
         }
+    }
+
+    /// How many bytes have been written into the flash so far.
+    pub fn flash_writes(&self) -> usize {
+        self.prom_writes.lock().unwrap().len()
     }
 
     /// Everything written into the flash, in order.
