@@ -312,7 +312,7 @@ pub struct Aic7880 {
     /// Host memory. The controller fetches its work from there rather than
     /// being handed it a register at a time, so without this it can see the
     /// tag of a command and nothing else about it.
-    ram: std::sync::Arc<Mutex<Vec<u8>>>,
+    ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>,
     /// The SCSI id the one disk answers at.
     target: u8,
     /// An address range to report DMA writes for, from IRIS_IP32_DMAWATCH.
@@ -324,7 +324,7 @@ pub struct Aic7880 {
 }
 
 impl Aic7880 {
-    pub fn new(ram: std::sync::Arc<Mutex<Vec<u8>>>) -> Self {
+    pub fn new(ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
         Self {
             st: Mutex::new(State::default()),
             disks: Mutex::new(std::collections::BTreeMap::new()),
@@ -341,26 +341,14 @@ impl Aic7880 {
         }
     }
 
-    /// Offset into RAM for an address the device sees.
-    ///
     /// Memory answers at its own base and again in a low alias, and the
     /// driver uses both in the same breath: the SCB's own address is given as
     /// `0x410752fc` while the CDB pointer inside it is `0x0107532c`, which is
-    /// the same bytes. Resolving only one of them reads the SCB correctly and
-    /// then finds an all-zero command.
-    fn ram_offset(&self, addr: u32, len: usize) -> Option<usize> {
-        let i = if addr >= crate::ip32::RAM_BASE {
-            addr.wrapping_sub(crate::ip32::RAM_BASE) as usize
-        } else {
-            addr as usize
-        };
-        (i < len).then_some(i)
-    }
-
+    /// the same bytes. The memory's own decode covers both.
     /// Read a byte of host memory, given the address the device sees.
     fn dma_read8(&self, addr: u32) -> u8 {
         let r = self.ram.lock().unwrap();
-        match self.ram_offset(addr, r.len()) {
+        match r.offset(addr) {
             Some(i) => r[i],
             None => 0,
         }
@@ -377,7 +365,7 @@ impl Aic7880 {
             }
         }
         let mut r = self.ram.lock().unwrap();
-        if let Some(i) = self.ram_offset(addr, r.len()) {
+        if let Some(i) = r.offset(addr) {
             r[i] = val;
         }
     }
@@ -1068,7 +1056,7 @@ mod tests {
     use crate::ip32::PciDeviceOps;
 
     fn chip() -> Aic7880 {
-        Aic7880::new(std::sync::Arc::new(std::sync::Mutex::new(vec![0u8; 1 << 20])))
+        Aic7880::new(std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20))))
     }
 
     #[test]
@@ -1134,7 +1122,7 @@ mod tests {
     /// driver rather than a datasheet, so it is worth pinning down.
     #[test]
     fn a_queued_tag_fetches_the_command_and_answers_it() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(vec![0u8; 1 << 20]));
+        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
         let c = Aic7880::new(ram.clone());
 
         // A controller with nothing attached answers nothing, so the test
@@ -1148,7 +1136,7 @@ mod tests {
             (0x1000u32, 0x2000u32, 0x2100u32, 0x2200u32, 0x3000u32, 0x4000u32);
         {
             let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut Vec<u8>, at: u32, v: u32| {
+            let put32 = |m: &mut [u8], at: u32, v: u32| {
                 m[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
             };
             // array[1] = the SCB's bus address
@@ -1194,7 +1182,7 @@ mod tests {
     /// must reach the image rather than growing it.
     #[test]
     fn a_write_reaches_the_disk_and_reads_back() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(vec![0u8; 1 << 20]));
+        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
         let c = Aic7880::new(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-write.img");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
@@ -1206,7 +1194,7 @@ mod tests {
         let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
         {
             let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut Vec<u8>, at: u32, v: u32| {
+            let put32 = |m: &mut [u8], at: u32, v: u32| {
                 m[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
             };
             put32(&mut m, array + 4, base + scb);
@@ -1246,7 +1234,7 @@ mod tests {
     /// program.
     #[test]
     fn a_long_scatter_gather_list_is_followed_to_the_end() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(vec![0u8; 4 << 20]));
+        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(4 << 20)));
         let c = Aic7880::new(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-sg.img");
         let pattern: Vec<u8> = (0..264 * BLOCK_SIZE).map(|i| (i % 253) as u8).collect();
@@ -1261,7 +1249,7 @@ mod tests {
         assert!(pages > 32, "the test must cross the bound it is checking");
         {
             let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut Vec<u8>, at: u32, v: u32| {
+            let put32 = |m: &mut [u8], at: u32, v: u32| {
                 m[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
             };
             put32(&mut m, array + 4, base + scb);
@@ -1306,7 +1294,7 @@ mod tests {
     /// an all-zero command.
     #[test]
     fn dma_resolves_the_low_memory_alias() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(vec![0u8; 1 << 16]));
+        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 16)));
         ram.lock().unwrap()[0x40] = 0xa5;
         let c = Aic7880::new(ram);
         assert_eq!(c.dma_read8(0x40), 0xa5, "the low alias");

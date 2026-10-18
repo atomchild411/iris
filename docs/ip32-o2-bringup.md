@@ -1603,3 +1603,65 @@ the emulated R5000 doing the encryption), with no interface errors and no
 watchdog timeouts.
 
 Related: [`virtio-mmio-design.md`](virtio-mmio-design.md).
+
+## Memory as CRIME banks, and the R10000 (2026-10-17)
+
+Memory used to be one flat block from `0x40000000` that ignored CRIME's bank
+controls. It is now `src/dev/crime_mem.rs`: eight banks of 32 or 128 MB,
+placed in the 1 GB window by their control registers (`0x208 + 8*i`, base in
+32 MB units in bits 0-4, 128 MB in bit 8), and decoded the way POST relies on:
+
+- several controls matching one address: the lowest-numbered bank answers;
+- a matching bank with nothing fitted: no error, the read returns what was
+  last on the memory bus (zero, since POST clears it before reading);
+- a 32 MB bank set to 128 MB: its 32 MB repeat across the range, which is how
+  POST tells the sizes apart;
+- nothing matching: a bus error.
+
+The low alias at physical 0 is now the first 256 MB of the window, not "as
+much as there is RAM": with 1 GB fitted the old rule would have covered CRIME
+and MACE.
+
+What is fitted follows SGI's memory installation flier (007-3778-002): four
+DIMM pairs (A-D), kits of 32 MB (2x16 MB single-sided, one CRIME bank),
+64 MB (2x32 double-sided, two 32 MB banks), 128 MB (2x64 single-sided, one
+128 MB bank) and 256 MB (2x128 double-sided, two 128 MB banks); pair A always
+fitted, pairs filled in order, no pair larger than the one before it. That is
+69 fittings from 32 MB to 1 GB; a unit test runs POST's own sizing procedure
+against every one and checks it finds what is fitted, bank by bank.
+
+    IRIS_IP32_DIMMS=256,128,32   the kit in each pair from A, in MB
+    IRIS_IP32_RAM_MB=1024        a total, fitted with the fewest kits
+                                 (neither: 128 MB). Impossible fittings are
+                                 refused with SGI's rule.
+
+**NetBSD sees at most 256 MB.** With 1 GB fitted, POST sizes all eight banks
+(the PROM's `hinv` says `Memory size: 1024 Mbytes`) but the PROM's ARCS memory descriptors stop at `0x10000000`, and
+NetBSD/sgimips builds its memory map from those alone (32- or 64-bit kernel).
+Using the rest takes a kernel that reads the bank controls itself (IRIX does;
+OpenBSD is the next thing to try).
+
+### R10000
+
+`IRIS_IP32_CPU=r10000` (or `r10k`) runs the O2 on `R10000O2Cache`, the IP28
+model with one difference: **64-byte secondary-cache lines** (Config SB = 0).
+With the IP28's 128-byte lines the PROM panicked before printing anything:
+`Write TLB miss exception, bad address: 0x0` in `bzero`, called by the SCSI
+probe with a NULL buffer. The chain, from breakpoints on the allocator:
+
+- the DMA-buffer allocator aligns to a global the cache setup computes; it read
+  `0x1f` on the R5000 and `0xfffff` on the R10000;
+- the R10000 path of that setup (firmware `0x01006330`) reads SS and SB from
+  Config; for SB = 0 it stores a 64-byte line, but for SB = 1 its branch skips
+  the assignment and stores the secondary cache's *size* as the line size;
+- 1 MB alignment exhausts the PROM heap, the allocator returns NULL, and the
+  first SCSI command clears address 0.
+
+The SB = 1 path cannot work, so the inference is that O2 R10000 modules all
+have 64-byte secondary lines and the PROM never met anything else. With that, PROM 4.18 boots NetBSD 11 on the R10000:
+`cpu0: MIPS R10000 CPU (0x925) Rev. 2.5`, `1024KB/64B 2-way ... L2`.
+
+`IRIS_IP32_BREAK=pc,...` (new) prints a0-a3, v0, v1, sp and ra the first eight
+times each address is reached; `IRIS_IP32_DIS` now takes several ranges.
+`machines/o2-netbsd/console.sh` in the workspace defaults to R10000 and 1 GB
+(`CPU=`, `RAM=`, `DIMMS=` to change).

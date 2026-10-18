@@ -218,13 +218,13 @@ struct Link {
 }
 
 pub struct Mec {
-    ram: Arc<Mutex<Vec<u8>>>,
+    ram: Arc<Mutex<crate::dev::crime_mem::O2Memory>>,
     st: Mutex<State>,
     link: Mutex<Option<Link>>,
 }
 
 impl Mec {
-    pub fn new(ram: Arc<Mutex<Vec<u8>>>) -> Self {
+    pub fn new(ram: Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
         Self { ram, st: Mutex::new(State::new()), link: Mutex::new(None) }
     }
 
@@ -271,27 +271,17 @@ impl Mec {
         tx || rx
     }
 
-    fn ram_offset(addr: u64, len: usize) -> Option<usize> {
-        let addr = addr as u32;
-        let i = if addr >= crate::ip32::RAM_BASE {
-            addr.wrapping_sub(crate::ip32::RAM_BASE) as usize
-        } else {
-            addr as usize
-        };
-        (i < len).then_some(i)
-    }
-
     fn ram_read(&self, addr: u64, out: &mut [u8]) {
         let r = self.ram.lock().unwrap();
         for (k, b) in out.iter_mut().enumerate() {
-            *b = Self::ram_offset(addr + k as u64, r.len()).map_or(0, |i| r[i]);
+            *b = r.offset((addr + k as u64) as u32).map_or(0, |i| r[i]);
         }
     }
 
     fn ram_write(&self, addr: u64, data: &[u8]) {
         let mut r = self.ram.lock().unwrap();
         for (k, &b) in data.iter().enumerate() {
-            if let Some(i) = Self::ram_offset(addr + k as u64, r.len()) {
+            if let Some(i) = r.offset((addr + k as u64) as u32) {
                 r[i] = b;
             }
         }
@@ -544,16 +534,16 @@ mod tests {
     use super::*;
     use crate::ip32::RAM_BASE;
 
-    fn mec() -> (Mec, Arc<Mutex<Vec<u8>>>) {
-        let ram = Arc::new(Mutex::new(vec![0u8; 1 << 20]));
+    fn mec() -> (Mec, Arc<Mutex<crate::dev::crime_mem::O2Memory>>) {
+        let ram = Arc::new(Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
         (Mec::new(ram.clone()), ram)
     }
 
-    fn put(ram: &Arc<Mutex<Vec<u8>>>, off: usize, b: &[u8]) {
+    fn put(ram: &Arc<Mutex<crate::dev::crime_mem::O2Memory>>, off: usize, b: &[u8]) {
         ram.lock().unwrap()[off..off + b.len()].copy_from_slice(b);
     }
 
-    fn get(ram: &Arc<Mutex<Vec<u8>>>, off: usize, n: usize) -> Vec<u8> {
+    fn get(ram: &Arc<Mutex<crate::dev::crime_mem::O2Memory>>, off: usize, n: usize) -> Vec<u8> {
         ram.lock().unwrap()[off..off + n].to_vec()
     }
 

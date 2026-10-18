@@ -2,6 +2,7 @@
 //! IMPACT); the rest of the system's devices sit here as single files.
 
 pub mod aic7880;
+pub mod crime_mem;
 pub mod gl;
 pub mod gr2;
 pub mod mec;

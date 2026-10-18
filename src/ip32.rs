@@ -113,19 +113,18 @@ pub const CRIME_RE_SIZE: u32 = 0x0000_6000;
 /// exception vector. The Indy models the same idea (`ALIAS_BASE` in
 /// `physical.rs`), so the shape is familiar even though the base differs.
 ///
-/// The alias covers as much as there is RAM. POST walks well past the first
-/// page, and since the lowest device sits at 0x14000000 an alias of up to
-/// 128 MB cannot shadow anything.
+/// The alias is the first 256 MB of the window ([`LOW_ALIAS_SIZE`]); memory
+/// above that is only at its own address. The lowest device sits at
+/// 0x14000000, so the alias cannot shadow one.
 
-/// The memory window CRIME decodes: eight banks of 128 MB from [`RAM_BASE`].
-///
-/// Whether a bank is *populated* is a separate question from whether it is
-/// decoded. POST probes every bank in turn; an absent one must read back
-/// something that fails its pattern check, **not** raise a bus error. Erroring
-/// sends the PROM into its bus-error handler, which on an unpopulated machine
-/// immediately faults again — a two-address exception loop between `jr s8` and
-/// whatever `s8` happens to hold.
+/// The memory window CRIME decodes: 1 GB from [`RAM_BASE`], which its eight
+/// bank controls place banks of 32 or 128 MB in. How, and what an absent bank
+/// answers, is in [`crate::dev::crime_mem`].
+use crate::dev::crime_mem::{Decode, O2Memory};
+
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
+/// How much of memory also answers from address 0: the first 256 MB.
+pub const LOW_ALIAS_SIZE: u32 = 0x1000_0000;
 
 /// Boot PROM. Same address as the Indy's, which is the one thing that carries
 /// over: the MIPS reset vector is 0xbfc00000 on both.
@@ -1663,7 +1662,7 @@ impl BusDevice for Stub {
 /// uses. At this stage legibility and being able to log an unmapped access are
 /// worth more than the lookup.
 pub struct Ip32Bus {
-    ram: std::sync::Arc<Mutex<Vec<u8>>>,
+    ram: std::sync::Arc<Mutex<O2Memory>>,
     /// The flash. Writable, because an O2 keeps its environment variables in
     /// it -- there is no separate NVRAM chip -- and the installer saves
     /// settings there. The user's PROM file is never touched: this is a copy.
@@ -1712,11 +1711,21 @@ pub struct Ip32Bus {
 }
 
 impl Ip32Bus {
-    /// `ram_bytes` is rounded down to a multiple of 8. `prom` must be the raw
-    /// 512 KiB IP32 PROM image.
+    /// `ram_bytes` of memory in the usual fitting for that size, or, for a
+    /// size no O2 can have, one bank of it (power-of-two sizes only). `prom`
+    /// must be the raw 512 KiB IP32 PROM image.
     pub fn new(ram_bytes: usize, prom: Vec<u8>) -> Self {
+        let mem = O2Memory::with_total((ram_bytes >> 20) as u32)
+            .ok()
+            .filter(|m| m.total() as usize == ram_bytes)
+            .unwrap_or_else(|| O2Memory::single(ram_bytes));
+        Self::with_memory(mem, prom)
+    }
+
+    /// A machine with `mem` fitted.
+    pub fn with_memory(mem: O2Memory, prom: Vec<u8>) -> Self {
         let pc = std::sync::Arc::new(PcTap::default());
-        let ram = std::sync::Arc::new(Mutex::new(vec![0u8; ram_bytes & !7]));
+        let ram = std::sync::Arc::new(Mutex::new(mem));
         let ust = std::sync::Arc::new(MaceUst::new());
         let bus = Self {
             ram: ram.clone(),
@@ -1882,8 +1891,18 @@ impl Ip32Bus {
         }
     }
 
-    fn ram_len(&self) -> u32 {
-        self.ram.lock().unwrap().len() as u32
+    /// Memory fitted, in bytes.
+    pub fn ram_len(&self) -> u32 {
+        self.ram.lock().unwrap().total()
+    }
+
+    /// A CRIME write that may have moved a memory bank.
+    fn crime_wrote(&self, addr: u32) {
+        let off = (addr - CRIME_BASE) & !7;
+        if (crime_reg::MEM_BANK_CTRL0..crime_reg::MEM_BANK_CTRL0 + 8 * 8).contains(&off) {
+            let v = self.crime.load(off);
+            self.ram.lock().unwrap().set_ctrl(((off - crime_reg::MEM_BANK_CTRL0) / 8) as usize, v);
+        }
     }
 
     /// Record an access if it falls in the watch range.
@@ -1918,25 +1937,9 @@ impl Ip32Bus {
         self.watch_log.lock().unwrap().clone()
     }
 
-    fn in_ram(&self, addr: u32) -> bool {
-        addr >= RAM_BASE && addr < RAM_BASE.wrapping_add(self.ram_len())
-    }
-
-    /// Inside CRIME's memory window but behind a bank with no SIMM in it.
-    fn in_unpopulated_ram(&self, addr: u32) -> bool {
-        !self.in_ram(addr)
-            && addr >= RAM_BASE
-            && addr < RAM_BASE.wrapping_add(RAM_WINDOW_SIZE)
-    }
-
     /// Writes landing where the `firmware` section would be loaded.
     pub fn firmware_writes(&self) -> u64 {
         *self.fw_writes.lock().unwrap()
-    }
-
-    /// Offset of `addr` within RAM, if it is in RAM.
-    pub fn ram_offset(&self, addr: u32) -> Option<u32> {
-        self.in_ram(addr).then(|| addr - RAM_BASE)
     }
 
     fn in_prom(&self, addr: u32) -> bool {
@@ -2074,9 +2077,12 @@ impl Ip32Bus {
         false
     }
 
-    /// Map an address through the low-memory alias, if it falls in it.
+    /// Map an address through the low-memory alias, if it falls in it. The
+    /// alias covers the first 256 MB only, as on an O2: above that, CRIME and
+    /// MACE live at 0x14000000 and 0x1f000000, and memory beyond 256 MB is
+    /// reached at its own address above `RAM_BASE`.
     fn resolve(&self, addr: u32) -> u32 {
-        if addr < self.ram_len() {
+        if addr < LOW_ALIAS_SIZE {
             RAM_BASE.wrapping_add(addr)
         } else {
             addr
@@ -2085,23 +2091,23 @@ impl Ip32Bus {
 
     fn read_bytes(&self, addr: u32, n: usize) -> Option<u64> {
         let addr = self.resolve(addr);
-        // Decoded but not populated: give back a value that cannot pass POST's
-        // address/complement check, so sizing concludes "no SIMM" and moves on.
-        if self.in_unpopulated_ram(addr) {
-            return Some(0);
-        }
-        if self.in_ram(addr) {
+        {
             let r = self.ram.lock().unwrap();
-            let i = (addr - RAM_BASE) as usize;
-            if i + n > r.len() {
-                return None;
+            match r.decode(addr) {
+                // A bank control matches but nothing is fitted: what is left
+                // on the memory bus, which POST has just cleared to zero.
+                Decode::Empty => return Some(0),
+                Decode::Ram(i) => {
+                    let mut v = 0u64;
+                    for k in 0..n {
+                        v = (v << 8) | r[i + k] as u64;
+                    }
+                    drop(r);
+                    self.watch_hit(addr, false, v);
+                    return Some(v);
+                }
+                Decode::None => {}
             }
-            let mut v = 0u64;
-            for k in 0..n {
-                v = (v << 8) | r[i + k] as u64;
-            }
-            self.watch_hit(addr, false, v);
-            return Some(v);
         }
         if self.in_prom(addr) {
             let p = self.prom.lock().unwrap();
@@ -2124,20 +2130,19 @@ impl Ip32Bus {
         }
         let addr = self.resolve(addr);
         self.watch_hit(addr, true, val);
-        // Writes into an empty bank are swallowed by the memory controller.
-        if self.in_unpopulated_ram(addr) {
-            return true;
-        }
-        if self.in_ram(addr) {
+        {
             let mut r = self.ram.lock().unwrap();
-            let i = (addr - RAM_BASE) as usize;
-            if i + n > r.len() {
-                return false;
+            match r.decode(addr) {
+                // Writes into an empty bank are swallowed by the memory controller.
+                Decode::Empty => return true,
+                Decode::Ram(i) => {
+                    for k in 0..n {
+                        r[i + k] = (val >> (8 * (n - 1 - k))) as u8;
+                    }
+                    return true;
+                }
+                Decode::None => {}
             }
-            for k in 0..n {
-                r[i + k] = (val >> (8 * (n - 1 - k))) as u8;
-            }
-            return true;
         }
         if self.in_prom(addr) {
             let mut p = self.prom.lock().unwrap();
@@ -2357,7 +2362,9 @@ impl BusDevice for Ip32Bus {
             return self.crime_re.write32(addr & !3, val as u32);
         }
         if self.in_crime(addr) {
-            return self.crime.write32(addr & !3, val as u32);
+            let r = self.crime.write32(addr & !3, val as u32);
+            self.crime_wrote(addr);
+            return r;
         }
         if self.in_macepci(addr) {
             return self.macepci.write32(addr & !3, val as u32);
@@ -2398,7 +2405,9 @@ impl BusDevice for Ip32Bus {
             return self.crime_re.write32(addr & !3, val as u32);
         }
         if self.in_crime(addr) {
-            return self.crime.write32(addr & !3, val as u32);
+            let r = self.crime.write32(addr & !3, val as u32);
+            self.crime_wrote(addr);
+            return r;
         }
         if self.in_macepci(addr) {
             return self.macepci.write32(addr & !3, val as u32);
@@ -2439,7 +2448,9 @@ impl BusDevice for Ip32Bus {
             return self.crime_re.write32(addr, val);
         }
         if self.in_crime(addr) {
-            return self.crime.write32(addr, val);
+            let r = self.crime.write32(addr, val);
+            self.crime_wrote(addr);
+            return r;
         }
         if self.in_ust(addr) {
             return self.ust.write32(addr, val);
@@ -2487,7 +2498,9 @@ impl BusDevice for Ip32Bus {
             return self.crime_re.write64(addr, val);
         }
         if self.in_crime(addr) {
-            return self.crime.write64(addr, val);
+            let r = self.crime.write64(addr, val);
+            self.crime_wrote(addr);
+            return r;
         }
         if self.in_ust(addr) {
             return self.ust.write64(addr, val);
@@ -3254,7 +3267,19 @@ mod bringup {
             .unwrap();
     }
 
+    /// The CPU: `IRIS_IP32_CPU=r10000` (or `r10k`) for an R10000, as the O2
+    /// was also sold with; an R5000 otherwise.
     fn trace_the_prom_from_reset_inner() {
+        match std::env::var("IRIS_IP32_CPU").unwrap_or_default().to_ascii_lowercase().as_str() {
+            "r10000" | "r10k" => run_the_prom_from_reset::<crate::cpu::mips_cache_v2::R10000O2Cache>("R10000"),
+            _ => run_the_prom_from_reset::<R5000Cache>("R5000"),
+        }
+    }
+
+    fn run_the_prom_from_reset<C>(cpu: &str)
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn crate::traits::BusDevice>>,
+    {
         let Some(prom) = prom_image() else { return };
 
         let sections = parse_prom_sections(&prom);
@@ -3263,14 +3288,31 @@ mod bringup {
             eprintln!("   {:<10} v{:<5} @0x{:06x} len 0x{:05x}", s.name, s.version, s.file_off, s.length);
         }
 
-        // 128 MB: a common O2 configuration, and enough that a memory sizing
-        // loop has something to find.
+        // Memory: IRIS_IP32_DIMMS names the kit in each DIMM pair from A
+        // (`256,128,32`), IRIS_IP32_RAM_MB a total to fit the usual way, and
+        // with neither it is 128 MB, a common O2 configuration. Anything an O2
+        // cannot be fitted with is refused, with SGI's reason.
+        let kits = match (std::env::var("IRIS_IP32_DIMMS"), std::env::var("IRIS_IP32_RAM_MB")) {
+            (Ok(d), _) => d.split(',').map(|k| k.trim().trim_end_matches("MB").parse::<u32>()
+                .map_err(|_| format!("IRIS_IP32_DIMMS: {k:?} is not a size in MB"))).collect::<Result<Vec<_>, _>>(),
+            (_, Ok(mb)) => mb.trim().parse::<u32>().map_err(|_| format!("IRIS_IP32_RAM_MB: {mb:?}"))
+                .and_then(crate::dev::crime_mem::kits_for),
+            _ => Ok(vec![128]),
+        };
+        let mem = match kits.and_then(|k| O2Memory::from_kits(&k).map(|m| (k, m))) {
+            Ok((k, m)) => {
+                let pairs: Vec<String> = k.iter().zip("ABCD".chars()).map(|(s, p)| format!("{p} {s} MB")).collect();
+                eprintln!("ip32: {cpu} with {} MB ({})", m.total() >> 20, pairs.join(", "));
+                m
+            }
+            Err(e) => panic!("ip32: no such O2 memory fitting: {e}"),
+        };
         let bus_prom = prom.clone();
-        let bus = Arc::new(Ip32Bus::new(128 << 20, prom));
+        let bus = Arc::new(Ip32Bus::with_memory(mem, prom));
         let sysad: Arc<dyn crate::traits::BusDevice> = bus.clone();
-        let cfg = MipsCpuConfig::for_model::<R5000Cache>();
+        let cfg = MipsCpuConfig::for_model::<C>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
-        let mut exec: MipsExecutor<MipsTlb, R5000Cache> = MipsExecutor::new(sysad, tlb, &cfg);
+        let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
 
         let mut reached_post1 = false;
         let mut steps = 0u64;
@@ -3312,6 +3354,12 @@ mod bringup {
         // a run whose point is "does it boot" rather than "where did it
         // stop", that is several times the throughput.
         let fast = std::env::var("IRIS_IP32_FAST").is_ok();
+        // IRIS_IP32_BREAK=pc,pc,... prints the registers the first few times
+        // each of those addresses is reached: what a function was called
+        // with, or returned, without a debugger.
+        let mut breaks: Vec<(u32, u32)> = std::env::var("IRIS_IP32_BREAK").unwrap_or_default()
+            .split(',').filter_map(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+            .map(|a| (a, 0)).collect();
         // A loaded kernel lives in kseg0 well above the PROM's own use of it.
         // Track when we get there and what the last thing before leaving was.
         let mut kernel_entered = 0u64;
@@ -3478,6 +3526,15 @@ mod bringup {
             // instruction is about to make.
             bus.pc.set(pc);
             bus.pc.set_ra(exec.core.gpr[31] as u32);
+            if !breaks.is_empty() {
+                let pa = pc & 0x1fff_ffff;
+                if let Some(b) = breaks.iter_mut().find(|b| b.0 & 0x1fff_ffff == pa && b.1 < 8) {
+                    b.1 += 1;
+                    let g = &exec.core.gpr;
+                    eprintln!("ip32: break {pc:08x} @{steps}: a0 {:x} a1 {:x} a2 {:x} a3 {:x} v0 {:x} v1 {:x} sp {:x} ra {:x}",
+                              g[4], g[5], g[6], g[7], g[2], g[3], g[29], g[31]);
+                }
+            }
             // The clock only has to be right when something reads it, and
             // the readers are all on the periodic path below.
             if !fast || steps % TIMER_POLL_STEPS == 0 {
@@ -3795,9 +3852,10 @@ mod bringup {
                 }
             }
         }
-        // IRIS_IP32_DIS=start:end disassembles a range once the run is over,
-        // reading through the bus so RAM-resident code (post1) is visible.
-        if let Ok(spec) = std::env::var("IRIS_IP32_DIS") {
+        // IRIS_IP32_DIS=start:end[,start:end...] disassembles ranges once the
+        // run is over, reading through the bus so RAM-resident code (post1)
+        // is visible.
+        for spec in std::env::var("IRIS_IP32_DIS").unwrap_or_default().split(',') {
             if let Some((a, b)) = spec.split_once(':') {
                 let a = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0);
                 let b = u32::from_str_radix(b.trim_start_matches("0x"), 16).unwrap_or(0);
