@@ -79,6 +79,12 @@ pub struct Gbe {
     pub hot: Mutex<BTreeMap<u32, u64>>,
     /// Guest time in microseconds (MACE UST).
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The beam's clock when it should follow the CPU instead: microseconds
+    /// from the instruction count (see `use_cpu_clock`).
+    cpu_clock: std::sync::OnceLock<(crate::cpu::mips_core::CyclesPtr, u64)>,
+    /// The 64 KB tiles the last rendered frame came from (physical >> 16),
+    /// for a memory watch that wants only what is on screen.
+    pub displayed: Mutex<std::collections::HashSet<u32>>,
 }
 
 impl Gbe {
@@ -87,7 +93,25 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), displayed: Mutex::new(Default::default()) }
+    }
+
+    /// Run the beam on the CPU's instruction count at `mhz` rather than on
+    /// the host clock. The vertical-timing interrupts then come at the rate
+    /// the guest would see on its own hardware: on the host clock a slow
+    /// emulated CPU gets sixty a real second whatever it manages to do, and
+    /// IRIX's interrupt dispatcher -- which re-reads CRIME until nothing is
+    /// pending -- found GBE latched again before each pass was out and never
+    /// returned.
+    pub fn use_cpu_clock(&self, cycles: crate::cpu::mips_core::CyclesPtr, mhz: u32) {
+        let _ = self.cpu_clock.set((cycles, mhz.max(1) as u64));
+    }
+
+    fn now(&self) -> u64 {
+        match self.cpu_clock.get() {
+            Some((c, mhz)) => c.get() / mhz,
+            None => (self.now)(),
+        }
     }
 
     fn get(r: &[u32], off: u32) -> u32 {
@@ -114,7 +138,7 @@ impl Gbe {
             return xy & 0x00ff_ffff;
         }
         s.reads += 1;
-        let us = (self.now)().saturating_sub(s.t0);
+        let us = self.now().saturating_sub(s.t0);
         let dots = us * Self::dot_hz(&s.r) / 1_000_000 + s.reads * DOTS_PER_READ;
         let x = dots % (maxx + 1);
         let y = (dots / (maxx + 1)) % (maxy + 1);
@@ -132,7 +156,7 @@ impl Gbe {
         if maxx == 0 || maxy == 0 {
             return None;
         }
-        let us = (self.now)().saturating_sub(s.t0);
+        let us = self.now().saturating_sub(s.t0);
         let dots = us * Self::dot_hz(&s.r) / 1_000_000 + s.reads * DOTS_PER_READ;
         Some(dots / ((maxx + 1) * (maxy + 1)))
     }
@@ -168,7 +192,7 @@ impl Gbe {
         if maxx == 0 || maxy == 0 {
             return 0;
         }
-        let us = (self.now)().saturating_sub(s.t0);
+        let us = self.now().saturating_sub(s.t0);
         let now = us * Self::dot_hz(&s.r) / 1_000_000 + s.reads * DOTS_PER_READ;
         let last = std::mem::replace(&mut s.seen_dots, now);
         if now <= last {
@@ -228,7 +252,7 @@ impl Gbe {
             for (live, v, _) in std::mem::take(&mut s.pending) {
                 s.r[(live / 4) as usize] = v;
             }
-            s.t0 = (self.now)();
+            s.t0 = self.now();
             s.reads = 0;
             s.seen_dots = 0;
         }
@@ -319,6 +343,11 @@ impl Gbe {
                     .unwrap_or(0);
                 tiles.push(if e == 0 { None } else { mem.dma_offset((e as u32) << 16).filter(|&o| o + 0x10000 <= mem.len()) });
             }
+            *self.displayed.lock().unwrap() = (0..n.min(65536))
+                .filter_map(|i| mem.dma_offset(list + 2 * i as u32).filter(|&o| o + 1 < mem.len()))
+                .map(|o| u16::from_be_bytes([mem[o], mem[o + 1]]) as u32)
+                .filter(|&e| e != 0)
+                .collect();
         }
         let fetch = |s: usize| -> u32 {
             if !dma {
@@ -480,9 +509,10 @@ pub mod re_reg {
     pub const VERTEX_0: u32 = 0x2070;
     pub const VERTEX_1: u32 = 0x2074;
     pub const XFER_SRC: u32 = 0x20a0;
-    /// Linear source and destination strides, in 32-byte units.
-    pub const XFER_STRIDE_SRC: u32 = 0x20a8;
-    pub const XFER_STRIDE_DST: u32 = 0x20ac;
+    /// The linear end's address steps, in bytes: from one pixel to the
+    /// next, and from a row's last pixel to the next row's first.
+    pub const XFER_STEP_X: u32 = 0x20a8;
+    pub const XFER_STEP_ROW: u32 = 0x20ac;
     /// Linear destination byte address.
     pub const XFER_DST: u32 = 0x20b0;
     pub const STIPPLE_MODE: u32 = 0x20c0;
@@ -715,13 +745,36 @@ impl CrimeRe {
     }
 
     /// Run the pixel pipe's current primitive.
+    /// A 32-bit pixel moved between buffers whose pixel types (BufMode
+    /// 7:4) differ: through RGBA. RGB keeps its colour in the low three
+    /// bytes (0x00RRGGBB) and ABGR is RGBA reversed. IRIX's X server keeps
+    /// pixmaps as RGB in linear B and the screen as RGBA; copying the word
+    /// unchanged gave 0x00c0c0c0's grey back as 0x00c0c0 -- cyan.
+    fn convert(v: u32, from_mode: u32, to_mode: u32, bd: u32) -> u32 {
+        let (from, to) = ((from_mode >> 4) & 0xf, (to_mode >> 4) & 0xf);
+        if from == to || bd != 4 {
+            return v;
+        }
+        let rgba = match from {
+            1 => (v << 8) | 0xff,
+            3 => v.swap_bytes(),
+            _ => v,
+        };
+        match to {
+            1 => rgba >> 8,
+            3 => rgba.swap_bytes(),
+            _ => rgba,
+        }
+    }
+
     /// A rectangle pixel transfer with a linear buffer at either end: the
     /// X server keeps icons and saved screen areas in linear B and copies
-    /// them in and out this way. A linear end is a byte address (XFER_SRC
-    /// for a source, XFER_DST for a destination) for the rectangle's first
-    /// vertex, rows a stride of 32-byte units apart. On the login screen a
-    /// 16-pixel icon row has stride 4 (a 32-pixel pixmap) and an 8-pixel
-    /// save stride 1.
+    /// them in and out this way. The linear end starts at a byte address
+    /// (XFER_SRC for a source, XFER_DST for a destination) for the
+    /// rectangle's top-left pixel and moves XFER_STEP_X bytes per pixel and
+    /// XFER_STEP_ROW from the end of one row to the start of the next. The
+    /// login screen's copies out of a 16-pixel-wide pixmap all have steps 4
+    /// and 4 + (16 - width) x 4: a 64-byte pitch whatever the width.
     fn xfer_linear(&self, r: &[u32]) {
         let g = |off: u32| r[(off / 4) as usize];
         let (sm, dmode) = (g(BUFMODE_SRC), g(BUFMODE_DST));
@@ -742,7 +795,13 @@ impl CrimeRe {
             self.note(format!("xfer rect {xa},{ya}..{xb},{yb}"));
             return;
         }
-        let (sstride, dstride) = (g(XFER_STRIDE_SRC).wrapping_mul(32), g(XFER_STRIDE_DST).wrapping_mul(32));
+        let (step_x, step_row) = (g(XFER_STEP_X), g(XFER_STEP_ROW));
+        let width = (xb - xa) as u32;
+        // Offset of pixel (x, y) from the top-left one, along the linear end.
+        let lin_off = |x: i32, y: i32| -> u32 {
+            let row = width.wrapping_mul(step_x).wrapping_add(step_row);
+            ((y - ya) as u32).wrapping_mul(row).wrapping_add(((x - xa) as u32).wrapping_mul(step_x))
+        };
         let (sx0, sy0) = Self::xy(g(XFER_SRC));
         let src_tiled = Buf { tlb: TLB_A + 0x200 * sb.min(2), bd: sbd };
         let dst_tiled = Buf { tlb: TLB_A + 0x200 * db.min(2), bd: dbd };
@@ -750,9 +809,7 @@ impl CrimeRe {
         let mem: &mut O2Memory = &mut ram;
         let src_at = |mem: &O2Memory, x: i32, y: i32| -> Option<usize> {
             if lin(sb) {
-                let a = g(XFER_SRC)
-                    .wrapping_add(((y - y0) as u32).wrapping_mul(sstride))
-                    .wrapping_add(((x - x0) as u32).wrapping_mul(sbd));
+                let a = g(XFER_SRC).wrapping_add(lin_off(x, y));
                 Self::linear(r, mem, sb - 4, a)
             } else {
                 let (px, py) = (x + sx0 - x0, y + sy0 - y0);
@@ -764,9 +821,7 @@ impl CrimeRe {
         };
         let dst_at = |mem: &O2Memory, x: i32, y: i32| -> Option<usize> {
             if lin(db) {
-                let a = g(XFER_DST)
-                    .wrapping_add(((y - y0) as u32).wrapping_mul(dstride))
-                    .wrapping_add(((x - x0) as u32).wrapping_mul(dbd));
+                let a = g(XFER_DST).wrapping_add(lin_off(x, y));
                 Self::linear(r, mem, db - 4, a)
             } else {
                 Self::locate(r, mem, dst_tiled, x as u32, y as u32)
@@ -776,7 +831,8 @@ impl CrimeRe {
         let mut tmp = Vec::with_capacity(((xb - xa + 1) * (yb - ya + 1)) as usize);
         for y in ya..=yb {
             for x in xa..=xb {
-                tmp.push(src_at(mem, x, y).map(|o| Self::get_px(mem, o, sbd)).unwrap_or(0));
+                let v = src_at(mem, x, y).map(|o| Self::get_px(mem, o, sbd)).unwrap_or(0);
+                tmp.push(Self::convert(v, sm, dmode, sbd.min(dbd)));
             }
         }
         let mut it = tmp.into_iter();
@@ -897,7 +953,7 @@ impl CrimeRe {
                             } else {
                                 0
                             };
-                            tmp.push(v);
+                            tmp.push(Self::convert(v, g(BUFMODE_SRC), g(BUFMODE_DST), src.bd.min(dst.bd)));
                         }
                     }
                     let mut it = tmp.into_iter();
@@ -1192,6 +1248,15 @@ mod tests {
             }
         }
         crate::ip32_screen::save_png(&out, &rgba, w, h).unwrap();
+    }
+
+    #[test]
+    fn rgb_pixmaps_become_rgba_on_the_way_to_the_screen() {
+        // BufMode pixel types: 1 RGB, 2 RGBA, 3 ABGR, in bits 7:4.
+        assert_eq!(CrimeRe::convert(0x00c0_c0c0, 0x1618, 0x228, 4), 0xc0c0_c0ff);
+        assert_eq!(CrimeRe::convert(0x1122_3344, 0x228, 0x1618, 4), 0x0011_2233);
+        assert_eq!(CrimeRe::convert(0x1122_3344, 0x228, 0x238, 4), 0x4433_2211);
+        assert_eq!(CrimeRe::convert(0x1122_3344, 0x228, 0x228, 4), 0x1122_3344);
     }
 
     /// IRIX zeroes pages with the MTE: linear A mapped onto the pages in

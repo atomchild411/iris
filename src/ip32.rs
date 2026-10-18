@@ -2626,8 +2626,12 @@ pub struct Ip32Bus {
     /// A physical-address watch range, from `IRIS_IP32_WATCHMEM=lo[:hi]`.
     /// Every access within it is logged as `(addr, is_write, value, pc)`.
     /// Cheap to leave in: one range compare on the RAM path.
-    watch: Option<(u32, u32)>,
-    watch_log: Mutex<Vec<(u32, bool, u64, u32, u64)>>,
+    watch: Mutex<Option<(u32, u32)>>,
+    watch_log: Mutex<Vec<(u32, bool, u64, u32, u64, u8)>>,
+    /// Entries kept (IRIS_IP32_WATCHMEM_CAP, default 256) and whether reads
+    /// are left out (IRIS_IP32_WATCHMEM_WRITES).
+    watch_cap: usize,
+    watch_writes_only: bool,
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
     pub scsi: Mutex<Vec<(std::sync::Arc<crate::dev::aic7880::Aic7880>, u32)>>,
@@ -2686,12 +2690,14 @@ impl Ip32Bus {
             pc: pc.clone(),
             fw_writes: Mutex::new(0),
             sizemem: Mutex::new(Vec::new()),
-            watch: std::env::var("IRIS_IP32_WATCHMEM").ok().and_then(|v| {
+            watch: Mutex::new(std::env::var("IRIS_IP32_WATCHMEM").ok().and_then(|v| {
                 let (a, b) = v.split_once(':').unwrap_or((&v, &v));
                 let p = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
                 Some((p(a)?, p(b)? + 8))
-            }),
+            })),
             watch_log: Mutex::new(Vec::new()),
+            watch_cap: std::env::var("IRIS_IP32_WATCHMEM_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(256),
+            watch_writes_only: std::env::var("IRIS_IP32_WATCHMEM_WRITES").is_ok(),
             scsi: Mutex::new(Vec::new()),
         };
         // An experiment for now: the PROM probes slots 1..3 for a vendor ID
@@ -3021,15 +3027,44 @@ impl Ip32Bus {
     }
 
     /// Record an access if it falls in the watch range.
-    fn watch_hit(&self, addr: u32, write: bool, val: u64) {
-        if let Some((lo, hi)) = self.watch {
-            if addr >= lo && addr < hi {
+    fn watch_hit(&self, addr: u32, write: bool, val: u64, n: usize) {
+        if let Some((lo, hi)) = *self.watch.lock().unwrap() {
+            // (0, 0) watches whatever the display is scanning out.
+            let hit = if (lo, hi) == (0, 0) {
+                addr >= RAM_BASE && self.gbe.displayed.lock().unwrap().contains(&((addr - RAM_BASE) >> 16))
+            } else {
+                addr < hi && addr + n as u32 > lo
+            };
+            if hit && (write || !self.watch_writes_only) {
                 let mut w = self.watch_log.lock().unwrap();
-                if w.len() < 256 {
-                    w.push((addr, write, val, self.pc.get(), self.ust.now()));
+                if w.len() < self.watch_cap {
+                    // The harness sets the PC every step; the machine only
+                    // knows where its last batch ended.
+                    let pc = match self.pc.get() {
+                        0 => crate::ip32_machine::LAST_PC.load(Ordering::Relaxed),
+                        pc => pc,
+                    };
+                    w.push((addr, write, val, pc, self.ust.now(), n as u8));
                 }
             }
         }
+    }
+
+    /// Watch physical `lo..hi` (as the bus sees it, RAM at 0x4000_0000) from
+    /// now on, with an empty log; None stops watching.
+    pub fn set_watch(&self, range: Option<(u32, u32)>) {
+        *self.watch.lock().unwrap() = range;
+        self.watch_log.lock().unwrap().clear();
+    }
+
+    /// The watch log as text, one access per line.
+    pub fn watch_text(&self) -> String {
+        let w = self.watch_log.lock().unwrap();
+        let mut s = String::new();
+        for (a, wr, v, p, t, n) in w.iter() {
+            s.push_str(&format!("{t} {} {n} 0x{a:08x} 0x{v:0w$x} pc 0x{p:08x}\n", if *wr { "W" } else { "R" }, w = 2 * *n as usize));
+        }
+        s
     }
 
     /// The watch log, in order.
@@ -3053,7 +3088,7 @@ impl Ip32Bus {
         self.prom_writes.lock().unwrap().clone()
     }
 
-    pub fn watched(&self) -> Vec<(u32, bool, u64, u32, u64)> {
+    pub fn watched(&self) -> Vec<(u32, bool, u64, u32, u64, u8)> {
         self.watch_log.lock().unwrap().clone()
     }
 
@@ -3231,7 +3266,7 @@ impl Ip32Bus {
                         v = (v << 8) | r[i + k] as u64;
                     }
                     drop(r);
-                    self.watch_hit(addr, false, v);
+                    self.watch_hit(addr, false, v, n);
                     return Some(v);
                 }
                 Decode::None => {}
@@ -3257,7 +3292,7 @@ impl Ip32Bus {
             *self.fw_writes.lock().unwrap() += 1;
         }
         let addr = self.resolve(addr);
-        self.watch_hit(addr, true, val);
+        self.watch_hit(addr, true, val, n);
         {
             let mut r = self.ram.lock().unwrap();
             match r.decode(addr) {
@@ -5928,7 +5963,7 @@ mod bringup {
         let watched = bus.watched();
         if !watched.is_empty() {
             eprintln!("ip32: watched memory accesses ({}):", watched.len());
-            for (a, w, v, p, t) in watched.iter().take(40) {
+            for (a, w, v, p, t, _) in watched.iter().take(40) {
                 eprintln!("   @{t:<9} 0x{a:08x} {} 0x{v:016x}  from PC 0x{p:08x}",
                           if *w { "W" } else { "R" });
             }

@@ -132,6 +132,7 @@ impl O2Machine {
             bus.set_irq_sink(Box::new(move |level| dev.signal(Signal::Interrupt(2, level))));
         }
 
+        bus.gbe.use_cpu_clock(cpu.cycles_ptr(), o2.cpu_mhz);
         let running = Arc::new(AtomicBool::new(false));
         let display = Arc::new(O2Display::new(bus.clone(), cpu.cycles_ptr(), running.clone()));
         if let Some(port) = o2.control_port {
@@ -452,7 +453,7 @@ impl crate::gfx_display::GfxDisplay for O2Display {
 /// Where the CPU was at the end of its last batch, and how many batches it
 /// has run: enough to tell a guest spinning in one place from one that is
 /// still moving, without stopping it.
-static LAST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) static LAST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The general registers at the same moment, then Status, Cause, EPC and
 /// BadVAddr: what a polling loop is polling.
@@ -525,6 +526,29 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
                 _ => "err usage: peek ADDR LEN PATH".into(),
             }
         }
+        // `watch LO HI` (hex, bus addresses: RAM from 0x40000000) arms the
+        // memory watch with an empty log; `watch off` stops it.
+        "watch" => {
+            let v: Vec<u32> = arg.split_whitespace().filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).collect();
+            if arg.trim() == "fb" {
+                bus.set_watch(Some((0, 0)));
+                return "ok watching the displayed frame buffer".into();
+            }
+            match v[..] {
+                [lo, hi] if lo < hi => {
+                    bus.set_watch(Some((lo, hi)));
+                    format!("ok watching 0x{lo:08x}..0x{hi:08x}")
+                }
+                _ => {
+                    bus.set_watch(None);
+                    "ok watch off".into()
+                }
+            }
+        }
+        "watchdump" => match std::fs::write(arg, bus.watch_text()) {
+            Ok(()) => "ok".into(),
+            Err(e) => format!("err {e}"),
+        },
         "retrace" => match std::fs::write(arg, bus.crime_re.trace_text()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),
