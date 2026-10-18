@@ -729,6 +729,11 @@ pub struct O2Section {
     /// A keyboard and the PROM's graphics console. Off: serial console.
     #[serde(default = "o2_on")]
     pub graphics: bool,
+    /// The CPU clock in MHz. CP0 Count runs at half of it, and the PROM
+    /// measures it from Count (it reports it, and passes `cpufreq` to the OS).
+    /// R10000 O2s shipped at 175 and 195 MHz, R5000s at 180 to 300.
+    #[serde(default = "default_o2_mhz")]
+    pub cpu_mhz: u32,
     /// A PS/2 mouse on the second port (with `graphics`).
     #[serde(default = "o2_on")]
     pub mouse: bool,
@@ -761,6 +766,10 @@ fn default_o2_prom() -> String {
     "ip32prom.rev4.18.bin".into()
 }
 
+fn default_o2_mhz() -> u32 {
+    180
+}
+
 fn default_o2_ram() -> u32 {
     256
 }
@@ -783,6 +792,7 @@ impl Default for O2Section {
             arcs_fpu: false,
             mouse: true,
             control_port: None,
+            cpu_mhz: default_o2_mhz(),
             net: true,
             forwards: Vec::new(),
         }

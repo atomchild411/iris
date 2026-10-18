@@ -103,8 +103,8 @@ impl O2Machine {
         let sysad: Arc<dyn BusDevice> = bus.clone();
         let arcs_fpu = o2.arcs_fpu;
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
-            CpuModel::R10000 => Self::build_cpu::<R10000O2Cache>(sysad, &timer_manager, arcs_fpu),
-            CpuModel::R5000 => Self::build_cpu::<R5000Cache>(sysad, &timer_manager, arcs_fpu),
+            CpuModel::R10000 => Self::build_cpu::<R10000O2Cache>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz),
+            CpuModel::R5000 => Self::build_cpu::<R5000Cache>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz),
             CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
         };
 
@@ -144,7 +144,7 @@ impl O2Machine {
         Ok(Self { bus, cpu, timer_manager, display, running, threads: Vec::new() })
     }
 
-    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool) -> Arc<dyn CpuDevice>
+    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
@@ -153,6 +153,8 @@ impl O2Machine {
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         exec.core.set_timer_manager(tm.clone());
+        // Count runs at half the pipeline clock on both CPUs.
+        exec.core.set_count_hz(mhz.max(1) as u64 * 500_000);
         // The PROM runs with the cache holding its data (see the module doc).
         exec.cache.set_tcache_live(false);
         let mut post_done = false;
