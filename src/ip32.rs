@@ -41,6 +41,9 @@ pub const CRIME_SIZE: u32 = 0x0000_1000;
 /// has to answer. A storing register file is enough for that.
 pub const GBE_BASE: u32 = 0x1600_0000;
 pub const GBE_SIZE: u32 = 0x0010_0000;
+/// VICE, the video and image compression engine.
+pub const VICE_BASE: u32 = 0x1700_0000;
+pub const VICE_SIZE: u32 = 0x0100_0000;
 
 pub const MACE_BASE: u32 = 0x1f00_0000;
 pub const MACE_SIZE: u32 = 0x0080_0000;
@@ -2162,6 +2165,10 @@ pub struct Ip32Bus {
     pub crime_re: crate::dev::o2gfx::CrimeRe,
     /// The display back end: scans the frame buffer out of RAM.
     pub gbe: crate::dev::o2gfx::Gbe,
+    /// VICE, the video/image compression engine: a register file for now.
+    /// IRIX probes it at boot (OpenBSD and NetBSD never look), and a bus
+    /// error there panics the kernel.
+    pub vice: Stub,
     pub macepci: MacePci,
     pub ust: std::sync::Arc<MaceUst>,
     pub nic_trace: NicTrace,
@@ -2227,6 +2234,7 @@ impl Ip32Bus {
             crime: Crime::new(ust.clone()),
             mace: Stub::new("mace"),
             crime_re: crate::dev::o2gfx::CrimeRe::new(ram.clone()),
+            vice: Stub::new("vice"),
             gbe: {
                 let ust = ust.clone();
                 crate::dev::o2gfx::Gbe::new(std::sync::Arc::new(move || ust.now()))
@@ -2606,6 +2614,10 @@ impl Ip32Bus {
         addr >= MACE_PS2 && addr < MACE_PS2 + MACE_PS2_SIZE
     }
 
+    fn in_vice(&self, addr: u32) -> bool {
+        addr >= VICE_BASE && addr < VICE_BASE + VICE_SIZE
+    }
+
     fn in_gbe(&self, addr: u32) -> bool {
         addr >= GBE_BASE && addr < GBE_BASE + GBE_SIZE
     }
@@ -2789,6 +2801,9 @@ macro_rules! bus_read {
 
 impl Ip32Bus {
     fn read8_raw(&self, addr: u32) -> BusRead8 {
+        if self.in_vice(addr) {
+            return self.vice.read8(addr);
+        }
         if self.in_gbe(addr) {
             return BusRead8::ok(self.gbe.read32(addr & !3).data as u8);
         }
@@ -2830,6 +2845,9 @@ impl Ip32Bus {
     }
 
     fn read16_raw(&self, addr: u32) -> BusRead16 {
+        if self.in_vice(addr) {
+            return self.vice.read16(addr);
+        }
         if self.in_gbe(addr) {
             return BusRead16::ok(self.gbe.read32(addr & !3).data as u16);
         }
@@ -2870,6 +2888,9 @@ impl Ip32Bus {
             // The registers are 64-bit; a 32-bit access is the half it names.
             let v = self.mec.read64((addr - MACE_MEC) & !7);
             return BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 });
+        }
+        if self.in_vice(addr) {
+            return self.vice.read32(addr);
         }
         if self.in_gbe(addr) {
             return self.gbe.read32(addr);
@@ -2915,6 +2936,9 @@ impl Ip32Bus {
     }
 
     fn read64_raw(&self, addr: u32) -> BusRead64 {
+        if self.in_vice(addr) {
+            return self.vice.read64(addr);
+        }
         if self.in_gbe(addr) {
             return self.gbe.read64(addr);
         }
@@ -2967,6 +2991,9 @@ impl Ip32Bus {
     }
 
     fn write8_raw(&self, addr: u32, val: u8) -> u32 {
+        if self.in_vice(addr) {
+            return self.vice.write8(addr, val);
+        }
         if self.in_gbe(addr) {
             return self.gbe.write32(addr & !3, val as u32);
         }
@@ -3015,6 +3042,9 @@ impl Ip32Bus {
     }
 
     fn write16_raw(&self, addr: u32, val: u16) -> u32 {
+        if self.in_vice(addr) {
+            return self.vice.write16(addr, val);
+        }
         if self.in_gbe(addr) {
             return self.gbe.write32(addr & !3, val as u32);
         }
@@ -3060,6 +3090,9 @@ impl Ip32Bus {
             // MACE takes 64-bit stores; a 32-bit one is the low word.
             self.mec.write64((addr - MACE_MEC) & !7, val as u64);
             return BUS_OK;
+        }
+        if self.in_vice(addr) {
+            return self.vice.write32(addr, val);
         }
         if self.in_gbe(addr) {
             return self.gbe.write32(addr, val);
@@ -3115,6 +3148,9 @@ impl Ip32Bus {
         if self.in_mec(addr) {
             self.mec.write64(addr - MACE_MEC, val);
             return BUS_OK;
+        }
+        if self.in_vice(addr) {
+            return self.vice.write64(addr, val);
         }
         if self.in_gbe(addr) {
             return self.gbe.write64(addr, val);
