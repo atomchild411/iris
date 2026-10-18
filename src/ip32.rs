@@ -611,6 +611,46 @@ pub const MACE_REV2_BIT: u64 = 0x10;
 /// The bits NetBSD's `com0` attaches with, as it prints them:
 /// "com0 at mace0 offset 0x390000 intr 4 intrmask 0x3f00000".
 pub const MACE_ISA_SERIAL0_MASK: u64 = 0x03f0_0000;
+/// The serial DMA channels' registers: port 0 at the start, port 1 16 KB on.
+pub const MACE_SDMA: u32 = MACE_BASE + 0x0031_8000;
+pub const MACE_SDMA_SIZE: u32 = 0x0000_8000;
+
+/// The serial DMA control registers, rings and status bits, as MACE's
+/// datasheet lays them out.
+pub mod sdma {
+    /// Control bit 10: the channel is held in reset, pointers at zero.
+    pub const CTRL_RESET: u64 = 0x400;
+    /// Control bit 9: the engine runs. Clear, it is frozen with its state.
+    pub const CTRL_ENABLE: u64 = 0x200;
+    /// Control bits 7:5: which depth condition raises the threshold bit.
+    pub const CTRL_COND: u64 = 0xe0;
+    /// The bits a control register keeps; the rest read as zero.
+    pub const CTRL_MASK: u64 = 0x6e0;
+    /// Pointers and depths count 32-byte blocks in bits 11:5.
+    pub const PTR_MASK: u32 = 0xfe0;
+    /// One block short of the ring: the engine never fills the last slot.
+    pub const RING_FULL: u32 = 0xfe0;
+    pub const BLOCK: u32 = 32;
+    /// Where the eight 4 KB rings start: bits 31:15 of the ring base register.
+    pub const RING_BASE_MASK: u64 = 0xffff_8000;
+    /// Transmit pair commands, in the top two bits of a control byte.
+    pub const TX_CMD_THR: u8 = 1;
+    pub const TX_CMD_MCR: u8 = 2;
+    /// Transmit control bit 5: tell software once this pair is done.
+    pub const TX_PREQ: u8 = 0x20;
+    /// Receive control bit 7: this slot holds a real character.
+    pub const RX_VALID: u8 = 0x80;
+
+    /// Port `p`'s six ISA status bits, from bit 20 for port 0.
+    pub const fn group(p: usize) -> u64 { 0x3f << (20 + 6 * p) }
+    /// The 16550's own interrupt request.
+    pub const fn dir(p: usize) -> u64 { 1 << (20 + 6 * p) }
+    pub const fn tx_thir(p: usize) -> u64 { 1 << (21 + 6 * p) }
+    pub const fn tx_preq(p: usize) -> u64 { 1 << (22 + 6 * p) }
+    pub const fn tx_memerr(p: usize) -> u64 { 1 << (23 + 6 * p) }
+    pub const fn rx_thir(p: usize) -> u64 { 1 << (24 + 6 * p) }
+    pub const fn rx_overrun(p: usize) -> u64 { 1 << (25 + 6 * p) }
+}
 
 /// Which of CRIME's interrupt inputs the controller in that slot drives.
 /// NetBSD works this out for itself and prints it: "interrupting at crime
@@ -1047,29 +1087,60 @@ impl Com16550 {
     pub fn write_reg(&self, addr: u32, val: u8) {
         let Some(n) = Self::reg_of(addr) else { return };
         if n == com_reg::THR && !self.dlab() {
-            // Loopback: the byte never leaves the chip, it arrives back in
-            // the receive register. post1 writes 0..254 this way and insists
-            // on reading the same sequence back.
-            if self.looped() {
-                self.input.lock().unwrap().push_back(val);
-            } else {
-                self.out.lock().unwrap().push(val);
-                if let Some(f) = self.log.lock().unwrap().as_mut() {
-                    use std::io::Write;
-                    let _ = f.write_all(&[val]);
-                    let _ = f.flush();
-                }
-                let mut tcp = self.tcp.lock().unwrap();
-                if !tcp.is_empty() {
-                    use std::io::Write;
-                    let mut buf = Vec::with_capacity(2);
-                    crate::net::telnet::escape_byte(val, &mut buf);
-                    tcp.retain_mut(|t| t.write_all(&buf).is_ok());
-                }
-            }
+            self.transmit(val);
             return;
         }
         self.regs.lock().unwrap()[n as usize] = val;
+    }
+
+    /// Send one character, as a write of the transmit register does. MACE's
+    /// serial DMA engine comes here too, so a byte sent from the ring reaches
+    /// the log and the TCP console by exactly the same road as one the
+    /// firmware writes by hand.
+    pub fn transmit(&self, val: u8) {
+        // Loopback: the byte never leaves the chip, it arrives back in
+        // the receive register. post1 writes 0..254 this way and insists
+        // on reading the same sequence back.
+        if self.looped() {
+            self.input.lock().unwrap().push_back(val);
+            return;
+        }
+        self.out.lock().unwrap().push(val);
+        if let Some(f) = self.log.lock().unwrap().as_mut() {
+            use std::io::Write;
+            let _ = f.write_all(&[val]);
+            let _ = f.flush();
+        }
+        let mut tcp = self.tcp.lock().unwrap();
+        if !tcp.is_empty() {
+            use std::io::Write;
+            let mut buf = Vec::with_capacity(2);
+            crate::net::telnet::escape_byte(val, &mut buf);
+            tcp.retain_mut(|t| t.write_all(&buf).is_ok());
+        }
+    }
+
+    /// Set the modem control register, for a DMA pair that names it rather
+    /// than the transmitter.
+    pub fn write_mcr(&self, val: u8) {
+        self.regs.lock().unwrap()[com_reg::MCR as usize] = val;
+    }
+
+    /// Hand up to `buf.len()` received characters to the DMA engine, oldest
+    /// first, and say how many. They leave the queue, so the PIO path never
+    /// sees them as well.
+    pub fn take_input(&self, buf: &mut [u8]) -> usize {
+        let mut q = self.input.lock().unwrap();
+        let n = buf.len().min(q.len());
+        for (b, c) in buf.iter_mut().zip(q.drain(..n)) {
+            *b = c;
+        }
+        n
+    }
+
+    /// True when nothing has been received and not yet taken.
+    fn input_empty(&self) -> bool {
+        self.input.lock().unwrap().is_empty()
     }
 }
 
@@ -1085,6 +1156,358 @@ impl BusDevice for Com16550 {
     fn write32(&self, addr: u32, val: u32) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
     fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.read_reg(addr | 7) as u64) }
     fn write64(&self, addr: u32, val: u64) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
+}
+
+/// One direction of a serial port's DMA: its control register and the two
+/// pointers into its ring, as byte offsets with only bits 11:5 kept.
+#[derive(Clone, Copy)]
+struct SdmaChan {
+    ctrl: u64,
+    rptr: u32,
+    wptr: u32,
+    /// Blocks and characters moved, so a quiet console can be told apart
+    /// from an engine that never ran.
+    blocks: u64,
+    bytes: u64,
+}
+
+impl SdmaChan {
+    /// Out of reset a channel is held in reset, which is what software that
+    /// reads the control register before ever writing it gets back.
+    const RESET: Self = Self { ctrl: sdma::CTRL_RESET, rptr: 0, wptr: 0, blocks: 0, bytes: 0 };
+
+    /// Bytes of ring in use, always a whole number of blocks.
+    fn depth(&self) -> u32 {
+        self.wptr.wrapping_sub(self.rptr) & sdma::PTR_MASK
+    }
+
+    fn in_reset(&self) -> bool {
+        self.ctrl & sdma::CTRL_RESET != 0
+    }
+
+    fn running(&self) -> bool {
+        self.ctrl & (sdma::CTRL_RESET | sdma::CTRL_ENABLE) == sdma::CTRL_ENABLE
+    }
+
+    /// The threshold bit, as a level: true exactly while the depth meets the
+    /// condition in the control register. A pure level is what lets the
+    /// driver's own control writes take it down again; anything latched here
+    /// would be an interrupt nobody can clear. It does not wait for ENABLE:
+    /// a disabled channel is frozen, not switched off.
+    fn threshold(&self, output: bool) -> bool {
+        if self.in_reset() {
+            return false;
+        }
+        let n = self.depth() >> 5;
+        // The fill-level codes read the same comparator both ways round: an
+        // input channel wants attention once it is that full, an output
+        // channel once it has drained below it.
+        let level = |at: u32| if output { n < at } else { n >= at };
+        match (self.ctrl & sdma::CTRL_COND) >> 5 {
+            1 => level(32),
+            2 => level(64),
+            3 => level(96),
+            4 => n == 0,
+            5 => n != 0,
+            6 => n == 127,
+            7 => n != 127,
+            _ => false,
+        }
+    }
+}
+
+/// Both directions of one serial port, and whether the guest is using them.
+#[derive(Clone, Copy)]
+struct SdmaPort {
+    tx: SdmaChan,
+    rx: SdmaChan,
+    /// The guest has taken a channel out of reset, so the port's interrupt
+    /// bits follow the DMA model rather than the 16550 alone. See
+    /// [`MaceSerialDma`].
+    owned: bool,
+    /// Latches. Only `preq` can ever be set: the model has no memory errors
+    /// to report on receive, and applies back-pressure rather than overrun.
+    preq: bool,
+    tx_memerr: bool,
+    rx_overrun: bool,
+}
+
+impl SdmaPort {
+    const RESET: Self =
+        Self { tx: SdmaChan::RESET, rx: SdmaChan::RESET, owned: false, preq: false, tx_memerr: false, rx_overrun: false };
+}
+
+/// What the engines reach outside themselves: memory, the two UARTs, and
+/// where the rings are.
+pub struct SdmaIo<'a> {
+    pub ram: &'a Mutex<O2Memory>,
+    pub com: [&'a Com16550; 2],
+    /// The ring block's physical address, from the ring base register.
+    pub ring_base: u32,
+}
+
+impl SdmaIo<'_> {
+    /// Where block `ptr` of ring `ring` is in memory, as an offset into it.
+    /// The rings are a DMA master's view of memory, as the Ethernet's are.
+    fn block(&self, ram: &O2Memory, ring: u32, ptr: u32) -> Option<usize> {
+        let i = ram.dma_offset(self.ring_base | (ring << 12) | ptr)?;
+        (i + sdma::BLOCK as usize <= ram.len()).then_some(i)
+    }
+}
+
+/// MACE's serial DMA: the rings that carry IRIX's console once its tty
+/// driver is attached.
+///
+/// Each port has a transmit and a receive ring of 32-byte blocks in a 32 KB
+/// area the ring base register names. A block is four 64-bit pairs, each four
+/// control bytes then the four data bytes they describe. Software fills
+/// transmit blocks and moves the write pointer; the engine sends them and
+/// moves the read pointer. On receive the engine packs characters into
+/// blocks and software follows behind.
+///
+/// Transmit is drained at once, inside the write of the write pointer: the
+/// depth is back to zero by the time the driver reads it, and a polled
+/// console write between two batches cannot overtake output still queued.
+/// Receive fills from the UART's input queue on the service tick and
+/// whenever the read pointer moves, never past one block short of full;
+/// characters that do not fit wait in the queue.
+///
+/// Only a port whose guest has taken a channel out of reset is "owned" by
+/// the model. The PROM, NetBSD and OpenBSD never touch these registers, and
+/// for them the 16550's interrupt keeps driving all six of the port's status
+/// bits exactly as before. An owned port's bits are the datasheet's: the two
+/// thresholds and the latches, read through the mask, with the UART's own
+/// request held low because in DMA mode the engine consumes it.
+pub struct MaceSerialDma {
+    ports: Mutex<[SdmaPort; 2]>,
+    /// Either port owned, readable without the lock, so the per-access hooks
+    /// cost nothing on a machine that never uses DMA.
+    any_owned: std::sync::atomic::AtomicBool,
+}
+
+impl Default for MaceSerialDma {
+    fn default() -> Self { Self::new() }
+}
+
+impl MaceSerialDma {
+    pub fn new() -> Self {
+        Self { ports: Mutex::new([SdmaPort::RESET; 2]), any_owned: Default::default() }
+    }
+
+    /// Every channel back in reset and neither port owned, as at power-on.
+    /// A warm restart that left them running would leave the next kernel's
+    /// pointers out of step with the engine's, and steal the PROM's input.
+    pub fn reset(&self) {
+        *self.ports.lock().unwrap() = [SdmaPort::RESET; 2];
+        self.any_owned.store(false, Ordering::Release);
+    }
+
+    pub fn any_owned(&self) -> bool {
+        self.any_owned.load(Ordering::Acquire)
+    }
+
+    /// Port and register number. Gaps within a port's 16 KB page alias to
+    /// its eight registers.
+    fn decode(addr: u32) -> (usize, u32) {
+        (((addr >> 14) & 1) as usize, (addr >> 3) & 7)
+    }
+
+    pub fn read(&self, addr: u32) -> u64 {
+        let (p, reg) = Self::decode(addr);
+        let st = self.ports.lock().unwrap();
+        let port = &st[p];
+        (match reg {
+            0 => return port.tx.ctrl,
+            1 => port.tx.rptr,
+            2 => port.tx.wptr,
+            3 => port.tx.depth(),
+            4 => return port.rx.ctrl,
+            5 => port.rx.rptr,
+            6 => port.rx.wptr,
+            _ => port.rx.depth(),
+        }) as u64
+    }
+
+    pub fn write(&self, addr: u32, val: u64, io: &SdmaIo) {
+        let (p, reg) = Self::decode(addr);
+        let mut st = self.ports.lock().unwrap();
+        let port = &mut st[p];
+        let ptr = val as u32 & sdma::PTR_MASK;
+        match reg {
+            0 | 4 => {
+                let tx = reg == 0;
+                let ch = if tx { &mut port.tx } else { &mut port.rx };
+                ch.ctrl = val & sdma::CTRL_MASK;
+                if ch.in_reset() {
+                    ch.rptr = 0;
+                    ch.wptr = 0;
+                    if tx {
+                        port.preq = false;
+                        port.tx_memerr = false;
+                    } else {
+                        port.rx_overrun = false;
+                    }
+                }
+                port.owned = !(port.tx.in_reset() && port.rx.in_reset());
+                if tx {
+                    Self::tx_run(p, port, io);
+                } else {
+                    Self::rx_run(p, port, io);
+                }
+                let owned = st.iter().any(|q| q.owned);
+                self.any_owned.store(owned, Ordering::Release);
+            }
+            1 => port.tx.rptr = ptr,
+            2 => {
+                port.tx.wptr = ptr;
+                Self::tx_run(p, port, io);
+                // In loopback what was just sent is already waiting to come
+                // back in.
+                Self::rx_run(p, port, io);
+            }
+            5 => {
+                port.rx.rptr = ptr;
+                Self::rx_run(p, port, io);
+            }
+            // The receive write pointer is the engine's, and depths are
+            // computed.
+            _ => {}
+        }
+    }
+
+    /// Move whatever can be moved: characters that arrived between register
+    /// accesses (the TCP console, a script's `feed`), and any transmit work
+    /// left over.
+    pub fn poll(&self, io: &SdmaIo) {
+        let mut st = self.ports.lock().unwrap();
+        for (p, port) in st.iter_mut().enumerate() {
+            if port.owned {
+                Self::tx_run(p, port, io);
+                Self::rx_run(p, port, io);
+            }
+        }
+    }
+
+    /// Send every block between the read and write pointers.
+    fn tx_run(p: usize, port: &mut SdmaPort, io: &SdmaIo) {
+        let ring = 4 + 2 * p as u32;
+        while port.tx.running() && port.tx.rptr != port.tx.wptr {
+            let mut b = [0u8; sdma::BLOCK as usize];
+            {
+                let ram = io.ram.lock().unwrap();
+                let Some(i) = io.block(&ram, ring, port.tx.rptr) else {
+                    // Nowhere to read from: the hardware stops the channel and
+                    // says why.
+                    port.tx_memerr = true;
+                    port.tx.ctrl &= !sdma::CTRL_ENABLE;
+                    return;
+                };
+                b.copy_from_slice(&ram[i..i + sdma::BLOCK as usize]);
+            }
+            for pair in b.chunks_exact(8) {
+                for slot in 0..4 {
+                    let (c, d) = (pair[slot], pair[4 + slot]);
+                    match c >> 6 {
+                        sdma::TX_CMD_THR => {
+                            io.com[p].transmit(d);
+                            port.tx.bytes += 1;
+                        }
+                        sdma::TX_CMD_MCR => io.com[p].write_mcr(d),
+                        // Skip, or a delay: there is no wire to be idle on.
+                        _ => {}
+                    }
+                    if c & sdma::TX_PREQ != 0 {
+                        port.preq = true;
+                    }
+                }
+            }
+            port.tx.blocks += 1;
+            port.tx.rptr = (port.tx.rptr + sdma::BLOCK) & sdma::PTR_MASK;
+        }
+    }
+
+    /// Pack received characters into blocks while there is room.
+    ///
+    /// Each block is written whole, characters from the first slot on with
+    /// the valid bit and every unused slot as padding (control 0, data 0xff),
+    /// because IRIX's reader stops at the first all-zero control word and
+    /// walks off the start of its buffer if a block it is handed has none in
+    /// its first pair. The block is in memory before the write pointer says
+    /// so: the service thread fills while the CPU reads.
+    fn rx_run(p: usize, port: &mut SdmaPort, io: &SdmaIo) {
+        let ring = 5 + 2 * p as u32;
+        while port.rx.running() && port.rx.depth() < sdma::RING_FULL && !io.com[p].input_empty() {
+            let mut ram = io.ram.lock().unwrap();
+            let Some(i) = io.block(&ram, ring, port.rx.wptr) else { return };
+            let mut chars = [0u8; 16];
+            let n = io.com[p].take_input(&mut chars);
+            if n == 0 {
+                return;
+            }
+            let mut b = [0u8; sdma::BLOCK as usize];
+            for (j, &c) in chars.iter().enumerate() {
+                let (ctrl, data) = if j < n { (sdma::RX_VALID, c) } else { (0, 0xff) };
+                b[8 * (j / 4) + j % 4] = ctrl;
+                b[8 * (j / 4) + 4 + j % 4] = data;
+            }
+            ram.write(i, &b);
+            drop(ram);
+            port.rx.blocks += 1;
+            port.rx.bytes += n as u64;
+            port.rx.wptr = (port.rx.wptr + sdma::BLOCK) & sdma::PTR_MASK;
+        }
+    }
+
+    /// Which ports are owned, and their status bits before the mask.
+    pub fn status(&self) -> ([bool; 2], u64) {
+        let st = self.ports.lock().unwrap();
+        let mut bits = 0;
+        for (p, port) in st.iter().enumerate() {
+            for (on, bit) in [
+                (port.tx.threshold(true), sdma::tx_thir(p)),
+                (port.preq, sdma::tx_preq(p)),
+                (port.tx_memerr, sdma::tx_memerr(p)),
+                (port.rx.threshold(false), sdma::rx_thir(p)),
+                (port.rx_overrun, sdma::rx_overrun(p)),
+            ] {
+                if on {
+                    bits |= bit;
+                }
+            }
+        }
+        ([st[0].owned, st[1].owned], bits)
+    }
+
+    /// Software wrote the ISA status register: a pair-request latch whose
+    /// bit it wrote as zero is cleared. Every other serial bit is a level or
+    /// fatal, and is not the guest's to change.
+    pub fn status_written(&self, val: u64) {
+        let mut st = self.ports.lock().unwrap();
+        for (p, port) in st.iter_mut().enumerate() {
+            if val & sdma::tx_preq(p) == 0 {
+                port.preq = false;
+            }
+        }
+    }
+
+    /// One line per port: who owns it, its control registers, pointers and
+    /// what has moved.
+    pub fn summary(&self) -> String {
+        let st = self.ports.lock().unwrap();
+        st.iter()
+            .enumerate()
+            .map(|(p, s)| {
+                format!(
+                    "port {p}{}: tx ctrl {:03x} r {:03x} w {:03x} ({} blocks, {} bytes); \
+                     rx ctrl {:03x} r {:03x} w {:03x} ({} blocks, {} bytes)",
+                    if s.owned { " (DMA)" } else { "" },
+                    s.tx.ctrl, s.tx.rptr, s.tx.wptr, s.tx.blocks, s.tx.bytes,
+                    s.rx.ctrl, s.rx.rptr, s.rx.wptr, s.rx.blocks, s.rx.bytes,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// The pair of PS/2 ports, with nothing plugged into either.
@@ -2180,6 +2603,8 @@ pub struct Ip32Bus {
     pub onewire: OneWireId,
     pub com0: Com16550,
     pub com1: Com16550,
+    /// The serial ports' DMA rings, which IRIX's console runs on.
+    pub sdma: MaceSerialDma,
     /// The Ethernet. Its frames go nowhere until `start_nat` (IRIS_IP32_NET).
     pub mec: std::sync::Arc<crate::dev::mec::Mec>,
     pub pci_view: PciNativeView,
@@ -2250,6 +2675,7 @@ impl Ip32Bus {
             onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
             com0: Com16550::new(),
             com1: Com16550::new(),
+            sdma: MaceSerialDma::new(),
             mec: std::sync::Arc::new(crate::dev::mec::Mec::new(ram.clone())),
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
@@ -2439,16 +2865,82 @@ impl Ip32Bus {
             self.crime.set_int(*line, scsi.interrupting());
         }
         self.crime.set_int(IP32_MEC_CRIME_INT, self.mec.interrupting());
-        // The console's receive interrupt: a kernel does not poll the UART.
-        // Only this device's bits are set and cleared; overwriting the whole
-        // register would erase the guest's own and other devices' bits.
-        let isa = self.mace.cell_pub(MACE_ISA_INT_STATUS);
-        let isa = if self.com0.interrupting() { isa | MACE_ISA_SERIAL0_MASK } else { isa & !MACE_ISA_SERIAL0_MASK };
-        self.mace.set_cell_pub(MACE_ISA_INT_STATUS, isa);
+        self.serial_touched(true);
+        self.ps2_touched();
+    }
+
+    /// The serial ports' bits of MACE's ISA status, and CRIME line 4 from
+    /// them. Only these bits are set and cleared; overwriting the whole
+    /// register would erase the guest's own and other devices' bits.
+    ///
+    /// A port the guest drives by PIO keeps the behaviour the PROM and the
+    /// BSDs boot with: all six bits follow the 16550's interrupt (`legacy`
+    /// says whether to look at it again; port 1 has never contributed), and
+    /// go to the line whatever the mask says. A port in DMA mode has the
+    /// datasheet's bits, read through the mask, and the line follows them
+    /// only while unmasked: IRIX acknowledges a level by masking it and
+    /// leaving the work to a thread, and a line that ignored the mask would
+    /// bring it straight back into the dispatcher, never letting that thread
+    /// run.
+    fn serial_touched(&self, legacy: bool) {
+        let mut isa = self.mace.cell(MACE_ISA_INT_STATUS);
+        let (owned, bits) = if self.sdma.any_owned() { self.sdma.status() } else { ([false; 2], 0) };
+        let mask = if owned.contains(&true) { self.mace.cell(MACE_ISA_INT_MASK) } else { 0 };
+        for p in 0..2 {
+            let g = sdma::group(p);
+            if owned[p] {
+                isa = (isa & !g) | (bits & g & mask);
+            } else if legacy && p == 0 {
+                // The console's receive interrupt: a kernel does not poll
+                // the UART.
+                isa = if self.com0.interrupting() { isa | g } else { isa & !g };
+            }
+        }
+        self.mace.set_cell(MACE_ISA_INT_STATUS, isa);
         // Line 4 is serial and parallel only (bits 16..31); bits 8..15 are
         // line 5's, from the PS/2 ports among others.
         self.crime.set_int(IP32_ISA_CRIME_INT, isa & 0xffff_0000 != 0);
-        self.ps2_touched();
+    }
+
+    /// The engines' view of the machine.
+    fn sdma_io(&self) -> SdmaIo<'_> {
+        SdmaIo {
+            ram: &self.ram,
+            com: [&self.com0, &self.com1],
+            ring_base: (self.mace.cell(MACE_ISA_RING_BASE) & sdma::RING_BASE_MASK) as u32,
+        }
+    }
+
+    fn in_sdma(&self, addr: u32) -> bool {
+        (MACE_SDMA..MACE_SDMA + MACE_SDMA_SIZE).contains(&addr)
+    }
+
+    /// A serial DMA register, read. Counted with MACE's other offsets, so a
+    /// guest polling one shows up where every other hot register does.
+    fn sdma_read(&self, addr: u32) -> u64 {
+        self.mace.r();
+        self.mace.hit(addr, false);
+        self.sdma.read(addr)
+    }
+
+    fn sdma_write(&self, addr: u32, val: u64) -> u32 {
+        self.mace.w();
+        self.mace.hit(addr, true);
+        self.sdma.write(addr, val, &self.sdma_io());
+        // A pointer or control write moves the levels, and may hand the port
+        // back to (or take it from) the 16550's own interrupt.
+        self.serial_touched(true);
+        BUS_OK
+    }
+
+    /// Before a read of a register held as a plain MACE cell: the ISA status
+    /// is brought up to date for a DMA port, so the dispatcher's one read of
+    /// it is current even between service ticks.
+    #[inline]
+    fn before_mace_read(&self, addr: u32) {
+        if addr & !7 == MACE_ISA_INT_STATUS && self.sdma.any_owned() {
+            self.serial_touched(false);
+        }
     }
 
     /// Bring every device interrupt up to date in CRIME: the SCSI
@@ -2458,6 +2950,9 @@ impl Ip32Bus {
     /// service thread.
     pub fn service(&self) -> bool {
         self.mec.poll();
+        if self.sdma.any_owned() {
+            self.sdma.poll(&self.sdma_io());
+        }
         self.refresh_irq()
     }
 
@@ -2484,6 +2979,15 @@ impl Ip32Bus {
         if addr & !7 == MACE_ISA_RING_BASE && self.ps2.devices().is_some() {
             let v = self.mace.cell_pub(MACE_ISA_RING_BASE);
             self.mace.set_cell_pub(MACE_ISA_RING_BASE, v | MACE_REV2_BIT);
+        }
+        // A DMA port's status bits are not the guest's to set, and its mask
+        // decides what it sees of them.
+        let reg = addr & !7;
+        if reg == MACE_ISA_INT_STATUS {
+            self.sdma.status_written(self.mace.cell(MACE_ISA_INT_STATUS));
+        }
+        if (reg == MACE_ISA_INT_STATUS || reg == MACE_ISA_INT_MASK) && self.sdma.any_owned() {
+            self.serial_touched(false);
         }
     }
 
@@ -2838,7 +3342,12 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.read8(addr);
         }
+        if self.in_sdma(addr) {
+            let v = self.sdma_read(addr);
+            return BusRead8::ok(v as u8);
+        }
         if self.in_mace(addr) {
+            self.before_mace_read(addr);
             return self.mace.read8(addr);
         }
         bus_read!(self, addr, 1, BusRead8::ok, |v: u64| v as u8)
@@ -2877,7 +3386,12 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.read16(addr);
         }
+        if self.in_sdma(addr) {
+            let v = self.sdma_read(addr);
+            return BusRead16::ok(v as u16);
+        }
         if self.in_mace(addr) {
+            self.before_mace_read(addr);
             return self.mace.read16(addr);
         }
         bus_read!(self, addr, 2, BusRead16::ok, |v: u64| v as u16)
@@ -2929,7 +3443,13 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.read32(addr);
         }
+        if self.in_sdma(addr) {
+            // The registers are 64-bit; a 32-bit access is the half it names.
+            let v = self.sdma_read(addr);
+            return BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 });
+        }
         if self.in_mace(addr) {
+            self.before_mace_read(addr);
             return self.mace.read32(addr);
         }
         bus_read!(self, addr, 4, BusRead32::ok, |v: u64| v as u32)
@@ -2982,7 +3502,12 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.read64(addr);
         }
+        if self.in_sdma(addr) {
+            let v = self.sdma_read(addr);
+            return BusRead64::ok(v);
+        }
         if self.in_mace(addr) {
+            self.before_mace_read(addr);
             return self.mace.read64(addr);
         }
         let r = bus_read!(self, addr, 8, BusRead64::ok, |v: u64| v);
@@ -3033,6 +3558,10 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.write8(addr, val);
         }
+        if self.in_sdma(addr) {
+            // A narrow store is the low end of the register.
+            return self.sdma_write(addr, val as u64);
+        }
         if self.in_mace(addr) {
             let r = self.mace.write8(addr, val);
             self.mace_wrote(addr);
@@ -3076,6 +3605,10 @@ impl Ip32Bus {
         }
         if self.in_rtc(addr) {
             return self.rtc.write16(addr, val);
+        }
+        if self.in_sdma(addr) {
+            // A narrow store is the low end of the register.
+            return self.sdma_write(addr, val as u64);
         }
         if self.in_mace(addr) {
             let r = self.mace.write16(addr, val);
@@ -3136,6 +3669,10 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.write32(addr, val);
         }
+        if self.in_sdma(addr) {
+            // A narrow store is the low end of the register.
+            return self.sdma_write(addr, val as u64);
+        }
         if self.in_mace(addr) {
             let r = self.mace.write32(addr, val);
             self.mace_wrote(addr);
@@ -3193,6 +3730,9 @@ impl Ip32Bus {
         }
         if self.in_rtc(addr) {
             return self.rtc.write64(addr, val);
+        }
+        if self.in_sdma(addr) {
+            return self.sdma_write(addr, val);
         }
         if self.in_mace(addr) {
             let r = self.mace.write64(addr, val);
@@ -3676,6 +4216,417 @@ mod tests {
         assert_eq!(c.read8(MACE_COM0 + 7).data, b'h');
         assert_eq!(c.read8(MACE_COM0 + 7).data, b'i');
         assert_eq!(c.read8(lsr).data & com_reg::LSR_DR, 0, "queue drained");
+    }
+
+    // ── Serial DMA ──────────────────────────────────────────────────────────
+
+    /// Where the tests put the ring block: low memory, 32 KB aligned.
+    const SDMA_RING: u32 = 0x0010_0000;
+    const TX_CTRL: u32 = 0;
+    const TX_RPTR: u32 = 1;
+    const TX_WPTR: u32 = 2;
+    const TX_DEPTH: u32 = 3;
+    const RX_CTRL: u32 = 4;
+    const RX_RPTR: u32 = 5;
+    const RX_WPTR: u32 = 6;
+    const RX_DEPTH: u32 = 7;
+
+    fn sdma_bus() -> Ip32Bus {
+        let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
+        bus.write64(MACE_ISA_RING_BASE, SDMA_RING as u64);
+        bus
+    }
+
+    fn sdma_reg(p: u32, reg: u32) -> u32 {
+        MACE_SDMA + p * 0x4000 + reg * 8
+    }
+
+    fn sdma_get(bus: &Ip32Bus, p: u32, reg: u32) -> u64 {
+        bus.read64(sdma_reg(p, reg)).data
+    }
+
+    fn sdma_set(bus: &Ip32Bus, p: u32, reg: u32, v: u64) {
+        assert_eq!(bus.write64(sdma_reg(p, reg), v), BUS_OK);
+    }
+
+    fn tx_ring(p: u32) -> u32 {
+        SDMA_RING + 0x4000 + p * 0x2000
+    }
+
+    fn rx_ring(p: u32) -> u32 {
+        SDMA_RING + 0x5000 + p * 0x2000
+    }
+
+    /// Fill one transmit block as IRIX does: characters from pair 0 on with
+    /// control 0x40, every unused slot zero.
+    fn tx_block(bus: &Ip32Bus, p: u32, ptr: u32, text: &[u8]) {
+        assert!(text.len() <= 16);
+        let mut b = [0u8; 32];
+        for (j, &c) in text.iter().enumerate() {
+            b[8 * (j / 4) + j % 4] = 0x40;
+            b[8 * (j / 4) + 4 + j % 4] = c;
+        }
+        tx_raw(bus, p, ptr, &b);
+    }
+
+    fn tx_raw(bus: &Ip32Bus, p: u32, ptr: u32, b: &[u8; 32]) {
+        for k in 0..4 {
+            let w = u64::from_be_bytes(b[8 * k..8 * k + 8].try_into().unwrap());
+            bus.write64(tx_ring(p) + ptr + 8 * k as u32, w);
+        }
+    }
+
+    fn isa_status(bus: &Ip32Bus) -> u64 {
+        bus.read64(MACE_ISA_INT_STATUS).data
+    }
+
+    fn line4(bus: &Ip32Bus) -> bool {
+        bus.crime.intstat() & (1 << IP32_ISA_CRIME_INT) != 0
+    }
+
+    #[test]
+    fn serial_dma_registers_decode_and_start_in_reset() {
+        let bus = sdma_bus();
+        for p in 0..2 {
+            assert_eq!(sdma_get(&bus, p, TX_CTRL), 0x400, "port {p} TX control resets held in reset");
+            assert_eq!(sdma_get(&bus, p, RX_CTRL), 0x400, "port {p} RX control too");
+            for reg in [TX_RPTR, TX_WPTR, TX_DEPTH, RX_RPTR, RX_WPTR, RX_DEPTH] {
+                assert_eq!(sdma_get(&bus, p, reg), 0);
+            }
+        }
+        // Port 1 is its own page, and keeps only the defined bits.
+        sdma_set(&bus, 1, TX_CTRL, 0xffff_ffff);
+        assert_eq!(sdma_get(&bus, 1, TX_CTRL), 0x6e0);
+        assert_eq!(sdma_get(&bus, 0, TX_CTRL), 0x400, "port 0 untouched");
+        // Gaps in a page alias to its eight registers.
+        assert_eq!(bus.read64(MACE_SDMA + 0x40).data, 0x400);
+        assert_eq!(bus.read64(MACE_SDMA + 0x4000 + 0x40).data, 0x6e0);
+        // Every width answers.
+        assert_eq!(bus.read32(sdma_reg(1, TX_CTRL) + 4).data, 0x6e0, "+4 is the low word");
+        assert_eq!(bus.read32(sdma_reg(1, TX_CTRL)).data, 0, "+0 the high word");
+        assert_eq!(bus.read16(sdma_reg(1, TX_CTRL) + 6).data, 0x6e0);
+        assert_eq!(bus.read8(sdma_reg(1, TX_CTRL) + 7).data, 0xe0);
+        assert_eq!(bus.write32(sdma_reg(1, TX_CTRL) + 4, 0x400), BUS_OK);
+        assert_eq!(sdma_get(&bus, 1, TX_CTRL), 0x400);
+        assert!(bus.unmapped().is_empty());
+    }
+
+    /// Blocks are sent in order, a partly filled one up to its first unused
+    /// slot, and the engine is caught up before the store returns.
+    #[test]
+    fn serial_dma_transmits_full_and_partial_blocks() {
+        let bus = sdma_bus();
+        tx_block(&bus, 0, 0, b"0123456789abcdef");
+        tx_block(&bus, 0, 32, b"xyz");
+        sdma_set(&bus, 0, TX_CTRL, 0x200);
+        sdma_set(&bus, 0, TX_WPTR, 64);
+        assert_eq!(bus.com0.output(), "0123456789abcdefxyz");
+        assert_eq!(sdma_get(&bus, 0, TX_RPTR), 64);
+        assert_eq!(sdma_get(&bus, 0, TX_DEPTH), 0);
+        assert_eq!(bus.com1.output(), "", "port 1 is a different UART");
+    }
+
+    #[test]
+    fn a_disabled_transmit_channel_is_frozen_not_lost() {
+        let bus = sdma_bus();
+        tx_block(&bus, 0, 0, b"later");
+        sdma_set(&bus, 0, TX_CTRL, 0x000);
+        sdma_set(&bus, 0, TX_WPTR, 32);
+        assert_eq!(bus.com0.output(), "");
+        assert_eq!(sdma_get(&bus, 0, TX_DEPTH), 32, "IRIX reads the depth as bytes");
+        bus.service();
+        assert_eq!(bus.com0.output(), "", "the service tick does not run a frozen channel");
+        sdma_set(&bus, 0, TX_CTRL, 0x200);
+        assert_eq!(bus.com0.output(), "later");
+        assert_eq!(sdma_get(&bus, 0, TX_DEPTH), 0);
+    }
+
+    /// Batches of three blocks, so some straddle the end of the ring and the
+    /// write pointer goes from 0xfe0 (or near it) back past zero.
+    #[test]
+    fn the_transmit_ring_wraps() {
+        let bus = sdma_bus();
+        sdma_set(&bus, 0, TX_CTRL, 0x280);
+        let mut sw = 0u32;
+        let mut want = String::new();
+        for batch in 0..60 {
+            for k in 0..3 {
+                let t = format!("<{batch}.{k}>");
+                tx_block(&bus, 0, sw, t.as_bytes());
+                want += &t;
+                sw = (sw + 32) % 4096;
+            }
+            sdma_set(&bus, 0, TX_WPTR, sw as u64);
+            assert_eq!(sdma_get(&bus, 0, TX_DEPTH), 0);
+        }
+        assert_eq!(bus.com0.output(), want);
+        assert_eq!(sdma_get(&bus, 0, TX_RPTR), sw as u64);
+    }
+
+    #[test]
+    fn a_transmit_pair_can_set_mcr_and_ask_for_a_pair_request() {
+        let bus = sdma_bus();
+        bus.write64(MACE_ISA_INT_MASK, sdma::tx_preq(0));
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&[0x80, 0x60, 0, 0, 0x0b, b'Q', 0, 0]);
+        tx_raw(&bus, 0, 0, &b);
+        sdma_set(&bus, 0, TX_CTRL, 0x200);
+        sdma_set(&bus, 0, TX_WPTR, 32);
+        assert_eq!(bus.read8(MACE_COM0 + 0x407).data, 0x0b, "the MCR pair landed in MCR");
+        assert_eq!(bus.com0.output(), "Q");
+        assert_ne!(isa_status(&bus) & sdma::tx_preq(0), 0, "bit 22 latched");
+        assert!(line4(&bus));
+        bus.write64(MACE_ISA_INT_STATUS, 0);
+        assert_eq!(isa_status(&bus) & sdma::tx_preq(0), 0, "writing it 0 clears it");
+        assert!(!line4(&bus));
+    }
+
+    /// The IRIX dispatcher's contract: it acknowledges by masking, and the
+    /// line has to drop when it does.
+    #[test]
+    fn the_transmit_threshold_is_a_level_and_the_line_obeys_the_mask() {
+        let bus = sdma_bus();
+        bus.write64(MACE_ISA_INT_MASK, sdma::tx_thir(0));
+        sdma_set(&bus, 0, TX_CTRL, 0x280);
+        bus.service();
+        assert_eq!(isa_status(&bus) & sdma::group(0), sdma::tx_thir(0));
+        assert!(line4(&bus), "empty ring, EMPTY condition, unmasked");
+        bus.write64(MACE_ISA_INT_MASK, 0);
+        assert_eq!(isa_status(&bus) & sdma::tx_thir(0), 0, "status reads through the mask");
+        assert!(!line4(&bus), "masked: CRIME input 4 drops at once");
+        bus.service();
+        assert!(!line4(&bus), "and stays down");
+        bus.write64(MACE_ISA_INT_MASK, sdma::tx_thir(0));
+        assert!(line4(&bus), "unmasked again: up again");
+        sdma_set(&bus, 0, TX_CTRL, 0x200);
+        assert_eq!(isa_status(&bus) & sdma::tx_thir(0), 0, "no condition, no bit");
+        assert!(!line4(&bus));
+    }
+
+    #[test]
+    fn the_threshold_conditions_follow_the_datasheet_table() {
+        let blocks = [0u32, 31, 32, 64, 96, 127];
+        // Input channel, per code 1..7, for each depth above.
+        let input: [[bool; 6]; 7] = [
+            [false, false, true, true, true, true],
+            [false, false, false, true, true, true],
+            [false, false, false, false, true, true],
+            [true, false, false, false, false, false],
+            [false, true, true, true, true, true],
+            [false, false, false, false, false, true],
+            [true, true, true, true, true, false],
+        ];
+        for code in 0..8u64 {
+            for (i, &n) in blocks.iter().enumerate() {
+                let ch = SdmaChan { ctrl: code << 5, rptr: 0, wptr: n * 32, blocks: 0, bytes: 0 };
+                let (inp, out) = if code == 0 {
+                    (false, false)
+                } else {
+                    let v = input[code as usize - 1][i];
+                    // The fill levels invert for an output channel.
+                    (v, if code <= 3 { !v } else { v })
+                };
+                assert_eq!(ch.threshold(false), inp, "input, code {code}, {n} blocks");
+                assert_eq!(ch.threshold(true), out, "output, code {code}, {n} blocks");
+                let held = SdmaChan { ctrl: ch.ctrl | sdma::CTRL_RESET, ..ch };
+                assert!(!held.threshold(false) && !held.threshold(true), "never in reset");
+            }
+        }
+    }
+
+    #[test]
+    fn received_characters_are_packed_into_whole_blocks() {
+        let bus = sdma_bus();
+        bus.write64(MACE_ISA_INT_MASK, sdma::rx_thir(0));
+        sdma_set(&bus, 0, RX_CTRL, 0x2a0);
+        assert!(!line4(&bus), "an empty ring is not 'not empty'");
+        bus.com0.feed(b"abcde");
+        bus.service();
+        let words: Vec<u64> = (0..4).map(|k| bus.read64(rx_ring(0) + 8 * k).data).collect();
+        assert_eq!(words, [0x8080_8080_6162_6364, 0x8000_0000_65ff_ffff, 0xffff_ffff, 0xffff_ffff]);
+        assert_eq!(sdma_get(&bus, 0, RX_WPTR), 32);
+        assert_eq!(sdma_get(&bus, 0, RX_DEPTH), 32);
+        assert_eq!(bus.com0.pending_input(), 0);
+        assert_ne!(isa_status(&bus) & sdma::rx_thir(0), 0);
+        assert!(line4(&bus));
+        sdma_set(&bus, 0, RX_RPTR, 32);
+        assert_eq!(isa_status(&bus) & sdma::rx_thir(0), 0, "drained: the level drops");
+        assert!(!line4(&bus));
+
+        // Exactly one pair, then exactly a whole block.
+        bus.com0.feed(b"wxyz");
+        bus.service();
+        let w: Vec<u64> = (0..4).map(|k| bus.read64(rx_ring(0) + 32 + 8 * k).data).collect();
+        assert_eq!(w, [0x8080_8080_7778_797a, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff]);
+        bus.com0.feed(b"0123456789ABCDEF");
+        bus.service();
+        let w: Vec<u64> = (0..4).map(|k| bus.read64(rx_ring(0) + 64 + 8 * k).data).collect();
+        assert_eq!(w, [0x8080_8080_3031_3233, 0x8080_8080_3435_3637,
+                       0x8080_8080_3839_4142, 0x8080_8080_4344_4546]);
+        assert_eq!(sdma_get(&bus, 0, RX_WPTR), 96);
+    }
+
+    /// Take one block the way IRIX's reader does: compare the pointers, copy
+    /// pairs until a zero control word, zero what it consumed, trim the last
+    /// pair, and step the read pointer (+32, or 0 from the last block).
+    fn irix_rx_block(bus: &Ip32Bus, sw: &mut u32) -> Option<Vec<u8>> {
+        let rp = sdma_get(bus, 0, RX_RPTR);
+        if rp == sdma_get(bus, 0, RX_WPTR) {
+            return None;
+        }
+        let blk = rx_ring(0) + *sw;
+        let mut chars = Vec::new();
+        let (mut last_ctrl, mut last_at) = (0u32, 0usize);
+        for k in 0..4 {
+            let w = bus.read64(blk + 8 * k).data;
+            let ctrl = (w >> 32) as u32;
+            if ctrl == 0 {
+                break;
+            }
+            for c in ctrl.to_be_bytes() {
+                assert!(c == 0x80 || c == 0, "control byte {c:02x}");
+            }
+            last_at = chars.len();
+            last_ctrl = ctrl;
+            chars.extend_from_slice(&(w as u32).to_be_bytes());
+            bus.write64(blk + 8 * k, w & 0xffff_ffff);
+        }
+        assert!(!chars.is_empty(), "a block was handed over with nothing in pair 0");
+        let unused = last_ctrl.to_be_bytes().iter().rev().take_while(|&&c| c == 0).count();
+        chars.truncate(last_at + 4 - unused);
+        sdma_set(bus, 0, RX_RPTR, if *sw == 0xfe0 { 0 } else { rp + 32 });
+        *sw = (*sw + 32) & 0xfe0;
+        Some(chars)
+    }
+
+    #[test]
+    fn a_long_paste_arrives_intact_through_an_irix_style_reader() {
+        let bus = sdma_bus();
+        sdma_set(&bus, 0, RX_CTRL, 0x2a0);
+        let sent: Vec<u8> = (0..3000).map(|i| b'!' + (i % 90) as u8).collect();
+        bus.com0.feed(&sent);
+        bus.service();
+        assert_eq!(sdma_get(&bus, 0, RX_DEPTH), 0xfe0, "full is one block short of the ring");
+        assert_eq!(bus.com0.pending_input(), 3000 - 127 * 16, "the rest waits in the queue");
+        let mut got = Vec::new();
+        let mut sw = 0;
+        for _ in 0..10_000 {
+            match irix_rx_block(&bus, &mut sw) {
+                Some(c) => got.extend(c),
+                None => {
+                    if got.len() == sent.len() {
+                        break;
+                    }
+                    bus.service();
+                }
+            }
+            assert!(sdma_get(&bus, 0, RX_DEPTH) <= 0xfe0);
+        }
+        assert_eq!(got.len(), sent.len());
+        assert!(got == sent, "characters out of order or damaged");
+        assert_eq!(bus.com0.pending_input(), 0);
+    }
+
+    /// Without receive DMA running, typed characters stay where the PROM, the
+    /// BSDs and IRIX's own polled paths read them.
+    #[test]
+    fn without_receive_dma_input_stays_on_the_pio_path() {
+        for ctrl in [None, Some(0x400), Some(0x000)] {
+            let bus = sdma_bus();
+            if let Some(c) = ctrl {
+                sdma_set(&bus, 0, RX_CTRL, c);
+            }
+            bus.com0.feed(b"hi");
+            bus.service();
+            let lsr = MACE_COM0 + 0x507;
+            assert_ne!(bus.read8(lsr).data & com_reg::LSR_DR, 0, "{ctrl:?}: data ready");
+            assert_eq!(bus.read8(MACE_COM0 + 7).data, b'h');
+            assert_eq!(bus.read8(MACE_COM0 + 7).data, b'i');
+            assert_eq!(sdma_get(&bus, 0, RX_WPTR), 0, "{ctrl:?}: nothing went into the ring");
+        }
+    }
+
+    /// The PROM can leave IER's transmit bit set, which holds the 16550's
+    /// request high for ever. In DMA mode that request is not software's.
+    #[test]
+    fn the_uarts_own_request_is_held_low_in_dma_mode() {
+        let bus = sdma_bus();
+        bus.write64(MACE_ISA_INT_MASK, 0xffff_ffff);
+        bus.write8(MACE_COM0 + 0x107, com_reg::IER_TX);
+        bus.service();
+        assert_eq!(isa_status(&bus) & sdma::group(0), sdma::group(0), "before: all six, as today");
+        assert!(line4(&bus));
+        sdma_set(&bus, 0, TX_CTRL, 0x200);
+        bus.service();
+        assert_eq!(isa_status(&bus) & sdma::group(0), 0, "DIR and the rest are now the DMA model's");
+        assert!(!line4(&bus));
+        // Both channels back in reset hands the port back.
+        sdma_set(&bus, 0, TX_CTRL, 0x400);
+        bus.service();
+        assert_eq!(isa_status(&bus) & sdma::group(0), sdma::group(0));
+    }
+
+    /// What NetBSD and OpenBSD boot with: all six port-0 bits from the 16550,
+    /// into line 4 whatever the mask.
+    #[test]
+    fn a_pio_port_keeps_the_unmasked_six_bit_behaviour() {
+        assert_eq!(sdma::group(0), MACE_ISA_SERIAL0_MASK);
+        for mask in [0xffff_0aff, 0] {
+            let bus = sdma_bus();
+            bus.write64(MACE_ISA_INT_MASK, mask);
+            bus.write64(MACE_ISA_INT_STATUS, 0);
+            bus.write8(MACE_COM0 + 0x107, com_reg::IER_RX);
+            bus.com0.feed(b"x");
+            bus.service();
+            assert_eq!(isa_status(&bus) & 0xffff_0000, 0x03f0_0000, "mask {mask:x}");
+            assert!(line4(&bus), "mask {mask:x}");
+            assert_eq!(bus.read8(MACE_COM0 + 7).data, b'x');
+            bus.service();
+            assert_eq!(isa_status(&bus) & 0xffff_0000, 0, "mask {mask:x}: read, so quiet");
+            assert!(!line4(&bus));
+        }
+    }
+
+    /// IRIX's polled console write between two DMA batches: nothing lost,
+    /// nothing reordered.
+    #[test]
+    fn a_polled_write_between_batches_keeps_its_place() {
+        let bus = sdma_bus();
+        sdma_set(&bus, 0, TX_CTRL, 0x280);
+        tx_block(&bus, 0, 0, b"AB");
+        sdma_set(&bus, 0, TX_WPTR, 32);
+        let saved = sdma_get(&bus, 0, TX_CTRL);
+        sdma_set(&bus, 0, TX_CTRL, saved & !0x280);
+        for &c in b"cd" {
+            assert_ne!(bus.read8(MACE_COM0 + 0x507).data & com_reg::LSR_THRE, 0);
+            bus.write8(MACE_COM0 + 7, c);
+        }
+        sdma_set(&bus, 0, TX_CTRL, saved);
+        tx_block(&bus, 0, 32, b"EF");
+        sdma_set(&bus, 0, TX_WPTR, 64);
+        assert_eq!(bus.com0.output(), "ABcdEF");
+    }
+
+    #[test]
+    fn resetting_a_channel_clears_its_pointers_latches_and_level() {
+        let bus = sdma_bus();
+        bus.write64(MACE_ISA_INT_MASK, 0xffff_ffff);
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&[0x60, 0, 0, 0, b'!', 0, 0, 0]);
+        tx_raw(&bus, 0, 0, &b);
+        sdma_set(&bus, 0, TX_CTRL, 0x200);
+        sdma_set(&bus, 0, TX_WPTR, 32);
+        // Frozen with work queued and "not empty" asked for.
+        sdma_set(&bus, 0, TX_CTRL, 0x0a0);
+        sdma_set(&bus, 0, TX_WPTR, 96);
+        assert_eq!(sdma_get(&bus, 0, TX_DEPTH), 64);
+        assert_eq!(isa_status(&bus) & sdma::group(0), sdma::tx_thir(0) | sdma::tx_preq(0));
+        sdma_set(&bus, 0, TX_CTRL, 0x4a0);
+        assert_eq!(sdma_get(&bus, 0, TX_RPTR), 0);
+        assert_eq!(sdma_get(&bus, 0, TX_WPTR), 0);
+        assert_eq!(isa_status(&bus) & sdma::group(0), 0);
+        assert!(!line4(&bus));
+        assert_eq!(bus.com0.output(), "!");
     }
 
     /// The RTC runs, from host time, and a guest that sets it with SET moves it.
@@ -5229,6 +6180,7 @@ mod bringup {
             eprintln!("   +0x{:06x}  {:>8} R  {:>4} W   from {}",
                       off, r, w, who.join(" "));
         }
+        eprintln!("ip32: serial DMA:\n   {}", bus.sdma.summary().replace('\n', "\n   "));
 
         for slot in 0..8u8 {
             if let Some(f) = bus.macepci.slot(slot) {
