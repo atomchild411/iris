@@ -137,7 +137,7 @@ impl O2Machine {
         if let Some(port) = o2.control_port {
             match std::net::TcpListener::bind(("127.0.0.1", port)) {
                 Ok(l) => {
-                    eprintln!("iris: O2 control on 127.0.0.1:{port} (shot, type, key, mouse, click, status, pc, regs, peek, scsi)");
+                    eprintln!("iris: O2 control on 127.0.0.1:{port} (shot, type, key, mouse, click, status, pc, regs, peek, scsi, retrace)");
                     let bus = bus.clone();
                     std::thread::Builder::new().name("O2-Control".into()).spawn(move || control_server(l, bus)).unwrap();
                 }
@@ -525,6 +525,10 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
                 _ => "err usage: peek ADDR LEN PATH".into(),
             }
         }
+        "retrace" => match std::fs::write(arg, bus.crime_re.trace_text()) {
+            Ok(()) => "ok".into(),
+            Err(e) => format!("err {e}"),
+        },
         "scsi" => {
             let mut text = String::new();
             for (n, (c, _)) in bus.scsi.lock().unwrap().iter().enumerate() {

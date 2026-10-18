@@ -337,12 +337,19 @@ impl Gbe {
             }
         };
 
-        // DID tables are not modelled yet: WID 0 for every pixel, which is
-        // what the PROM and both BSD consoles program (all 32 alike).
-        let wid = g(MODE);
-        let typ = (wid >> 2) & 7;
-        let cm = (wid >> 5) & 0x1f;
-        let gamma = wid & (1 << 10) == 0;
+        // Each pixel's WID (mode-table entry) comes from the DID tables when
+        // DID DMA is on and the 32 WIDs differ; otherwise WID 0, which is
+        // all the PROM and the BSD consoles use. IRIX's X server runs 8-bit
+        // indexed windows (the colour index in a pixel's low byte) beside
+        // 24-bit ones, and only the DIDs say which a pixel belongs to.
+        let did = g(DID_CONTROL);
+        let wids: Vec<u32> = (0..32).map(|i| g(MODE + 4 * i)).collect();
+        let use_did = did & (1 << 16) != 0 && wids.iter().any(|&m| m != wids[0]);
+        let mut line_did = vec![0u8; if use_did { w } else { 0 }];
+        let table = (did & 0xffff) << 16;
+        let rd16 = |a: u32| mem.dma_offset(a).filter(|&o| o + 1 < mem.len()).map(|o| u16::from_be_bytes([mem[o], mem[o + 1]])).unwrap_or(0);
+        let rd32 = |a: u32| (rd16(a) as u32) << 16 | rd16(a + 2) as u32;
+        let mut frame_i = 0u32;
         let cmap = |i: u32| g(CMAP + 4 * (i % 6144));
         let gmap = |v: u32, shift: u32| (g(GMAP + 4 * (v & 0xff)) >> shift) & 0xff;
         let crs_on = g(CRS_CTL) & 1 != 0;
@@ -350,9 +357,45 @@ impl Gbe {
         let (cx, cy) = ((crs & 0xffff) as i16 as i32, (crs >> 16) as i16 as i32);
 
         for y in 0..h {
+            if use_did {
+                // Frame entry: 25:19 block, 18:11 offset, 10:0 last line. Its
+                // line table (16-bit entries, 15:11 DID, 10:0 last x) sits in
+                // one 512-byte block of the 64 KB table.
+                let fe = rd32(table + 4 * frame_i.min(16383));
+                let (block, off, yend) = ((fe >> 19) & 0x7f, (fe >> 11) & 0xff, fe & 0x7ff);
+                let lt = table + 512 * block + 2 * off;
+                let (mut x, mut k) = (0usize, 0u32);
+                while x < w && k < 256 - off {
+                    let le = rd16(lt + 2 * k);
+                    let (d, xend) = ((le >> 11) as u8, (le & 0x7ff) as usize);
+                    while x < w && x <= xend {
+                        line_did[x] = d;
+                        x += 1;
+                    }
+                    k += 1;
+                }
+                // Anything past the table's last span keeps that span's DID.
+                let last = if x > 0 { line_did[x - 1] } else { 0 };
+                line_did[x..].fill(last);
+                if y as u32 >= yend {
+                    frame_i += 1;
+                }
+            }
             for x in 0..w {
+                let wid = if use_did { wids[line_did[x] as usize & 31] } else { wids[0] };
+                let typ = (wid >> 2) & 7;
+                let cm = (wid >> 5) & 0x1f;
+                let gamma = wid & (1 << 10) == 0;
                 let p = fetch((y * w + x) * bpp);
-                let p = if typ <= 3 && bpp > 1 { p & 0xffff } else { p };
+                // A type narrower than the frame buffer reads one half of the
+                // word: buf 10 the upper half, otherwise the lower.
+                let p = if typ <= 3 && bpp > 1 {
+                    let half = bpp as u32 * 4;
+                    let mask = (1u32 << half) - 1;
+                    if wid & 3 == 2 { (p >> half) & mask } else { p & mask }
+                } else {
+                    p
+                };
                 let (mut rr, mut gg, mut bb) = match typ {
                     0 => {
                         let c = cmap((cm << 8) | (p & 0xff));
@@ -427,6 +470,7 @@ impl BusDevice for Gbe {
 pub mod re_reg {
     pub const IB_CONTROL: u32 = 0x0400;
     pub const TLB_A: u32 = 0x1000;
+    pub const TLB_LINEAR_A: u32 = 0x1700;
     pub const BUFMODE_SRC: u32 = 0x2000;
     pub const BUFMODE_DST: u32 = 0x2008;
     pub const DRAWMODE: u32 = 0x2018;
@@ -436,6 +480,11 @@ pub mod re_reg {
     pub const VERTEX_0: u32 = 0x2070;
     pub const VERTEX_1: u32 = 0x2074;
     pub const XFER_SRC: u32 = 0x20a0;
+    /// Linear source and destination strides, in 32-byte units.
+    pub const XFER_STRIDE_SRC: u32 = 0x20a8;
+    pub const XFER_STRIDE_DST: u32 = 0x20ac;
+    /// Linear destination byte address.
+    pub const XFER_DST: u32 = 0x20b0;
     pub const STIPPLE_MODE: u32 = 0x20c0;
     pub const STIPPLE_PATTERN: u32 = 0x20c4;
     pub const FG: u32 = 0x20d0;
@@ -443,6 +492,8 @@ pub mod re_reg {
     pub const LOGIC_OP: u32 = 0x21b0;
     pub const COLOR_MASK: u32 = 0x21b8;
     pub const MTE_MODE: u32 = 0x3000;
+    pub const MTE_BYTEMASK: u32 = 0x3008;
+    pub const MTE_STIPPLE: u32 = 0x3010;
     pub const MTE_FG: u32 = 0x3018;
     pub const MTE_SRC0: u32 = 0x3020;
     pub const MTE_DST0: u32 = 0x3030;
@@ -477,6 +528,11 @@ pub struct CrimeRe {
     unhandled: Mutex<BTreeMap<String, u64>>,
     /// Primitives run, for the end-of-run report.
     pub drawn: std::sync::atomic::AtomicU64,
+    /// Register writes as they happen, `(offset, value, width)`, kept while
+    /// fewer than `trace_cap` (IRIS_IP32_RE_TRACE): the evidence for what a
+    /// driver does with parts the model does not know yet.
+    trace: Mutex<Vec<(u32, u64, u8)>>,
+    trace_cap: usize,
 }
 
 /// A buffer the RE draws through: which TLB, and bytes per pixel word.
@@ -488,13 +544,39 @@ struct Buf {
 
 impl CrimeRe {
     pub fn new(ram: Arc<Mutex<O2Memory>>) -> Self {
+        // byteMask resets to all ones: NetBSD's MTE clears never write it.
+        let mut regs = vec![0; RE_WORDS];
+        regs[(MTE_BYTEMASK / 4) as usize] = 0xffff_ffff;
         Self {
-            regs: Mutex::new(vec![0; RE_WORDS]),
+            regs: Mutex::new(regs),
             hot: Mutex::new(BTreeMap::new()),
             ram,
             unhandled: Mutex::new(BTreeMap::new()),
             drawn: std::sync::atomic::AtomicU64::new(0),
+            trace: Mutex::new(Vec::new()),
+            trace_cap: std::env::var("IRIS_IP32_RE_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         }
+    }
+
+    fn record(&self, off: u32, val: u64, width: u8) {
+        if self.trace_cap == 0 {
+            return;
+        }
+        let mut t = self.trace.lock().unwrap();
+        if t.len() < self.trace_cap {
+            t.push((off, val, width));
+        }
+    }
+
+    /// The recorded writes, one per line: `w32 OFFSET VALUE` (offsets from
+    /// the RE base, 0x1500_0000).
+    pub fn trace_text(&self) -> String {
+        let t = self.trace.lock().unwrap();
+        let mut s = String::with_capacity(t.len() * 28);
+        for &(off, val, w) in t.iter() {
+            s.push_str(&format!("w{w} {off:05x} {val:0pad$x}\n", pad = w as usize / 4));
+        }
+        s
     }
 
     pub fn unhandled(&self) -> BTreeMap<String, u64> {
@@ -633,12 +715,94 @@ impl CrimeRe {
     }
 
     /// Run the pixel pipe's current primitive.
+    /// A rectangle pixel transfer with a linear buffer at either end: the
+    /// X server keeps icons and saved screen areas in linear B and copies
+    /// them in and out this way. A linear end is a byte address (XFER_SRC
+    /// for a source, XFER_DST for a destination) for the rectangle's first
+    /// vertex, rows a stride of 32-byte units apart. On the login screen a
+    /// 16-pixel icon row has stride 4 (a 32-pixel pixmap) and an 8-pixel
+    /// save stride 1.
+    fn xfer_linear(&self, r: &[u32]) {
+        let g = |off: u32| r[(off / 4) as usize];
+        let (sm, dmode) = (g(BUFMODE_SRC), g(BUFMODE_DST));
+        let (sb, db) = ((sm >> 10) & 7, (dmode >> 10) & 7);
+        let (sbd, dbd) = (1u32 << ((sm >> 8) & 3).min(2), 1u32 << ((dmode >> 8) & 3).min(2));
+        let lin = |b: u32| b == 4 || b == 5;
+        if (!lin(sb) && sb > 2) || (!lin(db) && db > 2) {
+            self.note(format!("xfer buffers src {sb} dst {db}"));
+            return;
+        }
+        let (ox, oy) = Self::xy(g(WINOFFSET_DST));
+        let (x0, y0) = Self::xy(g(VERTEX_0));
+        let (x1, y1) = Self::xy(g(VERTEX_1));
+        let (x0, y0, x1, y1) = (x0 + ox, y0 + oy, x1 + ox, y1 + oy);
+        let (xa, xb) = (x0.min(x1).max(0), x0.max(x1).max(0));
+        let (ya, yb) = (y0.min(y1).max(0), y0.max(y1).max(0));
+        if xb - xa > 4096 || yb - ya > 4096 {
+            self.note(format!("xfer rect {xa},{ya}..{xb},{yb}"));
+            return;
+        }
+        let (sstride, dstride) = (g(XFER_STRIDE_SRC).wrapping_mul(32), g(XFER_STRIDE_DST).wrapping_mul(32));
+        let (sx0, sy0) = Self::xy(g(XFER_SRC));
+        let src_tiled = Buf { tlb: TLB_A + 0x200 * sb.min(2), bd: sbd };
+        let dst_tiled = Buf { tlb: TLB_A + 0x200 * db.min(2), bd: dbd };
+        let mut ram = self.ram.lock().unwrap();
+        let mem: &mut O2Memory = &mut ram;
+        let src_at = |mem: &O2Memory, x: i32, y: i32| -> Option<usize> {
+            if lin(sb) {
+                let a = g(XFER_SRC)
+                    .wrapping_add(((y - y0) as u32).wrapping_mul(sstride))
+                    .wrapping_add(((x - x0) as u32).wrapping_mul(sbd));
+                Self::linear(r, mem, sb - 4, a)
+            } else {
+                let (px, py) = (x + sx0 - x0, y + sy0 - y0);
+                if px < 0 || py < 0 {
+                    return None;
+                }
+                Self::locate(r, mem, src_tiled, px as u32, py as u32)
+            }
+        };
+        let dst_at = |mem: &O2Memory, x: i32, y: i32| -> Option<usize> {
+            if lin(db) {
+                let a = g(XFER_DST)
+                    .wrapping_add(((y - y0) as u32).wrapping_mul(dstride))
+                    .wrapping_add(((x - x0) as u32).wrapping_mul(dbd));
+                Self::linear(r, mem, db - 4, a)
+            } else {
+                Self::locate(r, mem, dst_tiled, x as u32, y as u32)
+            }
+        };
+        // Read the whole source first, as the tiled copy does.
+        let mut tmp = Vec::with_capacity(((xb - xa + 1) * (yb - ya + 1)) as usize);
+        for y in ya..=yb {
+            for x in xa..=xb {
+                tmp.push(src_at(mem, x, y).map(|o| Self::get_px(mem, o, sbd)).unwrap_or(0));
+            }
+        }
+        let mut it = tmp.into_iter();
+        for y in ya..=yb {
+            for x in xa..=xb {
+                let v = it.next().unwrap_or(0);
+                if let Some(o) = dst_at(mem, x, y) {
+                    Self::put(r, mem, o, dbd, v);
+                }
+            }
+        }
+    }
+
     fn pixel_pipe(&self) {
         self.drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let r = self.regs.lock().unwrap().clone();
         let g = |off: u32| r[(off / 4) as usize];
         let dm = g(DRAWMODE);
         let prim = g(PRIMITIVE);
+        if dm & draw::PIXEL_XFER != 0 && (prim >> 24) & 3 == 3 {
+            let (sb, db) = ((g(BUFMODE_SRC) >> 10) & 7, (g(BUFMODE_DST) >> 10) & 7);
+            if matches!(sb, 4 | 5) || matches!(db, 4 | 5) {
+                self.xfer_linear(&r);
+                return;
+            }
+        }
         let Some(dst) = self.buf(&r, g(BUFMODE_DST), "dst") else { return };
         let (ox, oy) = Self::xy(g(WINOFFSET_DST));
         let (x0, y0) = Self::xy(g(VERTEX_0));
@@ -764,6 +928,57 @@ impl CrimeRe {
 
     /// Run the memory transfer engine's current transfer (NetBSD's clears
     /// and scrolls).
+    /// RAM offset of byte `addr` of linear buffer `which` (0 = A, 1 = B).
+    ///
+    /// A linear buffer is 32 pages of 4 KB: entry `(addr >> 12) & 31`, kept
+    /// in pairs, the even page in a word's high half and the odd one in its
+    /// low half. An entry is bit 31 valid and the page number below it, so
+    /// the byte is at `page << 12 | addr & 0xfff`. IRIX maps a buffer onto
+    /// the pages it is about to clear or copy, with the page number equal to
+    /// the address it then hands the MTE.
+    fn linear(r: &[u32], mem: &O2Memory, which: u32, addr: u32) -> Option<usize> {
+        let idx = (addr >> 12) & 31;
+        let word = TLB_LINEAR_A + 0x80 * which + 8 * (idx / 2);
+        let e = r[(word / 4 + (idx & 1)) as usize];
+        if e & (1 << 31) == 0 {
+            return None;
+        }
+        mem.dma_offset(((e & 0x000f_ffff) << 12) | (addr & 0xfff))
+    }
+
+    /// An MTE clear or copy whose buffers are linear: DST0..=DST1 (and SRC0
+    /// on) are byte addresses, not x/y. The kernel zeroes and copies pages
+    /// this way; doing nothing left them holding whatever was there before.
+    fn mte_linear(&self, r: &[u32], copy: bool, sbuf: u32, dbuf: u32) {
+        let g = |off: u32| r[(off / 4) as usize];
+        let (d0, d1) = (g(MTE_DST0), g(MTE_DST1));
+        if d1 < d0 || d1 - d0 >= 32 * 4096 {
+            self.note(format!("mte linear span {d0:#x}..{d1:#x}"));
+            return;
+        }
+        let s0 = g(MTE_SRC0);
+        let fg = g(MTE_FG);
+        let mask = g(MTE_BYTEMASK);
+        let mut ram = self.ram.lock().unwrap();
+        let mem: &mut O2Memory = &mut ram;
+        for a in d0..=d1 {
+            let lane = 24 - 8 * (a & 3);
+            if (mask >> (31 - (a & 31))) & 1 == 0 {
+                continue;
+            }
+            let Some(o) = Self::linear(r, mem, dbuf - 4, a) else { continue };
+            let b = if copy {
+                match Self::linear(r, mem, sbuf - 4, s0.wrapping_add(a - d0)) {
+                    Some(so) => mem[so],
+                    None => continue,
+                }
+            } else {
+                (fg >> lane) as u8
+            };
+            mem.write(o, &[b]);
+        }
+    }
+
     fn mte(&self) {
         self.drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let r = self.regs.lock().unwrap().clone();
@@ -772,6 +987,11 @@ impl CrimeRe {
         let copy = mode & (1 << 11) != 0;
         let dbuf = (mode >> 2) & 7;
         let sbuf = (mode >> 5) & 7;
+        let linear = |b: u32| b == 4 || b == 5;
+        if linear(dbuf) && (!copy || linear(sbuf)) {
+            self.mte_linear(&r, copy, sbuf, dbuf);
+            return;
+        }
         if dbuf > 2 || (copy && sbuf > 2) {
             self.note(format!("mte buffers src {sbuf} dst {dbuf}"));
             return;
@@ -791,6 +1011,10 @@ impl CrimeRe {
             return;
         }
         let fg = g(MTE_FG);
+        let bytemask = g(MTE_BYTEMASK);
+        let stippled = mode & (1 << 10) != 0;
+        let stipple = g(MTE_STIPPLE);
+        let bpp = 1u32 << ((mode >> 8) & 3).min(2);
         let mut ram = self.ram.lock().unwrap();
         let mem: &mut O2Memory = &mut ram;
         for i in 0..rows as i32 {
@@ -816,6 +1040,28 @@ impl CrimeRe {
                 }
             } else {
                 for x in xa..=xb {
+                    // A stippled clear writes only the pixels whose mask bit
+                    // is set: one bit per pixel, most significant first,
+                    // counted from the 32-byte block holding the row's first
+                    // byte (eight pixels at 32 bpp, 32 at 8 bpp). IRIX's X
+                    // server draws text a row and a mask at a time; replaying
+                    // its recorded draws, only this count spells the login
+                    // screen's labels (from the row start, letters that do
+                    // not begin on a block boundary come out shifted).
+                    if stippled {
+                        let k = (x - (xa & !31)) as u32 / bpp;
+                        if k >= 32 || (stipple >> (31 - k)) & 1 == 0 {
+                            continue;
+                        }
+                    }
+                    // byteMask: one bit per byte of a 32-byte block, most
+                    // significant first. The kernel's page clears pass all
+                    // ones; IRIX's X server passes 0x11111111 to clear only
+                    // the low byte of each 32-bit pixel, and writing the
+                    // whole pixel instead blacked out what it had drawn.
+                    if (bytemask >> (31 - (x as u32 & 31))) & 1 == 0 {
+                        continue;
+                    }
                     if let Some(o) = Self::locate(&r, mem, dst, x as u32, dy as u32) {
                         let b = (fg >> (24 - 8 * (o as u32 & 3))) as u8;
                         mem.write(o, &[b]);
@@ -838,6 +1084,7 @@ impl BusDevice for CrimeRe {
         BusRead64::ok((self.read_reg(a) as u64) << 32 | self.read_reg(a + 4) as u64)
     }
     fn write32(&self, addr: u32, val: u32) -> u32 {
+        self.record(addr & 0x7ffc, val as u64, 32);
         self.write_reg(addr & 0x7ffc, val);
         BUS_OK
     }
@@ -845,6 +1092,7 @@ impl BusDevice for CrimeRe {
         // Both halves land before a start acts, so a 64-bit write to a start
         // address (vertices 0 and 1 at once) draws with both.
         let a = addr & 0x7ff8;
+        self.record(a, val, 64);
         let page = a & 0xf000;
         let start = (page == 0x2000 || page == 0x3000) && a & 0x800 != 0;
         let base = if start { a & !0x800 } else { a };
@@ -904,6 +1152,73 @@ mod tests {
     }
 
     const GBE_CTRLSTAT_ADDR: u32 = 0x1600_0000;
+
+    /// Replay a recorded register trace (IRIS_IP32_RE_TRACE, saved with the
+    /// control port's `retrace`) into a fresh RE and save what TLB A shows
+    /// at 32 bpp as a PNG: RE_REPLAY=trace RE_REPLAY_PNG=out.png. CPU writes
+    /// to the frame buffer are not in the trace, so only drawing shows.
+    #[test]
+    #[ignore]
+    fn replay_a_recorded_trace() {
+        let Ok(path) = std::env::var("RE_REPLAY") else { return };
+        let out = std::env::var("RE_REPLAY_PNG").unwrap_or("replay.png".into());
+        // 256 MB as two 128 MB banks, placed the way the PROM places them.
+        let mut m = O2Memory::from_kits(&[128, 128]).unwrap();
+        m.set_ctrl(0, 0x100);
+        m.set_ctrl(2, 0x100 | 4);
+        let ram = Arc::new(Mutex::new(m));
+        let re = CrimeRe::new(ram.clone());
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let mut f = line.split_whitespace();
+            let (w, off, val) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
+            let (off, val) = (u32::from_str_radix(off, 16).unwrap(), u64::from_str_radix(val, 16).unwrap());
+            if w == "w64" {
+                re.write64(0x1500_0000 + off, val);
+            } else {
+                re.write32(0x1500_0000 + off, val as u32);
+            }
+        }
+        let r = re.regs.lock().unwrap().clone();
+        let mem = ram.lock().unwrap();
+        let (w, h) = (1280u32, 1024u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                if let Some(o) = CrimeRe::locate(&r, &mem, Buf { tlb: TLB_A, bd: 4 }, x, y) {
+                    let i = ((y * w + x) * 4) as usize;
+                    rgba[i..i + 3].copy_from_slice(&mem[o..o + 3]);
+                    rgba[i + 3] = 255;
+                }
+            }
+        }
+        crate::ip32_screen::save_png(&out, &rgba, w, h).unwrap();
+    }
+
+    /// IRIX zeroes pages with the MTE: linear A mapped onto the pages in
+    /// pairs, then a clear from DST0 to DST1 with the fill colour.
+    #[test]
+    fn the_mte_clears_pages_through_linear_a_as_irix_asks() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        ram.lock().unwrap().write(0x0011_3fff, &[0x55; 0x2_0002]);
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        let addr = 0x0011_4000u32;
+        let page = addr >> 12;
+        for i in 0..16u32 {
+            let p = page + 2 * i;
+            let pair = ((1u64 << 31 | p as u64) << 32) | (1u64 << 31 | (p + 1) as u64);
+            re.write64(base + TLB_LINEAR_A + 8 * ((p & 31) >> 1), pair);
+        }
+        re.write32(base + MTE_DST0, addr);
+        re.write32(base + MTE_DST1, addr + 32 * 4096 - 1);
+        re.write32(base + MTE_FG, 0);
+        re.write32(base + MTE_BYTEMASK, 0xffff_ffff);
+        re.write32(base + (MTE_MODE | 0x800), 0x11);
+        let m = ram.lock().unwrap();
+        assert!(m[addr as usize..(addr + 32 * 4096) as usize].iter().all(|&b| b == 0), "all 128 KB cleared");
+        assert_eq!(m[addr as usize - 1], 0x55, "the byte before is untouched");
+        assert_eq!(m[(addr + 32 * 4096) as usize], 0x55, "the byte after is untouched");
+    }
 
     /// IRIX's mode set writes the overlay shadow with DMA on and then waits
     /// for the live register to read the old state; it must see it until

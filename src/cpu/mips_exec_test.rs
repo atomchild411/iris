@@ -279,6 +279,22 @@ mod tests {
         assert_eq!(exec.core.read_gpr(3), 0); // 32-bit wrapping add, result sign extended (0 -> 0)
     }
 
+    /// IRIX 6.5.22's IP32 `mte_set_tlb` (n32, 32-bit kernel, Status 0)
+    /// builds a CRIME linear-TLB pair `(1<<31|page) << 32 | (1<<31|page+1)`
+    /// with these exact words; the O2 recorded 0xffffffff80042041 instead.
+    #[test]
+    fn irix_crime_tlb_pair_builds_in_32bit_kernel_mode() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status = 0;
+        exec.core.write_gpr(16, 0x42040);
+        exec.core.write_gpr(4, 0x42041);
+        for w in [0x3c09_8000u32, 0x0130_7025, 0x000e_703c, 0x0124_6025, 0x000c_603c, 0x000c_603e, 0x018e_6025] {
+            assert_eq!(exec.exec(w), EXEC_COMPLETE, "{w:08x}");
+        }
+        assert_eq!(exec.core.read_gpr(14), 0x8004_2040_0000_0000);
+        assert_eq!(exec.core.read_gpr(12), 0x8004_2040_8004_2041);
+    }
+
     #[test]
     fn test_add_overflow() {
         let (mut exec, _) = create_executor();
