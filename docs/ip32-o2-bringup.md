@@ -1665,3 +1665,78 @@ have 64-byte secondary lines and the PROM never met anything else. With that, PR
 times each address is reached; `IRIS_IP32_DIS` now takes several ranges.
 `machines/o2-netbsd/console.sh` in the workspace defaults to R10000 and 1 GB
 (`CPU=`, `RAM=`, `DIMMS=` to change).
+
+## OpenBSD and NetBSD on jitv2 (2026-10-18)
+
+tcache is a run-time switch on the full cache model (`set_tcache_live`): the
+PROM keeps its stack in the data cache while it tests memory, so the cache
+holds its data until POST has handed over to the firmware, and again whenever
+the guest is back inside the PROM (ARCS PowerDown sets the caches up the same
+way). Switching it on writes every dirty line back first. O2 memory keeps a
+generation counter per 4 KB page, bumped by every write through
+`O2Memory::write` (CPU stores, SCSI and Ethernet DMA, the rendering engine),
+which is what jitv2 checks compiled code against.
+
+OpenBSD 6.9 boots to ssh in about 150 s on jitv2 (fork stress 95 s, against
+191 s interpreted); NetBSD 11's heavier work runs three to five times faster.
+
+## Graphics: GBE, the rendering engine and the keyboard (2026-10-18)
+
+`src/dev/o2gfx.rs` is a plain CPU model, meant as the oracle for a later GPU
+version:
+
+- `Gbe`: a 32-bit register file; a beam counter driven by guest time (plus a
+  little per read, so a blanking poll always sees it move); the DMA control
+  shadows copied straight to their live registers; chip id 1 with a non-zero
+  board revision strap (revision 0 makes the PROM load a bit-reversed gamma
+  ramp); an idle colour-map FIFO; and `render()`, a pure function of RAM and the
+  registers: tile list (16-bit entries, 64 KB tiles of 128 lines x 512 bytes,
+  partial right-hand tiles), 8/16/32 bpp, WID types, CMAP, gamma, cursor.
+  `vt_crossings()` raises the four vertical-timing interrupts.
+- `CrimeRe`: TLB A/B/C tile lookup, points, lines, rectangles (fill,
+  opaque/transparent stipple, pixel-transfer copy through a temporary), logic
+  ops, plane mask, byte lanes, and the memory transfer engine's clears and
+  copies. Every primitive runs when started; status always reads idle.
+- MACE PS/2: two real ports driving `dev/ps2.rs`'s keyboard (set 3 for the
+  PROM and IRIX, set 2 for OpenBSD, set 1 for NetBSD); interrupts on ISA bits
+  9..12, CRIME line 5. MACE reads as revision 2 (bit 4 of 0x1f310000).
+- CRIME's ID has to read 0xa1 before the PROM offers a graphics console, and
+  it needs a keyboard that answers its probe (0xF5).
+
+With those the PROM draws its graphical console, and OpenBSD's gbe(4) and
+NetBSD's crmfb(4) run glass consoles. NetBSD on IP32 prints through the PROM
+until crmfb attaches, with the FPU disabled, and the PROM scrolls with
+ldc1/sdc1: once its text window fills, the kernel faults inside the firmware.
+`[o2] arcs_fpu` / `IRIS_IP32_ARCS_FPU=1` is a labelled test aid that lends it
+the FPU meanwhile.
+
+CRIME's interrupts follow the CRIME 1.5 spec: INTSTAT is the level sources
+plus the latched edges (30, 24:22, 19:16) plus SOFTINT; writing 0 to a latched
+bit in HARDINT clears it.
+
+## The O2 as an iris machine (2026-10-18)
+
+`[machine] profile = "o2_ip32"` builds an O2 from the `[o2]` section (prom,
+flash, ram_mb or dimms, disks, serial_port/serial_log, graphics, net,
+forwards, arcs_fpu) instead of the Indy/Indigo2 board: `src/ip32_machine.rs`.
+The CPU is iris's own thread (with jitv2's compile pool); a batch hook on the
+executor switches tcache as above; CRIME's output reaches IP2 through an
+interrupt sink the bus calls before CRIME reads and after any non-RAM write
+(a 100 us poll alone left acknowledged interrupts up long enough for OpenBSD
+to report them as spurious); the MACE clock runs from the host clock, read
+live (the 1-Wire ID chip's slots are microseconds). `O2Display` scans GBE out
+at 60 Hz for the standard window, whose keys go to the PS/2 keyboard. The
+PROM's flash is saved whenever the guest has written to it.
+
+The bring-up harness stays for diagnostics (trap logs, hot PCs and registers,
+breakpoints), and `ip32-view` gives it a window through a shared file.
+
+## IRIX 6.5.22 (2026-10-18, in progress)
+
+From the Overlay 1 CD the PROM loads sashARCS, the miniroot copies to the
+target disk and its IP32 kernel runs. With GBE's timing interrupts and CRIME's
+latching in place it gets past driver initialisation to the SCSI probe, where
+IRIX's own AIC-7880 driver (adp78, with Adaptec's HIM) times out on every
+command: it uses a third host/sequencer contract the model does not know yet.
+With more than 256 MB the kernel faults earlier, walking a corrupt page frame
+list (both CPUs); not yet understood.
