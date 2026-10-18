@@ -6286,6 +6286,10 @@ mod bringup {
             }
             let ex = scsi.executed();
             eprintln!("   {} command(s) fetched and run", ex.len());
+            for (tag, scb, cdb) in ex.iter().rev().take(60).rev() {
+                let hex: Vec<String> = cdb.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("      tag {tag:2} scb 0x{scb:08x}  {}", hex.join(" "));
+            }
         }
         let probed = bus.macepci.probed();
         eprintln!("ip32: PCI config addresses selected ({}):", probed.len());

@@ -1300,12 +1300,20 @@ impl Aic7880 {
 
     fn write8(&self, off: u32, val: u8) {
         // SCSIRSTO: the controller drives a SCSI bus reset, and every device
-        // returns to its power-on state -- a CD-ROM to 2048-byte blocks,
-        // whatever MODE SELECT set before. The PROM sets 512 to boot; the
-        // kernel's driver resets the bus when it attaches and gets 2048.
+        // returns to its power-on state. What that is for a CD-ROM depends on
+        // whose drive it is: an SGI drive comes up in 512-byte blocks, which
+        // SGI's own driver (the HIM, in the PROM and in IRIX) relies on --
+        // IRIX resets the bus when it attaches and never sends MODE SELECT
+        // again, then reads 512-byte sectors. The BSDs' driver expects the
+        // common 2048 after its reset (the PROM had left 512 behind).
         if off == reg::SCSISEQ && val & 0x01 != 0 {
+            let sgi = Self::him(&self.st.lock().unwrap());
             for d in self.disks.lock().unwrap().values() {
-                d.power_on_block_len();
+                if sgi && d.cdrom {
+                    d.set_block_len(512);
+                } else {
+                    d.power_on_block_len();
+                }
             }
         }
         let mut st = self.st.lock().unwrap();
