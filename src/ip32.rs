@@ -578,6 +578,12 @@ pub const PCI_MEM_BASE: u32 = 0x1a00_0000;
 pub const PCI_MEM_SIZE: u32 = 0x0200_0000;
 pub const PCI_MEM_PCI_BASE: u32 = 0x8000_0000;
 
+/// PCI memory's second, one-to-one window, from physical 0x2_8000_0000. A
+/// 64-bit kernel (OpenBSD's) reaches devices there; the PROM and NetBSD use
+/// the low window above. Physical addresses reach this bus as 32 bits, so it
+/// arrives as 0x8000_0000 and up, where an O2 has nothing else below 4 GB.
+pub const PCI_HI_MEM_BASE: u32 = 0x8000_0000;
+
 impl Default for MacePci {
     fn default() -> Self { Self::new() }
 }
@@ -745,7 +751,8 @@ pub struct Com16550 {
     regs: Mutex<[u8; 8]>,
     /// The client of a TCP console (`serve_tcp`), which gets every byte
     /// transmitted and whose keystrokes are queued as input.
-    tcp: std::sync::Arc<Mutex<Option<std::net::TcpStream>>>,
+    /// Every connected console client: each sees all output and may type.
+    tcp: std::sync::Arc<Mutex<Vec<std::net::TcpStream>>>,
 }
 
 pub mod com_reg {
@@ -823,6 +830,8 @@ impl Com16550 {
         let input = self.input.clone();
         let client = self.tcp.clone();
         std::thread::Builder::new().name(format!("ip32-com0-tcp-{port}")).spawn(move || {
+            // One thread per client, so a person and a script can share the
+            // console: both see everything, and whatever either types goes in.
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let _ = stream.set_nodelay(true);
@@ -830,27 +839,32 @@ impl Com16550 {
                     continue;
                 }
                 let Ok(writer) = stream.try_clone() else { continue };
-                *client.lock().unwrap() = Some(writer);
-                let mut telnet = crate::net::telnet::TelnetFilter::new();
-                let mut buf = [0u8; 256];
-                loop {
-                    let n = match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    let mut reply = Vec::new();
-                    let mut typed = Vec::new();
-                    for &b in &buf[..n] {
-                        if let Some(d) = telnet.feed(b, &mut reply) {
-                            typed.push(d);
+                client.lock().unwrap().push(writer);
+                let input = input.clone();
+                let _ = std::thread::Builder::new().name(format!("ip32-com0-client-{port}")).spawn(move || {
+                    let mut telnet = crate::net::telnet::TelnetFilter::new();
+                    let mut buf = [0u8; 256];
+                    loop {
+                        let n = match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        let mut reply = Vec::new();
+                        let mut typed = Vec::new();
+                        for &b in &buf[..n] {
+                            if let Some(d) = telnet.feed(b, &mut reply) {
+                                typed.push(d);
+                            }
                         }
+                        if !reply.is_empty() && stream.write_all(&reply).is_err() {
+                            break;
+                        }
+                        input.lock().unwrap().extend(typed);
                     }
-                    if !reply.is_empty() && stream.write_all(&reply).is_err() {
-                        break;
-                    }
-                    input.lock().unwrap().extend(typed);
-                }
-                *client.lock().unwrap() = None;
+                    // A client that has gone is dropped on the next write
+                    // that fails.
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                });
             }
         })?;
         Ok(bound)
@@ -879,6 +893,12 @@ impl Com16550 {
 
     pub fn bytes_out(&self) -> usize {
         self.out.lock().unwrap().len()
+    }
+
+    /// The last `n` bytes written, without copying the whole history.
+    pub fn output_tail(&self, n: usize) -> String {
+        let o = self.out.lock().unwrap();
+        String::from_utf8_lossy(&o[o.len().saturating_sub(n)..]).to_string()
     }
 
     /// Decode a MACE ISA address into a 16550 register number, if it names one.
@@ -988,13 +1008,11 @@ impl Com16550 {
                     let _ = f.flush();
                 }
                 let mut tcp = self.tcp.lock().unwrap();
-                if let Some(t) = tcp.as_mut() {
+                if !tcp.is_empty() {
                     use std::io::Write;
                     let mut buf = Vec::with_capacity(2);
                     crate::net::telnet::escape_byte(val, &mut buf);
-                    if t.write_all(&buf).is_err() {
-                        *tcp = None;
-                    }
+                    tcp.retain_mut(|t| t.write_all(&buf).is_ok());
                 }
             }
             return;
@@ -1095,6 +1113,55 @@ impl Default for MacePs2 {
 /// trusts it, and why handing back zeros is not neutral.
 pub struct MaceRtc {
     cells: Mutex<Vec<u8>>,
+    /// The clock: guest seconds since 1970 at a host instant, so it runs.
+    /// A kernel that calibrates its CPU clock against the RTC waits for the
+    /// seconds to change, and a stopped clock leaves it waiting for ever
+    /// (OpenBSD, straight after autoconfiguration).
+    clock: Mutex<(i64, std::time::Instant)>,
+}
+
+/// The DS1687's clock registers and the bits of register B that shape them.
+mod rtc_reg {
+    pub const SEC: usize = 0x00;
+    pub const MIN: usize = 0x02;
+    pub const HOUR: usize = 0x04;
+    pub const WDAY: usize = 0x06;
+    pub const MDAY: usize = 0x07;
+    pub const MONTH: usize = 0x08;
+    pub const YEAR: usize = 0x09;
+    pub const A: usize = 0x0a;
+    /// Register A's bank select: with it set, 0x40-0x7f are the extended
+    /// registers, and 0x48 is the century.
+    pub const A_DV0: u8 = 0x10;
+    pub const CENTURY: usize = 0x48;
+    pub const B: usize = 0x0b;
+    pub const B_SET: u8 = 0x80;
+    pub const B_BINARY: u8 = 0x04;
+    pub const B_24H: u8 = 0x02;
+    pub const TIME: [usize; 7] = [SEC, MIN, HOUR, WDAY, MDAY, MONTH, YEAR];
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The date for a count of days since 1970-01-01: (year, month, day).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 impl MaceRtc {
@@ -1108,7 +1175,75 @@ impl MaceRtc {
         // valid-RAM-and-time flag: firmware that sees it clear concludes the
         // battery died, which is its own diagnostic path.
         c[0x0d] = 0x80;
-        Self { cells: Mutex::new(c) }
+        // BCD, 24-hour: what SGI firmware leaves the part in.
+        c[rtc_reg::B] = rtc_reg::B_24H;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        Self { cells: Mutex::new(c), clock: Mutex::new((now, std::time::Instant::now())) }
+    }
+
+    /// Guest time now, in seconds since 1970.
+    fn now(&self) -> i64 {
+        let (secs, at) = *self.clock.lock().unwrap();
+        secs + at.elapsed().as_secs() as i64
+    }
+
+    /// The clock registers' value for `t`, in the mode register B selects.
+    fn field(&self, reg: usize, t: i64, b: u8) -> u8 {
+        let days = t.div_euclid(86400);
+        let secs = t.rem_euclid(86400);
+        let (y, m, d) = civil_from_days(days);
+        let mut hour = (secs / 3600) as u8;
+        let mut pm = 0u8;
+        if reg == rtc_reg::HOUR && b & rtc_reg::B_24H == 0 {
+            pm = if hour >= 12 { 0x80 } else { 0 };
+            hour %= 12;
+            if hour == 0 { hour = 12; }
+        }
+        let v = match reg {
+            rtc_reg::SEC => (secs % 60) as u8,
+            rtc_reg::MIN => (secs / 60 % 60) as u8,
+            rtc_reg::HOUR => hour,
+            // 1 = Sunday; 1970-01-01 was a Thursday.
+            rtc_reg::WDAY => ((days + 4).rem_euclid(7) + 1) as u8,
+            rtc_reg::MDAY => d as u8,
+            rtc_reg::MONTH => m as u8,
+            _ => y.rem_euclid(100) as u8,
+        };
+        let v = if b & rtc_reg::B_BINARY != 0 { v } else { (v / 10) << 4 | v % 10 };
+        v | pm
+    }
+
+    /// Restart the clock from what the guest has written into the time
+    /// registers. A two-digit year below 70 is taken as 20xx.
+    fn set_from_cells(&self) {
+        self.set_from_cells_in(None)
+    }
+
+    /// The same, with the century given (a write to the century register).
+    fn set_from_cells_in(&self, century: Option<i64>) {
+        let c = self.cells.lock().unwrap();
+        let b = c[rtc_reg::B];
+        let get = |r: usize| -> i64 {
+            let raw = c[r] & if r == rtc_reg::HOUR && b & rtc_reg::B_24H == 0 { 0x7f } else { 0xff };
+            (if b & rtc_reg::B_BINARY != 0 { raw } else { (raw >> 4) * 10 + (raw & 0x0f) }) as i64
+        };
+        let mut hour = get(rtc_reg::HOUR);
+        if b & rtc_reg::B_24H == 0 {
+            hour %= 12;
+            if c[rtc_reg::HOUR] & 0x80 != 0 { hour += 12; }
+        }
+        let yy = get(rtc_reg::YEAR);
+        let year = match century {
+            Some(c) => c * 100 + yy,
+            None if yy < 70 => 2000 + yy,
+            None => 1900 + yy,
+        };
+        let (month, mday) = (get(rtc_reg::MONTH).clamp(1, 12), get(rtc_reg::MDAY).clamp(1, 31));
+        let t = days_from_civil(year, month, mday) * 86400
+            + hour * 3600 + get(rtc_reg::MIN) * 60 + get(rtc_reg::SEC);
+        drop(c);
+        *self.clock.lock().unwrap() = (t, std::time::Instant::now());
     }
 
     fn reg_of(addr: u32) -> Option<usize> {
@@ -1132,11 +1267,57 @@ impl Default for MaceRtc {
 
 impl BusDevice for MaceRtc {
     fn read8(&self, addr: u32) -> BusRead8 {
-        BusRead8::ok(Self::reg_of(addr).map(|r| self.peek(r)).unwrap_or(0))
+        let Some(r) = Self::reg_of(addr) else { return BusRead8::ok(0) };
+        let b = self.peek(rtc_reg::B);
+        if r == rtc_reg::CENTURY && self.peek(rtc_reg::A) & rtc_reg::A_DV0 != 0 {
+            let days = self.now().div_euclid(86400);
+            let c = (civil_from_days(days).0 / 100) as u8;
+            return BusRead8::ok(if b & rtc_reg::B_BINARY != 0 { c } else { (c / 10) << 4 | c % 10 });
+        }
+        // While SET is up the clock is frozen at what is being written.
+        if rtc_reg::TIME.contains(&r) && b & rtc_reg::B_SET == 0 {
+            return BusRead8::ok(self.field(r, self.now(), b));
+        }
+        BusRead8::ok(self.peek(r))
     }
     fn write8(&self, addr: u32, val: u8) -> u32 {
-        if let Some(r) = Self::reg_of(addr) {
-            self.poke(r, val);
+        let Some(r) = Self::reg_of(addr) else { return BUS_OK };
+        let b = self.peek(rtc_reg::B);
+        if r == rtc_reg::CENTURY && self.peek(rtc_reg::A) & rtc_reg::A_DV0 != 0 {
+            // The century, in the extended bank: keep the rest of the time.
+            let t = self.now();
+            for &f in &rtc_reg::TIME {
+                let v = self.field(f, t, b);
+                self.poke(f, v);
+            }
+            let c = if b & rtc_reg::B_BINARY != 0 { val } else { (val >> 4) * 10 + (val & 0x0f) };
+            self.set_from_cells_in(Some(c as i64));
+            return BUS_OK;
+        }
+        if r == rtc_reg::B && b & rtc_reg::B_SET == 0 && val & rtc_reg::B_SET != 0 {
+            // SET going up: freeze the time registers at the current time,
+            // so fields the guest does not rewrite keep their values.
+            let t = self.now();
+            for &f in &rtc_reg::TIME {
+                let v = self.field(f, t, b);
+                self.poke(f, v);
+            }
+        }
+        self.poke(r, val);
+        if r == rtc_reg::B && b & rtc_reg::B_SET != 0 && val & rtc_reg::B_SET == 0 {
+            // SET coming down: the clock runs on from what was written.
+            self.set_from_cells();
+        } else if rtc_reg::TIME.contains(&r) && b & rtc_reg::B_SET == 0 {
+            // A field written without SET: freeze the others at the current
+            // time first, then take the whole lot as the new time.
+            let t = self.now();
+            for &f in &rtc_reg::TIME {
+                if f != r {
+                    let v = self.field(f, t, b);
+                    self.poke(f, v);
+                }
+            }
+            self.set_from_cells();
         }
         BUS_OK
     }
@@ -1966,6 +2147,9 @@ impl Ip32Bus {
     }
 
     fn pci_addr_of(addr: u32) -> u32 {
+        if addr >= PCI_HI_MEM_BASE {
+            return addr;
+        }
         PCI_MEM_PCI_BASE.wrapping_add(addr.wrapping_sub(PCI_MEM_BASE))
     }
 
@@ -1993,7 +2177,8 @@ impl Ip32Bus {
     }
 
     fn in_pci_mem(&self, addr: u32) -> bool {
-        addr >= PCI_MEM_BASE && addr < PCI_MEM_BASE.wrapping_add(PCI_MEM_SIZE)
+        (addr >= PCI_MEM_BASE && addr < PCI_MEM_BASE.wrapping_add(PCI_MEM_SIZE))
+            || addr >= PCI_HI_MEM_BASE
     }
 
     fn in_ps2(&self, addr: u32) -> bool {
@@ -2883,6 +3068,44 @@ mod tests {
         assert_eq!(c.read8(lsr).data & com_reg::LSR_DR, 0, "queue drained");
     }
 
+    /// The RTC runs, from host time, and a guest that sets it with SET moves it.
+    #[test]
+    fn the_rtc_runs_and_can_be_set() {
+        let r = MaceRtc::new();
+        let reg = |n: u32| (n << 8) | 7;
+        // Host time on power-up: some year from 2026 on, in BCD.
+        let yy = r.read8(reg(9)).data;
+        assert!(yy >= 0x26 && yy & 0x0f < 10, "year {yy:#x}");
+        // Set 1999-12-31 23:59:58 under SET, binary mode, 24-hour.
+        r.write8(reg(0x0b), 0x80 | 0x04 | 0x02);
+        for (n, v) in [(0u32, 58u8), (2, 59), (4, 23), (7, 31), (8, 12), (9, 99)] {
+            r.write8(reg(n), v);
+        }
+        r.write8(reg(0x0b), 0x04 | 0x02);
+        assert_eq!(r.read8(reg(9)).data, 99);
+        assert_eq!(r.read8(reg(6)).data, 6, "a Friday");
+        // Three seconds on, it is the year 2000.
+        {
+            let mut c = r.clock.lock().unwrap();
+            c.1 -= std::time::Duration::from_secs(3);
+        }
+        assert_eq!((r.read8(reg(9)).data, r.read8(reg(8)).data, r.read8(reg(7)).data), (0, 1, 1));
+        assert_eq!(r.read8(reg(0)).data, 1);
+        // And BCD again on request.
+        r.write8(reg(0x0b), 0x02);
+        assert_eq!(r.read8(reg(8)).data, 0x01);
+        // The century, in the extended bank (register A bit 4).
+        r.write8(reg(0x0a), 0x10);
+        assert_eq!(r.read8(reg(0x48)).data, 0x20);
+        r.write8(reg(0x48), 0x19);
+        r.write8(reg(0x0a), 0x00);
+        assert_eq!(r.read8(reg(9)).data, 0x00, "1900: same two digits");
+        r.write8(reg(0x0a), 0x10);
+        assert_eq!(r.read8(reg(0x48)).data, 0x19);
+        assert_eq!(days_from_civil(2000, 1, 1), 10957);
+        assert_eq!(civil_from_days(10957), (2000, 1, 1));
+    }
+
     /// The TCP console: a client gets the telnet handshake, then every byte
     /// the guest transmits, and what it types becomes the guest's input --
     /// with telnet's own commands taken out on the way.
@@ -2907,7 +3130,7 @@ mod tests {
         assert_eq!(c.read8(MACE_COM0 + 7).data, b'\r');
         assert_eq!(c.pending_input(), 0, "the telnet command is not input");
         // Transmitted: reaches the client (once it is registered as the client).
-        while c.tcp.lock().unwrap().is_none() && std::time::Instant::now() < until {
+        while c.tcp.lock().unwrap().is_empty() && std::time::Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         for &b in b"ok" {
@@ -3357,6 +3580,23 @@ mod bringup {
         // IRIS_IP32_BREAK=pc,pc,... prints the registers the first few times
         // each of those addresses is reached: what a function was called
         // with, or returned, without a debugger.
+        // IRIS_IP32_STOP_ON_RESET ends the run soon after a kernel hands
+        // control back to the PROM (a panic, a reboot, a reset), so the report
+        // describes the boot that failed.
+        let stop_on_reset = std::env::var("IRIS_IP32_STOP_ON_RESET").is_ok();
+        // IRIS_IP32_STOP_ON=text ends the run once the console has printed
+        // `text` (a panic message, say), checked every million steps.
+        let stop_on = std::env::var("IRIS_IP32_STOP_ON").ok().filter(|t| !t.is_empty());
+        // IRIS_IP32_STOP_AFTER=steps keeps running that long past the match and
+        // reports where the time went: the answer to "it printed X and then
+        // nothing".
+        let stop_after: u64 = std::env::var("IRIS_IP32_STOP_AFTER").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut stop_at: Option<u64> = None;
+        let mut hot: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        // IRIS_IP32_BREAK_AFTER_STOP arms the breakpoints only once
+        // IRIS_IP32_STOP_ON has matched, to look at a hang rather than a boot.
+        let break_after_stop = std::env::var("IRIS_IP32_BREAK_AFTER_STOP").is_ok();
         let mut breaks: Vec<(u32, u32)> = std::env::var("IRIS_IP32_BREAK").unwrap_or_default()
             .split(',').filter_map(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
             .map(|a| (a, 0)).collect();
@@ -3471,6 +3711,11 @@ mod bringup {
         let mut in_loop = false;
         let prom_for_strings = bus_prom.clone();
 
+        // Status writes have to reach the executor, or a kernel that sets KX
+        // keeps translating 64-bit addresses as 32-bit ones: XKPHYS loads go to
+        // the TLB and fault (OpenBSD's first device access). Installed here,
+        // where `exec` has stopped moving, since the callback keeps a pointer.
+        exec.install_status_cb();
         while steps < LIMIT {
             let pc = exec.core.pc as u32;
             if pc == POST1_ENTRY {
@@ -3526,13 +3771,53 @@ mod bringup {
             // instruction is about to make.
             bus.pc.set(pc);
             bus.pc.set_ra(exec.core.gpr[31] as u32);
-            if !breaks.is_empty() {
+            if let Some(at) = stop_at {
+                *hot.entry(pc).or_insert(0) += 1;
+                if steps >= at {
+                    let mut v: Vec<_> = hot.iter().map(|(&p, &n)| (n, p)).collect();
+                    v.sort_unstable_by(|a, b| b.cmp(a));
+                    eprintln!("ip32: hottest PCs over the last {stop_after} steps:");
+                    for (n, p) in v.iter().take(24) {
+                        let w = bus.read32(p & 0x1fff_ffff).data;
+                        eprintln!("   {p:08x} {n:>10}  {}", crate::cpu::mips_dis::disassemble(w, *p as u64, None));
+                    }
+                    // The same time by 256-byte region, so a wait spread over a
+                    // whole function still shows up.
+                    let mut regions: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+                    for (&p, &n) in hot.iter() {
+                        *regions.entry(p & !0xff).or_insert(0) += n;
+                    }
+                    let mut r: Vec<_> = regions.into_iter().map(|(p, n)| (n, p)).collect();
+                    r.sort_unstable_by(|a, b| b.cmp(a));
+                    eprintln!("ip32: hottest 256-byte regions:");
+                    for (n, p) in r.iter().take(16) {
+                        eprintln!("   {p:08x} {n:>10}  {:.1}%", *n as f64 * 100.0 / stop_after.max(1) as f64);
+                    }
+                    break;
+                }
+            } else if let Some(t) = &stop_on {
+                if steps % 1_000_000 == 0 && bus.com0.output_tail(t.len() + 4096).contains(t.as_str()) {
+                    eprintln!("ip32: console printed {t:?} by step {steps}; stopping after {stop_after} more");
+                    if stop_after == 0 {
+                        break;
+                    }
+                    stop_at = Some(steps + stop_after);
+                }
+            }
+            if stop_on_reset && !kernel_exit.is_empty() && steps > kernel_exit_at + 20_000_000 {
+                eprintln!("ip32: the kernel left at step {kernel_exit_at}; stopping");
+                break;
+            }
+            if !breaks.is_empty() && (!break_after_stop || stop_at.is_some()) {
                 let pa = pc & 0x1fff_ffff;
                 if let Some(b) = breaks.iter_mut().find(|b| b.0 & 0x1fff_ffff == pa && b.1 < 8) {
                     b.1 += 1;
                     let g = &exec.core.gpr;
-                    eprintln!("ip32: break {pc:08x} @{steps}: a0 {:x} a1 {:x} a2 {:x} a3 {:x} v0 {:x} v1 {:x} sp {:x} ra {:x}",
-                              g[4], g[5], g[6], g[7], g[2], g[3], g[29], g[31]);
+                    eprintln!("ip32: break {pc:08x} @{steps}: a0 {:x} a1 {:x} a2 {:x} a3 {:x} v0 {:x} v1 {:x} s0 {:x} s1 {:x} s2 {:x} s3 {:x} sp {:x} ra {:x} status {:x} cause {:x} count {:x} compare {:x} crime stat {:x} mask {:x}",
+                              g[4], g[5], g[6], g[7], g[2], g[3], g[16], g[17], g[18], g[19], g[29], g[31],
+                              exec.core.cp0_status, exec.core.cp0_cause,
+                              exec.core.cp0_count as u32, exec.core.cp0_compare as u32,
+                              bus.crime.load(crime_reg::INTSTAT), bus.crime.load(crime_reg::INTMASK));
                 }
             }
             // The clock only has to be right when something reads it, and
@@ -3734,21 +4019,13 @@ mod bringup {
                     bits.store(want, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                let compare = exec.core.cp0_compare as u32;
-                let count = exec.core.count_now();
-                // Count wraps; treat it as fired when it is within a window
-                // past Compare, which is what a real edge would look like.
-                let fired = count.wrapping_sub(compare) < 0x4000_0000;
-                let bits = &exec.core.hot.interrupts;
-                let cur = bits.load(std::sync::atomic::Ordering::Relaxed);
-                let want = if compare != 0 && fired {
-                    cur | crate::cpu::mips_core::CAUSE_IP7 as u64
-                } else {
-                    cur & !(crate::cpu::mips_core::CAUSE_IP7 as u64)
-                };
-                if want != cur {
-                    bits.store(want, std::sync::atomic::Ordering::Relaxed);
-                }
+                // Advancing Count is enough: the core raises IP7 when an
+                // advance crosses Compare, once, and a Compare write is the
+                // acknowledgement, as on silicon. This used to raise IP7 as a
+                // *level* whenever Count was within 2^30 past Compare, which
+                // re-fired forever on a timer parked at Compare = Count - 1
+                // (OpenBSD before its clock starts): an interrupt storm.
+                let _ = exec.core.count_now();
             }
             if arm_call.is_none() && exec.core.gpr[31] as u32 == pc.wrapping_add(8) {
                 arm_call = Some((pc.wrapping_add(8), steps, 1));
