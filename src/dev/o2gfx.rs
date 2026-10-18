@@ -503,6 +503,9 @@ pub mod re_reg {
     pub const BUFMODE_SRC: u32 = 0x2000;
     pub const BUFMODE_DST: u32 = 0x2008;
     pub const DRAWMODE: u32 = 0x2018;
+    /// Clip mode (low four bits enable the rectangles) and the rectangles.
+    pub const CLIP_MODE: u32 = 0x2010;
+    pub const CLIP_RECT0: u32 = 0x2020;
     pub const WINOFFSET_SRC: u32 = 0x2050;
     pub const WINOFFSET_DST: u32 = 0x2058;
     pub const PRIMITIVE: u32 = 0x2060;
@@ -749,6 +752,27 @@ impl CrimeRe {
         ((v >> 16) as i32, (v & 0xffff) as i32)
     }
 
+    /// Whether the clip rectangles let pixel (x, y) be drawn. CLIP_MODE's
+    /// low four bits enable rectangles 0-3 (CLIP_RECT0 on, 64 bits each:
+    /// x0, y0 high, x1, y1 low, inclusive); with any enabled, a pixel must
+    /// lie in one of them. 4Dwm fills a minimized window's frame with the
+    /// four rectangles around the icon picture enabled (mode 0x1ef), which
+    /// keeps the fill off the picture it has just copied in.
+    fn clip_ok(r: &[u32], x: i32, y: i32) -> bool {
+        let mode = r[(CLIP_MODE / 4) as usize];
+        if mode & 0xf == 0 {
+            return true;
+        }
+        (0..4).any(|i| {
+            if mode & (1 << i) == 0 {
+                return false;
+            }
+            let (x0, y0) = Self::xy(r[((CLIP_RECT0 + 8 * i) / 4) as usize]);
+            let (x1, y1) = Self::xy(r[((CLIP_RECT0 + 8 * i) / 4 + 1) as usize]);
+            (x0..=x1).contains(&x) && (y0..=y1).contains(&y)
+        })
+    }
+
     /// A window offset: two signed 16-bit halves. IRIX's GL windows sit at
     /// offsets like (-3443, -3477) -- the window origin less a 4096 guard --
     /// which read unsigned put every triangle 62,000 pixels off screen.
@@ -851,6 +875,9 @@ impl CrimeRe {
         for y in ya..=yb {
             for x in xa..=xb {
                 let v = it.next().unwrap_or(0);
+                if !Self::clip_ok(r, x, y) {
+                    continue;
+                }
                 if let Some(o) = dst_at(mem, x, y) {
                     Self::put(r, mem, o, dbd, v);
                 }
@@ -906,6 +933,9 @@ impl CrimeRe {
         match (prim >> 24) & 3 {
             // Point.
             0 => {
+                if !Self::clip_ok(&r, x0, y0) {
+                    return;
+                }
                 if let Some(o) = Self::locate(&r, mem, dst, x0.max(0) as u32, y0.max(0) as u32) {
                     let v = Self::lane(fg, o, dst.bd);
                     Self::put(&r, mem, o, dst.bd, v);
@@ -920,7 +950,7 @@ impl CrimeRe {
                 let (mut x, mut y, mut err, mut k) = (x0, y0, dx + dy, 0u32);
                 loop {
                     let last = x == x1 && y == y1;
-                    if !(last && skip_last) && x >= 0 && y >= 0 {
+                    if !(last && skip_last) && x >= 0 && y >= 0 && Self::clip_ok(&r, x, y) {
                         if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
                             if let Some(v) = colour_at(mem, o, k, stippled) {
                                 Self::put(&r, mem, o, dst.bd, v);
@@ -972,6 +1002,9 @@ impl CrimeRe {
                     for y in ya..=yb {
                         for x in xa..=xb {
                             let v = it.next().unwrap_or(0);
+                            if !Self::clip_ok(&r, x as i32, y as i32) {
+                                continue;
+                            }
                             if let Some(o) = Self::locate(&r, mem, dst, x, y) {
                                 Self::put(&r, mem, o, dst.bd, v);
                             }
@@ -981,6 +1014,9 @@ impl CrimeRe {
                     let stippled = dm & draw::POLY_STIPPLE != 0;
                     for y in ya..=yb {
                         for (k, x) in (xa..=xb).enumerate() {
+                            if !Self::clip_ok(&r, x as i32, y as i32) {
+                                continue;
+                            }
                             if let Some(o) = Self::locate(&r, mem, dst, x, y) {
                                 if let Some(v) = colour_at(mem, o, k as u32, stippled) {
                                     Self::put(&r, mem, o, dst.bd, v);
@@ -1055,7 +1091,7 @@ impl CrimeRe {
                             let e = edge(a, b, px, py);
                             e > 0.0 || (e == 0.0 && top_left(a, b))
                         });
-                        if inside {
+                        if inside && Self::clip_ok(&r, x, y) {
                             if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
                                 if half {
                                     Self::put(&r, mem, o + half_off, 2, colour);
@@ -1345,6 +1381,38 @@ mod tests {
                 eprintln!("replay px {x},{y} = {:02x}{:02x}{:02x}{:02x}", mem[o], mem[o + 1], mem[o + 2], mem[o + 3]);
             }
         }
+    }
+
+    /// 4Dwm's minimized-window icon: an 8-bit pixmap in linear B copied to
+    /// the 8-bit root window (32-bit words, index in the low byte), with
+    /// the registers IRIX used.
+    #[test]
+    fn an_8bit_pixmap_copies_out_of_linear_b_into_the_root_window() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        // Screen: TLB A entry 0 at 0x0100_0000. Pixmap page at 0x0050_0000.
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        let src = 0x1038_fb60u32;
+        let page = 0x0050_0000u32;
+        let idx = (src >> 12) & 31;
+        re.write64(base + TLB_LINEAR_A + 0x80 + 8 * (idx / 2), if idx & 1 == 1 { 0x8000_0000 | (page >> 12) as u64 } else { (0x8000_0000 | (page >> 12) as u64) << 32 });
+        for i in 0..88u32 {
+            ram.lock().unwrap().write((page | (src & 0xfff)) as usize + i as usize, &[0x21]);
+        }
+        re.write32(base + BUFMODE_SRC, 0x1400);
+        re.write32(base + BUFMODE_DST, 0x8000_0200);
+        re.write32(base + DRAWMODE, 0x0020_0208);
+        re.write32(base + LOGIC_OP, 3);
+        re.write32(base + PRIMITIVE, 0x0302_0000);
+        re.write32(base + VERTEX_0, (10 << 16) | 0);
+        re.write32(base + VERTEX_1, (20 << 16) | 0);
+        re.write32(base + XFER_STEP_X, 1);
+        re.write32(base + XFER_STEP_ROW, 4);
+        re.write32(base + (XFER_SRC | 0x800), src);
+        let m = ram.lock().unwrap();
+        // Pixel (10, 0): word 10 of the first tile row.
+        assert_eq!(&m[0x0100_0000 + 40..0x0100_0000 + 44], &[0, 0, 0, 0x21]);
     }
 
     #[test]
