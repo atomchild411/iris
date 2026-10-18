@@ -3951,8 +3951,13 @@ mod bringup {
             .collect();
         let key_idle: u32 = std::env::var("IRIS_IP32_KEYS_IDLE").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
         let key_gap: u64 = std::env::var("IRIS_IP32_KEY_GAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
+        // A kernel at a shell prompt reads the keyboard by interrupt, not by
+        // polling it, so the idle test never fires there: after this many
+        // steps without it, the next segment goes in anyway.
+        let key_wait: u64 = std::env::var("IRIS_IP32_KEYS_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000_000);
         let mut typing = false;
         let mut next_key = 0u64;
+        let mut segment_done = 0u64;
         let keys = std::env::var("IRIS_IP32_KBD").ok().and_then(|p| p.parse::<u16>().ok()).and_then(|p| {
             match crate::ip32_screen::KeyEvents::listen(p) {
                 Ok(k) => {
@@ -4018,6 +4023,14 @@ mod bringup {
         // describes the boot that failed.
         let stop_on_reset = std::env::var("IRIS_IP32_STOP_ON_RESET").is_ok();
         let trap_log = std::env::var("IRIS_IP32_TRAP_LOG").is_ok();
+        // IRIS_IP32_TRAP_LOG=all logs every exception but interrupts and TLB
+        // refills, and
+        // IRIS_IP32_TRAP_FROM=step starts logging there: the way to find the
+        // first fault in front of a crash loop.
+        let trap_all = std::env::var("IRIS_IP32_TRAP_LOG").as_deref() == Ok("all");
+        // IRIS_IP32_TRAP_LOG=tlb adds TLB refills too (busy: use a window).
+        let trap_tlb = std::env::var("IRIS_IP32_TRAP_LOG").as_deref() == Ok("tlb");
+        let trap_from: u64 = std::env::var("IRIS_IP32_TRAP_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let mut trap_logged = 0u32;
         // IRIS_IP32_STOP_ON=text ends the run once the console has printed
         // `text` (a panic message, say), checked every million steps.
@@ -4171,6 +4184,14 @@ mod bringup {
         // cache holds data again, and the interpreter runs it.
         let mut in_firmware = false;
         let mut firmware_calls = 0u64;
+        // IRIS_IP32_ARCS_FPU=1, a test aid and not hardware behaviour: mark
+        // the FPU usable while a kernel is inside the firmware, as NetBSD
+        // itself does around ArcPowerDown. The PROM's graphics console scrolls
+        // with ldc1/sdc1, and a kernel printing through it with CU1 clear
+        // (NetBSD on IP32 until crmfb attaches) takes a coprocessor-unusable
+        // fault there.
+        let arcs_fpu = std::env::var("IRIS_IP32_ARCS_FPU").as_deref() == Ok("1");
+        let mut cu1_saved = 0u32;
         while steps < LIMIT {
             let pc = exec.core.pc as u32;
             if pc == POST1_ENTRY {
@@ -4241,7 +4262,7 @@ mod bringup {
                 // happens, with the instruction -- these are what a kernel
                 // turns into SIGBUS, and in user mode they are otherwise
                 // invisible.
-                if trap_log && matches!(exc, 4..=7) && trap_logged < 200 {
+                if trap_log && steps >= trap_from && (matches!(exc, 4..=7) || (trap_all && !matches!(exc, 0 | 2 | 3)) || (trap_tlb && exc != 0)) && trap_logged < 200 {
                     trap_logged += 1;
                     let epc = exec.core.cp0_epc;
                     let insn = exec.debug_read(epc, 4).map(|w| w as u32).ok();
@@ -4475,6 +4496,16 @@ mod bringup {
                 if fw != in_firmware {
                     in_firmware = fw;
                     exec.cache.set_tcache_live(!fw);
+                    if arcs_fpu {
+                        const CU1: u32 = 1 << 29;
+                        if fw {
+                            cu1_saved = exec.core.cp0_status & CU1;
+                            exec.core.cp0_status |= CU1;
+                        } else {
+                            exec.core.cp0_status = (exec.core.cp0_status & !CU1) | cu1_saved;
+                        }
+                        exec.resync_privilege_state();
+                    }
                     if fw {
                         firmware_calls += 1;
                         if firmware_calls <= 8 {
@@ -4565,7 +4596,9 @@ mod bringup {
                     }
                 }
                 if let Some(dev) = bus.ps2.devices() {
-                    if !typing && !key_script.is_empty() && dev.scanning() && bus.ps2.idle_polls() >= key_idle {
+                    if !typing && !key_script.is_empty() && dev.scanning()
+                        && (bus.ps2.idle_polls() >= key_idle || (segment_done != 0 && steps - segment_done >= key_wait))
+                    {
                         typing = true;
                         next_key = steps;
                     }
@@ -4578,6 +4611,7 @@ mod bringup {
                         if seg.is_empty() {
                             key_script.pop_front();
                             typing = false;
+                            segment_done = steps;
                             bus.ps2.reset_idle();
                             eprintln!("ip32: typed a key segment at step {steps}");
                         }
@@ -4612,6 +4646,19 @@ mod bringup {
         jit_pause.finish();
 
         let pc = exec.core.pc as u32;
+        for (name, hot) in [("gbe", bus.gbe.hot.lock().unwrap().clone()), ("crime-re", bus.crime_re.hot.lock().unwrap().clone())] {
+            let mut v: Vec<_> = hot.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = v.iter().take(8).map(|(o, n)| format!("+{o:#x} x{n}")).collect();
+            eprintln!("ip32: {name} hottest reads: {}", top.join(", "));
+        }
+        eprintln!("ip32: crime-re primitives run: {}", bus.crime_re.drawn.load(Ordering::Relaxed));
+        eprintln!("ip32: gbe {}", bus.gbe.summary());
+        let shown = bus.gbe.render(&bus.ram.lock().unwrap(), &mut frame);
+        eprintln!("ip32: gbe would show {shown:?}");
+        if let (Some(p), Some((w, h))) = (png_path.as_ref(), shown) {
+            let _ = crate::ip32_screen::save_png(p, &frame[..(w * h * 4) as usize], w, h);
+        }
         eprintln!("ip32: stopped after {steps} steps at PC 0x{pc:08x}{}",
                   if reached_post1 { "  <-- post1 entry" } else { "" });
         eprintln!("ip32: furthest PC seen inside the PROM: 0x{max_prom_pc:08x}");

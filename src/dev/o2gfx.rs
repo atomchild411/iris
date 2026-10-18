@@ -68,6 +68,8 @@ struct GbeState {
 
 pub struct Gbe {
     s: Mutex<GbeState>,
+    /// Reads per register offset, for finding a driver spinning on one.
+    pub hot: Mutex<BTreeMap<u32, u64>>,
     /// Guest time in microseconds (MACE UST).
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -78,7 +80,7 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0 }), now }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0 }), hot: Mutex::new(BTreeMap::new()), now }
     }
 
     fn get(r: &[u32], off: u32) -> u32 {
@@ -113,6 +115,7 @@ impl Gbe {
     }
 
     fn read_reg(&self, off: u32) -> u32 {
+        *self.hot.lock().unwrap().entry(off).or_insert(0) += 1;
         let mut s = self.s.lock().unwrap();
         match off {
             CTRLSTAT => {
@@ -156,6 +159,18 @@ impl Gbe {
         if let Some(l) = live {
             s.r[(l / 4) as usize] = val;
         }
+    }
+
+    /// The registers that decide what is on screen, for a report.
+    pub fn summary(&self) -> String {
+        let s = self.s.lock().unwrap();
+        let g = |o: u32| Self::get(&s.r, o);
+        format!(
+            "ctrlstat {:#010x} dotclock {:#010x} vt_xy {:#010x} xymax {:#010x} hcmap {:#010x} vcmap {:#010x} \
+             flags {:#x} tile {:#010x} pix {:#010x} frm {:#010x}/{:#010x} did {:#010x} mode0 {:#x}",
+            g(CTRLSTAT), g(DOTCLOCK), g(VT_XY), g(VT_XYMAX), g(VT_HCMAP), g(VT_VCMAP), g(VT_FLAGS),
+            g(FRM_SIZE_TILE), g(FRM_SIZE_PIXEL), g(FRM_CONTROL), g(FRM_CONTROL_SHADOW), g(DID_CONTROL), g(MODE)
+        )
     }
 
     /// Scan the frame out of RAM into `out` (R, G, B, A bytes, row 0 at the
@@ -352,6 +367,8 @@ mod draw {
 
 pub struct CrimeRe {
     regs: Mutex<Vec<u32>>,
+    /// Reads per register offset, for finding a driver spinning on one.
+    pub hot: Mutex<BTreeMap<u32, u64>>,
     ram: Arc<Mutex<O2Memory>>,
     /// What the guest asked for that is not modelled, with counts, so a
     /// missing primitive shows up instead of drawing nothing silently.
@@ -371,6 +388,7 @@ impl CrimeRe {
     pub fn new(ram: Arc<Mutex<O2Memory>>) -> Self {
         Self {
             regs: Mutex::new(vec![0; RE_WORDS]),
+            hot: Mutex::new(BTreeMap::new()),
             ram,
             unhandled: Mutex::new(BTreeMap::new()),
             drawn: std::sync::atomic::AtomicU64::new(0),
@@ -391,6 +409,7 @@ impl CrimeRe {
     }
 
     fn read_reg(&self, off: u32) -> u32 {
+        *self.hot.lock().unwrap().entry(off & !3).or_insert(0) += 1;
         match off & !3 {
             STATUS | 0x4004 => RE_STATUS_IDLE,
             IB_CONTROL | 0x0404 => 0,
