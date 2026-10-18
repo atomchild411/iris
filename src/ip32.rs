@@ -1061,6 +1061,9 @@ pub struct MacePs2 {
     /// serial-console machines run.
     dev: Option<std::sync::Arc<crate::dev::ps2::Ps2Controller>>,
     mouse: bool,
+    /// Keyboard STATUS reads with nothing to read since a byte last arrived:
+    /// a guest sitting at a prompt runs this up fast.
+    idle_polls: AtomicU32,
 }
 
 struct Ps2Port {
@@ -1093,7 +1096,12 @@ pub mod ps2_ctl {
 
 impl MacePs2 {
     pub fn new() -> Self {
-        Self { ports: [Mutex::new(Ps2Port::default()), Mutex::new(Ps2Port::default())], dev: None, mouse: false }
+        Self {
+            ports: [Mutex::new(Ps2Port::default()), Mutex::new(Ps2Port::default())],
+            dev: None,
+            mouse: false,
+            idle_polls: AtomicU32::new(0),
+        }
     }
 
     /// With a keyboard on port 0 (and a mouse on port 1 if `mouse`).
@@ -1159,6 +1167,13 @@ impl MacePs2 {
             }
             2 => port.control,
             3 => {
+                if p == 0 {
+                    if port.rx_full {
+                        self.idle_polls.store(0, Ordering::Relaxed);
+                    } else {
+                        self.idle_polls.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 let mut st = ps2_bit::CLOCK_SIGNAL;
                 if port.control & ps2_ctl::CLKEN != 0 && port.control & ps2_ctl::RESET == 0 {
                     st |= ps2_bit::CLOCK_INHIBIT;
@@ -1199,6 +1214,15 @@ impl MacePs2 {
             }
             _ => {}
         }
+    }
+
+    /// Keyboard status reads with nothing waiting, since the last byte.
+    pub fn idle_polls(&self) -> u32 {
+        self.idle_polls.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_idle(&self) {
+        self.idle_polls.store(0, Ordering::Relaxed);
     }
 
     /// The PS/2 bits of MACE's ISA interrupt status: 9 and 11 are the ports'
@@ -3911,6 +3935,24 @@ mod bringup {
         let mut last_frame = std::time::Instant::now();
         let mut last_png = std::time::Instant::now();
         let mut png_hash = 0u64;
+        // IRIS_IP32_KEYS: what a person would type at the graphics console,
+        // in segments split by `|`. Each waits until the guest has sat at a
+        // prompt (polling an empty keyboard) for IRIS_IP32_KEYS_IDLE status
+        // reads, then goes in one key per IRIS_IP32_KEY_GAP steps. `\r`,
+        // `\e` and `\b` are Enter, Escape and Backspace.
+        let mut key_script: std::collections::VecDeque<std::collections::VecDeque<char>> = std::env::var("IRIS_IP32_KEYS")
+            .unwrap_or_default()
+            .replace("\\r", "\r")
+            .replace("\\e", "\x1b")
+            .replace("\\b", "\x08")
+            .split('|')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().collect())
+            .collect();
+        let key_idle: u32 = std::env::var("IRIS_IP32_KEYS_IDLE").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+        let key_gap: u64 = std::env::var("IRIS_IP32_KEY_GAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
+        let mut typing = false;
+        let mut next_key = 0u64;
         let keys = std::env::var("IRIS_IP32_KBD").ok().and_then(|p| p.parse::<u16>().ok()).and_then(|p| {
             match crate::ip32_screen::KeyEvents::listen(p) {
                 Ok(k) => {
@@ -4519,6 +4561,25 @@ mod bringup {
                     while let Some((name, down)) = k.pop() {
                         if let Some(code) = crate::ip32_screen::keycode(&name) {
                             dev.push_kb(code, down);
+                        }
+                    }
+                }
+                if let Some(dev) = bus.ps2.devices() {
+                    if !typing && !key_script.is_empty() && dev.scanning() && bus.ps2.idle_polls() >= key_idle {
+                        typing = true;
+                        next_key = steps;
+                    }
+                    if typing && steps >= next_key {
+                        let seg = key_script.front_mut().unwrap();
+                        if let Some(ch) = seg.pop_front() {
+                            dev.type_char(ch);
+                            next_key = steps + key_gap;
+                        }
+                        if seg.is_empty() {
+                            key_script.pop_front();
+                            typing = false;
+                            bus.ps2.reset_idle();
+                            eprintln!("ip32: typed a key segment at step {steps}");
                         }
                     }
                 }

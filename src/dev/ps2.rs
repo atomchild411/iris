@@ -476,6 +476,31 @@ impl Ps2Controller {
         self.update_interrupt();
     }
 
+    /// Type one character as a press and release, with Shift where needed.
+    /// `\r` and `\n` are Enter, `\x1b` is Escape. False if there is no key
+    /// for it.
+    pub fn type_char(&self, ch: char) -> bool {
+        let (k, shifted) = match ch {
+            '\r' | '\n' => (KeyCode::Enter, false),
+            '\x1b' => (KeyCode::Escape, false),
+            '\x08' => (KeyCode::Backspace, false),
+            c => match ascii_to_keycode(c) {
+                Some(k) => k,
+                None => return false,
+            },
+        };
+        if shifted { self.push_kb(KeyCode::ShiftLeft, true); }
+        self.push_kb(k, true);
+        self.push_kb(k, false);
+        if shifted { self.push_kb(KeyCode::ShiftLeft, false); }
+        true
+    }
+
+    /// Whether the keyboard is sending keys (the guest enabled scanning).
+    pub fn scanning(&self) -> bool {
+        self.state.lock().scanning_enabled
+    }
+
     /// Send a byte straight to the keyboard (`mouse == false`) or the mouse,
     /// for a host with a separate port per device and no 8042 (the O2's
     /// MACE). Same device behaviour as the data port, without controller
