@@ -546,9 +546,12 @@ impl Aic7880 {
     }
 
     fn note(st: &mut State, what: String) {
-        if st.notes.len() < 4096 {
-            st.notes.push(what);
+        // The most recent stretch, not the first: a question about a
+        // running guest is about what it is doing now.
+        if st.notes.len() >= 8192 {
+            st.notes.drain(..1024);
         }
+        st.notes.push(what);
     }
 
     /// A running commentary on what the driver asked for.

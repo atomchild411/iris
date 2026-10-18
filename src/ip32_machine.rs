@@ -61,12 +61,15 @@ impl O2Machine {
             None => crate::dev::crime_mem::kits_for(o2.ram_mb)?,
         };
         let mem = O2Memory::from_kits(&kits)?;
+        if let Some(d) = o2.disks.iter().find(|d| d.bus > 1) {
+            return Err(format!("O2 disk {}: bus {} (an O2 has controllers 0 and 1)", d.path, d.bus));
+        }
         let opts = Ip32Options {
             scsi: true,
             disks: o2
                 .disks
                 .iter()
-                .map(|d| Ip32Disk { id: Some(d.id), path: d.path.clone().into(), cdrom: d.cdrom })
+                .map(|d| Ip32Disk { id: Some(d.id), bus: d.bus, path: d.path.clone().into(), cdrom: d.cdrom })
                 .collect(),
             flash_file: o2.flash.clone().map(Into::into),
         };
@@ -468,6 +471,18 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
             },
             None => "err display off".into(),
         },
+        "scsi" => {
+            let mut text = String::new();
+            for (n, (c, _)) in bus.scsi.lock().unwrap().iter().enumerate() {
+                for line in c.notes() {
+                    text.push_str(&format!("{n}: {line}\n"));
+                }
+            }
+            match std::fs::write(arg, text) {
+                Ok(()) => "ok".into(),
+                Err(e) => format!("err {e}"),
+            }
+        }
         "status" => {
             let shown = bus.render_screen(rgba);
             format!("ok display {shown:?}; {}", bus.gbe.summary())

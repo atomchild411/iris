@@ -1754,8 +1754,12 @@ pub struct Ip32Options {
 
 #[derive(Clone, Debug)]
 pub struct Ip32Disk {
-    /// SCSI id on the first controller; None is the controller's default.
+    /// SCSI id; None is the controller's default.
     pub id: Option<u8>,
+    /// Which controller: 0 is the internal bus, 1 the external connector.
+    /// IRIX looks only at ids 1 to 4 on the internal one, as the case has
+    /// room for no more, so further drives go outside.
+    pub bus: u8,
     pub path: std::path::PathBuf,
     /// A CD-ROM, which the PROM's install menu insists on seeing.
     pub cdrom: bool,
@@ -1768,7 +1772,7 @@ impl Ip32Options {
     pub fn from_env() -> Self {
         let mut disks = Vec::new();
         if let Ok(path) = std::env::var("IRIS_IP32_DISK") {
-            disks.push(Ip32Disk { id: None, path: path.into(), cdrom: false });
+            disks.push(Ip32Disk { id: None, bus: 0, path: path.into(), cdrom: false });
         }
         if let Ok(spec) = std::env::var("IRIS_IP32_DISKS") {
             for entry in spec.split(',') {
@@ -1778,7 +1782,7 @@ impl Ip32Options {
                     Some(p) => (p, true),
                     None => (path.trim(), false),
                 };
-                disks.push(Ip32Disk { id: Some(id), path: path.into(), cdrom });
+                disks.push(Ip32Disk { id: Some(id), bus: 0, path: path.into(), cdrom });
             }
         }
         Self {
@@ -2733,10 +2737,12 @@ impl Ip32Bus {
                 ),
             );
             for d in &opts.disks {
-                let id = d.id.unwrap_or(scsi.default_target());
-                match scsi.attach_at(id, &d.path, d.cdrom) {
-                    Ok(b) => eprintln!("ip32: SCSI id {id}: {} ({b} blocks)", d.path.display()),
-                    Err(e) => eprintln!("ip32: SCSI id {id}: {}: {e}", d.path.display()),
+                let ctl = if d.bus == 0 { &scsi } else { &scsi_b };
+                let id = d.id.unwrap_or(ctl.default_target());
+                let at = if d.bus == 0 { format!("id {id}") } else { format!("{}:{id}", d.bus) };
+                match ctl.attach_at(id, &d.path, d.cdrom) {
+                    Ok(b) => eprintln!("ip32: SCSI {at}: {} ({b} blocks)", d.path.display()),
+                    Err(e) => eprintln!("ip32: SCSI {at}: {}: {e}", d.path.display()),
                 }
             }
             let mut list = bus.scsi.lock().unwrap();

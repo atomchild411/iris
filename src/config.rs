@@ -757,6 +757,9 @@ pub struct O2Section {
 #[serde(deny_unknown_fields)]
 pub struct O2Disk {
     pub id: u8,
+    /// The controller: 0 (internal, ids 1-4 under IRIX) or 1 (external).
+    #[serde(default)]
+    pub bus: u8,
     pub path: String,
     #[serde(default)]
     pub cdrom: bool,
