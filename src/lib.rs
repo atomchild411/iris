@@ -174,6 +174,7 @@ pub mod machine;
 /// into `Physical`; it drives the CPU against its own bus.
 pub mod ip32;
 pub mod ip32_handover;
+pub mod ip32_screen;
 pub mod platform;
 pub mod physical;
 pub mod monitor;

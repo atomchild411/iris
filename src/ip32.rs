@@ -193,6 +193,8 @@ pub mod crime_reg {
 /// number here. Which value the PROM demands is one of the things the first
 /// run is meant to discover, so it is a field rather than a constant.
 pub const CRIME_REV_DEFAULT: u64 = 0x0000_0000_0000_0011;
+/// CRIME 1.1 as the PROM wants to see it before it offers a graphics console.
+pub const CRIME_REV_GBE: u64 = 0x0000_0000_0000_00a1;
 
 /// Minimal CRIME: a 64-bit register file that remembers what it is told, with
 /// the handful of reads the PROM cannot be fobbed off with zero for.
@@ -556,6 +558,16 @@ pub const IP32_SCSI_SLOT_B: u8 = 2;
 pub const MACE_ISA_INT_STATUS: u32 = MACE_BASE + 0x0031_0010;
 /// CRIME input 4 is the ISA cascade; `com0` sits behind it.
 pub const IP32_ISA_CRIME_INT: u32 = 4;
+/// CRIME input for MACE ISA status bits 8..15: RTC, the PS/2 ports, UST timers.
+pub const IP32_MISC_CRIME_INT: u32 = 5;
+/// MACE ISA interrupt mask, next to [`MACE_ISA_INT_STATUS`].
+pub const MACE_ISA_INT_MASK: u32 = MACE_BASE + 0x0031_0018;
+/// The PS/2 bits of the ISA status: 9 and 11 the ports' requests, 10 and 12
+/// their poll flags.
+pub const MACE_ISA_PS2_MASK: u64 = 0x1e00;
+/// ISA ring base and reset register; bit 4 reads as the MACE revision.
+pub const MACE_ISA_RING_BASE: u32 = MACE_BASE + 0x0031_0000;
+pub const MACE_REV2_BIT: u64 = 0x10;
 /// The bits NetBSD's `com0` attaches with, as it prints them:
 /// "com0 at mace0 offset 0x390000 intr 4 intrmask 0x3f00000".
 pub const MACE_ISA_SERIAL0_MASK: u64 = 0x03f0_0000;
@@ -1044,19 +1056,61 @@ impl BusDevice for Com16550 {
 /// its full 20834-iteration timeout instead of returning at once.
 pub struct MacePs2 {
     ports: [Mutex<Ps2Port>; 2],
+    /// The keyboard (port 0) and, when `mouse` is set, the mouse (port 1),
+    /// as one PS/2 device model. None: nothing plugged in, which is how the
+    /// serial-console machines run.
+    dev: Option<std::sync::Arc<crate::dev::ps2::Ps2Controller>>,
+    mouse: bool,
 }
 
-#[derive(Default)]
 struct Ps2Port {
     control: u64,
-    /// Bytes the PROM has sent into the void, kept so a test can see that the
-    /// transmit path was actually exercised.
+    /// The receive latch: it keeps the last byte, which a read returns again
+    /// when nothing new has arrived (IRIX reads the ID twice that way).
+    rx: u8,
+    rx_full: bool,
+    /// A byte written to TX that has not gone out yet (TxEN clear).
+    tx: Option<u8>,
+    /// Bytes the guest has sent, kept so a test can see the transmit path ran.
     sent: Vec<u8>,
+}
+
+impl Default for Ps2Port {
+    fn default() -> Self {
+        Self { control: ps2_ctl::CLKEN, rx: 0, rx_full: false, tx: None, sent: Vec::new() }
+    }
+}
+
+/// CONTROL bits of a MACE PS/2 port.
+pub mod ps2_ctl {
+    pub const TX_ENABLE: u64 = 1 << 1;
+    pub const TX_INT: u64 = 1 << 2;
+    pub const RX_INT: u64 = 1 << 3;
+    /// Clock enabled: while clear the device may not send.
+    pub const CLKEN: u64 = 1 << 4;
+    pub const RESET: u64 = 1 << 5;
 }
 
 impl MacePs2 {
     pub fn new() -> Self {
-        Self { ports: [Mutex::new(Ps2Port::default()), Mutex::new(Ps2Port::default())] }
+        Self { ports: [Mutex::new(Ps2Port::default()), Mutex::new(Ps2Port::default())], dev: None, mouse: false }
+    }
+
+    /// With a keyboard on port 0 (and a mouse on port 1 if `mouse`).
+    pub fn with_devices(mouse: bool) -> Self {
+        let dev = std::sync::Arc::new(crate::dev::ps2::Ps2Controller::new(None));
+        crate::traits::Device::start(&*dev);
+        Self { dev: Some(dev), mouse, ..Self::new() }
+    }
+
+    /// The device model, for the host side to push keys into.
+    pub fn devices(&self) -> Option<&std::sync::Arc<crate::dev::ps2::Ps2Controller>> {
+        self.dev.as_ref()
+    }
+
+    /// The device on port `p`, if one is plugged in.
+    fn attached(&self, p: usize) -> Option<&std::sync::Arc<crate::dev::ps2::Ps2Controller>> {
+        if p == 1 && !self.mouse { None } else { self.dev.as_ref() }
     }
 
     /// `(port, register)` for an address in the block, if it names one.
@@ -1069,17 +1123,54 @@ impl MacePs2 {
         self.ports[port].lock().unwrap().sent.clone()
     }
 
+    /// Move the device's next byte into an empty latch, if the clock lets it.
+    fn latch(&self, p: usize, port: &mut Ps2Port) {
+        if port.rx_full || port.control & ps2_ctl::CLKEN == 0 || port.control & ps2_ctl::RESET != 0 {
+            return;
+        }
+        if let Some(b) = self.attached(p).and_then(|d| d.pop_from(p == 1)) {
+            port.rx = b;
+            port.rx_full = true;
+        }
+    }
+
+    /// Send the pending byte if the transmitter is enabled.
+    fn transmit(&self, p: usize, port: &mut Ps2Port) {
+        if port.control & ps2_ctl::TX_ENABLE == 0 || port.control & ps2_ctl::RESET != 0 {
+            return;
+        }
+        if let Some(b) = port.tx.take() {
+            if let Some(d) = self.attached(p) {
+                d.write_to(b, p == 1);
+            }
+        }
+    }
+
     pub fn read(&self, addr: u32) -> u64 {
         let (p, reg) = Self::decode(addr);
-        let port = self.ports[p].lock().unwrap();
+        let mut port = self.ports[p].lock().unwrap();
+        self.latch(p, &mut port);
         match reg {
+            1 => {
+                let v = port.rx as u64;
+                port.rx_full = false;
+                self.latch(p, &mut port);
+                v
+            }
             2 => port.control,
             3 => {
-                // Idle and drained, with nothing ever arriving. The clock line
-                // is pulled up when no device is holding it down.
-                ps2_bit::TX_EMPTY | ps2_bit::CLOCK_SIGNAL
+                let mut st = ps2_bit::CLOCK_SIGNAL;
+                if port.control & ps2_ctl::CLKEN != 0 && port.control & ps2_ctl::RESET == 0 {
+                    st |= ps2_bit::CLOCK_INHIBIT;
+                }
+                if port.tx.is_none() {
+                    st |= ps2_bit::TX_EMPTY;
+                }
+                if port.rx_full {
+                    st |= ps2_bit::RX_FULL;
+                }
+                st
             }
-            // The receive register of a port with nothing on it.
             _ => 0,
         }
     }
@@ -1092,10 +1183,42 @@ impl MacePs2 {
                 if port.sent.len() < 64 {
                     port.sent.push(val as u8);
                 }
+                if port.control & ps2_ctl::RESET == 0 {
+                    port.tx = Some(val as u8);
+                    self.transmit(p, &mut port);
+                }
             }
-            2 => port.control = val,
+            2 => {
+                port.control = val & 0x3f;
+                if port.control & ps2_ctl::RESET != 0 {
+                    port.tx = None;
+                    port.rx_full = false;
+                }
+                self.transmit(p, &mut port);
+                self.latch(p, &mut port);
+            }
             _ => {}
         }
+    }
+
+    /// The PS/2 bits of MACE's ISA interrupt status: 9 and 11 are the ports'
+    /// interrupt requests (receive full with RxIEN, transmit empty with
+    /// TxIEN), 10 and 12 their unmasked receive-full flags.
+    pub fn isa_bits(&self) -> u64 {
+        let mut bits = 0;
+        for p in 0..2 {
+            let mut port = self.ports[p].lock().unwrap();
+            self.latch(p, &mut port);
+            let irq = (port.control & ps2_ctl::RX_INT != 0 && port.rx_full)
+                || (port.control & ps2_ctl::TX_INT != 0 && port.tx.is_none());
+            if irq {
+                bits |= 1 << (9 + 2 * p);
+            }
+            if port.rx_full {
+                bits |= 1 << (10 + 2 * p);
+            }
+        }
+        bits
     }
 }
 
@@ -1880,8 +2003,10 @@ pub struct Ip32Bus {
     flash_file: Option<std::path::PathBuf>,
     pub crime: Crime,
     pub mace: Stub,
-    pub crime_re: Stub,
-    pub gbe: Stub,
+    /// CRIME's rendering engine: draws into RAM through its tile tables.
+    pub crime_re: crate::dev::o2gfx::CrimeRe,
+    /// The display back end: scans the frame buffer out of RAM.
+    pub gbe: crate::dev::o2gfx::Gbe,
     pub macepci: MacePci,
     pub ust: std::sync::Arc<MaceUst>,
     pub nic_trace: NicTrace,
@@ -1938,8 +2063,11 @@ impl Ip32Bus {
             flash_file: std::env::var_os("IRIS_IP32_FLASH").map(Into::into),
             crime: Crime::new(ust.clone()),
             mace: Stub::new("mace"),
-            crime_re: Stub::new("crime-re"),
-            gbe: Stub::new("gbe"),
+            crime_re: crate::dev::o2gfx::CrimeRe::new(ram.clone()),
+            gbe: {
+                let ust = ust.clone();
+                crate::dev::o2gfx::Gbe::new(std::sync::Arc::new(move || ust.now()))
+            },
             macepci: MacePci::new(),
             ust: ust.clone(),
             nic_trace: NicTrace::new(),
@@ -2049,8 +2177,7 @@ impl Ip32Bus {
         }
         // So a hot offset can name the code polling it.
         bus.mace.watch_pc(pc.clone());
-        bus.crime_re.watch_pc(pc.clone());
-        bus.gbe.watch_pc(pc);
+        let _ = pc;
         bus
     }
 
@@ -2101,6 +2228,42 @@ impl Ip32Bus {
     }
 
     /// A CRIME write that may have moved a memory bank.
+    /// After any PS/2 register access: the ports' bits of MACE's ISA
+    /// interrupt status, and CRIME line 5 from them, follow at once. A level
+    /// left high after the handler drained the port reads as a spurious
+    /// interrupt to OpenBSD.
+    pub fn ps2_touched(&self) {
+        if self.ps2.devices().is_none() {
+            return;
+        }
+        let bits = self.ps2.isa_bits();
+        let isa = (self.mace.cell_pub(MACE_ISA_INT_STATUS) & !MACE_ISA_PS2_MASK) | bits;
+        self.mace.set_cell_pub(MACE_ISA_INT_STATUS, isa);
+        let mask = self.mace.cell_pub(MACE_ISA_INT_MASK);
+        self.crime.set_int(IP32_MISC_CRIME_INT, isa & mask & 0xff00 != 0);
+    }
+
+    /// After a write to a MACE register held as a plain cell.
+    fn mace_wrote(&self, addr: u32) {
+        // MACE revision 2 or later: SGI software reads bit 4 of the ISA ring
+        // base register as that, and with it clear shifts every PS/2 reply
+        // right one bit to work around revision 1.
+        if addr & !7 == MACE_ISA_RING_BASE && self.ps2.devices().is_some() {
+            let v = self.mace.cell_pub(MACE_ISA_RING_BASE);
+            self.mace.set_cell_pub(MACE_ISA_RING_BASE, v | MACE_REV2_BIT);
+        }
+    }
+
+    /// Plug in what a graphics console needs: a PS/2 keyboard on port 0, a
+    /// CRIME that reads as revision 1.1 (ID 0xa1, the value the PROM requires
+    /// before it adds the graphics component) and MACE revision 2.
+    pub fn enable_graphics(&mut self) {
+        self.ps2 = MacePs2::with_devices(false);
+        self.crime.revision = CRIME_REV_GBE;
+        let v = self.mace.cell_pub(MACE_ISA_RING_BASE);
+        self.mace.set_cell_pub(MACE_ISA_RING_BASE, v | MACE_REV2_BIT);
+    }
+
     fn crime_wrote(&self, addr: u32) {
         let off = (addr - CRIME_BASE) & !7;
         if (crime_reg::MEM_BANK_CTRL0..crime_reg::MEM_BANK_CTRL0 + 8 * 8).contains(&off) {
@@ -2430,7 +2593,9 @@ impl BusDevice for Ip32Bus {
             return BusRead8::ok(self.pci_mem_read_w(addr, 1) as u8);
         }
         if self.in_ps2(addr) {
-            return BusRead8::ok(self.ps2.read(addr) as u8);
+            let v = self.ps2.read(addr);
+            self.ps2_touched();
+            return BusRead8::ok(v as u8);
         }
         if self.in_rtc(addr) {
             return self.rtc.read8(addr);
@@ -2464,7 +2629,9 @@ impl BusDevice for Ip32Bus {
             return BusRead16::ok(self.pci_mem_read_w(addr, 2) as u16);
         }
         if self.in_ps2(addr) {
-            return BusRead16::ok(self.ps2.read(addr) as u16);
+            let v = self.ps2.read(addr);
+            self.ps2_touched();
+            return BusRead16::ok(v as u16);
         }
         if self.in_rtc(addr) {
             return self.rtc.read16(addr);
@@ -2511,7 +2678,9 @@ impl BusDevice for Ip32Bus {
             return BusRead32::ok(self.pci_mem_read(addr) as u32);
         }
         if self.in_ps2(addr) {
-            return BusRead32::ok(self.ps2.read(addr) as u32);
+            let v = self.ps2.read(addr);
+            self.ps2_touched();
+            return BusRead32::ok(v as u32);
         }
         if self.in_rtc(addr) {
             return self.rtc.read32(addr);
@@ -2559,7 +2728,9 @@ impl BusDevice for Ip32Bus {
             return BusRead64::ok((hi << 32) | lo);
         }
         if self.in_ps2(addr) {
-            return BusRead64::ok(self.ps2.read(addr));
+            let v = self.ps2.read(addr);
+            self.ps2_touched();
+            return BusRead64::ok(v);
         }
         if self.in_rtc(addr) {
             return self.rtc.read64(addr);
@@ -2593,7 +2764,9 @@ impl BusDevice for Ip32Bus {
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), true, val);
             self.nic_write(val);
-            return self.mace.write8(addr, val);
+            let r = self.mace.write8(addr, val);
+            self.mace_wrote(addr);
+            return r;
         }
         if let Some(c) = self.com_for(addr) {
             return c.write8(addr, val);
@@ -2604,13 +2777,16 @@ impl BusDevice for Ip32Bus {
         }
         if self.in_ps2(addr) {
             self.ps2.write(addr, val as u64);
+            self.ps2_touched();
             return BUS_OK;
         }
         if self.in_rtc(addr) {
             return self.rtc.write8(addr, val);
         }
         if self.in_mace(addr) {
-            return self.mace.write8(addr, val);
+            let r = self.mace.write8(addr, val);
+            self.mace_wrote(addr);
+            return r;
         }
         if self.write_bytes(addr, 1, val as u64) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
@@ -2642,13 +2818,16 @@ impl BusDevice for Ip32Bus {
         }
         if self.in_ps2(addr) {
             self.ps2.write(addr, val as u64);
+            self.ps2_touched();
             return BUS_OK;
         }
         if self.in_rtc(addr) {
             return self.rtc.write16(addr, val);
         }
         if self.in_mace(addr) {
-            return self.mace.write16(addr, val);
+            let r = self.mace.write16(addr, val);
+            self.mace_wrote(addr);
+            return r;
         }
         if self.write_bytes(addr, 2, val as u64) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
@@ -2682,7 +2861,9 @@ impl BusDevice for Ip32Bus {
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), true, val as u8);
             self.nic_write(val as u8);
-            return self.mace.write32(addr, val);
+            let r = self.mace.write32(addr, val);
+            self.mace_wrote(addr);
+            return r;
         }
         if let Some(c) = self.com_for(addr) {
             return c.write32(addr, val);
@@ -2693,13 +2874,16 @@ impl BusDevice for Ip32Bus {
         }
         if self.in_ps2(addr) {
             self.ps2.write(addr, val as u64);
+            self.ps2_touched();
             return BUS_OK;
         }
         if self.in_rtc(addr) {
             return self.rtc.write32(addr, val);
         }
         if self.in_mace(addr) {
-            return self.mace.write32(addr, val);
+            let r = self.mace.write32(addr, val);
+            self.mace_wrote(addr);
+            return r;
         }
         if self.write_bytes(addr, 4, val as u64) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
@@ -2732,7 +2916,9 @@ impl BusDevice for Ip32Bus {
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), true, val as u8);
             self.nic_write(val as u8);
-            return self.mace.write64(addr, val);
+            let r = self.mace.write64(addr, val);
+            self.mace_wrote(addr);
+            return r;
         }
         if let Some(c) = self.com_for(addr) {
             return c.write64(addr, val);
@@ -2743,13 +2929,16 @@ impl BusDevice for Ip32Bus {
         }
         if self.in_ps2(addr) {
             self.ps2.write(addr, val as u64);
+            self.ps2_touched();
             return BUS_OK;
         }
         if self.in_rtc(addr) {
             return self.rtc.write64(addr, val);
         }
         if self.in_mace(addr) {
-            return self.mace.write64(addr, val);
+            let r = self.mace.write64(addr, val);
+            self.mace_wrote(addr);
+            return r;
         }
         self.note_sizemem(addr, true, val);
         if self.write_bytes(addr, 8, val) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
@@ -2969,6 +3158,63 @@ pub fn parse_prom_sections(prom: &[u8]) -> Vec<PromSection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Send `b` the PROM's way: clock off, TX, then TxEN|CLKEN.
+    fn ps2_send(k: &MacePs2, port: u32, b: u8) {
+        let base = MACE_PS2 + 0x20 * port;
+        k.write(base + 0x10, 0);
+        k.write(base, b as u64);
+        k.write(base + 0x10, ps2_ctl::TX_ENABLE | ps2_ctl::CLKEN);
+    }
+
+    fn ps2_recv(k: &MacePs2, port: u32) -> Option<u8> {
+        let base = MACE_PS2 + 0x20 * port;
+        (k.read(base + 0x18) & ps2_bit::RX_FULL != 0).then(|| k.read(base + 8) as u8)
+    }
+
+    #[test]
+    fn the_keyboard_answers_the_proms_probe_and_identifies_itself() {
+        let k = MacePs2::with_devices(false);
+        ps2_send(&k, 0, 0xf5);
+        assert_eq!(ps2_recv(&k, 0), Some(0xfa));
+        assert_eq!(ps2_recv(&k, 0), None, "one reply");
+        assert_eq!(k.read(MACE_PS2 + 8) as u8, 0xfa, "the latch keeps the last byte");
+        ps2_send(&k, 0, 0xf2);
+        let id: Vec<_> = std::iter::from_fn(|| ps2_recv(&k, 0)).collect();
+        assert_eq!(id, [0xfa, 0xab, 0x83]);
+        ps2_send(&k, 0, 0xf0);
+        ps2_send(&k, 0, 0x03);
+        ps2_send(&k, 0, 0xf0);
+        ps2_send(&k, 0, 0x00);
+        let got: Vec<_> = std::iter::from_fn(|| ps2_recv(&k, 0)).collect();
+        assert_eq!(got, [0xfa, 0xfa, 0xfa, 0xfa, 0x03], "set 3 selected, then read back");
+    }
+
+    #[test]
+    fn nothing_arrives_while_the_clock_is_held_or_on_an_empty_port() {
+        let k = MacePs2::with_devices(false);
+        k.write(MACE_PS2 + 0x10, 0);
+        k.write(MACE_PS2, 0xf5);
+        k.write(MACE_PS2 + 0x10, ps2_ctl::TX_ENABLE);
+        assert_eq!(k.read(MACE_PS2 + 0x18) & ps2_bit::RX_FULL, 0, "clock held: the reply waits");
+        k.write(MACE_PS2 + 0x10, ps2_ctl::TX_ENABLE | ps2_ctl::CLKEN);
+        assert_eq!(ps2_recv(&k, 0), Some(0xfa));
+        // No mouse: the byte drains and nothing ever comes back.
+        ps2_send(&k, 1, 0xf6);
+        assert_ne!(k.read(MACE_PS2 + 0x38) & ps2_bit::TX_EMPTY, 0);
+        assert_eq!(ps2_recv(&k, 1), None);
+    }
+
+    #[test]
+    fn a_waiting_byte_raises_the_keyboard_interrupt_only_when_enabled() {
+        let k = MacePs2::with_devices(false);
+        ps2_send(&k, 0, 0xee);
+        assert_eq!(k.isa_bits(), 1 << 10, "poll flag only");
+        k.write(MACE_PS2 + 0x10, ps2_ctl::TX_ENABLE | ps2_ctl::CLKEN | ps2_ctl::RX_INT);
+        assert_eq!(k.isa_bits(), (1 << 9) | (1 << 10));
+        assert_eq!(ps2_recv(&k, 0), Some(0xee));
+        assert_eq!(k.isa_bits(), 0);
+    }
 
     #[test]
     fn crime_is_a_64_bit_register_file() {
@@ -3640,7 +3886,43 @@ mod bringup {
             Err(e) => panic!("ip32: no such O2 memory fitting: {e}"),
         };
         let bus_prom = prom.clone();
-        let bus = Arc::new(Ip32Bus::with_memory(mem, prom));
+        // IRIS_IP32_GFX=1: a keyboard and the graphics console's CRIME ID.
+        let gfx = std::env::var("IRIS_IP32_GFX").as_deref() == Ok("1");
+        let mut bus = Ip32Bus::with_memory(mem, prom);
+        if gfx {
+            bus.enable_graphics();
+        }
+        let bus = Arc::new(bus);
+        // Keys from ip32-view (IRIS_IP32_KBD, a TCP port on 127.0.0.1).
+        // The screen for ip32-view (IRIS_IP32_FB, a file both share) and, every
+        // few seconds while it changes, a PNG of it (IRIS_IP32_PNG).
+        let mut screen = std::env::var("IRIS_IP32_FB").ok().and_then(|p| match crate::ip32_screen::ScreenFile::create(&p) {
+            Ok(s) => {
+                eprintln!("ip32: screen in {p} (ip32-view {p})");
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("ip32: no screen file {p}: {e}");
+                None
+            }
+        });
+        let png_path = std::env::var("IRIS_IP32_PNG").ok();
+        let mut frame = vec![0u8; 2048 * 2048 * 4];
+        let mut last_frame = std::time::Instant::now();
+        let mut last_png = std::time::Instant::now();
+        let mut png_hash = 0u64;
+        let keys = std::env::var("IRIS_IP32_KBD").ok().and_then(|p| p.parse::<u16>().ok()).and_then(|p| {
+            match crate::ip32_screen::KeyEvents::listen(p) {
+                Ok(k) => {
+                    eprintln!("ip32: keyboard from ip32-view on 127.0.0.1:{p}");
+                    Some(k)
+                }
+                Err(e) => {
+                    eprintln!("ip32: no keyboard port {p}: {e}");
+                    None
+                }
+            }
+        });
         let sysad: Arc<dyn crate::traits::BusDevice> = bus.clone();
         let cfg = MipsCpuConfig::for_model::<C>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
@@ -4159,6 +4441,32 @@ mod bringup {
                     }
                 }
             }
+            // About 25 frames a second to the viewer, by host time.
+            if steps % 65536 == 0 && (screen.is_some() || png_path.is_some())
+                && last_frame.elapsed() >= std::time::Duration::from_millis(40)
+            {
+                last_frame = std::time::Instant::now();
+                let size = bus.gbe.render(&bus.ram.lock().unwrap(), &mut frame);
+                let (w, h) = size.unwrap_or((0, 0));
+                if let Some(s) = screen.as_mut() {
+                    let n = (w * h * 4) as usize;
+                    s.pixels(w, h)[..n].copy_from_slice(&frame[..n]);
+                    s.publish(w, h);
+                }
+                if let (Some(p), Some((w, h))) = (png_path.as_ref(), size) {
+                    if last_png.elapsed() >= std::time::Duration::from_secs(5) {
+                        last_png = std::time::Instant::now();
+                        let n = (w * h * 4) as usize;
+                        let hash = frame[..n].iter().step_by(61).fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
+                        if hash != png_hash {
+                            png_hash = hash;
+                            if let Err(e) = crate::ip32_screen::save_png(p, &frame[..n], w, h) {
+                                eprintln!("ip32: PNG {p}: {e}");
+                            }
+                        }
+                    }
+                }
+            }
             #[cfg(feature = "jitv2")]
             if jit_on {
                 jit_pause.check();
@@ -4203,7 +4511,18 @@ mod bringup {
                     isa & !MACE_ISA_SERIAL0_MASK
                 };
                 bus.mace.set_cell_pub(MACE_ISA_INT_STATUS, isa);
-                bus.crime.set_int(IP32_ISA_CRIME_INT, isa != 0);
+                // Line 4 is serial and parallel only (bits 16..31); bits 8..15
+                // are line 5's, from the PS/2 ports among others.
+                bus.crime.set_int(IP32_ISA_CRIME_INT, isa & 0xffff_0000 != 0);
+                // Keys pushed from the viewer arrive between register accesses.
+                if let (Some(k), Some(dev)) = (keys.as_ref(), bus.ps2.devices()) {
+                    while let Some((name, down)) = k.pop() {
+                        if let Some(code) = crate::ip32_screen::keycode(&name) {
+                            dev.push_kb(code, down);
+                        }
+                    }
+                }
+                bus.ps2_touched();
                 let bits = &exec.core.hot.interrupts;
                 let cur = bits.load(std::sync::atomic::Ordering::Relaxed);
                 let ip2 = crate::cpu::mips_core::CAUSE_IP2 as u64;

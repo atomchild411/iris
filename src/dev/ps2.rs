@@ -476,6 +476,29 @@ impl Ps2Controller {
         self.update_interrupt();
     }
 
+    /// Send a byte straight to the keyboard (`mouse == false`) or the mouse,
+    /// for a host with a separate port per device and no 8042 (the O2's
+    /// MACE). Same device behaviour as the data port, without controller
+    /// commands in between.
+    pub fn write_to(&self, val: u8, mouse: bool) {
+        self.state.lock().next_write_is_mouse = mouse;
+        self.write_data(val);
+    }
+
+    /// The oldest byte the keyboard (or the mouse) has sent, taken from the
+    /// shared queue. For one-port-per-device hosts; see [`Self::write_to`].
+    pub fn pop_from(&self, mouse: bool) -> Option<u8> {
+        let mut state = self.state.lock();
+        let i = state.rx_queue.iter().position(|(_, src)| matches!(src, Ps2Source::Keyboard) != mouse)?;
+        let (byte, src) = state.rx_queue.remove(i)?;
+        if matches!(src, Ps2Source::Mouse) {
+            state.mouse_queue_bytes -= 1;
+        }
+        drop(state);
+        self.update_interrupt();
+        Some(byte)
+    }
+
     /// Push a scancode byte to the keyboard queue (called from UI)
     pub fn push_kb(&self, key: KeyCode, pressed: bool) {
         if !self.running.load(Ordering::Relaxed) { return; }
