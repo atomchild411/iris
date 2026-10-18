@@ -4,6 +4,7 @@
 pub mod aic7880;
 pub mod gl;
 pub mod gr2;
+pub mod mec;
 pub mod mgras;
 pub mod ng1;
 

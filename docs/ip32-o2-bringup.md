@@ -1573,13 +1573,33 @@ is not at `ip32/` beside the working directory.
 
 The machine it builds: an R5000 (rev 2.1, 48 TLB entries, 32 KB/32 KB L1),
 128 MB at `0x40000000`, the real PROM, CRIME and MACE, com0 as the console, and
-an AIC-7880 with the disk at target 1 (a second, empty, as on a real O2). Not
-there yet: Ethernet (NetBSD's `mec0` times out), audio, graphics output, and a
-real-time clock time. It is a test harness, not a machine profile: the console
+an AIC-7880 with the disk at target 1 (a second, empty, as on a real O2), and
+the Ethernet (below). Not there yet: audio, graphics output, and a real-time
+clock time. It is a test harness, not a machine profile: the console
 goes to a file (`IRIS_IP32_CONSOLE`), input can be scripted, and
 `IRIS_IP32_SERIAL=port` puts com0 on a live TCP console as well -- `telnet
 127.0.0.1 port`, the same telnet character mode as the other machines' serial
 ports. With `IRIS_IP32_STEPS` large the machine runs until stopped: log in, use
 it, `shutdown -p now`, then stop the test.
+
+## Ethernet: MACE's MAC-110 (2026-10-17)
+
+`src/dev/mec.rs`, at MACE + 0x280000 on CRIME interrupt 3, implements what
+NetBSD's `mec` driver relies on: 64-bit registers; a 64-entry ring of 128-byte
+transmit descriptors (inline data ending at byte 127, then up to three pointers,
+each descriptor's word 0 rewritten as its status, the read pointer in
+INT_STATUS bits 16-24, TX_EMPTY latched when the ring runs dry); a 16-deep FIFO
+of 4 KB receive buffers (two bytes of padding, the frame at offset 34 with its
+CRC, the status word written last, RX_THRESHOLD); write-one-to-clear
+interrupts; and a QS6612 PHY at MII address 8 that has a 100 Mbit full-duplex
+link, as on a real O2 -- NetBSD attaches `qsphy0 at mec0 phy 8`.
+
+`IRIS_IP32_NET=1` puts it behind IRIS's NAT gateway (the Indy's: DHCP, DNS,
+port forwards), `IRIS_IP32_FWD=tcp:2263:22,...` forwards host ports on
+127.0.0.1. NetBSD 11 on the O2 then takes 192.168.0.2 by DHCP, pings the gateway
+and the internet, resolves names, and runs sshd: `ssh -p 2263 root@127.0.0.1`
+logs in, and 4 MB copied each way with scp came back identical (about 200 KB/s,
+the emulated R5000 doing the encryption), with no interface errors and no
+watchdog timeouts.
 
 Related: [`virtio-mmio-design.md`](virtio-mmio-design.md).

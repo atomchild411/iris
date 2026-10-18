@@ -60,6 +60,10 @@ pub mod nic_bit {
 
 /// `com0`, the PROM's console UART. NetBSD attaches it at `mace0 offset
 /// 0x390000`; `com1` follows at 0x398000.
+/// The Ethernet, MAC-110 (`crate::dev::mec`), and its CRIME interrupt.
+pub const MACE_MEC: u32 = MACE_BASE + 0x0028_0000;
+pub const MACE_MEC_SIZE: u32 = 0x0000_0200;
+pub const IP32_MEC_CRIME_INT: u32 = 3;
 pub const MACE_COM0: u32 = MACE_BASE + 0x0039_0000;
 pub const MACE_COM1: u32 = MACE_BASE + 0x0039_8000;
 pub const MACE_COM_SIZE: u32 = 0x0000_0800;
@@ -1683,6 +1687,8 @@ pub struct Ip32Bus {
     pub onewire: OneWireId,
     pub com0: Com16550,
     pub com1: Com16550,
+    /// The Ethernet. Its frames go nowhere until `start_nat` (IRIS_IP32_NET).
+    pub mec: std::sync::Arc<crate::dev::mec::Mec>,
     pub pci_view: PciNativeView,
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write, pc)`.
     unmapped: Mutex<Vec<(u32, bool, u32)>>,
@@ -1730,6 +1736,7 @@ impl Ip32Bus {
             onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
             com0: Com16550::new(),
             com1: Com16550::new(),
+            mec: std::sync::Arc::new(crate::dev::mec::Mec::new(ram.clone())),
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
             pc: pc.clone(),
@@ -2002,6 +2009,10 @@ impl Ip32Bus {
         addr >= CRIME_BASE && addr < CRIME_BASE + CRIME_SIZE
     }
 
+    fn in_mec(&self, addr: u32) -> bool {
+        (MACE_MEC..MACE_MEC + MACE_MEC_SIZE).contains(&addr)
+    }
+
     fn in_mace(&self, addr: u32) -> bool {
         addr >= MACE_BASE && addr < MACE_BASE + MACE_SIZE
     }
@@ -2242,6 +2253,11 @@ impl BusDevice for Ip32Bus {
     }
 
     fn read32(&self, addr: u32) -> BusRead32 {
+        if self.in_mec(addr) {
+            // The registers are 64-bit; a 32-bit access is the half it names.
+            let v = self.mec.read64((addr - MACE_MEC) & !7);
+            return BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 });
+        }
         if self.in_gbe(addr) {
             return self.gbe.read32(addr);
         }
@@ -2306,6 +2322,9 @@ impl BusDevice for Ip32Bus {
             let v = self.nic_read();
             self.nic_trace.record(self.ust.now(), false, v);
             return BusRead64::ok(v as u64);
+        }
+        if self.in_mec(addr) {
+            return BusRead64::ok(self.mec.read64(addr - MACE_MEC));
         }
         if let Some(c) = self.com_for(addr) {
             return c.read64(addr);
@@ -2408,6 +2427,11 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write32(&self, addr: u32, val: u32) -> u32 {
+        if self.in_mec(addr) {
+            // MACE takes 64-bit stores; a 32-bit one is the low word.
+            self.mec.write64((addr - MACE_MEC) & !7, val as u64);
+            return BUS_OK;
+        }
         if self.in_gbe(addr) {
             return self.gbe.write32(addr, val);
         }
@@ -2452,6 +2476,10 @@ impl BusDevice for Ip32Bus {
     }
 
     fn write64(&self, addr: u32, val: u64) -> u32 {
+        if self.in_mec(addr) {
+            self.mec.write64(addr - MACE_MEC, val);
+            return BUS_OK;
+        }
         if self.in_gbe(addr) {
             return self.gbe.write64(addr, val);
         }
@@ -3311,6 +3339,34 @@ mod bringup {
                 eprintln!("ip32: console log {path}: {e}");
             }
         }
+        // IRIS_IP32_NET=1: the Ethernet behind IRIS's NAT gateway (DHCP,
+        // DNS), with IRIS_IP32_FWD="tcp:2263:22,..." forwarding host ports
+        // on 127.0.0.1 to the guest.
+        if std::env::var("IRIS_IP32_NET").is_ok() {
+            let mut cfg = crate::net::GatewayConfig::default();
+            for rule in std::env::var("IRIS_IP32_FWD").unwrap_or_default().split(',').filter(|r| !r.is_empty()) {
+                let parts: Vec<&str> = rule.split(':').collect();
+                let proto = match parts.first().copied() {
+                    Some("udp") => crate::config::ForwardProto::Udp,
+                    _ => crate::config::ForwardProto::Tcp,
+                };
+                let (Some(Ok(host_port)), Some(Ok(guest_port))) =
+                    (parts.get(1).map(|p| p.parse::<u16>()), parts.get(2).map(|p| p.parse::<u16>()))
+                else {
+                    eprintln!("ip32: IRIS_IP32_FWD rule {rule:?}: want proto:host_port:guest_port");
+                    continue;
+                };
+                cfg.port_forwards.push(crate::config::PortForwardConfig {
+                    proto,
+                    host_port,
+                    guest_port,
+                    bind: crate::config::ForwardBind::Localhost,
+                });
+                eprintln!("ip32: forwarding 127.0.0.1:{host_port} to the guest's port {guest_port}");
+            }
+            eprintln!("ip32: Ethernet on NAT: gateway {}, guest {} (DHCP)", cfg.gateway_ip, cfg.client_ip);
+            bus.mec.start_nat(cfg);
+        }
         // IRIS_IP32_SERIAL=port: com0 as a live console on 127.0.0.1:port
         // (telnet or nc), alongside the log and any script.
         if let Some(port) = std::env::var("IRIS_IP32_SERIAL").ok().and_then(|v| v.parse::<u16>().ok()) {
@@ -3592,6 +3648,9 @@ mod bringup {
                 for (scsi, line) in bus.scsi.lock().unwrap().iter() {
                     bus.crime.set_int(*line, scsi.interrupting());
                 }
+                // The Ethernet: frames the network has for the guest, then its line.
+                bus.mec.poll();
+                bus.crime.set_int(IP32_MEC_CRIME_INT, bus.mec.interrupting());
                 // The console's receive interrupt. The PROM polls the UART
                 // and never needed this; a kernel does not poll, so without
                 // it every character typed at a prompt sits in the receive

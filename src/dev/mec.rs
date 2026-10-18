@@ -1,0 +1,653 @@
+//! The SGI O2's Ethernet: MACE's MAC-110 ("mec"), at MACE + 0x280000, on
+//! CRIME interrupt 3.
+//!
+//! What it implements is the contract NetBSD's `mec` driver relies on, as its
+//! source shows it (see `docs/ip32-o2-bringup.md`):
+//!
+//! - Registers are 64 bits, big-endian. INT_STATUS's low byte is
+//!   write-one-to-clear; bits 16-24 read back the transmit read pointer.
+//! - Transmit: a ring of 64 descriptors of 128 bytes at TX_RING_BASE. Word 0
+//!   is the command (frame length - 1, where the inline data starts, which of
+//!   three pointers follow, interrupt-on-send); inline data runs to the end of
+//!   the descriptor, then each pointer's bytes (address in bits 3-31, length -
+//!   1 in bits 32-47). Writing TX_RING_PTR sends everything up to it; each
+//!   descriptor's word 0 then becomes its status (sent, success, length) and
+//!   the read pointer advances past it. Running dry latches TX_EMPTY.
+//! - Receive: the driver hands 4 KB buffers over by writing their addresses
+//!   to the MCL FIFO. A frame goes into the oldest: two bytes of padding at
+//!   offset 32, the frame at 34, then its CRC; the status word (length with
+//!   the CRC, received, broadcast/multicast) at offset 0 is written last, and
+//!   RX_THRESHOLD is latched.
+//! - The PHY: a Quality Semiconductor QS6612 at MII address 8, as on a real
+//!   O2, autonegotiated to 100 Mbit full duplex. Every MII operation is done
+//!   by the time the driver looks, so the busy bit never reads set.
+//!
+//! Frames go to and come from a network backend over two rings, the way the
+//! Indy's SEEQ 8003 meets IRIS's NAT gateway: `start_nat` runs one.
+
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
+pub mod reg {
+    pub const MAC_CONTROL: u32 = 0x00;
+    pub const INT_STATUS: u32 = 0x08;
+    pub const DMA_CONTROL: u32 = 0x10;
+    pub const TIMER: u32 = 0x18;
+    pub const TX_ALIAS: u32 = 0x20;
+    pub const RX_ALIAS: u32 = 0x28;
+    pub const TX_RING_PTR: u32 = 0x30;
+    pub const RX_FIFO: u32 = 0x40;
+    pub const PHY_DATA: u32 = 0x60;
+    pub const PHY_ADDRESS: u32 = 0x68;
+    pub const PHY_READ_INITIATE: u32 = 0x70;
+    pub const STATION: u32 = 0xa0;
+    pub const STATION_ALT: u32 = 0xa8;
+    pub const MULTICAST: u32 = 0xb0;
+    pub const TX_RING_BASE: u32 = 0xb8;
+    pub const MCL_RX_FIFO: u32 = 0x100;
+}
+
+pub mod bits {
+    pub const MAC_CORE_RESET: u64 = 0x1;
+    pub const MAC_FILTER_MASK: u64 = 0x60;
+    pub const MAC_FILTER_MATCHMULTI: u64 = 0x20;
+    pub const MAC_FILTER_ALLMULTI: u64 = 0x40;
+    pub const MAC_FILTER_PROMISC: u64 = 0x60;
+
+    pub const INT_TX_EMPTY: u64 = 0x01;
+    pub const INT_TX_PACKET_SENT: u64 = 0x02;
+    pub const INT_RX_THRESHOLD: u64 = 0x20;
+    pub const INT_RX_FIFO_UNDERFLOW: u64 = 0x40;
+
+    pub const DMA_TX_INT_ENABLE: u64 = 0x1;
+    pub const DMA_TX_DMA_ENABLE: u64 = 0x2;
+    pub const DMA_RX_INT_ENABLE: u64 = 0x200;
+    pub const DMA_RX_DMA_OFFSET_SHIFT: u32 = 12;
+    pub const DMA_RX_DMA_ENABLE: u64 = 0x8000;
+
+    pub const TXCMD_LEN_MASK: u64 = 0xffff;
+    pub const TXCMD_BUFSTART_SHIFT: u32 = 16;
+    pub const TXCMD_TXINT: u64 = 1 << 24;
+    pub const TXCMD_PTR1: u64 = 1 << 25;
+
+    pub const TXSTAT_SUCCESS: u64 = 1 << 23;
+    pub const TXSTAT_SENT: u64 = 1 << 63;
+
+    pub const RXSTAT_MCAST: u64 = 1 << 19;
+    pub const RXSTAT_BCAST: u64 = 1 << 20;
+    pub const RXSTAT_MATCHMAC: u64 = 1 << 26;
+    pub const RXSTAT_SEQ_SHIFT: u32 = 27;
+    pub const RXSTAT_RECEIVED: u64 = 1 << 63;
+
+    pub const PHY_BUSY: u64 = 0x1_0000;
+}
+
+/// Ring and buffer geometry the driver fixes.
+pub const TX_RING_LEN: u32 = 64;
+pub const TX_DESC_SIZE: u32 = 128;
+pub const RX_FIFO_DEPTH: usize = 16;
+pub const RX_BUF_SIZE: usize = 4096;
+/// Two bytes the chip puts in front of a received frame, so its IP header
+/// lands on a 4-byte boundary.
+const RX_PAD: usize = 2;
+/// The shortest frame on the wire, without its CRC.
+const MIN_FRAME: usize = 60;
+
+/// The PHY: one, at the MII address a real O2's has.
+pub const PHY_ADDR: u32 = 8;
+
+/// A QS6612, autonegotiated to 100 Mbit full duplex.
+struct Phy {
+    regs: [u16; 32],
+}
+
+impl Phy {
+    const BMCR: usize = 0;
+    const BMSR: usize = 1;
+    const ANAR: usize = 4;
+    /// After a reset: autonegotiation on, 100 Mbit, full duplex.
+    const BMCR_DEFAULT: u16 = 0x3100;
+    const BMCR_RESET: u16 = 0x8000;
+    const BMCR_STARTNEG: u16 = 0x0200;
+
+    fn new() -> Self {
+        let mut regs = [0u16; 32];
+        regs[Self::BMCR] = Self::BMCR_DEFAULT;
+        // 100TX FD/HD, 10 FD/HD, autonegotiation complete, able to
+        // autonegotiate, link up, extended registers.
+        regs[Self::BMSR] = 0x782d;
+        // QS6612: OUI 0x00068a, model 0.
+        regs[2] = 0x0181;
+        regs[3] = 0x4401;
+        regs[Self::ANAR] = 0x01e1;
+        // The partner offers the same.
+        regs[5] = 0x45e1;
+        regs[6] = 0x0001;
+        // QS6612 PHY control: the negotiated mode, 100TX full duplex.
+        regs[31] = 0x1018;
+        Self { regs }
+    }
+
+    fn read(&self, r: usize) -> u16 {
+        self.regs[r & 31]
+    }
+
+    fn write(&mut self, r: usize, v: u16) {
+        let r = r & 31;
+        match r {
+            Self::BMCR => {
+                if v & Self::BMCR_RESET != 0 {
+                    *self = Self::new();
+                } else {
+                    // Starting a negotiation finishes at once.
+                    self.regs[r] = v & !Self::BMCR_STARTNEG;
+                }
+            }
+            // Status, identity and the partner's word are read-only.
+            1 | 2 | 3 | 5 | 6 | 31 => {}
+            _ => self.regs[r] = v,
+        }
+    }
+}
+
+struct State {
+    mac_control: u64,
+    /// INT_STATUS bits 0-7, latched until written back.
+    int_status: u64,
+    dma_control: u64,
+    tx_ring_base: u64,
+    tx_read: u32,
+    tx_write: u32,
+    station: u64,
+    multicast: u64,
+    /// Buffers handed over and not yet filled, oldest first.
+    mcl_fifo: VecDeque<u32>,
+    /// Bits 27-31 of each received frame's status.
+    rx_seq: u64,
+    phy: Phy,
+    phy_address: u64,
+    phy_data: u64,
+    /// Anything else written, read back as written.
+    other: std::collections::HashMap<u32, u64>,
+    tx_frames: u64,
+    rx_frames: u64,
+    rx_dropped: u64,
+}
+
+impl State {
+    fn new() -> Self {
+        Self {
+            mac_control: 0,
+            int_status: 0,
+            dma_control: 0,
+            tx_ring_base: 0,
+            tx_read: 0,
+            tx_write: 0,
+            station: 0,
+            multicast: 0,
+            mcl_fifo: VecDeque::new(),
+            rx_seq: 0,
+            phy: Phy::new(),
+            phy_address: 0,
+            phy_data: 0,
+            other: Default::default(),
+            tx_frames: 0,
+            rx_frames: 0,
+            rx_dropped: 0,
+        }
+    }
+
+    /// A core reset, or DMA turned off: both rings start again from empty.
+    /// The station address survives -- the driver writes it once, before its
+    /// first reset.
+    fn reset_rings(&mut self) {
+        self.tx_read = 0;
+        self.tx_write = 0;
+        self.mcl_fifo.clear();
+        self.int_status = 0;
+    }
+}
+
+/// Where frames go: a backend's two rings.
+struct Link {
+    to_net: rtrb::Producer<Vec<u8>>,
+    from_net: rtrb::Consumer<Vec<u8>>,
+    /// Told when a frame has been put on `to_net`.
+    tx_wake: Option<Arc<crate::net::Wake>>,
+}
+
+pub struct Mec {
+    ram: Arc<Mutex<Vec<u8>>>,
+    st: Mutex<State>,
+    link: Mutex<Option<Link>>,
+}
+
+impl Mec {
+    pub fn new(ram: Arc<Mutex<Vec<u8>>>) -> Self {
+        Self { ram, st: Mutex::new(State::new()), link: Mutex::new(None) }
+    }
+
+    /// Connect to a backend: frames sent go on `to_net`, frames on `from_net`
+    /// are received.
+    pub fn attach(&self, to_net: rtrb::Producer<Vec<u8>>, from_net: rtrb::Consumer<Vec<u8>>, tx_wake: Option<Arc<crate::net::Wake>>) {
+        *self.link.lock().unwrap() = Some(Link { to_net, from_net, tx_wake });
+    }
+
+    /// Run IRIS's NAT gateway behind this interface, on a thread of its own:
+    /// DHCP, DNS and the port forwards in `config`, as the Indy's SEEQ 8003
+    /// has them.
+    pub fn start_nat(&self, config: crate::net::GatewayConfig) {
+        let (to_net, tx_cons) = rtrb::RingBuffer::new(256);
+        let (rx_prod, from_net) = rtrb::RingBuffer::new(256);
+        let rx_wake = crate::net::Wake::new();
+        let tx_wake = crate::net::Wake::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let ctl = crate::net::NatControl::new();
+        let tw = tx_wake.clone();
+        std::thread::Builder::new()
+            .name("ip32-mec-nat".into())
+            .spawn(move || {
+                crate::net::NatEngine::new(config, tx_cons, rx_prod, rx_wake, tw, running, ctl).run();
+            })
+            .expect("mec NAT thread");
+        self.attach(to_net, from_net, Some(tx_wake));
+    }
+
+    /// Frames sent and received so far, and received ones dropped for want of
+    /// a buffer.
+    pub fn counts(&self) -> (u64, u64, u64) {
+        let s = self.st.lock().unwrap();
+        (s.tx_frames, s.rx_frames, s.rx_dropped)
+    }
+
+    /// The interrupt line: something latched that is enabled.
+    pub fn interrupting(&self) -> bool {
+        let s = self.st.lock().unwrap();
+        let tx = s.int_status & (bits::INT_TX_EMPTY | bits::INT_TX_PACKET_SENT) != 0
+            && s.dma_control & bits::DMA_TX_INT_ENABLE != 0;
+        let rx = s.int_status & (bits::INT_RX_THRESHOLD | bits::INT_RX_FIFO_UNDERFLOW) != 0
+            && s.dma_control & bits::DMA_RX_INT_ENABLE != 0;
+        tx || rx
+    }
+
+    fn ram_offset(addr: u64, len: usize) -> Option<usize> {
+        let addr = addr as u32;
+        let i = if addr >= crate::ip32::RAM_BASE {
+            addr.wrapping_sub(crate::ip32::RAM_BASE) as usize
+        } else {
+            addr as usize
+        };
+        (i < len).then_some(i)
+    }
+
+    fn ram_read(&self, addr: u64, out: &mut [u8]) {
+        let r = self.ram.lock().unwrap();
+        for (k, b) in out.iter_mut().enumerate() {
+            *b = Self::ram_offset(addr + k as u64, r.len()).map_or(0, |i| r[i]);
+        }
+    }
+
+    fn ram_write(&self, addr: u64, data: &[u8]) {
+        let mut r = self.ram.lock().unwrap();
+        for (k, &b) in data.iter().enumerate() {
+            if let Some(i) = Self::ram_offset(addr + k as u64, r.len()) {
+                r[i] = b;
+            }
+        }
+    }
+
+    fn ram_read64(&self, addr: u64) -> u64 {
+        let mut b = [0u8; 8];
+        self.ram_read(addr, &mut b);
+        u64::from_be_bytes(b)
+    }
+
+    pub fn read64(&self, off: u32) -> u64 {
+        let s = self.st.lock().unwrap();
+        match off & !7 {
+            reg::MAC_CONTROL => s.mac_control,
+            reg::INT_STATUS => (s.int_status & 0xff) | (u64::from(s.tx_read & 0x1ff) << 16),
+            reg::DMA_CONTROL => s.dma_control,
+            reg::TX_RING_PTR => u64::from(s.tx_write & 0x1ff) | (u64::from(s.tx_read & 0x1ff) << 16),
+            reg::RX_FIFO => s.mcl_fifo.len() as u64 & 0x1f,
+            reg::PHY_DATA => s.phy_data & !bits::PHY_BUSY,
+            reg::PHY_ADDRESS => s.phy_address,
+            reg::STATION => s.station,
+            reg::MULTICAST => s.multicast,
+            reg::TX_RING_BASE => s.tx_ring_base,
+            o => s.other.get(&o).copied().unwrap_or(0),
+        }
+    }
+
+    pub fn write64(&self, off: u32, val: u64) {
+        let mut send = false;
+        {
+            let mut s = self.st.lock().unwrap();
+            match off & !7 {
+                reg::MAC_CONTROL => {
+                    if val & bits::MAC_CORE_RESET != 0 {
+                        s.reset_rings();
+                    }
+                    s.mac_control = val & !bits::MAC_CORE_RESET;
+                }
+                reg::INT_STATUS => s.int_status &= !(val & 0xff),
+                reg::DMA_CONTROL => {
+                    if val & bits::DMA_TX_DMA_ENABLE == 0 {
+                        s.tx_read = 0;
+                        s.tx_write = 0;
+                    }
+                    if val & bits::DMA_RX_DMA_ENABLE == 0 && s.dma_control & bits::DMA_RX_DMA_ENABLE != 0 {
+                        s.mcl_fifo.clear();
+                    }
+                    s.dma_control = val;
+                }
+                // TX_ALIAS reaches DMA_CONTROL's transmit interrupt enable
+                // alone; RX_ALIAS the receive interrupt bits.
+                reg::TX_ALIAS => {
+                    s.dma_control = (s.dma_control & !bits::DMA_TX_INT_ENABLE) | (val & bits::DMA_TX_INT_ENABLE);
+                }
+                reg::RX_ALIAS => {
+                    s.dma_control = (s.dma_control & !0x3f0) | (val & 0x3f0);
+                }
+                reg::TX_RING_PTR => {
+                    s.tx_write = (val as u32) % TX_RING_LEN;
+                    send = true;
+                }
+                reg::PHY_ADDRESS => s.phy_address = val,
+                reg::PHY_READ_INITIATE => {
+                    let dev = ((s.phy_address >> 5) & 0x1f) as u32;
+                    let r = (s.phy_address & 0x1f) as usize;
+                    s.phy_data = if dev == PHY_ADDR { u64::from(s.phy.read(r)) } else { 0xffff };
+                }
+                reg::PHY_DATA => {
+                    // Writing the data is what starts an MII write.
+                    let dev = ((s.phy_address >> 5) & 0x1f) as u32;
+                    let r = (s.phy_address & 0x1f) as usize;
+                    if dev == PHY_ADDR {
+                        s.phy.write(r, val as u16);
+                    }
+                    s.phy_data = val & 0xffff;
+                }
+                reg::STATION => s.station = val & 0xffff_ffff_ffff,
+                reg::MULTICAST => s.multicast = val,
+                reg::TX_RING_BASE => s.tx_ring_base = val & 0xffff_ffff,
+                reg::MCL_RX_FIFO => {
+                    if s.mcl_fifo.len() < RX_FIFO_DEPTH {
+                        s.mcl_fifo.push_back(val as u32);
+                    }
+                }
+                reg::TIMER | reg::STATION_ALT => {
+                    s.other.insert(off & !7, val);
+                }
+                o => {
+                    s.other.insert(o, val);
+                }
+            }
+        }
+        if send {
+            self.transmit();
+        }
+    }
+
+    /// Send everything from the read pointer up to the write pointer.
+    fn transmit(&self) {
+        let mut frames = Vec::new();
+        {
+            let mut s = self.st.lock().unwrap();
+            if s.dma_control & bits::DMA_TX_DMA_ENABLE == 0 {
+                return;
+            }
+            let mut any = false;
+            while s.tx_read != s.tx_write {
+                let desc = s.tx_ring_base + u64::from(s.tx_read * TX_DESC_SIZE);
+                let cmd = self.ram_read64(desc);
+                let len = ((cmd & bits::TXCMD_LEN_MASK) + 1) as usize;
+                let start = ((cmd >> bits::TXCMD_BUFSTART_SHIFT) & 0x7f) as u64;
+                let mut frame = Vec::with_capacity(len);
+                if start < u64::from(TX_DESC_SIZE) {
+                    let mut inline = vec![0u8; (u64::from(TX_DESC_SIZE) - start) as usize];
+                    self.ram_read(desc + start, &mut inline);
+                    frame.extend_from_slice(&inline);
+                }
+                for p in 0..3u64 {
+                    if cmd & (bits::TXCMD_PTR1 << p) == 0 {
+                        continue;
+                    }
+                    let ptr = self.ram_read64(desc + 8 + 8 * p);
+                    let addr = ptr & 0xffff_fff8;
+                    let plen = (((ptr >> 32) & 0xffff) + 1) as usize;
+                    let mut data = vec![0u8; plen];
+                    self.ram_read(addr, &mut data);
+                    frame.extend_from_slice(&data);
+                }
+                frame.truncate(len);
+                // The status: sent, without error, and how long.
+                let stat = bits::TXSTAT_SENT | bits::TXSTAT_SUCCESS | (len as u64 & 0xffff);
+                self.ram_write(desc, &stat.to_be_bytes());
+                if cmd & bits::TXCMD_TXINT != 0 {
+                    s.int_status |= bits::INT_TX_PACKET_SENT;
+                }
+                s.tx_read = (s.tx_read + 1) % TX_RING_LEN;
+                s.tx_frames += 1;
+                frames.push(frame);
+                any = true;
+            }
+            if any {
+                // Latched when the ring runs dry, so an interrupt enabled
+                // after the ring pointer was written still sees it.
+                s.int_status |= bits::INT_TX_EMPTY;
+            }
+        }
+        if frames.is_empty() {
+            return;
+        }
+        if let Some(link) = self.link.lock().unwrap().as_mut() {
+            for f in frames {
+                let _ = link.to_net.push(f);
+            }
+            if let Some(w) = &link.tx_wake {
+                w.notify();
+            }
+        }
+    }
+
+    /// Whether the receive filter takes a frame to `dst`.
+    fn accepts(s: &State, dst: &[u8]) -> bool {
+        if dst.len() < 6 {
+            return false;
+        }
+        let filter = s.mac_control & bits::MAC_FILTER_MASK;
+        if filter == bits::MAC_FILTER_PROMISC {
+            return true;
+        }
+        if dst.iter().all(|&b| b == 0xff) {
+            return true;
+        }
+        if dst[0] & 1 != 0 {
+            // A multicast: all of them when asked to match any.
+            return filter == bits::MAC_FILTER_MATCHMULTI || filter == bits::MAC_FILTER_ALLMULTI;
+        }
+        let station = s.station.to_be_bytes();
+        dst[..6] == station[2..8]
+    }
+
+    /// Take frames from the backend into the buffers the driver has handed
+    /// over. Called from the machine's polling loop.
+    pub fn poll(&self) {
+        let mut link = self.link.lock().unwrap();
+        let Some(link) = link.as_mut() else { return };
+        loop {
+            let mut s = self.st.lock().unwrap();
+            if s.dma_control & bits::DMA_RX_DMA_ENABLE == 0 {
+                // Not receiving: frames are not kept for later.
+                while link.from_net.pop().is_ok() {}
+                return;
+            }
+            let Ok(frame) = link.from_net.peek() else { return };
+            if !Self::accepts(&s, frame) {
+                let _ = link.from_net.pop();
+                continue;
+            }
+            let Some(buf) = s.mcl_fifo.pop_front() else {
+                // No buffer: it waits for one.
+                return;
+            };
+            let frame = link.from_net.pop().unwrap_or_default();
+            let mut data = frame;
+            if data.len() < MIN_FRAME {
+                data.resize(MIN_FRAME, 0);
+            }
+            let fcs = crc32(&data);
+            data.extend_from_slice(&fcs.to_le_bytes());
+            let offset = (((s.dma_control >> bits::DMA_RX_DMA_OFFSET_SHIFT) & 7) * 8) as u64;
+            let start = u64::from(buf) + offset;
+            if offset as usize + RX_PAD + data.len() > RX_BUF_SIZE {
+                s.rx_dropped += 1;
+                s.mcl_fifo.push_front(buf);
+                continue;
+            }
+            self.ram_write(start, &[0u8; RX_PAD]);
+            self.ram_write(start + RX_PAD as u64, &data);
+            let dst = &data[..6];
+            let mut stat = bits::RXSTAT_RECEIVED | (data.len() as u64 & 0xffff) | ((s.rx_seq & 0x1f) << bits::RXSTAT_SEQ_SHIFT);
+            if dst.iter().all(|&b| b == 0xff) {
+                stat |= bits::RXSTAT_BCAST;
+            } else if dst[0] & 1 != 0 {
+                stat |= bits::RXSTAT_MCAST;
+            } else {
+                stat |= bits::RXSTAT_MATCHMAC;
+            }
+            s.rx_seq = s.rx_seq.wrapping_add(1);
+            // The status last: the driver takes the buffer once it is set.
+            self.ram_write(u64::from(buf), &stat.to_be_bytes());
+            s.int_status |= bits::INT_RX_THRESHOLD;
+            s.rx_frames += 1;
+        }
+    }
+}
+
+/// The Ethernet CRC-32 of `data`, as its FCS is computed.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ip32::RAM_BASE;
+
+    fn mec() -> (Mec, Arc<Mutex<Vec<u8>>>) {
+        let ram = Arc::new(Mutex::new(vec![0u8; 1 << 20]));
+        (Mec::new(ram.clone()), ram)
+    }
+
+    fn put(ram: &Arc<Mutex<Vec<u8>>>, off: usize, b: &[u8]) {
+        ram.lock().unwrap()[off..off + b.len()].copy_from_slice(b);
+    }
+
+    fn get(ram: &Arc<Mutex<Vec<u8>>>, off: usize, n: usize) -> Vec<u8> {
+        ram.lock().unwrap()[off..off + n].to_vec()
+    }
+
+    fn mii_read(m: &Mec, phy: u32, r: u32) -> u64 {
+        m.write64(reg::PHY_ADDRESS, u64::from((phy << 5) | r));
+        m.write64(reg::PHY_READ_INITIATE, 1);
+        m.read64(reg::PHY_DATA)
+    }
+
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    /// The driver probes every MII address: one PHY answers, a QS6612 that
+    /// can autonegotiate and has a link; the rest read all ones.
+    #[test]
+    fn one_phy_answers_and_it_has_a_link() {
+        let (m, _) = mec();
+        assert_eq!(mii_read(&m, 0, 1), 0xffff);
+        let bmsr = mii_read(&m, PHY_ADDR, 1);
+        assert_eq!(bmsr & 0x0008, 0x0008, "able to autonegotiate");
+        assert_eq!(bmsr & 0x0004, 0x0004, "link up");
+        assert_eq!(bmsr & 0x0100, 0, "no extended status");
+        assert_eq!((mii_read(&m, PHY_ADDR, 2), mii_read(&m, PHY_ADDR, 3)), (0x0181, 0x4401), "QS6612");
+        assert_eq!(m.read64(reg::PHY_DATA) & bits::PHY_BUSY, 0);
+        // A reset: isolation and the reset bit itself do not stay set.
+        m.write64(reg::PHY_ADDRESS, u64::from(PHY_ADDR << 5));
+        m.write64(reg::PHY_DATA, 0x8400);
+        assert_eq!(mii_read(&m, PHY_ADDR, 0) & 0x8400, 0);
+        assert_eq!(mii_read(&m, PHY_ADDR, 31) & 0x1c, 0x18, "100TX full duplex");
+    }
+
+    /// A frame in two parts -- 6 bytes inline, the rest through a pointer --
+    /// goes out whole; the descriptor gets its status, INT_STATUS shows the
+    /// read pointer past it and TX_EMPTY, which interrupts once enabled.
+    #[test]
+    fn a_descriptor_is_sent_and_reports_back() {
+        let (m, ram) = mec();
+        let (to_net, mut tx_cons) = rtrb::RingBuffer::new(8);
+        let (_rx_prod, from_net) = rtrb::RingBuffer::new(8);
+        m.attach(to_net, from_net, None);
+        let ring = 0x2000usize;
+        let data = 0x8008usize;
+        let frame: Vec<u8> = (0..70u8).collect();
+        put(&ram, ring + 128 - 6, &frame[..6]);
+        put(&ram, data, &frame[6..]);
+        let cmd: u64 = (70 - 1) | ((128 - 6) << 16) | bits::TXCMD_PTR1;
+        put(&ram, ring, &cmd.to_be_bytes());
+        let ptr: u64 = (RAM_BASE as u64 + data as u64) | ((64 - 1) << 32);
+        put(&ram, ring + 8, &ptr.to_be_bytes());
+        m.write64(reg::TX_RING_BASE, RAM_BASE as u64 + ring as u64);
+        m.write64(reg::DMA_CONTROL, bits::DMA_TX_DMA_ENABLE);
+        m.write64(reg::TX_RING_PTR, 1);
+        assert_eq!(tx_cons.pop().unwrap(), frame);
+        let stat = u64::from_be_bytes(get(&ram, ring, 8).try_into().unwrap());
+        assert_eq!(stat & (bits::TXSTAT_SENT | bits::TXSTAT_SUCCESS), bits::TXSTAT_SENT | bits::TXSTAT_SUCCESS);
+        let is = m.read64(reg::INT_STATUS);
+        assert_eq!((is >> 16) & 0x1ff, 1, "read pointer past the descriptor");
+        assert_eq!(is & bits::INT_TX_EMPTY, bits::INT_TX_EMPTY);
+        assert!(!m.interrupting(), "not before the transmit interrupt is enabled");
+        m.write64(reg::TX_ALIAS, 1);
+        assert!(m.interrupting());
+        assert_eq!(m.read64(reg::DMA_CONTROL) & bits::DMA_TX_DMA_ENABLE, bits::DMA_TX_DMA_ENABLE, "TX_ALIAS leaves DMA alone");
+        m.write64(reg::INT_STATUS, bits::INT_TX_EMPTY);
+        assert!(!m.interrupting(), "write one to clear");
+    }
+
+    /// A received frame lands in the oldest buffer handed over: padding, the
+    /// frame, its CRC; then the status word, and RX_THRESHOLD.
+    #[test]
+    fn a_frame_is_received_into_the_oldest_buffer() {
+        let (m, ram) = mec();
+        let (to_net, _tx_cons) = rtrb::RingBuffer::new(8);
+        let (mut rx_prod, from_net) = rtrb::RingBuffer::new(8);
+        m.attach(to_net, from_net, None);
+        m.write64(reg::STATION, 0x0800_6912_3456);
+        let (b0, b1) = (0x4000usize, 0x5000usize);
+        m.write64(reg::MCL_RX_FIFO, RAM_BASE as u64 + b0 as u64);
+        m.write64(reg::MCL_RX_FIFO, RAM_BASE as u64 + b1 as u64);
+        m.write64(reg::DMA_CONTROL, bits::DMA_RX_DMA_ENABLE | bits::DMA_RX_INT_ENABLE | (4 << bits::DMA_RX_DMA_OFFSET_SHIFT));
+        let mut frame = vec![0x08, 0x00, 0x69, 0x12, 0x34, 0x56, 2, 0, 0xde, 0xad, 0xbe, 0xef, 0x08, 0x00];
+        frame.extend_from_slice(&[0xaa; 20]);
+        rx_prod.push(frame.clone()).unwrap();
+        rx_prod.push(vec![0x02, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2]).unwrap(); // not for us
+        m.poll();
+        let stat = u64::from_be_bytes(get(&ram, b0, 8).try_into().unwrap());
+        assert_ne!(stat & bits::RXSTAT_RECEIVED, 0);
+        assert_eq!(stat & 0xffff, (MIN_FRAME + 4) as u64, "padded to 60, plus the CRC");
+        assert_eq!(get(&ram, b0 + 32 + 2, frame.len()), frame, "the frame at offset 34");
+        assert_eq!(get(&ram, b1, 8), vec![0u8; 8], "the other frame was not for this station");
+        assert!(m.interrupting());
+        m.write64(reg::INT_STATUS, bits::INT_RX_THRESHOLD);
+        assert!(!m.interrupting());
+        assert_eq!(m.counts().1, 1);
+    }
+}
