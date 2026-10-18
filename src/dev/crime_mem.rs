@@ -198,6 +198,20 @@ impl O2Memory {
             _ => None,
         }
     }
+
+    /// The same for an address a DMA master (a PCI device, the Ethernet)
+    /// hands the memory controller. Below 1 GB a bus address is an offset
+    /// into the whole memory window, not just its first 256 MB: the CPU's
+    /// low alias stops there because CRIME and MACE sit at 0x14000000 and up,
+    /// but nothing on the bus does. OpenBSD programs buffers above 256 MB this
+    /// way (0x3fffb000 for the top of a 1 GB machine); from `RAM_BASE` up an
+    /// address is read as the CPU reads it, which is how Linux does it.
+    pub fn dma_offset(&self, addr: u32) -> Option<usize> {
+        if addr < RAM_WINDOW_SIZE {
+            return self.offset(RAM_BASE + addr);
+        }
+        self.offset(addr)
+    }
 }
 
 /// `bytes` is the memory itself, so a device can index it once it has an
@@ -396,6 +410,17 @@ mod tests {
         assert_eq!(m.offset(LOW_ALIAS_SIZE - 8), m.offset(RAM_BASE + LOW_ALIAS_SIZE - 8));
         assert_eq!(m.decode(LOW_ALIAS_SIZE), Decode::None, "CRIME and MACE live above it");
         assert!(m.offset(RAM_BASE + (1 << 30) - 8).is_some(), "the top of a full machine");
+    }
+
+    #[test]
+    fn dma_reaches_all_of_memory_below_1_gb() {
+        let mut m = O2Memory::with_total(1024).unwrap();
+        size_like_post(&mut m);
+        let top = (1u32 << 30) - 0x5000;
+        assert_eq!(m.dma_offset(top), m.offset(RAM_BASE + top), "OpenBSD's bus address for high memory");
+        assert_eq!(m.dma_offset(0x1000), m.offset(0x1000), "and the low 256 MB as before");
+        assert_eq!(m.dma_offset(RAM_BASE + 0x2000_0000), m.offset(RAM_BASE + 0x2000_0000), "and the CPU's own addresses");
+        assert!(m.offset(0x3fff_b000).is_none(), "which the CPU cannot use: that is not its alias");
     }
 
     #[test]

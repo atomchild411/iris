@@ -165,6 +165,11 @@ struct State {
     mcl_fifo: VecDeque<u32>,
     /// Bits 27-31 of each received frame's status.
     rx_seq: u64,
+    /// Receive buffers filled so far, mod 32: the MCL FIFO read pointer,
+    /// which INT_STATUS reports in bits 8-12. OpenBSD's driver takes the
+    /// buffers up to it from there instead of polling each one's status, so
+    /// without it every frame is delivered and none is ever seen.
+    rx_mcl_read: u32,
     phy: Phy,
     phy_address: u64,
     phy_data: u64,
@@ -188,6 +193,7 @@ impl State {
             multicast: 0,
             mcl_fifo: VecDeque::new(),
             rx_seq: 0,
+            rx_mcl_read: 0,
             phy: Phy::new(),
             phy_address: 0,
             phy_data: 0,
@@ -202,6 +208,7 @@ impl State {
     /// The station address survives -- the driver writes it once, before its
     /// first reset.
     fn reset_rings(&mut self) {
+        self.rx_mcl_read = 0;
         self.tx_read = 0;
         self.tx_write = 0;
         self.mcl_fifo.clear();
@@ -274,14 +281,14 @@ impl Mec {
     fn ram_read(&self, addr: u64, out: &mut [u8]) {
         let r = self.ram.lock().unwrap();
         for (k, b) in out.iter_mut().enumerate() {
-            *b = r.offset((addr + k as u64) as u32).map_or(0, |i| r[i]);
+            *b = r.dma_offset((addr + k as u64) as u32).map_or(0, |i| r[i]);
         }
     }
 
     fn ram_write(&self, addr: u64, data: &[u8]) {
         let mut r = self.ram.lock().unwrap();
         for (k, &b) in data.iter().enumerate() {
-            if let Some(i) = r.offset((addr + k as u64) as u32) {
+            if let Some(i) = r.dma_offset((addr + k as u64) as u32) {
                 r[i] = b;
             }
         }
@@ -297,7 +304,9 @@ impl Mec {
         let s = self.st.lock().unwrap();
         match off & !7 {
             reg::MAC_CONTROL => s.mac_control,
-            reg::INT_STATUS => (s.int_status & 0xff) | (u64::from(s.tx_read & 0x1ff) << 16),
+            reg::INT_STATUS => (s.int_status & 0xff)
+                | (u64::from(s.rx_mcl_read & 0x1f) << 8)
+                | (u64::from(s.tx_read & 0x1ff) << 16),
             reg::DMA_CONTROL => s.dma_control,
             reg::TX_RING_PTR => u64::from(s.tx_write & 0x1ff) | (u64::from(s.tx_read & 0x1ff) << 16),
             reg::RX_FIFO => s.mcl_fifo.len() as u64 & 0x1f,
@@ -434,12 +443,31 @@ impl Mec {
         }
         if let Some(link) = self.link.lock().unwrap().as_mut() {
             for f in frames {
+                Self::trace("tx", &f);
                 let _ = link.to_net.push(f);
             }
             if let Some(w) = &link.tx_wake {
                 w.notify();
             }
         }
+    }
+
+    /// `IRIS_IP32_MEC_TRACE`: report frames sent and received, and why a
+    /// received one was dropped, the first 40 of each.
+    fn trace(what: &str, frame: &[u8]) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static N: AtomicU32 = AtomicU32::new(0);
+        if !*ON.get_or_init(|| std::env::var_os("IRIS_IP32_MEC_TRACE").is_some()) {
+            return;
+        }
+        if N.fetch_add(1, Ordering::Relaxed) >= 120 {
+            return;
+        }
+        let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(":");
+        let et = if frame.len() >= 14 { u16::from_be_bytes([frame[12], frame[13]]) } else { 0 };
+        eprintln!("mec: {what} len {} dst {} src {} type {et:#06x}", frame.len(),
+                  hx(&frame[..6.min(frame.len())]), hx(&frame[6.min(frame.len())..12.min(frame.len())]));
     }
 
     /// Whether the receive filter takes a frame to `dst`.
@@ -471,11 +499,14 @@ impl Mec {
             let mut s = self.st.lock().unwrap();
             if s.dma_control & bits::DMA_RX_DMA_ENABLE == 0 {
                 // Not receiving: frames are not kept for later.
-                while link.from_net.pop().is_ok() {}
+                while let Ok(f) = link.from_net.pop() {
+                    Self::trace("rx DROPPED: receive DMA off", &f);
+                }
                 return;
             }
             let Ok(frame) = link.from_net.peek() else { return };
             if !Self::accepts(&s, frame) {
+                Self::trace(&format!("rx DROPPED by filter (mac_control {:#x}, station {:012x})", s.mac_control, s.station), frame);
                 let _ = link.from_net.pop();
                 continue;
             }
@@ -484,6 +515,7 @@ impl Mec {
                 return;
             };
             let frame = link.from_net.pop().unwrap_or_default();
+            Self::trace(&format!("rx into {buf:#010x}"), &frame);
             let mut data = frame;
             if data.len() < MIN_FRAME {
                 data.resize(MIN_FRAME, 0);
@@ -509,6 +541,7 @@ impl Mec {
                 stat |= bits::RXSTAT_MATCHMAC;
             }
             s.rx_seq = s.rx_seq.wrapping_add(1);
+            s.rx_mcl_read = (s.rx_mcl_read + 1) & 0x1f;
             // The status last: the driver takes the buffer once it is set.
             self.ram_write(u64::from(buf), &stat.to_be_bytes());
             s.int_status |= bits::INT_RX_THRESHOLD;
@@ -636,6 +669,8 @@ mod tests {
         assert_eq!(get(&ram, b0 + 32 + 2, frame.len()), frame, "the frame at offset 34");
         assert_eq!(get(&ram, b1, 8), vec![0u8; 8], "the other frame was not for this station");
         assert!(m.interrupting());
+        assert_eq!((m.read64(reg::INT_STATUS) >> 8) & 0x1f, 1,
+                   "the MCL FIFO read pointer, which OpenBSD reads to find filled buffers");
         m.write64(reg::INT_STATUS, bits::INT_RX_THRESHOLD);
         assert!(!m.interrupting());
         assert_eq!(m.counts().1, 1);

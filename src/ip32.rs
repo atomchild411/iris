@@ -3491,7 +3491,11 @@ mod bringup {
     }
 
     /// The CPU: `IRIS_IP32_CPU=r10000` (or `r10k`) for an R10000, as the O2
-    /// was also sold with; an R5000 otherwise.
+    /// was also sold with; an R5000 otherwise. Both run on the full cache
+    /// models, not the shadow ones IP28 uses: the O2 PROM sizes memory with its
+    /// stack in the data cache, before there is any RAM behind it, and a cache
+    /// that keeps only tags loses that stack (the return address comes back as
+    /// garbage straight after SizeMEM starts).
     fn trace_the_prom_from_reset_inner() {
         match std::env::var("IRIS_IP32_CPU").unwrap_or_default().to_ascii_lowercase().as_str() {
             "r10000" | "r10k" => run_the_prom_from_reset::<crate::cpu::mips_cache_v2::R10000O2Cache>("R10000"),
@@ -3584,6 +3588,8 @@ mod bringup {
         // control back to the PROM (a panic, a reboot, a reset), so the report
         // describes the boot that failed.
         let stop_on_reset = std::env::var("IRIS_IP32_STOP_ON_RESET").is_ok();
+        let trap_log = std::env::var("IRIS_IP32_TRAP_LOG").is_ok();
+        let mut trap_logged = 0u32;
         // IRIS_IP32_STOP_ON=text ends the run once the console has printed
         // `text` (a panic message, say), checked every million steps.
         let stop_on = std::env::var("IRIS_IP32_STOP_ON").ok().filter(|t| !t.is_empty());
@@ -3760,6 +3766,25 @@ mod bringup {
             {
                 let cause = exec.core.cp0_cause as u32;
                 let exc = (cause >> 2) & 0x1f;
+                // IRIS_IP32_TRAP_LOG: every address error and bus error, as it
+                // happens, with the instruction -- these are what a kernel
+                // turns into SIGBUS, and in user mode they are otherwise
+                // invisible.
+                if trap_log && matches!(exc, 4..=7) && trap_logged < 200 {
+                    trap_logged += 1;
+                    let epc = exec.core.cp0_epc;
+                    let insn = exec.debug_read(epc, 4).map(|w| w as u32).ok();
+                    let dis = insn.map(|w| crate::cpu::mips_dis::disassemble(w, epc, None)).unwrap_or_default();
+                    let g = exec.core.gpr;
+                    let pa = |exec: &mut MipsExecutor<MipsTlb, C>, va: u64| {
+                        let t = exec.debug_translate(va);
+                        if t.is_exception() { String::from("-") } else { format!("{:x}", t.phys) }
+                    };
+                    let (pc_pa, sp_pa) = (pa(&mut exec, epc), pa(&mut exec, g[29]));
+                    eprintln!("ip32: trap @{steps} exc {exc} epc {epc:x} (pa {pc_pa}) badva {:x} status {:x} [{}] a0 {:x} a1 {:x} v0 {:x} v1 {:x} t0 {:x} t1 {:x} sp {:x} (pa {sp_pa}) ra {:x}",
+                              exec.core.cp0_badvaddr, exec.core.cp0_status, dis,
+                              g[4], g[5], g[2], g[3], g[8], g[9], g[29], g[31]);
+                }
                 if exceptions.len() < 24 {
                     exceptions.push((steps, pc, exc, exec.core.cp0_epc, exec.core.cp0_badvaddr));
                 }
