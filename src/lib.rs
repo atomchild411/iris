@@ -175,6 +175,7 @@ pub mod machine;
 pub mod ip32;
 pub mod ip32_handover;
 pub mod ip32_screen;
+pub mod ip32_machine;
 pub mod platform;
 pub mod physical;
 pub mod monitor;

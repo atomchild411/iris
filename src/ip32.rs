@@ -1252,6 +1252,55 @@ impl Default for MacePs2 {
     }
 }
 
+/// What is plugged into an O2 beyond its memory: the SCSI controllers and
+/// their disks, and where the PROM's flash (its environment) is kept.
+#[derive(Clone, Debug, Default)]
+pub struct Ip32Options {
+    /// The two on-board AIC-7880s. Without them the PROM finds nothing to
+    /// boot from.
+    pub scsi: bool,
+    pub disks: Vec<Ip32Disk>,
+    /// A file holding the flash, so `setenv` survives from run to run.
+    pub flash_file: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Ip32Disk {
+    /// SCSI id on the first controller; None is the controller's default.
+    pub id: Option<u8>,
+    pub path: std::path::PathBuf,
+    /// A CD-ROM, which the PROM's install menu insists on seeing.
+    pub cdrom: bool,
+}
+
+impl Ip32Options {
+    /// IRIS_IP32_SCSI (controllers on), IRIS_IP32_DISK (one disk at the
+    /// default id), IRIS_IP32_DISKS=id=path[:cd],... (more than one: an install
+    /// needs the media on one id and the target on another), IRIS_IP32_FLASH.
+    pub fn from_env() -> Self {
+        let mut disks = Vec::new();
+        if let Ok(path) = std::env::var("IRIS_IP32_DISK") {
+            disks.push(Ip32Disk { id: None, path: path.into(), cdrom: false });
+        }
+        if let Ok(spec) = std::env::var("IRIS_IP32_DISKS") {
+            for entry in spec.split(',') {
+                let Some((id, path)) = entry.split_once('=') else { continue };
+                let Ok(id) = id.trim().parse::<u8>() else { continue };
+                let (path, cdrom) = match path.trim().strip_suffix(":cd") {
+                    Some(p) => (p, true),
+                    None => (path.trim(), false),
+                };
+                disks.push(Ip32Disk { id: Some(id), path: path.into(), cdrom });
+            }
+        }
+        Self {
+            scsi: std::env::var("IRIS_IP32_SCSI").is_ok(),
+            disks,
+            flash_file: std::env::var_os("IRIS_IP32_FLASH").map(Into::into),
+        }
+    }
+}
+
 /// A Dallas-style RTC with battery-backed NVRAM.
 ///
 /// Registers are reached with MACE's ISA spacing, `(reg << 8) + 7`. The low
@@ -1868,6 +1917,10 @@ impl NicTrace {
 /// count and the rate below fixes the relationship.
 pub struct MaceUst {
     ticks: Mutex<u64>,
+    /// When set, the clock is the host's: microseconds since this instant,
+    /// read live. The 1-Wire ID chip's slots are tens of microseconds, so a
+    /// clock stepped from another thread cannot time them.
+    host: std::sync::OnceLock<std::time::Instant>,
 }
 
 /// UST ticks per emulated instruction, as a fraction: `TICKS_NUM / TICKS_DEN`.
@@ -1884,15 +1937,31 @@ impl Default for MaceUst {
 }
 
 impl MaceUst {
-    pub fn new() -> Self { Self { ticks: Mutex::new(0) } }
+    pub fn new() -> Self { Self { ticks: Mutex::new(0), host: std::sync::OnceLock::new() } }
+
+    /// Run from the host clock from now on (a machine, not the harness).
+    pub fn use_host_clock(&self) {
+        let _ = self.host.set(std::time::Instant::now());
+    }
+
+    /// Set the clock to `us` microseconds, for a machine that keeps time by
+    /// the host clock rather than by instructions run.
+    pub fn set_us(&self, us: u64) {
+        *self.ticks.lock().unwrap() = us;
+    }
 
     /// Advance the clock to match `instructions` executed so far.
     pub fn advance_to(&self, instructions: u64) {
         *self.ticks.lock().unwrap() = instructions * UST_TICKS_NUM / UST_TICKS_DEN;
     }
 
-    fn tick(&self) -> u64 { *self.ticks.lock().unwrap() }
-    pub fn now(&self) -> u64 { *self.ticks.lock().unwrap() }
+    fn tick(&self) -> u64 { self.now() }
+    pub fn now(&self) -> u64 {
+        match self.host.get() {
+            Some(t0) => t0.elapsed().as_micros() as u64,
+            None => *self.ticks.lock().unwrap(),
+        }
+    }
 }
 
 impl BusDevice for MaceUst {
@@ -2036,6 +2105,9 @@ pub struct Ip32Bus {
     pub nic_trace: NicTrace,
     pub rtc: MaceRtc,
     pub ps2: MacePs2,
+    /// See [`Ip32Bus::set_irq_sink`].
+    irq_sink: std::sync::OnceLock<Box<dyn Fn(bool) + Send + Sync>>,
+    irq_level: std::sync::atomic::AtomicBool,
     pub onewire: OneWireId,
     pub com0: Com16550,
     pub com1: Com16550,
@@ -2075,8 +2147,13 @@ impl Ip32Bus {
         Self::with_memory(mem, prom)
     }
 
-    /// A machine with `mem` fitted.
+    /// A machine with `mem` fitted, configured from the IRIS_IP32_* variables.
     pub fn with_memory(mem: O2Memory, prom: Vec<u8>) -> Self {
+        Self::with_options(mem, prom, Ip32Options::from_env())
+    }
+
+    /// A machine with `mem` fitted, configured by `opts`.
+    pub fn with_options(mem: O2Memory, prom: Vec<u8>, opts: Ip32Options) -> Self {
         let pc = std::sync::Arc::new(PcTap::default());
         let ram = std::sync::Arc::new(Mutex::new(mem));
         let ust = std::sync::Arc::new(MaceUst::new());
@@ -2084,7 +2161,7 @@ impl Ip32Bus {
             ram: ram.clone(),
             prom: Mutex::new(prom),
             prom_writes: Mutex::new(Vec::new()),
-            flash_file: std::env::var_os("IRIS_IP32_FLASH").map(Into::into),
+            flash_file: opts.flash_file.clone(),
             crime: Crime::new(ust.clone()),
             mace: Stub::new("mace"),
             crime_re: crate::dev::o2gfx::CrimeRe::new(ram.clone()),
@@ -2097,6 +2174,8 @@ impl Ip32Bus {
             nic_trace: NicTrace::new(),
             rtc: MaceRtc::new(),
             ps2: MacePs2::new(),
+            irq_sink: std::sync::OnceLock::new(),
+            irq_level: std::sync::atomic::AtomicBool::new(false),
             // A locally-administered address; nothing depends on the value yet.
             onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
             com0: Com16550::new(),
@@ -2119,7 +2198,7 @@ impl Ip32Bus {
         // and finds nothing, so it has no disk and cannot boot. Putting the
         // controller a real O2 has there is how we learn how much of it the
         // PROM insists on.
-        if std::env::var("IRIS_IP32_SCSI").is_ok() {
+        if opts.scsi {
             // The controller fetches its work from host memory, so it
             // needs to reach RAM directly rather than through the bus that
             // owns it.
@@ -2157,29 +2236,11 @@ impl Ip32Bus {
                     .with_ops(scsi.clone()),
                 ),
             );
-            if let Ok(path) = std::env::var("IRIS_IP32_DISK") {
-                match scsi.attach_disk(std::path::Path::new(&path)) {
-                    Ok(blocks) => eprintln!("ip32: SCSI disk {path}: {blocks} blocks"),
-                    Err(e) => eprintln!("ip32: SCSI disk {path}: {e}"),
-                }
-            }
-            // IRIS_IP32_DISKS=id=path,id=path for more than one. An install
-            // needs the media on one id and the disk being installed to on
-            // another, so a single-disk machine cannot do it at all.
-            if let Ok(spec) = std::env::var("IRIS_IP32_DISKS") {
-                for entry in spec.split(',') {
-                    let Some((id, path)) = entry.split_once('=') else { continue };
-                    let Ok(id) = id.trim().parse::<u8>() else { continue };
-                    // A trailing ":cd" says the medium is a CD-ROM, which
-                    // the PROM's install menu insists on seeing.
-                    let (path, cdrom) = match path.trim().strip_suffix(":cd") {
-                        Some(p) => (p, true),
-                        None => (path.trim(), false),
-                    };
-                    match scsi.attach_at(id, std::path::Path::new(path), cdrom) {
-                        Ok(b) => eprintln!("ip32: SCSI id {id}: {path} ({b} blocks)"),
-                        Err(e) => eprintln!("ip32: SCSI id {id}: {path}: {e}"),
-                    }
+            for d in &opts.disks {
+                let id = d.id.unwrap_or(scsi.default_target());
+                match scsi.attach_at(id, &d.path, d.cdrom) {
+                    Ok(b) => eprintln!("ip32: SCSI id {id}: {} ({b} blocks)", d.path.display()),
+                    Err(e) => eprintln!("ip32: SCSI id {id}: {}: {e}", d.path.display()),
                 }
             }
             let mut list = bus.scsi.lock().unwrap();
@@ -2252,6 +2313,77 @@ impl Ip32Bus {
     }
 
     /// A CRIME write that may have moved a memory bank.
+    /// GBE's picture out of RAM into `out` (R, G, B, A bytes), or None while
+    /// the display is off. See [`crate::dev::o2gfx::Gbe::render`].
+    pub fn render_screen(&self, out: &mut [u8]) -> Option<(u32, u32)> {
+        self.gbe.render(&self.ram.lock().unwrap(), out)
+    }
+
+    /// Where IP2 goes when CRIME's output changes, for a machine whose CPU
+    /// runs on its own thread. Without one (the harness) nothing here runs.
+    pub fn set_irq_sink(&self, sink: Box<dyn Fn(bool) + Send + Sync>) {
+        let _ = self.irq_sink.set(sink);
+    }
+
+    fn is_ram_addr(addr: u32) -> bool {
+        addr < LOW_ALIAS_SIZE || addr >= RAM_BASE
+    }
+
+    #[inline]
+    fn before_read(&self, addr: u32) {
+        if self.irq_sink.get().is_some() && self.in_crime(addr) {
+            self.refresh_irq();
+        }
+    }
+
+    #[inline]
+    fn after_write(&self, addr: u32) {
+        if self.irq_sink.get().is_some() && !Self::is_ram_addr(addr) {
+            self.refresh_irq();
+        }
+    }
+
+    /// Device lines into CRIME and, if CRIME's output changed, into the sink.
+    pub fn refresh_irq(&self) -> bool {
+        self.update_lines();
+        let level = self.crime.interrupting();
+        if let Some(sink) = self.irq_sink.get() {
+            if self.irq_level.swap(level, Ordering::AcqRel) != level {
+                sink(level);
+            }
+        }
+        level
+    }
+
+    /// The SCSI controllers, the Ethernet, com0 and the PS/2 ports, into
+    /// their CRIME inputs.
+    fn update_lines(&self) {
+        for (scsi, line) in self.scsi.lock().unwrap().iter() {
+            self.crime.set_int(*line, scsi.interrupting());
+        }
+        self.crime.set_int(IP32_MEC_CRIME_INT, self.mec.interrupting());
+        // The console's receive interrupt: a kernel does not poll the UART.
+        // Only this device's bits are set and cleared; overwriting the whole
+        // register would erase the guest's own and other devices' bits.
+        let isa = self.mace.cell_pub(MACE_ISA_INT_STATUS);
+        let isa = if self.com0.interrupting() { isa | MACE_ISA_SERIAL0_MASK } else { isa & !MACE_ISA_SERIAL0_MASK };
+        self.mace.set_cell_pub(MACE_ISA_INT_STATUS, isa);
+        // Line 4 is serial and parallel only (bits 16..31); bits 8..15 are
+        // line 5's, from the PS/2 ports among others.
+        self.crime.set_int(IP32_ISA_CRIME_INT, isa & 0xffff_0000 != 0);
+        self.ps2_touched();
+    }
+
+    /// Bring every device interrupt up to date in CRIME: the SCSI
+    /// controllers, the Ethernet (and its frames from the network), com0 and
+    /// the PS/2 ports. Returns whether CRIME is interrupting the CPU (IP2).
+    /// The harness calls it every 256 instructions, the machine from its
+    /// service thread.
+    pub fn service(&self) -> bool {
+        self.mec.poll();
+        self.refresh_irq()
+    }
+
     /// After any PS/2 register access: the ports' bits of MACE's ISA
     /// interrupt status, and CRIME line 5 from them, follow at once. A level
     /// left high after the handler drained the port reads as a spurious
@@ -2576,20 +2708,8 @@ macro_rules! bus_read {
     }};
 }
 
-impl BusDevice for Ip32Bus {
-    /// Memory pages have generations jitv2 can compile against; the PROM and
-    /// devices have none, so nothing there is compiled.
-    #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
-        let addr = self.resolve(addr);
-        let r = self.ram.lock().unwrap();
-        match r.decode(addr) {
-            Decode::Ram(i) => r.gen_ptr(i),
-            _ => std::ptr::null(),
-        }
-    }
-
-    fn read8(&self, addr: u32) -> BusRead8 {
+impl Ip32Bus {
+    fn read8_raw(&self, addr: u32) -> BusRead8 {
         if self.in_gbe(addr) {
             return BusRead8::ok(self.gbe.read32(addr & !3).data as u8);
         }
@@ -2630,7 +2750,7 @@ impl BusDevice for Ip32Bus {
         bus_read!(self, addr, 1, BusRead8::ok, |v: u64| v as u8)
     }
 
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16_raw(&self, addr: u32) -> BusRead16 {
         if self.in_gbe(addr) {
             return BusRead16::ok(self.gbe.read32(addr & !3).data as u16);
         }
@@ -2666,7 +2786,7 @@ impl BusDevice for Ip32Bus {
         bus_read!(self, addr, 2, BusRead16::ok, |v: u64| v as u16)
     }
 
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32_raw(&self, addr: u32) -> BusRead32 {
         if self.in_mec(addr) {
             // The registers are 64-bit; a 32-bit access is the half it names.
             let v = self.mec.read64((addr - MACE_MEC) & !7);
@@ -2715,7 +2835,7 @@ impl BusDevice for Ip32Bus {
         bus_read!(self, addr, 4, BusRead32::ok, |v: u64| v as u32)
     }
 
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64_raw(&self, addr: u32) -> BusRead64 {
         if self.in_gbe(addr) {
             return self.gbe.read64(addr);
         }
@@ -2767,7 +2887,7 @@ impl BusDevice for Ip32Bus {
         r
     }
 
-    fn write8(&self, addr: u32, val: u8) -> u32 {
+    fn write8_raw(&self, addr: u32, val: u8) -> u32 {
         if self.in_gbe(addr) {
             return self.gbe.write32(addr & !3, val as u32);
         }
@@ -2815,7 +2935,7 @@ impl BusDevice for Ip32Bus {
         if self.write_bytes(addr, 1, val as u64) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
 
-    fn write16(&self, addr: u32, val: u16) -> u32 {
+    fn write16_raw(&self, addr: u32, val: u16) -> u32 {
         if self.in_gbe(addr) {
             return self.gbe.write32(addr & !3, val as u32);
         }
@@ -2856,7 +2976,7 @@ impl BusDevice for Ip32Bus {
         if self.write_bytes(addr, 2, val as u64) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn write32_raw(&self, addr: u32, val: u32) -> u32 {
         if self.in_mec(addr) {
             // MACE takes 64-bit stores; a 32-bit one is the low word.
             self.mec.write64((addr - MACE_MEC) & !7, val as u64);
@@ -2912,7 +3032,7 @@ impl BusDevice for Ip32Bus {
         if self.write_bytes(addr, 4, val as u64) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
 
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64_raw(&self, addr: u32, val: u64) -> u32 {
         if self.in_mec(addr) {
             self.mec.write64(addr - MACE_MEC, val);
             return BUS_OK;
@@ -2966,6 +3086,62 @@ impl BusDevice for Ip32Bus {
         }
         self.note_sizemem(addr, true, val);
         if self.write_bytes(addr, 8, val) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
+    }
+}
+
+/// Every access goes to the `_raw` decode above. Around it, a machine with
+/// an interrupt sink (`set_irq_sink`) gets its lines recomputed: before a
+/// read of CRIME, so INTSTAT is live, and after any write that is not RAM,
+/// so a handler's acknowledgement drops IP2 at once instead of leaving it up
+/// until the next service tick (OpenBSD: "spurious crime interrupt").
+impl BusDevice for Ip32Bus {
+    /// Memory pages have generations jitv2 can compile against; the PROM and
+    /// devices have none, so nothing there is compiled.
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
+        let addr = self.resolve(addr);
+        let r = self.ram.lock().unwrap();
+        match r.decode(addr) {
+            Decode::Ram(i) => r.gen_ptr(i),
+            _ => std::ptr::null(),
+        }
+    }
+
+    fn read8(&self, addr: u32) -> BusRead8 {
+        self.before_read(addr);
+        self.read8_raw(addr)
+    }
+    fn read16(&self, addr: u32) -> BusRead16 {
+        self.before_read(addr);
+        self.read16_raw(addr)
+    }
+    fn read32(&self, addr: u32) -> BusRead32 {
+        self.before_read(addr);
+        self.read32_raw(addr)
+    }
+    fn read64(&self, addr: u32) -> BusRead64 {
+        self.before_read(addr);
+        self.read64_raw(addr)
+    }
+    fn write8(&self, addr: u32, val: u8) -> u32 {
+        let r = self.write8_raw(addr, val);
+        self.after_write(addr);
+        r
+    }
+    fn write16(&self, addr: u32, val: u16) -> u32 {
+        let r = self.write16_raw(addr, val);
+        self.after_write(addr);
+        r
+    }
+    fn write32(&self, addr: u32, val: u32) -> u32 {
+        let r = self.write32_raw(addr, val);
+        self.after_write(addr);
+        r
+    }
+    fn write64(&self, addr: u32, val: u64) -> u32 {
+        let r = self.write64_raw(addr, val);
+        self.after_write(addr);
+        r
     }
 }
 
@@ -4561,32 +4737,7 @@ mod bringup {
                 // driver only discovers a finished command when its own
                 // watchdog fires, which it reports as "Interrupts may not be
                 // functioning", and it is right.
-                for (scsi, line) in bus.scsi.lock().unwrap().iter() {
-                    bus.crime.set_int(*line, scsi.interrupting());
-                }
-                // The Ethernet: frames the network has for the guest, then its line.
-                bus.mec.poll();
-                bus.crime.set_int(IP32_MEC_CRIME_INT, bus.mec.interrupting());
-                // The console's receive interrupt. The PROM polls the UART
-                // and never needed this; a kernel does not poll, so without
-                // it every character typed at a prompt sits in the receive
-                // register unread and the machine looks hung.
-                // Set and clear only this device's bits. Overwriting the
-                // whole register would erase whatever else the guest has put
-                // there -- other devices' pending bits, or an acknowledgement
-                // it is in the middle of -- and a kernel that finds its own
-                // writes disappearing has no way to make progress.
-                let com_irq = bus.com0.interrupting();
-                let isa = bus.mace.cell_pub(MACE_ISA_INT_STATUS);
-                let isa = if com_irq {
-                    isa | MACE_ISA_SERIAL0_MASK
-                } else {
-                    isa & !MACE_ISA_SERIAL0_MASK
-                };
-                bus.mace.set_cell_pub(MACE_ISA_INT_STATUS, isa);
-                // Line 4 is serial and parallel only (bits 16..31); bits 8..15
-                // are line 5's, from the PS/2 ports among others.
-                bus.crime.set_int(IP32_ISA_CRIME_INT, isa & 0xffff_0000 != 0);
+                bus.service();
                 // Keys pushed from the viewer arrive between register accesses.
                 if let (Some(k), Some(dev)) = (keys.as_ref(), bus.ps2.devices()) {
                     while let Some((name, down)) = k.pop() {

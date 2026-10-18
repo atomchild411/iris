@@ -551,6 +551,11 @@ impl Aic7880 {
 
 
     /// Attach at the default id, which is what a single-disk run wants.
+    /// The id a disk attached without one goes on.
+    pub fn default_target(&self) -> u8 {
+        self.target
+    }
+
     pub fn attach_disk(&self, path: &std::path::Path) -> std::io::Result<u64> {
         self.attach_disk_at(self.target, path)
     }

@@ -405,10 +405,15 @@ pub enum MachineProfile {
     /// Use an IMPACT board (`src/dev/mgras/`): an IP28 kernel carries no
     /// Newport driver, so REX3 is not an alternative for that guest.
     Indigo2Ip28,
+    /// SGI O2 IP32: CRIME, MACE and GBE, with an R5000 or R10000. Built from
+    /// the `[o2]` section, not the fullhouse/Guinness options above; see
+    /// `src/ip32_machine.rs`.
+    O2Ip32,
 }
 
 impl MachineProfile {
-    /// All selectable profiles, in display order. Single source of truth for the
+    /// All selectable profiles, in display order. (Not the O2 yet: iris-gui
+    /// builds through `Machine::new`, and the O2 is `ip32_machine::run`.) Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
     pub const ALL: [Self; 3] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28];
 
@@ -417,6 +422,7 @@ impl MachineProfile {
             Self::IndyIp24 => "SGI Indy (IP24)",
             Self::Indigo2Ip22 => "SGI Indigo2 (IP22)",
             Self::Indigo2Ip28 => "SGI Indigo2 IMPACT (IP28)",
+            Self::O2Ip32 => "SGI O2 (IP32)",
         }
     }
 
@@ -692,6 +698,85 @@ pub struct MachineSection {
 impl Default for MachineSection {
     fn default() -> Self {
         Self { profile: MachineProfile::default(), cpu: CpuModel::default(), cache: CacheModel::default() }
+    }
+}
+
+/// An O2 (`[o2]` section). Paths are relative to where iris runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct O2Section {
+    /// The PROM image (4.18 is the last).
+    #[serde(default = "default_o2_prom")]
+    pub prom: String,
+    /// Where the PROM's flash, and so its environment, is kept between runs.
+    #[serde(default)]
+    pub flash: Option<String>,
+    /// Memory in MB, fitted the usual way (largest kits first).
+    #[serde(default = "default_o2_ram")]
+    pub ram_mb: u32,
+    /// Or the kit in each DIMM pair from A, in MB (32, 64, 128 or 256).
+    #[serde(default)]
+    pub dimms: Option<Vec<u32>>,
+    /// Disks and CD-ROMs on the first SCSI controller.
+    #[serde(default)]
+    pub disks: Vec<O2Disk>,
+    /// A TCP port for the serial console (telnet 127.0.0.1 PORT).
+    #[serde(default)]
+    pub serial_port: Option<u16>,
+    /// A file the serial console is copied to.
+    #[serde(default)]
+    pub serial_log: Option<String>,
+    /// A keyboard and the PROM's graphics console. Off: serial console.
+    #[serde(default = "o2_on")]
+    pub graphics: bool,
+    /// Test aid, not hardware behaviour: lend a kernel the FPU while it is
+    /// inside the PROM (NetBSD prints through the PROM's graphics console
+    /// with CU1 clear, and the PROM scrolls with FPU loads).
+    #[serde(default)]
+    pub arcs_fpu: bool,
+    /// Ethernet on IRIS's NAT.
+    #[serde(default = "o2_on")]
+    pub net: bool,
+    #[serde(default)]
+    pub forwards: Vec<PortForwardConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct O2Disk {
+    pub id: u8,
+    pub path: String,
+    #[serde(default)]
+    pub cdrom: bool,
+}
+
+fn default_o2_prom() -> String {
+    "ip32prom.rev4.18.bin".into()
+}
+
+fn default_o2_ram() -> u32 {
+    256
+}
+
+fn o2_on() -> bool {
+    true
+}
+
+impl Default for O2Section {
+    fn default() -> Self {
+        Self {
+            prom: default_o2_prom(),
+            flash: None,
+            ram_mb: default_o2_ram(),
+            dimms: None,
+            disks: Vec::new(),
+            serial_port: None,
+            serial_log: None,
+            graphics: true,
+            arcs_fpu: false,
+            net: true,
+            forwards: Vec::new(),
+        }
     }
 }
 
@@ -1257,6 +1342,10 @@ pub struct MachineConfig {
     #[serde(default)]
     pub jitv2: Jitv2Config,
 
+    /// The O2 (`[o2]` section), used when `[machine] profile = "o2_ip32"`.
+    #[serde(default)]
+    pub o2: O2Section,
+
     /// Host performance tuning (`[perf]` section).
     #[serde(default)]
     pub perf: PerfConfig,
@@ -1383,6 +1472,7 @@ impl Default for MachineConfig {
             graphics: GraphicsSection::default(),
             debug: DebugConfig::default(),
             jitv2: Jitv2Config::default(),
+            o2: O2Section::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
