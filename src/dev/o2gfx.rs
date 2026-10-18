@@ -418,7 +418,7 @@ impl Gbe {
                 let p = fetch((y * w + x) * bpp);
                 // A type narrower than the frame buffer reads one half of the
                 // word: buf 10 the upper half, otherwise the lower.
-                let p = if typ <= 3 && bpp > 1 {
+                let p = if typ <= 4 && bpp > 1 {
                     let half = bpp as u32 * 4;
                     let mask = (1u32 << half) - 1;
                     if wid & 3 == 2 { (p >> half) & mask } else { p & mask }
@@ -518,6 +518,11 @@ pub mod re_reg {
     pub const STIPPLE_MODE: u32 = 0x20c0;
     pub const STIPPLE_PATTERN: u32 = 0x20c4;
     pub const FG: u32 = 0x20d0;
+    /// Triangle vertices, 64 bits each: x float high, y float low.
+    pub const TRI_V0: u32 = 0x2080;
+    /// Shade colour R, G, B, A (8.12 fixed), then their gradients.
+    pub const SHADE_R: u32 = 0x20e0;
+    pub const SHADE_GRAD: u32 = 0x20f0;
     pub const BG: u32 = 0x20d8;
     pub const LOGIC_OP: u32 = 0x21b0;
     pub const COLOR_MASK: u32 = 0x21b8;
@@ -744,6 +749,13 @@ impl CrimeRe {
         ((v >> 16) as i32, (v & 0xffff) as i32)
     }
 
+    /// A window offset: two signed 16-bit halves. IRIX's GL windows sit at
+    /// offsets like (-3443, -3477) -- the window origin less a 4096 guard --
+    /// which read unsigned put every triangle 62,000 pixels off screen.
+    fn offset_xy(v: u32) -> (i32, i32) {
+        ((v >> 16) as u16 as i16 as i32, v as u16 as i16 as i32)
+    }
+
     /// Run the pixel pipe's current primitive.
     /// A 32-bit pixel moved between buffers whose pixel types (BufMode
     /// 7:4) differ: through RGBA. RGB keeps its colour in the low three
@@ -785,7 +797,7 @@ impl CrimeRe {
             self.note(format!("xfer buffers src {sb} dst {db}"));
             return;
         }
-        let (ox, oy) = Self::xy(g(WINOFFSET_DST));
+        let (ox, oy) = Self::offset_xy(g(WINOFFSET_DST));
         let (x0, y0) = Self::xy(g(VERTEX_0));
         let (x1, y1) = Self::xy(g(VERTEX_1));
         let (x0, y0, x1, y1) = (x0 + ox, y0 + oy, x1 + ox, y1 + oy);
@@ -860,7 +872,7 @@ impl CrimeRe {
             }
         }
         let Some(dst) = self.buf(&r, g(BUFMODE_DST), "dst") else { return };
-        let (ox, oy) = Self::xy(g(WINOFFSET_DST));
+        let (ox, oy) = Self::offset_xy(g(WINOFFSET_DST));
         let (x0, y0) = Self::xy(g(VERTEX_0));
         let (x1, y1) = Self::xy(g(VERTEX_1));
         let (x0, y0, x1, y1) = (x0 + ox, y0 + oy, x1 + ox, y1 + oy);
@@ -978,7 +990,84 @@ impl CrimeRe {
                     }
                 }
             }
-            _ => self.note("triangle".into()),
+            // Triangle: three float vertices at 0x2080/0x2088/0x2090 (x in
+            // the high word, y in the low), biased by 2^17 so the mantissa
+            // holds 1/64-pixel fixed point, plus the signed window offset.
+            // Colour from the shade registers, 8.12 fixed RGBA. IRIX's
+            // desktop fills its icon backgrounds and vector icons this way,
+            // flat-shaded and opaque.
+            2 => {
+                let fv = |off: u32| -> (f64, f64) {
+                    let f = |w: u32| f32::from_bits(w) as f64 - 131072.0;
+                    (f(g(off)) + ox as f64, f(g(off + 4)) + oy as f64)
+                };
+                let v = [fv(TRI_V0), fv(TRI_V0 + 8), fv(TRI_V0 + 16)];
+                if (0..8).any(|i| g(SHADE_GRAD + 4 * i) != 0) {
+                    self.note("gouraud triangle (drawn flat)".into());
+                }
+                let ch = |off: u32| (g(off) >> 12) & 0xff;
+                let (cr, cg, cb, ca) = (ch(SHADE_R), ch(SHADE_R + 4), ch(SHADE_R + 8), ch(SHADE_R + 12));
+                if dm & (1 << 10) != 0 && ca != 0xff {
+                    self.note("blended triangle (drawn opaque)".into());
+                }
+                let rgba = (cr << 24) | (cg << 16) | (cb << 8) | ca;
+                let dmode = g(BUFMODE_DST);
+                // Double-pix (BufMode bit 1) with 16-bit pixels (3:2 = 1): a
+                // double-buffered GL window keeps front and back in the two
+                // halves of each 32-bit word, bit 0 choosing the half (0 the
+                // low one, which IRIX's WID for it, 0x11, shows). The 16-bit
+                // pixel is A1R5G5B5, as GBE decodes it.
+                let half = dmode & 2 != 0 && (dmode >> 2) & 3 == 1 && dst.bd == 4;
+                let colour = if half {
+                    let c5 = |c: u32| c >> 3;
+                    (u32::from(ca >= 0x80) << 15) | (c5(cr) << 10) | (c5(cg) << 5) | c5(cb)
+                } else {
+                    match (dmode >> 4) & 0xf {
+                        0 => cr,
+                        1 => rgba >> 8,
+                        3 => rgba.swap_bytes(),
+                        _ => rgba,
+                    }
+                };
+                let half_off = if dmode & 1 == 0 { 2 } else { 0 };
+                // Signed area, so the edge functions agree in sign inside.
+                let area = (v[1].0 - v[0].0) * (v[2].1 - v[0].1) - (v[1].1 - v[0].1) * (v[2].0 - v[0].0);
+                if area == 0.0 {
+                    return;
+                }
+                let s = area.signum();
+                let edge = |a: (f64, f64), b: (f64, f64), px: f64, py: f64| s * ((b.0 - a.0) * (py - a.1) - (b.1 - a.1) * (px - a.0));
+                // Top-left rule: a pixel centre exactly on an edge belongs to
+                // the triangle only for a top or left edge.
+                let top_left = |a: (f64, f64), b: (f64, f64)| {
+                    let (dx, dy) = (s * (b.0 - a.0), s * (b.1 - a.1));
+                    (dy == 0.0 && dx < 0.0) || dy > 0.0
+                };
+                let xmin = v.iter().map(|p| p.0).fold(f64::MAX, f64::min).floor().max(0.0) as i32;
+                let xmax = v.iter().map(|p| p.0).fold(f64::MIN, f64::max).ceil().min(4095.0) as i32;
+                let ymin = v.iter().map(|p| p.1).fold(f64::MAX, f64::min).floor().max(0.0) as i32;
+                let ymax = v.iter().map(|p| p.1).fold(f64::MIN, f64::max).ceil().min(4095.0) as i32;
+                let edges = [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])];
+                for y in ymin..=ymax {
+                    for x in xmin..=xmax {
+                        let (px, py) = (x as f64, y as f64);
+                        let inside = edges.iter().all(|&(a, b)| {
+                            let e = edge(a, b, px, py);
+                            e > 0.0 || (e == 0.0 && top_left(a, b))
+                        });
+                        if inside {
+                            if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
+                                if half {
+                                    Self::put(&r, mem, o + half_off, 2, colour);
+                                } else {
+                                    Self::put(&r, mem, o, dst.bd, colour);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => self.note("primitive type 3?".into()),
         }
     }
 
@@ -1248,6 +1337,14 @@ mod tests {
             }
         }
         crate::ip32_screen::save_png(&out, &rgba, w, h).unwrap();
+        // RE_REPLAY_PX="x,y x,y": the raw 32-bit words there.
+        for xy in std::env::var("RE_REPLAY_PX").unwrap_or_default().split_whitespace() {
+            let (x, y) = xy.split_once(',').unwrap();
+            let (x, y) = (x.parse::<u32>().unwrap(), y.parse::<u32>().unwrap());
+            if let Some(o) = CrimeRe::locate(&r, &mem, Buf { tlb: TLB_A, bd: 4 }, x, y) {
+                eprintln!("replay px {x},{y} = {:02x}{:02x}{:02x}{:02x}", mem[o], mem[o + 1], mem[o + 2], mem[o + 3]);
+            }
+        }
     }
 
     #[test]
