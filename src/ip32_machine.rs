@@ -137,7 +137,7 @@ impl O2Machine {
         if let Some(port) = o2.control_port {
             match std::net::TcpListener::bind(("127.0.0.1", port)) {
                 Ok(l) => {
-                    eprintln!("iris: O2 control on 127.0.0.1:{port} (shot, type, key, mouse, click, status)");
+                    eprintln!("iris: O2 control on 127.0.0.1:{port} (shot, type, key, mouse, click, status, pc, scsi)");
                     let bus = bus.clone();
                     std::thread::Builder::new().name("O2-Control".into()).spawn(move || control_server(l, bus)).unwrap();
                 }
@@ -165,6 +165,8 @@ impl O2Machine {
         let mut cu1_saved = 0u32;
         exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
             let pc = exec.core.pc as u32;
+            LAST_PC.store(pc, Ordering::Relaxed);
+            BATCHES.fetch_add(1, Ordering::Relaxed);
             if !post_done {
                 // POST is over once the firmware it loaded into RAM runs.
                 if (FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN).contains(&pc) {
@@ -440,6 +442,12 @@ impl crate::gfx_display::GfxDisplay for O2Display {
 ///   BUTTONS held (1 left, 2 right, 4 middle).
 /// - `click [BUTTON]`: press and release (default 1, left).
 /// - `status`: what the display is showing, and the GBE registers behind it.
+/// Where the CPU was at the end of its last batch, and how many batches it
+/// has run: enough to tell a guest spinning in one place from one that is
+/// still moving, without stopping it.
+static LAST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn control_server(listener: std::net::TcpListener, bus: Arc<Ip32Bus>) {
     use std::io::{BufRead, BufReader, Write};
     for conn in listener.incoming().flatten() {
@@ -471,6 +479,11 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
             },
             None => "err display off".into(),
         },
+        "pc" => format!(
+            "ok pc 0x{:08x} after {} batches",
+            LAST_PC.load(Ordering::Relaxed),
+            BATCHES.load(Ordering::Relaxed)
+        ),
         "scsi" => {
             let mut text = String::new();
             for (n, (c, _)) in bus.scsi.lock().unwrap().iter().enumerate() {
