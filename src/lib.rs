@@ -173,6 +173,7 @@ pub mod machine;
 /// IP32 (SGI O2) bring-up scaffold -- see `docs/ip32-o2-bringup.md`. Not wired
 /// into `Physical`; it drives the CPU against its own bus.
 pub mod ip32;
+pub mod ip32_handover;
 pub mod platform;
 pub mod physical;
 pub mod monitor;

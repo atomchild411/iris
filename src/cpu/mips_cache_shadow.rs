@@ -679,6 +679,14 @@ impl<
 pub type R10000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
+/// SGI O2 R10000 (IP32): the IP28 shadow with 64-byte secondary lines, the
+/// only size the O2 PROM handles (see `R10000O2Cache`). Not usable from reset
+/// on its own -- the O2 PROM keeps its stack in the data cache while it sizes
+/// memory -- so the O2 harness hands over to it once a kernel starts
+/// (`ip32_handover`).
+pub type R10000O2ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 1048576, 64, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
+
 /// SGI Indy / Indigo2 R4400: the full model's geometry and identity — 16 KB
 /// direct-mapped primaries with 16-byte lines, a 1 MB secondary with 128-byte
 /// lines, PRId/FIR, 48 TLB entries, MIPS III — so CP0 Config and a PROM's

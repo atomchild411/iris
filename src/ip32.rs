@@ -1118,6 +1118,11 @@ pub struct MaceRtc {
     /// seconds to change, and a stopped clock leaves it waiting for ever
     /// (OpenBSD, straight after autoconfiguration).
     clock: Mutex<(i64, std::time::Instant)>,
+    /// Set when the guest writes PAB in extended control register 4A: on an
+    /// O2 that is software power-off (the RTC lets go of the supply). Both
+    /// NetBSD and OpenBSD power down this way; without it OpenBSD retries
+    /// for ever, printing "Power supply did not shut down".
+    powered_off: std::sync::atomic::AtomicBool,
 }
 
 /// The DS1687's clock registers and the bits of register B that shape them.
@@ -1134,6 +1139,9 @@ mod rtc_reg {
     /// registers, and 0x48 is the century.
     pub const A_DV0: u8 = 0x10;
     pub const CENTURY: usize = 0x48;
+    /// Extended control register 4A (bank 1), and its power-active-bar bit.
+    pub const XCTRL4A: usize = 0x4a;
+    pub const XCTRL4A_PAB: u8 = 0x08;
     pub const B: usize = 0x0b;
     pub const B_SET: u8 = 0x80;
     pub const B_BINARY: u8 = 0x04;
@@ -1179,7 +1187,16 @@ impl MaceRtc {
         c[rtc_reg::B] = rtc_reg::B_24H;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64).unwrap_or(0);
-        Self { cells: Mutex::new(c), clock: Mutex::new((now, std::time::Instant::now())) }
+        Self {
+            cells: Mutex::new(c),
+            clock: Mutex::new((now, std::time::Instant::now())),
+            powered_off: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the guest has switched the machine off.
+    pub fn powered_off(&self) -> bool {
+        self.powered_off.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Guest time now, in seconds since 1970.
@@ -1283,6 +1300,12 @@ impl BusDevice for MaceRtc {
     fn write8(&self, addr: u32, val: u8) -> u32 {
         let Some(r) = Self::reg_of(addr) else { return BUS_OK };
         let b = self.peek(rtc_reg::B);
+        if r == rtc_reg::XCTRL4A && self.peek(rtc_reg::A) & rtc_reg::A_DV0 != 0 {
+            if val & rtc_reg::XCTRL4A_PAB != 0 {
+                self.powered_off.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return BUS_OK;
+        }
         if r == rtc_reg::CENTURY && self.peek(rtc_reg::A) & rtc_reg::A_DV0 != 0 {
             // The century, in the extended bank: keep the rest of the time.
             let t = self.now();
@@ -3103,6 +3126,11 @@ mod tests {
         r.write8(reg(0x0a), 0x10);
         assert_eq!(r.read8(reg(0x48)).data, 0x19);
         assert_eq!(days_from_civil(2000, 1, 1), 10957);
+        // Software power-off: PAB in extended control register 4A.
+        assert!(!r.powered_off());
+        r.write8(reg(0x0a), 0x10);
+        r.write8(reg(0x4a), 0x08);
+        assert!(r.powered_off(), "PAB switches the machine off");
         assert_eq!(civil_from_days(10957), (2000, 1, 1));
     }
 
@@ -3498,12 +3526,22 @@ mod bringup {
     /// garbage straight after SizeMEM starts).
     fn trace_the_prom_from_reset_inner() {
         match std::env::var("IRIS_IP32_CPU").unwrap_or_default().to_ascii_lowercase().as_str() {
-            "r10000" | "r10k" => run_the_prom_from_reset::<crate::cpu::mips_cache_v2::R10000O2Cache>("R10000"),
-            _ => run_the_prom_from_reset::<R5000Cache>("R5000"),
+            "r10000" | "r10k" if std::env::var("IRIS_IP32_CACHE").as_deref() == Ok("handover") => {
+                run_the_prom_from_reset::<crate::ip32_handover::HandoverCache>("R10000", |exec, steps| {
+                    exec.cache.hand_over();
+                    exec.resync_privilege_state();
+                    eprintln!("ip32: the kernel started at step {steps}; caches written back, now on the shadow cache");
+                })
+            }
+            "r10000" | "r10k" => run_the_prom_from_reset::<crate::cpu::mips_cache_v2::R10000O2Cache>("R10000", |_, _| {}),
+            _ => run_the_prom_from_reset::<R5000Cache>("R5000", |_, _| {}),
         }
     }
 
-    fn run_the_prom_from_reset<C>(cpu: &str)
+    /// `on_kernel` runs once, the first time the PC enters a kernel's text:
+    /// the R10000's cue to hand over from the full cache to the shadow one
+    /// (`IRIS_IP32_CACHE=handover`).
+    fn run_the_prom_from_reset<C>(cpu: &str, on_kernel: impl Fn(&mut MipsExecutor<MipsTlb, C>, u64))
     where
         C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn crate::traits::BusDevice>>,
     {
@@ -3740,6 +3778,7 @@ mod bringup {
                 if kernel_entered == 0 {
                     kernel_entered = steps;
                     kernel_first = pc;
+                    on_kernel(&mut exec, steps);
                 }
                 // The opening moves, which is where a kernel that runs away
                 // decides to.
@@ -4044,6 +4083,10 @@ mod bringup {
                     bits.store(want, std::sync::atomic::Ordering::Relaxed);
                 }
 
+                if bus.rtc.powered_off() {
+                    eprintln!("ip32: the guest switched the machine off at step {steps}");
+                    break;
+                }
                 // Advancing Count is enough: the core raises IP7 when an
                 // advance crosses Compare, once, and a Compare write is the
                 // acknowledgement, as on silicon. This used to raise IP7 as a
