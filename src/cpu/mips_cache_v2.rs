@@ -1825,6 +1825,23 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         *word = (*word & !mask) | ((val as u64) << (set & 63));
     }
 
+    /// The line an R10000 index op names in this direct-mapped model: the
+    /// index within one way (half the cache), with bit 0 of the address as
+    /// the way, which becomes the top index bit.
+    #[inline]
+    fn r10k_way_index(addr: u64, line_shift: u32, lines_shift: u32) -> usize {
+        let half = 1usize << (lines_shift - 1);
+        (((addr >> line_shift) as usize) & (half - 1)) | ((addr as usize & 1) << (lines_shift - 1))
+    }
+
+    /// The same for an R10000 Index_Load/Store_Data: a doubleword slot in a
+    /// data array of `slots` doublewords.
+    #[inline]
+    fn r10k_way_slot(addr: u64, slots: usize) -> usize {
+        let half = slots / 2;
+        ((addr as usize >> 3) & (half - 1)) | ((addr as usize & 1) * half)
+    }
+
     fn pidx(&self, virt_addr: u64) -> u32 {
         ((virt_addr >> L2_PIDX_VADDR_SHIFT) & L2_PIDX_VADDR_MASK as u64) as u32
     }
@@ -3973,20 +3990,17 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 C_R10K_CBARRIER if sel == CACH_PI => return 0,
                 C_R10K_ILD if matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
                     let is_l2 = sel == CACH_SD;
-                    // The index is a byte offset into the data array. Bit 0
-                    // selects the way on real silicon; this model is
-                    // direct-mapped, and bit 0 falls below the u64 slot index,
-                    // so it drops out without any special case.
-                    let slot = (virt_addr as usize) >> 3;
+                    // The index is a byte offset into one way's data, and bit
+                    // 0 selects the way: the same folding as the tag ops
+                    // below, so data and tags name the same line.
                     if is_l2 && HAS_L2 {
-                        return self.l2.data()[slot & (L2_DATA - 1)];
+                        return self.l2.data()[Self::r10k_way_slot(virt_addr, L2_DATA)];
                     }
-                    return self.dc.data()[slot & (DC_DATA - 1)];
+                    return self.dc.data()[Self::r10k_way_slot(virt_addr, DC_DATA)];
                 }
                 C_R10K_ISD if matches!(sel, CACH_SI | CACH_SD) => {
-                    let slot = (virt_addr as usize) >> 3;
                     if HAS_L2 {
-                        self.l2.data_mut()[slot & (L2_DATA - 1)] = phys_addr;
+                        self.l2.data_mut()[Self::r10k_way_slot(virt_addr, L2_DATA)] = phys_addr;
                     }
                     return 0;
                 }
@@ -4027,8 +4041,24 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // `phys_addr` too, except for C_IST, where `phys_addr` carries
         // TagHi:TagLo). Hit ops and Create_Dirty_Exclusive need the
         // translated `phys_addr`.
+        // R10000 index ops (Index_WB_Inv, Index_Load_Tag, Index_Store_Tag)
+        // address one way: the low bits index within it and bit 0 picks the
+        // way. This model is direct-mapped at the full size, so way 1 is the
+        // upper half. Ignoring bit 0 sent both ways of a whole-cache flush to
+        // the lower half and never flushed the upper one: dirty lines there
+        // outlived the flush and were later written back over reused pages.
+        let r10k_index = Self::R10K_CACHE_OPS && matches!(operation, C_IWBINV | C_ILT | C_IST);
         let idx = if is_l2 {
-            self.l2.get_index(if operation == C_IST { virt_addr } else { phys_addr })
+            if r10k_index {
+                // Index ops carry the index address in virt_addr (untranslated).
+                Self::r10k_way_index(virt_addr, Self::L2_LINE_SHIFT, Self::L2_NUM_LINES_SHIFT)
+            } else {
+                self.l2.get_index(if operation == C_IST { virt_addr } else { phys_addr })
+            }
+        } else if r10k_index && is_icache {
+            Self::r10k_way_index(virt_addr, Self::IC_LINE_SHIFT, Self::IC_NUM_LINES_SHIFT)
+        } else if r10k_index {
+            Self::r10k_way_index(virt_addr, Self::DC_LINE_SHIFT, Self::DC_NUM_LINES_SHIFT)
         } else if is_icache {
             let set = self.ic.get_index(virt_addr);
             if Self::IS_R5K { set | (((virt_addr >> 14) as usize & 1) << Self::IC_NUM_LINES_SHIFT) } else { set }
@@ -5262,6 +5292,34 @@ mod tests {
 
     // Flush a single L2 set to memory.  `phys` is any address within the L2 line.
     // Only valid when L2 is present (r4k or r5k+r5ksc).
+    /// A whole-cache flush the way an R10000 kernel does it -- every index of
+    /// one way, then of the other, bit 0 picking the way -- reaches every line,
+    /// including those this direct-mapped model keeps in its upper half.
+    #[test]
+    fn r10000_index_flush_reaches_both_ways() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache: R10000Cache = make_cache_of(mem.clone());
+        // Upper half of the L1D (VA bit 14) and of the 1 MB L2 (PA bit 19).
+        let cases = [(0x9800_0000_0000_6040u64, 0x2040u32), (0x9800_0000_0008_2080, 0x8_2080)];
+        for (i, &(va, pa)) in cases.iter().enumerate() {
+            let _ = cache.write::<4>(va, pa as u64, 0xa5a5_0000 + i as u64);
+        }
+        for va in (0..16 * 1024u64).step_by(32) {
+            for way in 0..2 {
+                cache.cache_op(C_IWBINV | CACH_PD, 0x8000_0000 | va | way, 0);
+            }
+        }
+        for va in (0..512 * 1024u64).step_by(128) {
+            for way in 0..2 {
+                let a = 0x8000_0000 | va | way;
+                cache.cache_op(C_IWBINV | CACH_SD, a, a);
+            }
+        }
+        for (i, &(_, pa)) in cases.iter().enumerate() {
+            assert_eq!(mem_read(&mem, pa), 0xa5a5_0000 + i as u32, "line at {pa:#x} not flushed");
+        }
+    }
+
     fn flush_l2_to_mem(cache: &R4400Cache, phys: u32) {
         let l2_set = (phys as usize >> R4400Cache::L2_LINE_SHIFT as usize) & (R4400Cache::L2_SIZE / R4400Cache::L2_LINE - 1);
         let lp = (l2_set * R4400Cache::L2_LINE) as u64;
