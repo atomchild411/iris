@@ -574,6 +574,10 @@ pub mod re_reg {
     /// Shade colour R, G, B, A (8.12 fixed), then their gradients.
     pub const SHADE_R: u32 = 0x20e0;
     pub const SHADE_GRAD: u32 = 0x20f0;
+    pub const DEPTH_FUNC: u32 = 0x21c0;
+    pub const DEPTH_Z0: u32 = 0x21c8;
+    pub const DEPTH_DZDX: u32 = 0x21d0;
+    pub const DEPTH_DZDY: u32 = 0x21d8;
     pub const BG: u32 = 0x20d8;
     pub const LOGIC_OP: u32 = 0x21b0;
     pub const COLOR_MASK: u32 = 0x21b8;
@@ -604,6 +608,8 @@ mod draw {
     pub const SHADE: u32 = 1 << 16;
     pub const ANTIALIAS_LINE: u32 = 1 << 12;
     pub const BLEND: u32 = 1 << 10;
+    pub const DEPTH_TEST: u32 = 1 << 2;
+    pub const DEPTH_MASK: u32 = 1 << 1;
     pub const LOGIC_OP: u32 = 1 << 9;
     pub const PLANE_MASK: u32 = 1 << 7;
 }
@@ -1142,6 +1148,18 @@ impl CrimeRe {
                     }
                 };
                 let half_off = if dmode & 1 == 0 { 2 } else { 0 };
+                // Depth: Z0 and its gradients are 64-bit 25.12 (high word
+                // first), from the same start point as the colours, truncated
+                // and clamped to 24 bits. The stencil/depth buffer is 32-bit
+                // (stencil 31:24, Z 23:0) at the same x, y through TLB C: GL
+                // contexts load C with their depth buffer, the MTE clears it
+                // to 0xffffff, and the X server uses C for the overlay.
+                let depth = dm & draw::DEPTH_TEST != 0;
+                let zmask = dm & draw::DEPTH_MASK != 0;
+                let r64 = |off: u32| (((g(off) as u64) << 32) | g(off + 4) as u64) as i64 as f64 / 4096.0;
+                let (z0, dzdx, dzdy) = (r64(DEPTH_Z0), r64(DEPTH_DZDX), r64(DEPTH_DZDY));
+                let zfunc = (g(DEPTH_FUNC) >> 25) & 7;
+                let zbuf = Buf { tlb: TLB_A + 0x400, bd: 4 };
                 // Signed area, so the edge functions agree in sign inside.
                 let area = (v[1].0 - v[0].0) * (v[2].1 - v[0].1) - (v[1].1 - v[0].1) * (v[2].0 - v[0].0);
                 if area == 0.0 {
@@ -1168,6 +1186,29 @@ impl CrimeRe {
                             e > 0.0 || (e == 0.0 && top_left(a, b))
                         });
                         if inside && Self::clip_ok(&r, x, y) {
+                            if depth {
+                                let zs = (z0 + dzdx * (px - rx) + dzdy * (py - ry)).clamp(0.0, 16_777_215.0) as u32;
+                                if let Some(zo) = Self::locate(&r, mem, zbuf, x as u32, y as u32) {
+                                    let old = Self::get_px(mem, zo, 4);
+                                    let zd = old & 0xff_ffff;
+                                    let pass = match zfunc {
+                                        0 => false,
+                                        1 => zs < zd,
+                                        2 => zs == zd,
+                                        3 => zs <= zd,
+                                        4 => zs > zd,
+                                        5 => zs != zd,
+                                        6 => zs >= zd,
+                                        _ => true,
+                                    };
+                                    if !pass {
+                                        continue;
+                                    }
+                                    if zmask {
+                                        mem.write(zo, &((old & 0xff00_0000) | zs).to_be_bytes());
+                                    }
+                                }
+                            }
                             if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
                                 let colour = colour_at(px, py);
                                 if half {
