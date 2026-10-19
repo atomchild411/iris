@@ -2734,6 +2734,10 @@ pub struct Ip32Bus {
     pub pci_view: PciNativeView,
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write, pc)`.
     unmapped: Mutex<Vec<(u32, bool, u32)>>,
+    /// The ppmem window's base and the RAM bitmap the memory space keeps
+    /// (one bit per 64 MB region it has fully mapped), once the machine has
+    /// wired them: aligned RAM reads then skip the RAM lock. See `read_bytes`.
+    fast_ram: std::sync::OnceLock<(usize, usize)>,
     /// The PC of the instruction currently executing.
     pub pc: std::sync::Arc<PcTap>,
     /// Count of writes into the firmware load region.
@@ -2810,6 +2814,7 @@ impl Ip32Bus {
             mec: std::sync::Arc::new(crate::dev::mec::Mec::new(ram.clone())),
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
+            fast_ram: std::sync::OnceLock::new(),
             pc: pc.clone(),
             fw_writes: Mutex::new(0),
             sizemem: Mutex::new(Vec::new()),
@@ -2955,6 +2960,14 @@ impl Ip32Bus {
     /// runs on its own thread. Without one (the harness) nothing here runs.
     pub fn set_irq_sink(&self, sink: Box<dyn Fn(bool) + Send + Sync>) {
         let _ = self.irq_sink.set(sink);
+    }
+
+    /// Let aligned RAM reads go straight to the ppmem window: its base and
+    /// the bitmap the memory space publishes (the CPU's, as `ppmem_bitmap_ptr`).
+    pub fn set_fast_ram(&self, window: *mut u8, bitmap: *mut u64) {
+        if !window.is_null() && !bitmap.is_null() {
+            let _ = self.fast_ram.set((window as usize, bitmap as usize));
+        }
     }
 
     fn is_ram_addr(addr: u32) -> bool {
@@ -3399,6 +3412,27 @@ impl Ip32Bus {
 
     fn read_bytes(&self, addr: u32, n: usize) -> Option<u64> {
         let addr = self.resolve(addr);
+        // Mapped RAM, read straight from the window: IRIX's idle loop and
+        // uncached kernel loads came here thousands of times a second, each
+        // taking the RAM lock and assembling the value a byte at a time.
+        // An aligned word is a host u32 in the window's layout (see
+        // O2Memory::get_be).
+        if let Some(&(win, bm)) = self.fast_ram.get() {
+            let bits = unsafe { std::ptr::read_volatile(bm as *const u64) };
+            if bits & (1u64 << (addr >> crate::ppmem::BITMAP_SHIFT)) != 0 && addr as usize % n == 0 {
+                let p = win + addr as usize;
+                let v = unsafe {
+                    match n {
+                        1 => *((p ^ 3) as *const u8) as u64,
+                        2 => ((p ^ 2) as *const u16).read_unaligned() as u64,
+                        4 => (p as *const u32).read_unaligned() as u64,
+                        _ => ((p as *const u32).read_unaligned() as u64) << 32 | ((p + 4) as *const u32).read_unaligned() as u64,
+                    }
+                };
+                self.watch_hit(addr, false, v, n);
+                return Some(v);
+            }
+        }
         {
             let r = self.ram.lock().unwrap();
             match r.decode(addr) {
