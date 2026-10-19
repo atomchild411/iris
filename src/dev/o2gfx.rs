@@ -261,7 +261,9 @@ impl Gbe {
     }
 
     fn read_reg(&self, off: u32) -> u32 {
-        *self.hot.lock().unwrap().entry(off).or_insert(0) += 1;
+        if crate::ip32::hot_counters() {
+            *self.hot.lock().unwrap().entry(off).or_insert(0) += 1;
+        }
         let mut s = self.s.lock().unwrap();
         self.latch(&mut s);
         match off {
@@ -1136,7 +1138,9 @@ impl CrimeRe {
     }
 
     fn read_reg(&self, off: u32) -> u32 {
-        *self.hot.lock().unwrap().entry(off & !3).or_insert(0) += 1;
+        if crate::ip32::hot_counters() {
+            *self.hot.lock().unwrap().entry(off & !3).or_insert(0) += 1;
+        }
         match off & !3 {
             // Busy: the four idle bits clear, the interface buffer reported
             // empty (the queue's own back-pressure stands in for its level).
@@ -1215,8 +1219,7 @@ impl CrimeRe {
         Some(base + ((y % 128) * 512 + (x % tw) * buf.bd) as usize)
     }
 
-    #[inline(always)]
-    fn get_px(mem: &O2Memory, o: usize, bd: u32) -> u32 {
+        fn get_px(mem: &O2Memory, o: usize, bd: u32) -> u32 {
         mem.get_be(o, bd)
     }
 
@@ -1251,8 +1254,7 @@ impl CrimeRe {
 
     /// Write `src` to the pixel at `o`, through the logic op, plane mask and
     /// byte-lane enables.
-    #[inline(always)]
-    fn put(r: &[u32], mem: &mut O2Memory, o: usize, bd: u32, src: u32) {
+        fn put(r: &[u32], mem: &mut O2Memory, o: usize, bd: u32, src: u32) {
         let dm = r[(DRAWMODE / 4) as usize];
         let reads = dm & (draw::LOGIC_OP | draw::PLANE_MASK) != 0;
         let old = if reads { Self::get_px(mem, o, bd) } else { 0 };

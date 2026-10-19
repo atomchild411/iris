@@ -2572,6 +2572,15 @@ impl BusDevice for MaceUst {
     fn write64(&self, _a: u32, _v: u64) -> u32 { BUS_OK }
 }
 
+/// Whether the per-register access counters (MACE's, GBE's, the rendering
+/// engine's) run: `IRIS_IP32_HOT`. They are for finding a driver polling a
+/// bit nothing sets, and each access took a lock and a map update, every
+/// status poll of a GL scene included.
+pub fn hot_counters() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_IP32_HOT").is_some())
+}
+
 /// A register file that remembers what it is told, and counts accesses per
 /// offset. Stands in for MACE until there is a reason to build it properly.
 ///
@@ -2581,8 +2590,8 @@ impl BusDevice for MaceUst {
 /// set.
 pub struct Stub {
     pub name: &'static str,
-    reads: Mutex<u64>,
-    writes: Mutex<u64>,
+    reads: std::sync::atomic::AtomicU64,
+    writes: std::sync::atomic::AtomicU64,
     /// Per-offset access counts. A stub that is being polled hard is the guest
     /// waiting on a bit we are not setting, and the offset says which.
     hot: Mutex<std::collections::BTreeMap<u32, (u64, u64)>>,
@@ -2599,8 +2608,8 @@ impl Stub {
     pub fn new(name: &'static str) -> Self {
         Self {
             name,
-            reads: Mutex::new(0),
-            writes: Mutex::new(0),
+            reads: std::sync::atomic::AtomicU64::new(0),
+            writes: std::sync::atomic::AtomicU64::new(0),
             hot: Mutex::new(std::collections::BTreeMap::new()),
             cells: Mutex::new(std::collections::BTreeMap::new()),
             who: Mutex::new(std::collections::BTreeMap::new()),
@@ -2608,7 +2617,7 @@ impl Stub {
         }
     }
     pub fn counts(&self) -> (u64, u64) {
-        (*self.reads.lock().unwrap(), *self.writes.lock().unwrap())
+        (self.reads.load(Ordering::Relaxed), self.writes.load(Ordering::Relaxed))
     }
     /// Offsets by access count, busiest first: `(offset, reads, writes)`.
     pub fn hottest(&self) -> Vec<(u32, u64, u64)> {
@@ -2618,10 +2627,10 @@ impl Stub {
         v
     }
     fn r(&self) {
-        *self.reads.lock().unwrap() += 1;
+        self.reads.fetch_add(1, Ordering::Relaxed);
     }
     fn w(&self) {
-        *self.writes.lock().unwrap() += 1;
+        self.writes.fetch_add(1, Ordering::Relaxed);
     }
     fn cell(&self, addr: u32) -> u64 {
         *self.cells.lock().unwrap().get(&(addr & 0x007f_ffff & !7)).unwrap_or(&0)
@@ -2636,6 +2645,9 @@ impl Stub {
         self.cells.lock().unwrap().insert(addr & 0x007f_ffff & !7, val);
     }
     fn hit(&self, addr: u32, write: bool) {
+        if !hot_counters() {
+            return;
+        }
         let off = addr & 0x007f_ffff & !3;
         let mut h = self.hot.lock().unwrap();
         let e = h.entry(off).or_insert((0, 0));
