@@ -636,6 +636,94 @@ impl BusDevice for Gbe {
     }
 }
 
+/// A texture as the rendering engine samples it: its base level's size, how
+/// it wraps, and where its texels are. Worked out from perfly, whose hubcap
+/// tile matches hubcap.rgb texel for texel this way (the spec leaves texel
+/// look-up "TBD"):
+///
+/// - s and t are 1.15 fixed point once divided by q (32768 is the whole
+///   map); u = s * width / 32768, with width = 1 << the format's u wrap shift.
+/// - 16-bit texels (A1R5G5B5) sit in 64 KB tiles laid out like frame-buffer
+///   tiles, 128 lines of 512 bytes, in 4 x 4 blocks: texel-index bits from
+///   the bottom are u0 u1 v0 v1 u2 u3 u4 u5 v4 v5 v2 v3 u6 - v6. Index bits
+///   past those for maps over 128 texels are a guess.
+/// - The base level is at the first valid entry of the texture TLB (88 for
+///   perfly's 128 x 128 and 128 x 64 maps; levels 1 and up follow at 92 and
+///   93, unused here: no mipmapping yet).
+struct Texture {
+    w: u32,
+    h: u32,
+    repeat_s: bool,
+    repeat_t: bool,
+    linear: bool,
+    base: usize,
+}
+
+impl Texture {
+    fn from_regs(r: &[u32]) -> Option<Texture> {
+        let g = |off: u32| r[(off / 4) as usize];
+        let mode = g(TEX_MODE);
+        let (typ, depth) = ((mode >> 20) & 15, (mode >> 18) & 3);
+        if depth != 1 || !matches!(typ, 1 | 2) {
+            return None; // 32-bit and luminance/intensity texels: not yet
+        }
+        let fmt_hi = g(TEX_FORMAT);
+        let (uw, vw) = ((fmt_hi >> 4) & 15, fmt_hi & 15);
+        let base = (0..112).find(|&i| {
+            let word = TLB_TEX + 8 * (i as u32 / 4);
+            let w64 = ((g(word) as u64) << 32) | g(word + 4) as u64;
+            (w64 >> (48 - 16 * (i % 4))) & 0x8000 != 0
+        })?;
+        Some(Texture {
+            w: 1 << uw,
+            h: 1 << vw,
+            repeat_s: (mode >> 4) & 3 == 1,
+            repeat_t: (mode >> 2) & 3 == 1,
+            linear: mode & (1 << 6) != 0,
+            base,
+        })
+    }
+
+    /// The texel at integer (u, v), wrapped or clamped, as R, G, B, A.
+    fn texel(&self, r: &[u32], mem: &O2Memory, u: i64, v: i64) -> [f64; 4] {
+        let wrap = |c: i64, n: u32, rep: bool| if rep { c.rem_euclid(n as i64) as u32 } else { c.clamp(0, n as i64 - 1) as u32 };
+        let (u, v) = (wrap(u, self.w, self.repeat_s), wrap(v, self.h, self.repeat_t));
+        let idx = (u & 3) | (v & 3) << 2 | ((u >> 2) & 15) << 4 | ((v >> 4) & 3) << 8 | ((v >> 2) & 3) << 10
+            | ((u >> 6) & 1) << 12 | ((u >> 7) & 1) << 13 | ((v >> 6) & 1) << 14 | (v >> 7) << 15 | (u >> 8) << 16;
+        let byte = idx as usize * 2;
+        let entry = self.base + (byte >> 16);
+        let word = TLB_TEX + 8 * (entry as u32 / 4);
+        let w64 = ((r[(word / 4) as usize] as u64) << 32) | r[(word / 4 + 1) as usize] as u64;
+        let e = (w64 >> (48 - 16 * (entry % 4))) & 0xffff;
+        if e & 0x8000 == 0 {
+            return [0.0; 4];
+        }
+        let Some(o) = mem.dma_offset((((e & 0x7fff) as u32) << 16) + (byte & 0xffff) as u32).filter(|&o| o + 1 < mem.len()) else {
+            return [0.0; 4];
+        };
+        let p = ((mem[o] as u32) << 8) | mem[o + 1] as u32;
+        let c = |v: u32| ((v << 3) | (v >> 2)) as f64;
+        [c((p >> 10) & 31), c((p >> 5) & 31), c(p & 31), if p & 0x8000 != 0 { 255.0 } else { 0.0 }]
+    }
+
+    /// The map at (s, t) in 1.15 units, bilinear or nearest.
+    fn sample(&self, r: &[u32], mem: &O2Memory, s: f64, t: f64) -> [f64; 4] {
+        let (u, v) = (s * self.w as f64 / 32768.0 - 0.5, t * self.h as f64 / 32768.0 - 0.5);
+        if !self.linear {
+            return self.texel(r, mem, u.round() as i64, v.round() as i64);
+        }
+        let (u0, v0) = (u.floor(), v.floor());
+        let (fu, fv) = (u - u0, v - v0);
+        let (u0, v0) = (u0 as i64, v0 as i64);
+        let (a, b, c, d) = (self.texel(r, mem, u0, v0), self.texel(r, mem, u0 + 1, v0), self.texel(r, mem, u0, v0 + 1), self.texel(r, mem, u0 + 1, v0 + 1));
+        let mut out = [0.0; 4];
+        for k in 0..4 {
+            out[k] = (a[k] * (1.0 - fu) + b[k] * fu) * (1.0 - fv) + (c[k] * (1.0 - fu) + d[k] * fu) * fv;
+        }
+        out
+    }
+}
+
 /// A GL vertex coordinate: 13.6 fixed point in the low 23 bits (CRIME 1.5
 /// spec). IRIX's GL writes floats biased by 2^17, whose mantissa holds
 /// exactly that; perfly's panel text writes the fixed-point value itself
@@ -645,8 +733,9 @@ fn gl_coord(w: u32) -> f64 {
 }
 
 /// How Gouraud gradients are read: their fraction bits and which vertex the
-/// start colour belongs to. The replay test can try others (RE_GOURAUD).
-static GOURAUD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(12 << 8);
+/// start colour belongs to (3: the traversal's start point, the default).
+/// The replay test can try others (RE_GOURAUD).
+static GOURAUD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(12 << 8 | 3);
 
 fn gouraud_model() -> (u32, usize) {
     let v = GOURAUD.load(std::sync::atomic::Ordering::Relaxed);
@@ -684,6 +773,18 @@ pub mod re_reg {
     /// Shade colour R, G, B, A (8.12 fixed), then their gradients.
     pub const SHADE_R: u32 = 0x20e0;
     pub const SHADE_GRAD: u32 = 0x20f0;
+    pub const TEX_MODE: u32 = 0x2110;
+    pub const TEX_FORMAT: u32 = 0x2118;
+    pub const TEX_SQ0: u32 = 0x2120;
+    pub const TEX_TQ0: u32 = 0x2128;
+    pub const TEX_Q0: u32 = 0x2130;
+    pub const TEX_DSQDX: u32 = 0x2138;
+    pub const TEX_DSQDY: u32 = 0x2140;
+    pub const TEX_DTQDX: u32 = 0x2148;
+    pub const TEX_DTQDY: u32 = 0x2150;
+    pub const TEX_DQDX: u32 = 0x2158;
+    pub const TEX_DQDY: u32 = 0x215c;
+    pub const TLB_TEX: u32 = 0x1600;
     pub const DEPTH_FUNC: u32 = 0x21c0;
     pub const DEPTH_Z0: u32 = 0x21c8;
     pub const DEPTH_DZDX: u32 = 0x21d0;
@@ -716,6 +817,7 @@ mod draw {
     pub const POLY_STIPPLE: u32 = 1 << 18;
     pub const OPAQUE_STIPPLE: u32 = 1 << 17;
     pub const SHADE: u32 = 1 << 16;
+    pub const TEXTURE: u32 = 1 << 15;
     pub const ANTIALIAS_LINE: u32 = 1 << 12;
     pub const BLEND: u32 = 1 << 10;
     pub const DEPTH_TEST: u32 = 1 << 2;
@@ -1330,9 +1432,40 @@ impl CrimeRe {
                 let (frac, refv) = gouraud_model();
                 let grad = |i: u32| g(SHADE_GRAD + 4 * i) as i32 as f64 / (1u64 << frac) as f64;
                 let (ddx, ddy) = ([grad(0), grad(1), grad(4), grad(5)], [grad(2), grad(3), grad(6), grad(7)]);
-                let shaded = (0..8).any(|i| g(SHADE_GRAD + 4 * i) != 0);
-                let (rx, ry) = v[refv.min(2)];
-                let c0 = [0u32, 4, 8, 12].map(|o| g(SHADE_R + o) as i32 as f64 / 4096.0);
+                // Shading off (draw mode bit 16 clear): flat FG, as points and
+                // rectangles always are; the shade registers then hold
+                // whatever the last shaded primitive left (perfly's textured
+                // hubcaps: FG white, R0 negative).
+                let smooth = dm & draw::SHADE != 0;
+                let shaded = smooth && (0..8).any(|i| g(SHADE_GRAD + 4 * i) != 0);
+                // The start point the driver gives every attribute (colour,
+                // depth, texture) for: the vertex the traversal begins at,
+                // the bottom one for bottom-to-top edge types (0, 1) and the
+                // top one otherwise, the left or right one of two by the
+                // horizontal direction, at (1/16, 19/64) into its pixel.
+                // Solved from perfly's hubcap fan, where every triangle then
+                // agrees on the shared centre's texture coordinate.
+                let (rx, ry) = if refv < 3 {
+                    v[refv]
+                } else {
+                    let et = (prim >> 16) & 3;
+                    let rightward = et & 1 == 0;
+                    let start = v.iter().copied().fold(None::<(f64, f64)>, |best, p| match best {
+                        None => Some(p),
+                        Some(b) => {
+                            let better_y = if et < 2 { p.1 > b.1 } else { p.1 < b.1 };
+                            let tie_x = p.1 == b.1 && if rightward { p.0 < b.0 } else { p.0 > b.0 };
+                            Some(if better_y || tie_x { p } else { b })
+                        }
+                    }).unwrap();
+                    (start.0.floor() + 1.0 / 16.0, start.1.floor() + 19.0 / 64.0)
+                };
+                let fgc = g(FG);
+                let c0 = if smooth {
+                    [0u32, 4, 8, 12].map(|o| g(SHADE_R + o) as i32 as f64 / 4096.0)
+                } else {
+                    [24u32, 16, 8, 0].map(|sh| ((fgc >> sh) & 0xff) as f64)
+                };
                 let channel = |k: usize, px: f64, py: f64| -> u32 {
                     let c = if shaded { c0[k] + ddx[k] * (px - rx) + ddy[k] * (py - ry) } else { c0[k] };
                     c.clamp(0.0, 255.0) as u32
@@ -1363,12 +1496,40 @@ impl CrimeRe {
                     }
                 };
                 let flat = pack(cr, cg, cb, ca);
-                let colour_at = |px: f64, py: f64| -> u32 {
-                    if shaded {
-                        pack(channel(0, px, py), channel(1, px, py), channel(2, px, py), channel(3, px, py))
-                    } else {
-                        flat
+                // Texture (draw mode bit 15): s/q and t/q from the same start
+                // point as the colours, modulating them (perfly's texture
+                // function; the others are not modelled yet).
+                let tex = if dm & draw::TEXTURE != 0 {
+                    let t = Texture::from_regs(&r);
+                    if t.is_none() {
+                        self.note(format!("texture mode {:#x} (drawn untextured)", g(TEX_MODE)));
                     }
+                    t
+                } else {
+                    None
+                };
+                let s64r = |off: u32| (((g(off) as u64) << 32) | g(off + 4) as u64) as i64 as f64;
+                let s32r = |off: u32| g(off) as i32 as f64;
+                let (sq0, tq0, q0) = (s64r(TEX_SQ0), s64r(TEX_TQ0), s32r(TEX_Q0));
+                let (dsx, dsy, dtx, dty) = (s64r(TEX_DSQDX), s64r(TEX_DSQDY), s64r(TEX_DTQDX), s64r(TEX_DTQDY));
+                let (dqx, dqy) = (s32r(TEX_DQDX), s32r(TEX_DQDY));
+                let colour_at = |mem: &O2Memory, px: f64, py: f64| -> u32 {
+                    let Some(t) = &tex else {
+                        return if shaded {
+                            pack(channel(0, px, py), channel(1, px, py), channel(2, px, py), channel(3, px, py))
+                        } else {
+                            flat
+                        };
+                    };
+                    let (dx, dy) = (px - rx, py - ry);
+                    let q = q0 + dqx * dx + dqy * dy;
+                    if q == 0.0 {
+                        return flat;
+                    }
+                    let tx = t.sample(&r, mem, (sq0 + dsx * dx + dsy * dy) / q, (tq0 + dtx * dx + dty * dy) / q);
+                    let m = |k: usize| ((channel(k, px, py) as f64 * tx[k] / 255.0).round() as u32).min(255);
+                    let a = if (g(TEX_MODE) >> 20) & 15 == 2 { m(3) } else { channel(3, px, py) };
+                    pack(m(0), m(1), m(2), a)
                 };
                 let half_off = if dmode & 1 == 0 { 2 } else { 0 };
                 // Depth: Z0 and its gradients are 64-bit 25.12 (high word
@@ -1433,7 +1594,7 @@ impl CrimeRe {
                                 }
                             }
                             if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
-                                let colour = colour_at(px, py);
+                                let colour = colour_at(mem, px, py);
                                 if half {
                                     Self::put(&r, mem, o + half_off, 2, colour);
                                 } else {
@@ -1813,9 +1974,29 @@ mod tests {
         let mut m = O2Memory::from_kits(&[128, 128]).unwrap();
         m.set_ctrl(0, 0x100);
         m.set_ctrl(2, 0x100 | 4);
+        // RE_REPLAY_PRELOAD="0849:tex-0849.bin,...": 64 KB tiles (by tile
+        // number) to fill first, for what the CPU wrote that a register
+        // trace cannot hold (textures).
+        // The kernel's MTE page clears in the trace zero pages the CPU later
+        // refilled, so the tiles are put back every couple of thousand writes.
+        let preload: Vec<(usize, Vec<u8>)> = std::env::var("RE_REPLAY_PRELOAD")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|spec| {
+                let (tile, file) = spec.split_once(':').unwrap();
+                (m.dma_offset(u32::from_str_radix(tile, 16).unwrap() << 16).unwrap(), std::fs::read(file).unwrap())
+            })
+            .collect();
         let ram = Arc::new(Mutex::new(m));
         let re = CrimeRe::new(ram.clone());
-        for line in std::fs::read_to_string(path).unwrap().lines() {
+        for (n, line) in std::fs::read_to_string(path).unwrap().lines().enumerate() {
+            if n % 2000 == 0 {
+                let mut m = ram.lock().unwrap();
+                for (o, data) in &preload {
+                    m.write(*o, data);
+                }
+            }
             let mut f = line.split_whitespace();
             let (w, off, val) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
             let (off, val) = (u32::from_str_radix(off, 16).unwrap(), u64::from_str_radix(val, 16).unwrap());
