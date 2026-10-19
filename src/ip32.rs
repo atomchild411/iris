@@ -286,8 +286,7 @@ impl Crime {
 
     /// The raw counter, before the offset a write installs.
     fn raw_time(&self) -> u64 {
-        self.ust.guest_us();
-        self.ust.now().wrapping_mul(CRIME_TICKS_PER_US)
+        self.ust.guest_us().wrapping_mul(CRIME_TICKS_PER_US)
     }
 
     fn note(&self, off: u32, write: bool) {
@@ -2422,7 +2421,8 @@ pub fn crc8_dallas(data: &[u8]) -> u8 {
 /// Records what the PROM does to the 1-Wire register and when, so the protocol
 /// can be reconstructed from its own behaviour rather than guessed at.
 pub struct NicTrace {
-    events: Mutex<Vec<(u64, bool, u8)>>,
+    /// (host us, guest-clock us, write, value)
+    events: Mutex<Vec<(u64, u64, bool, u8)>>,
 }
 
 impl Default for NicTrace {
@@ -2431,14 +2431,18 @@ impl Default for NicTrace {
 
 impl NicTrace {
     pub fn new() -> Self { Self { events: Mutex::new(Vec::new()) } }
-    pub fn record(&self, t: u64, write: bool, val: u8) {
+    pub fn record(&self, t: u64, guest: u64, write: bool, val: u8) {
         let mut e = self.events.lock().unwrap();
-        if e.len() < 4096 {
-            e.push((t, write, val));
+        if e.len() < 65536 {
+            e.push((t, guest, write, val));
         }
     }
     pub fn events(&self) -> Vec<(u64, bool, u8)> {
-        self.events.lock().unwrap().clone()
+        self.events.lock().unwrap().iter().map(|&(t, _, w, v)| (t, w, v)).collect()
+    }
+    /// One line per access: host us, guest-clock us, R/W, value.
+    pub fn text(&self) -> String {
+        self.events.lock().unwrap().iter().map(|&(t, g, w, v)| format!("{t} {g} {} {v:02x}\n", if w { 'W' } else { 'R' })).collect()
     }
 }
 
@@ -2457,18 +2461,30 @@ pub struct MaceUst {
     /// read live. The 1-Wire ID chip's slots are tens of microseconds, so a
     /// clock stepped from another thread cannot time them.
     host: std::sync::OnceLock<std::time::Instant>,
-    /// The guest's clock as seen by a device that times the guest's own
-    /// pulses: (host time at the last guest clock read, accumulated time).
-    /// See [`MaceUst::guest_us`].
-    guest: Mutex<(u64, u64)>,
+    /// The guest's own view of time: see [`MaceUst::guest_us`].
+    guest: Mutex<GuestClock>,
 }
 
-/// The longest step [`MaceUst::guest_us`] takes between two guest clock
-/// reads. Firmware times short pulses by spinning on a clock; a host stall
-/// in the middle (a JIT pause, a busy host) would otherwise land in the
-/// pulse. 8 us is far above one spin of the loop and far below the 15 us a
-/// 1-Wire "1" may last.
+/// [`MaceUst::guest_us`]'s state, in host microseconds.
+#[derive(Default)]
+struct GuestClock {
+    /// The host time at the last guest clock read.
+    last: u64,
+    /// Host time the guest clock has dropped: stalls during 1-Wire work.
+    lost: u64,
+    /// The 1-Wire bus counts as busy until then.
+    onewire_until: u64,
+}
+
+/// While the PROM bit-banges 1-Wire, the longest step the guest clock takes
+/// between two of its reads. The PROM times each slot by spinning on the
+/// clock; a host stall in the middle (a JIT pause, a busy host) would land in
+/// the slot. 8 us is far above one spin of the loop and far below the 15 us
+/// a 1-Wire "1" may last.
 const GUEST_CLOCK_STEP_CAP_US: u64 = 8;
+
+/// How long after the last 1-Wire access the bus counts as busy.
+const ONEWIRE_BUSY_US: u64 = 5000;
 
 /// UST ticks per emulated instruction, as a fraction: `TICKS_NUM / TICKS_DEN`.
 ///
@@ -2484,7 +2500,7 @@ impl Default for MaceUst {
 }
 
 impl MaceUst {
-    pub fn new() -> Self { Self { ticks: Mutex::new(0), host: std::sync::OnceLock::new(), guest: Mutex::new((0, 0)) } }
+    pub fn new() -> Self { Self { ticks: Mutex::new(0), host: std::sync::OnceLock::new(), guest: Mutex::new(GuestClock::default()) } }
 
     /// Run from the host clock from now on (a machine, not the harness).
     pub fn use_host_clock(&self) {
@@ -2503,24 +2519,38 @@ impl MaceUst {
     }
 
     fn tick(&self) -> u64 {
-        self.guest_us();
-        self.now()
+        self.guest_us()
     }
 
-    /// Microseconds on a clock that runs with the host's between guest clock
-    /// reads but never more than [`GUEST_CLOCK_STEP_CAP_US`] per step: time
-    /// the guest was not running (a stalled emulator thread) does not count.
-    /// For timing pulses the guest itself times by spinning on UST: the
-    /// 1-Wire ID chip read the PROM's "1" bits as "0" whenever the CPU thread
-    /// stalled inside one, and IRIX came up with no Ethernet address.
-    /// Every guest read of UST or CRIME's timer advances it.
+    /// The time the guest reads (UST, CRIME's timer): the host's, less what
+    /// host stalls cost while the PROM was bit-banging 1-Wire. Then each step
+    /// between two guest reads counts at most [`GUEST_CLOCK_STEP_CAP_US`],
+    /// so after a stall the PROM goes on spinning to its own deadline and
+    /// every slot comes out as wide as it meant. Timed on the host clock, a
+    /// stall inside a "1" read as a "0" (or a reset), and on some boots the
+    /// PROM reported `ds2502_read_rom failed` and IRIX had no Ethernet
+    /// address. Capping a device-side clock alone was not enough: a stall
+    /// early in a "0" slot let the PROM see its deadline pass and release,
+    /// and the slot read short. Outside 1-Wire work nothing is dropped, and
+    /// the guest's time never runs backwards.
     pub fn guest_us(&self) -> u64 {
         let now = self.now();
         let mut g = self.guest.lock().unwrap();
-        let (last, acc) = *g;
-        let step = if last == 0 { 0 } else { now.saturating_sub(last).min(GUEST_CLOCK_STEP_CAP_US) };
-        *g = (now, acc + step);
-        acc + step
+        if g.last != 0 && now < g.onewire_until {
+            let step = now.saturating_sub(g.last);
+            if step > GUEST_CLOCK_STEP_CAP_US {
+                g.lost += step - GUEST_CLOCK_STEP_CAP_US;
+            }
+        }
+        g.last = now;
+        now - g.lost
+    }
+
+    /// The PROM touched the 1-Wire bus: hold stalls out of the guest's clock
+    /// for a while.
+    pub fn onewire_busy(&self) {
+        let now = self.now();
+        self.guest.lock().unwrap().onewire_until = now + ONEWIRE_BUSY_US;
     }
 
     pub fn now(&self) -> u64 {
@@ -3311,11 +3341,13 @@ impl Ip32Bus {
         // is exactly what the bus trace shows (only 0x08 and 0x0c are ever
         // written).
         let low = val & nic_bit::DEASSERT == 0;
+        self.ust.onewire_busy();
         self.onewire.master_drive(self.ust.guest_us(), low);
     }
 
     fn nic_read(&self) -> u8 {
         let mut v = self.mace.cell(MACE_ISA_FLASH_NIC_REG) as u8;
+        self.ust.onewire_busy();
         if self.onewire.line_level(self.ust.guest_us()) {
             v |= nic_bit::DATA;
         } else {
@@ -3470,7 +3502,7 @@ impl Ip32Bus {
         }
         if self.is_nic_reg(addr) {
             let v = self.nic_read();
-            self.nic_trace.record(self.ust.now(), false, v);
+            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
             return BusRead8::ok(v);
         }
         if let Some(c) = self.com_for(addr) {
@@ -3574,7 +3606,7 @@ impl Ip32Bus {
         }
         if self.is_nic_reg(addr) {
             let v = self.nic_read();
-            self.nic_trace.record(self.ust.now(), false, v);
+            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
             return BusRead32::ok(v as u32);
         }
         if let Some(c) = self.com_for(addr) {
@@ -3627,7 +3659,7 @@ impl Ip32Bus {
         }
         if self.is_nic_reg(addr) {
             let v = self.nic_read();
-            self.nic_trace.record(self.ust.now(), false, v);
+            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
             return BusRead64::ok(v as u64);
         }
         if self.in_mec(addr) {
@@ -3691,7 +3723,7 @@ impl Ip32Bus {
             return self.pci_view.write8(addr, val);
         }
         if self.is_nic_reg(addr) {
-            self.nic_trace.record(self.ust.now(), true, val);
+            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val);
             self.nic_write(val);
             let r = self.mace.write8(addr, val);
             self.mace_wrote(addr);
@@ -3806,7 +3838,7 @@ impl Ip32Bus {
             return self.pci_view.write32(addr, val);
         }
         if self.is_nic_reg(addr) {
-            self.nic_trace.record(self.ust.now(), true, val as u8);
+            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val as u8);
             self.nic_write(val as u8);
             let r = self.mace.write32(addr, val);
             self.mace_wrote(addr);
@@ -3868,7 +3900,7 @@ impl Ip32Bus {
             return self.pci_view.write64(addr, val);
         }
         if self.is_nic_reg(addr) {
-            self.nic_trace.record(self.ust.now(), true, val as u8);
+            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val as u8);
             self.nic_write(val as u8);
             let r = self.mace.write64(addr, val);
             self.mace_wrote(addr);

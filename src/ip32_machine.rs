@@ -538,6 +538,16 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
         ),
         // `crimelog PATH`: the guest's recent CRIME interrupt-register
         // accesses, oldest first.
+        "nictrace" => {
+            let mut t = bus.nic_trace.text();
+            for l in bus.onewire.protocol_log() {
+                t.push_str(&format!("# {l}\n"));
+            }
+            match std::fs::write(arg.trim(), t) {
+                Ok(()) => "ok".into(),
+                Err(e) => format!("err {e}"),
+            }
+        }
         "crimelog" => match std::fs::write(arg.trim(), bus.crime.irqlog_text()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),
