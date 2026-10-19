@@ -210,6 +210,25 @@ impl O2Memory {
         }
     }
 
+    /// Store `val` through `mask` into `words` aligned 32-bit words from
+    /// `off` (big-endian, as [`Self::put_be`]), each page bumped once: the
+    /// memory engine's clears and fills.
+    pub fn fill_words_masked(&mut self, off: usize, words: usize, val: u32, mask: u32) {
+        if words == 0 {
+            return;
+        }
+        assert!(off % 4 == 0 && off + 4 * words <= self.total, "O2 memory fill {off:#x}+{words} words");
+        for i in 0..words {
+            unsafe {
+                let p = self.host.add(off + 4 * i) as *mut u32;
+                p.write_unaligned((p.read_unaligned() & !mask) | (val & mask));
+            }
+        }
+        for page in off / PAGE..=(off + 4 * words - 1) / PAGE {
+            self.touch(page);
+        }
+    }
+
     /// Page `page` was written: bump its generation now, or note it for the
     /// end of the batch.
     #[inline]

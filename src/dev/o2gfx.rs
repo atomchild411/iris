@@ -1215,6 +1215,7 @@ impl CrimeRe {
         Some(base + ((y % 128) * 512 + (x % tw) * buf.bd) as usize)
     }
 
+    #[inline(always)]
     fn get_px(mem: &O2Memory, o: usize, bd: u32) -> u32 {
         mem.get_be(o, bd)
     }
@@ -1250,6 +1251,7 @@ impl CrimeRe {
 
     /// Write `src` to the pixel at `o`, through the logic op, plane mask and
     /// byte-lane enables.
+    #[inline(always)]
     fn put(r: &[u32], mem: &mut O2Memory, o: usize, bd: u32, src: u32) {
         let dm = r[(DRAWMODE / 4) as usize];
         let reads = dm & (draw::LOGIC_OP | draw::PLANE_MASK) != 0;
@@ -1263,9 +1265,18 @@ impl CrimeRe {
         if lanes == 0xf {
             mem.put_be(o, bd, v);
         } else {
-            let bytes = v.to_be_bytes();
-            let bytes = &bytes[4 - bd as usize..];
-            mem.write_span(o, bd as usize, |k| (lanes & (1 << (3 - ((o + k) & 3))) != 0).then(|| bytes[k]));
+            // The enabled byte lanes (lane bit 3 - (address & 3) for each
+            // byte) as a mask over the pixel: one read-modify-write.
+            let mut m = 0u32;
+            for k in 0..bd as usize {
+                if lanes & (1 << (3 - ((o + k) & 3))) != 0 {
+                    m |= 0xff << (8 * (bd as usize - 1 - k));
+                }
+            }
+            if m != 0 {
+                let cur = if reads { old } else { Self::get_px(mem, o, bd) };
+                mem.put_be(o, bd, (cur & !m) | (v & m));
+            }
         }
     }
 
@@ -1746,13 +1757,26 @@ impl CrimeRe {
                         continue;
                     }
                     let (xs, xe) = ((lo.floor() as i32 - 1).max(xmin), (hi.ceil() as i32 + 1).min(xmax));
-                    for x in xs..=xe {
+                    // A triangle covers one run of each row: find its ends
+                    // with the exact test and fill between them, rather than
+                    // testing three edges at every pixel.
+                    let covered = |x: i32| {
                         let px = x as f64;
-                        let inside = edges.iter().all(|&(a, b)| {
+                        edges.iter().all(|&(a, b)| {
                             let e = edge(a, b, px, py);
                             e > 0.0 || (e == 0.0 && top_left(a, b))
-                        });
-                        if inside && clip.ok(x, y) {
+                        })
+                    };
+                    let (mut xs, mut xe) = (xs, xe);
+                    while xs <= xe && !covered(xs) {
+                        xs += 1;
+                    }
+                    while xe >= xs && !covered(xe) {
+                        xe -= 1;
+                    }
+                    for x in xs..=xe {
+                        let px = x as f64;
+                        if clip.ok(x, y) {
                             if depth {
                                 let zs = (z0 + dzdx * (px - rx) + dzdy * (py - ry)).clamp(0.0, 16_777_215.0) as u32;
                                 if let Some(zo) = zrow.at(&r, mem, x as u32, y as u32) {
@@ -2045,6 +2069,23 @@ impl CrimeRe {
                 if copy {
                     let from = (x0 - xa) as usize;
                     mem.write_span(o, n as usize, |k| Some(row[from + k]));
+                } else if !stippled && bytemask == (bytemask >> 28).wrapping_mul(0x1111_1111) {
+                    // No stipple and the same byte mask in every word (page
+                    // clears, depth clears, the X server's low-byte fills):
+                    // whole words through a mask, ragged ends a byte at a
+                    // time. The memory offset and x agree mod 4.
+                    let nib = bytemask >> 28;
+                    let wm = (0..4).fold(0u32, |m, j| if nib & (1 << (3 - j)) != 0 { m | (0xff << (8 * (3 - j))) } else { m });
+                    let (start, end) = (o, o + n as usize);
+                    let (a0, a1) = ((start + 3) & !3, end & !3);
+                    let byte = |at: usize| (nib & (1 << (3 - (at & 3))) != 0).then(|| (fg >> (24 - 8 * (at & 3))) as u8);
+                    if a0 >= a1 {
+                        mem.write_span(start, n as usize, |k| byte(start + k));
+                    } else {
+                        mem.write_span(start, a0 - start, |k| byte(start + k));
+                        mem.fill_words_masked(a0, (a1 - a0) / 4, fg, wm);
+                        mem.write_span(a1, end - a1, |k| byte(a1 + k));
+                    }
                 } else {
                     mem.write_span(o, n as usize, |k| {
                         let x = x0 + k as i32;
