@@ -221,6 +221,10 @@ pub struct Crime {
     /// bit in HARDINT: GBE's four timing lines (16..19), the rendering
     /// engine's empty/full/idle edges (22..24) and bit 30.
     latched: Mutex<u64>,
+    /// The guest's last accesses to the interrupt registers (status, mask,
+    /// HARDINT, SOFTINT): `(write, offset, value)`, newest last, for the
+    /// control port's `crimelog` (chasing interrupt storms).
+    irqlog: Mutex<std::collections::VecDeque<(bool, u32, u64)>>,
     revision: u64,
     /// The clock CRIME's free-running counter is derived from, so the PROM's
     /// delays take the time they ask for rather than a number of reads.
@@ -241,6 +245,7 @@ impl Crime {
             trace: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             latched: Mutex::new(0),
+            irqlog: Mutex::new(std::collections::VecDeque::new()),
             revision: CRIME_REV_DEFAULT,
             ust,
             time_base: Mutex::new(0),
@@ -296,7 +301,28 @@ impl Crime {
         self.trace.lock().unwrap().clone()
     }
 
+    fn log_irq(&self, write: bool, off: u32, val: u64) {
+        if matches!(off, crime_reg::INTSTAT | crime_reg::INTMASK | crime_reg::HARDINT | crime_reg::SOFTINT) {
+            let mut l = self.irqlog.lock().unwrap();
+            if l.len() >= 8192 {
+                l.pop_front();
+            }
+            l.push_back((write, off, val));
+        }
+    }
+
+    /// The interrupt-register log, one access per line, oldest first.
+    pub fn irqlog_text(&self) -> String {
+        self.irqlog.lock().unwrap().iter().map(|&(w, off, v)| format!("{} {:#04x} {:#018x}\n", if w { 'W' } else { 'R' }, off, v)).collect()
+    }
+
     fn load(&self, off: u32) -> u64 {
+        let v = self.load_inner(off);
+        self.log_irq(false, off, v);
+        v
+    }
+
+    fn load_inner(&self, off: u32) -> u64 {
         match off {
             // Identity. Returning zero here is the one thing guaranteed to make
             // a PROM decide it is running on hardware it does not recognise.
@@ -314,6 +340,11 @@ impl Crime {
     }
 
     fn store(&self, off: u32, val: u64) {
+        self.log_irq(true, off, val);
+        self.store_inner(off, val);
+    }
+
+    fn store_inner(&self, off: u32, val: u64) {
         match off {
             // Read-only: the sources set it, not the CPU.
             crime_reg::INTSTAT => return,
@@ -2616,6 +2647,9 @@ pub struct Ip32Bus {
     /// See [`Ip32Bus::set_irq_sink`].
     irq_sink: std::sync::OnceLock<Box<dyn Fn(bool) + Send + Sync>>,
     irq_level: std::sync::atomic::AtomicBool,
+    /// Held while CRIME's output is computed and handed to the CPU, so two
+    /// threads refreshing at once cannot leave IP2 at a stale level.
+    irq_lock: Mutex<()>,
     pub onewire: OneWireId,
     pub com0: Com16550,
     pub com1: Com16550,
@@ -2691,6 +2725,7 @@ impl Ip32Bus {
             ps2: MacePs2::new(),
             irq_sink: std::sync::OnceLock::new(),
             irq_level: std::sync::atomic::AtomicBool::new(false),
+            irq_lock: Mutex::new(()),
             // A locally-administered address; nothing depends on the value yet.
             onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
             com0: Com16550::new(),
@@ -2864,8 +2899,17 @@ impl Ip32Bus {
     }
 
     /// Device lines into CRIME and, if CRIME's output changed, into the sink.
+    ///
+    /// The CPU thread (after a device access) and the service thread both
+    /// come here. Computing the level and handing it on happen under one
+    /// lock: unlocked, one thread could record "low" while another raised
+    /// IP2, after which every refresh saw no change and IP2 stayed up with
+    /// nothing behind it. IRIX then re-entered its CRIME dispatcher forever,
+    /// finding nothing, and the clock interrupt starved behind it: the O2's
+    /// input stall (no ticks, dead mouse, keyboard and serial login).
     pub fn refresh_irq(&self) -> bool {
         self.update_lines();
+        let _held = self.irq_lock.lock().unwrap();
         let level = self.crime.interrupting();
         if let Some(sink) = self.irq_sink.get() {
             if self.irq_level.swap(level, Ordering::AcqRel) != level {

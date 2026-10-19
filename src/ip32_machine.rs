@@ -536,6 +536,12 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
             LAST_PC.load(Ordering::Relaxed),
             BATCHES.load(Ordering::Relaxed)
         ),
+        // `crimelog PATH`: the guest's recent CRIME interrupt-register
+        // accesses, oldest first.
+        "crimelog" => match std::fs::write(arg.trim(), bus.crime.irqlog_text()) {
+            Ok(()) => "ok".into(),
+            Err(e) => format!("err {e}"),
+        },
         "regs" => {
             let r: Vec<u64> = LAST_REGS.iter().map(|v| v.load(Ordering::Relaxed)).collect();
             let mut s = format!("ok pc 0x{:08x}", LAST_PC.load(Ordering::Relaxed));
