@@ -286,6 +286,7 @@ impl Crime {
 
     /// The raw counter, before the offset a write installs.
     fn raw_time(&self) -> u64 {
+        self.ust.guest_us();
         self.ust.now().wrapping_mul(CRIME_TICKS_PER_US)
     }
 
@@ -2456,7 +2457,18 @@ pub struct MaceUst {
     /// read live. The 1-Wire ID chip's slots are tens of microseconds, so a
     /// clock stepped from another thread cannot time them.
     host: std::sync::OnceLock<std::time::Instant>,
+    /// The guest's clock as seen by a device that times the guest's own
+    /// pulses: (host time at the last guest clock read, accumulated time).
+    /// See [`MaceUst::guest_us`].
+    guest: Mutex<(u64, u64)>,
 }
+
+/// The longest step [`MaceUst::guest_us`] takes between two guest clock
+/// reads. Firmware times short pulses by spinning on a clock; a host stall
+/// in the middle (a JIT pause, a busy host) would otherwise land in the
+/// pulse. 8 us is far above one spin of the loop and far below the 15 us a
+/// 1-Wire "1" may last.
+const GUEST_CLOCK_STEP_CAP_US: u64 = 8;
 
 /// UST ticks per emulated instruction, as a fraction: `TICKS_NUM / TICKS_DEN`.
 ///
@@ -2472,7 +2484,7 @@ impl Default for MaceUst {
 }
 
 impl MaceUst {
-    pub fn new() -> Self { Self { ticks: Mutex::new(0), host: std::sync::OnceLock::new() } }
+    pub fn new() -> Self { Self { ticks: Mutex::new(0), host: std::sync::OnceLock::new(), guest: Mutex::new((0, 0)) } }
 
     /// Run from the host clock from now on (a machine, not the harness).
     pub fn use_host_clock(&self) {
@@ -2490,7 +2502,27 @@ impl MaceUst {
         *self.ticks.lock().unwrap() = instructions * UST_TICKS_NUM / UST_TICKS_DEN;
     }
 
-    fn tick(&self) -> u64 { self.now() }
+    fn tick(&self) -> u64 {
+        self.guest_us();
+        self.now()
+    }
+
+    /// Microseconds on a clock that runs with the host's between guest clock
+    /// reads but never more than [`GUEST_CLOCK_STEP_CAP_US`] per step: time
+    /// the guest was not running (a stalled emulator thread) does not count.
+    /// For timing pulses the guest itself times by spinning on UST: the
+    /// 1-Wire ID chip read the PROM's "1" bits as "0" whenever the CPU thread
+    /// stalled inside one, and IRIX came up with no Ethernet address.
+    /// Every guest read of UST or CRIME's timer advances it.
+    pub fn guest_us(&self) -> u64 {
+        let now = self.now();
+        let mut g = self.guest.lock().unwrap();
+        let (last, acc) = *g;
+        let step = if last == 0 { 0 } else { now.saturating_sub(last).min(GUEST_CLOCK_STEP_CAP_US) };
+        *g = (now, acc + step);
+        acc + step
+    }
+
     pub fn now(&self) -> u64 {
         match self.host.get() {
             Some(t0) => t0.elapsed().as_micros() as u64,
@@ -3279,12 +3311,12 @@ impl Ip32Bus {
         // is exactly what the bus trace shows (only 0x08 and 0x0c are ever
         // written).
         let low = val & nic_bit::DEASSERT == 0;
-        self.onewire.master_drive(self.ust.now(), low);
+        self.onewire.master_drive(self.ust.guest_us(), low);
     }
 
     fn nic_read(&self) -> u8 {
         let mut v = self.mace.cell(MACE_ISA_FLASH_NIC_REG) as u8;
-        if self.onewire.line_level(self.ust.now()) {
+        if self.onewire.line_level(self.ust.guest_us()) {
             v |= nic_bit::DATA;
         } else {
             v &= !nic_bit::DATA;
@@ -3415,6 +3447,9 @@ macro_rules! bus_read {
 
 impl Ip32Bus {
     fn read8_raw(&self, addr: u32) -> BusRead8 {
+        if self.in_mec(addr) {
+            return BusRead8::ok(self.mec.read_part(addr - MACE_MEC, 1) as u8);
+        }
         if self.in_vice(addr) {
             return self.vice.read8(addr);
         }
@@ -3464,6 +3499,9 @@ impl Ip32Bus {
     }
 
     fn read16_raw(&self, addr: u32) -> BusRead16 {
+        if self.in_mec(addr) {
+            return BusRead16::ok(self.mec.read_part(addr - MACE_MEC, 2) as u16);
+        }
         if self.in_vice(addr) {
             return self.vice.read16(addr);
         }
@@ -3626,6 +3664,12 @@ impl Ip32Bus {
     }
 
     fn write8_raw(&self, addr: u32, val: u8) -> u32 {
+        if self.in_mec(addr) {
+            // A part of a 64-bit register: IRIX writes the transmit ring's
+            // write pointer as a halfword.
+            self.mec.write_part(addr - MACE_MEC, 1, val as u64);
+            return BUS_OK;
+        }
         if self.in_vice(addr) {
             return self.vice.write8(addr, val);
         }
@@ -3681,6 +3725,10 @@ impl Ip32Bus {
     }
 
     fn write16_raw(&self, addr: u32, val: u16) -> u32 {
+        if self.in_mec(addr) {
+            self.mec.write_part(addr - MACE_MEC, 2, val as u64);
+            return BUS_OK;
+        }
         if self.in_vice(addr) {
             return self.vice.write16(addr, val);
         }

@@ -62,7 +62,9 @@ pub mod bits {
 
     pub const DMA_TX_INT_ENABLE: u64 = 0x1;
     pub const DMA_TX_DMA_ENABLE: u64 = 0x2;
+    pub const DMA_TX_RING_SIZE_SHIFT: u32 = 2;
     pub const DMA_RX_INT_ENABLE: u64 = 0x200;
+    pub const DMA_RX_INT_THRESHOLD_SHIFT: u32 = 4;
     pub const DMA_RX_DMA_OFFSET_SHIFT: u32 = 12;
     pub const DMA_RX_DMA_ENABLE: u64 = 0x8000;
 
@@ -83,7 +85,10 @@ pub mod bits {
     pub const PHY_BUSY: u64 = 0x1_0000;
 }
 
-/// Ring and buffer geometry the driver fixes.
+/// Ring and buffer geometry the driver fixes. The transmit ring is
+/// `TX_RING_LEN << DMA_CONTROL[3:2]` descriptors: NetBSD and OpenBSD leave
+/// the field 0 (64), IRIX sets 1 and runs a ring of 128; the pointers are
+/// nine bits, so 3 would be 512.
 pub const TX_RING_LEN: u32 = 64;
 pub const TX_DESC_SIZE: u32 = 128;
 pub const RX_FIFO_DEPTH: usize = 16;
@@ -207,6 +212,10 @@ impl State {
     /// A core reset, or DMA turned off: both rings start again from empty.
     /// The station address survives -- the driver writes it once, before its
     /// first reset.
+    fn tx_ring_len(&self) -> u32 {
+        TX_RING_LEN << ((self.dma_control >> bits::DMA_TX_RING_SIZE_SHIFT) & 3)
+    }
+
     fn reset_rings(&mut self) {
         self.rx_mcl_read = 0;
         self.tx_read = 0;
@@ -301,15 +310,49 @@ impl Mec {
     }
 
     pub fn read64(&self, off: u32) -> u64 {
+        let v = self.read64_inner(off);
+        Self::trace_reg("r", off, v);
+        v
+    }
+
+    /// `IRIS_IP32_MEC_REGS`: report the first 3000 register accesses, for
+    /// learning what a driver does with the chip.
+    fn trace_reg(what: &str, off: u32, val: u64) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static N: AtomicU32 = AtomicU32::new(0);
+        if !*ON.get_or_init(|| std::env::var_os("IRIS_IP32_MEC_REGS").is_some()) {
+            return;
+        }
+        if N.fetch_add(1, Ordering::Relaxed) < 3000 {
+            eprintln!("mec-reg: {what} {off:#05x} {val:#018x}");
+        }
+    }
+
+    fn read64_inner(&self, off: u32) -> u64 {
         let s = self.st.lock().unwrap();
         match off & !7 {
             reg::MAC_CONTROL => s.mac_control,
-            reg::INT_STATUS => (s.int_status & 0xff)
-                | (u64::from(s.rx_mcl_read & 0x1f) << 8)
-                | (u64::from(s.tx_read & 0x1ff) << 16),
+            // Transmit-empty shows only while its interrupt is enabled:
+            // IRIX answers it by disabling the interrupt, never clearing
+            // the bit, and loops in its handler while any status bit reads
+            // set.
+            reg::INT_STATUS => {
+                let mut low = s.int_status & 0xff;
+                if s.dma_control & bits::DMA_TX_INT_ENABLE == 0 {
+                    low &= !bits::INT_TX_EMPTY;
+                }
+                low | (u64::from(s.rx_mcl_read & 0x1f) << 8) | (u64::from(s.tx_read & 0x1ff) << 16)
+            }
             reg::DMA_CONTROL => s.dma_control,
             reg::TX_RING_PTR => u64::from(s.tx_write & 0x1ff) | (u64::from(s.tx_read & 0x1ff) << 16),
-            reg::RX_FIFO => s.mcl_fifo.len() as u64 & 0x1f,
+            // The MCL FIFO: write pointer, read pointer, depth, a byte
+            // each (IRIX reads the read pointer alone, as a byte).
+            reg::RX_FIFO => {
+                let depth = s.mcl_fifo.len() as u64 & 0x1f;
+                let rptr = u64::from(s.rx_mcl_read & 0x1f);
+                (((rptr + depth) & 0x1f) << 16) | (rptr << 8) | depth
+            }
             reg::PHY_DATA => s.phy_data & !bits::PHY_BUSY,
             reg::PHY_ADDRESS => s.phy_address,
             reg::STATION => s.station,
@@ -319,7 +362,27 @@ impl Mec {
         }
     }
 
+    /// A 1-, 2- or 4-byte read of the 64-bit register holding `off`
+    /// (big-endian): IRIX reads the transmit read pointer as a halfword.
+    pub fn read_part(&self, off: u32, size: u32) -> u64 {
+        let shift = 8 * (8 - (off & 7) - size);
+        (self.read64(off & !7) >> shift) & ((1u64 << (8 * size)) - 1)
+    }
+
+    /// A 1-, 2- or 4-byte write into the 64-bit register holding `off`,
+    /// merged with the rest of it; IRIX starts a transmit by writing the
+    /// ring's write pointer alone, a halfword at 0x36. The interrupt
+    /// status is write-one-to-clear, so there the other bytes write zero.
+    pub fn write_part(&self, off: u32, size: u32, val: u64) {
+        let base = off & !7;
+        let shift = 8 * (8 - (off & 7) - size);
+        let mask = ((1u64 << (8 * size)) - 1) << shift;
+        let old = if base == reg::INT_STATUS { 0 } else { self.read64_inner(base) };
+        self.write64(base, (old & !mask) | ((val << shift) & mask));
+    }
+
     pub fn write64(&self, off: u32, val: u64) {
+        Self::trace_reg("w", off, val);
         let mut send = false;
         {
             let mut s = self.st.lock().unwrap();
@@ -350,7 +413,7 @@ impl Mec {
                     s.dma_control = (s.dma_control & !0x3f0) | (val & 0x3f0);
                 }
                 reg::TX_RING_PTR => {
-                    s.tx_write = (val as u32) % TX_RING_LEN;
+                    s.tx_write = (val as u32) % s.tx_ring_len();
                     send = true;
                 }
                 reg::PHY_ADDRESS => s.phy_address = val,
@@ -374,6 +437,14 @@ impl Mec {
                 reg::MCL_RX_FIFO => {
                     if s.mcl_fifo.len() < RX_FIFO_DEPTH {
                         s.mcl_fifo.push_back(val as u32);
+                    }
+                    // The receive request is the FIFO running below the
+                    // threshold: handing buffers back up to it ends the
+                    // request. IRIX never clears it any other way after a
+                    // good frame.
+                    let threshold = ((s.dma_control >> bits::DMA_RX_INT_THRESHOLD_SHIFT) & 0x1f) as usize;
+                    if s.mcl_fifo.len() >= threshold {
+                        s.int_status &= !bits::INT_RX_THRESHOLD;
                     }
                 }
                 reg::TIMER | reg::STATION_ALT => {
@@ -427,7 +498,7 @@ impl Mec {
                 if cmd & bits::TXCMD_TXINT != 0 {
                     s.int_status |= bits::INT_TX_PACKET_SENT;
                 }
-                s.tx_read = (s.tx_read + 1) % TX_RING_LEN;
+                s.tx_read = (s.tx_read + 1) % s.tx_ring_len();
                 s.tx_frames += 1;
                 frames.push(frame);
                 any = true;
@@ -636,10 +707,11 @@ mod tests {
         assert_eq!(stat & (bits::TXSTAT_SENT | bits::TXSTAT_SUCCESS), bits::TXSTAT_SENT | bits::TXSTAT_SUCCESS);
         let is = m.read64(reg::INT_STATUS);
         assert_eq!((is >> 16) & 0x1ff, 1, "read pointer past the descriptor");
-        assert_eq!(is & bits::INT_TX_EMPTY, bits::INT_TX_EMPTY);
+        assert_eq!(is & bits::INT_TX_EMPTY, 0, "hidden while its interrupt is off (IRIX's handler loops on it)");
         assert!(!m.interrupting(), "not before the transmit interrupt is enabled");
         m.write64(reg::TX_ALIAS, 1);
         assert!(m.interrupting());
+        assert_eq!(m.read64(reg::INT_STATUS) & bits::INT_TX_EMPTY, bits::INT_TX_EMPTY, "latched, so enabling later still sees it");
         assert_eq!(m.read64(reg::DMA_CONTROL) & bits::DMA_TX_DMA_ENABLE, bits::DMA_TX_DMA_ENABLE, "TX_ALIAS leaves DMA alone");
         m.write64(reg::INT_STATUS, bits::INT_TX_EMPTY);
         assert!(!m.interrupting(), "write one to clear");
