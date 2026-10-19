@@ -830,6 +830,81 @@ mod draw {
     pub const PLANE_MASK: u32 = 1 << 7;
 }
 
+/// CRIME's host interface buffer for the asynchronous engine: IB_DEPTH
+/// register writes in a ring, one writer (the CPU thread) and one reader
+/// (the engine's thread). A channel cost a lock and usually a wake-up per
+/// write, which made X text slower asynchronous than synchronous; here a
+/// write is a store and a release, and the engine spins a little before it
+/// parks, so a stream of writes never sleeps it.
+struct IntfBuf {
+    slots: Box<[std::cell::UnsafeCell<(u32, u64, u8)>]>,
+    /// Writes taken (the engine) and put (the CPU), free-running.
+    head: std::sync::atomic::AtomicUsize,
+    tail: std::sync::atomic::AtomicUsize,
+    parked: std::sync::atomic::AtomicBool,
+    engine: std::sync::OnceLock<std::thread::Thread>,
+}
+
+// One writer and one reader, each slot handed over through head and tail.
+unsafe impl Sync for IntfBuf {}
+
+impl IntfBuf {
+    fn new() -> Self {
+        IntfBuf {
+            slots: (0..IB_DEPTH).map(|_| std::cell::UnsafeCell::new((0, 0, 0))).collect(),
+            head: std::sync::atomic::AtomicUsize::new(0),
+            tail: std::sync::atomic::AtomicUsize::new(0),
+            parked: std::sync::atomic::AtomicBool::new(false),
+            engine: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Put a write, waiting while the buffer is full (the CPU stalls).
+    fn put(&self, w: (u32, u64, u8)) {
+        use std::sync::atomic::Ordering::*;
+        let t = self.tail.load(Relaxed);
+        let mut spins = 0u32;
+        while t - self.head.load(Acquire) >= IB_DEPTH {
+            spins += 1;
+            if spins < 1000 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        unsafe { *self.slots[t % IB_DEPTH].get() = w };
+        self.tail.store(t + 1, SeqCst);
+        if self.parked.load(SeqCst) {
+            if let Some(e) = self.engine.get() {
+                e.unpark();
+            }
+        }
+    }
+
+    /// Take the next write, spinning and then parking while there is none.
+    fn take(&self) -> (u32, u64, u8) {
+        use std::sync::atomic::Ordering::*;
+        let h = self.head.load(Relaxed);
+        let mut spins = 0u32;
+        while self.tail.load(Acquire) == h {
+            spins += 1;
+            if spins < 20_000 {
+                std::hint::spin_loop();
+                continue;
+            }
+            self.parked.store(true, SeqCst);
+            if self.tail.load(SeqCst) == h {
+                std::thread::park();
+            }
+            self.parked.store(false, SeqCst);
+            spins = 0;
+        }
+        let w = unsafe { *self.slots[h % IB_DEPTH].get() };
+        self.head.store(h + 1, Release);
+        w
+    }
+}
+
 pub struct CrimeRe {
     regs: Mutex<Vec<u32>>,
     /// Reads per register offset, for finding a driver spinning on one.
@@ -852,7 +927,7 @@ pub struct CrimeRe {
     /// CPU reads its own copy of the registers (`shadow`) and a STATUS that
     /// says busy until every write it has queued (`queued`) has been carried
     /// out (`done`). Without it (tests, replays) writes act at once.
-    queue: std::sync::OnceLock<std::sync::mpsc::SyncSender<(u32, u64, u8)>>,
+    queue: std::sync::OnceLock<Arc<IntfBuf>>,
     shadow: Mutex<Vec<u32>>,
     queued: std::sync::atomic::AtomicU64,
     done: std::sync::atomic::AtomicU64,
@@ -962,15 +1037,19 @@ impl CrimeRe {
         // let it fall a frame behind, and the X server reused a staging
         // buffer the engine had not read yet (icons drawn from the wrong
         // picture).
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, u64, u8)>(IB_DEPTH);
-        if self.queue.set(tx).is_err() {
+        let ib = Arc::new(IntfBuf::new());
+        if self.queue.set(ib.clone()).is_err() {
             return;
         }
         std::thread::Builder::new()
             .name("CRIME-RE".into())
             .spawn(move || {
+                // Registered before it can ever park, so a write never
+                // misses waking it.
+                let _ = ib.engine.set(std::thread::current());
                 let re = get(&owner);
-                while let Ok((off, val, width)) = rx.recv() {
+                loop {
+                    let (off, val, width) = ib.take();
                     if width == 64 {
                         re.apply64(off, val);
                     } else {
@@ -997,7 +1076,7 @@ impl CrimeRe {
 
     /// A CPU write: carried out now, or queued with the CPU's copy updated.
     fn cpu_write(&self, off: u32, val: u64, width: u8) {
-        let Some(tx) = self.queue.get() else {
+        let Some(ib) = self.queue.get() else {
             if width == 64 {
                 self.apply64(off, val);
             } else {
@@ -1018,7 +1097,7 @@ impl CrimeRe {
             }
         }
         self.queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = tx.send((off, val, width));
+        ib.put((off, val, width));
     }
 
     fn record(&self, off: u32, val: u64, width: u8) {
@@ -2290,6 +2369,37 @@ mod tests {
         assert!(CrimeRe::clip_ok(&r, 30, 680) && !CrimeRe::clip_ok(&r, 400, 15));
         r[(CLIP_MODE / 4) as usize] = 0x20;
         assert!(!CrimeRe::clip_ok(&r, 30, 680) && CrimeRe::clip_ok(&r, 400, 15));
+    }
+
+    /// The asynchronous engine draws what the synchronous one does, and
+    /// reads of STATUS say busy until it has.
+    #[test]
+    fn the_async_engine_draws_the_same_and_reports_idle_after() {
+        let draw = |re: &CrimeRe| {
+            let base = 0x1500_0000;
+            re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+            re.write32(base + DRAWMODE, 0x0000_0278);
+            re.write32(base + LOGIC_OP, 3);
+            re.write32(base + PRIMITIVE, 0x0300_0000);
+            re.write32(base + BUFMODE_DST, 0x228);
+            for i in 0..200u32 {
+                re.write32(base + FG, 0x1020_3000 | i);
+                re.write32(base + VERTEX_0, (i % 100) << 16 | (i / 100));
+                re.write32(base + (VERTEX_1 | 0x800), ((i % 100) + 3) << 16 | (i / 100));
+            }
+        };
+        let sync_ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        draw(&CrimeRe::new(sync_ram.clone()));
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = Arc::new(CrimeRe::new(ram.clone()));
+        re.start_async(re.clone(), |r| r);
+        draw(&re);
+        let mut spins = 0;
+        while re.read32(0x1500_0000 + STATUS).data != RE_STATUS_IDLE {
+            spins += 1;
+            assert!(spins < 50_000_000, "never idle");
+        }
+        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000, 0x1000), sync_ram.lock().unwrap().bytes(0x0100_0000, 0x1000));
     }
 
     /// The X server's Motif bevel: a rectangle into the 32-bit ABGR screen
