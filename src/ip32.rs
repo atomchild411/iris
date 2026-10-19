@@ -1529,7 +1529,7 @@ pub struct MacePs2 {
     idle_polls: AtomicU32,
     /// The last bytes through either port, `(port, to the device?, byte)`,
     /// for working out a conversation that stalled.
-    traffic: Mutex<std::collections::VecDeque<(u8, bool, u8)>>,
+    traffic: Mutex<std::collections::VecDeque<(u8, bool, u8, std::time::Instant)>>,
 }
 
 struct Ps2Port {
@@ -1687,10 +1687,10 @@ impl MacePs2 {
 
     fn note(&self, p: usize, out: bool, b: u8) {
         let mut t = self.traffic.lock().unwrap();
-        if t.len() >= 400 {
+        if t.len() >= 4000 {
             t.pop_front();
         }
-        t.push_back((p as u8, out, b));
+        t.push_back((p as u8, out, b, std::time::Instant::now()));
     }
 
     /// The recent traffic as text: `>` to a device, `<` from it, per port.
@@ -1699,9 +1699,21 @@ impl MacePs2 {
             .lock()
             .unwrap()
             .iter()
-            .map(|&(p, out, b)| format!("{p}{}{b:02x}", if out { '>' } else { '<' }))
+            .map(|&(p, out, b, _)| format!("{p}{}{b:02x}", if out { '>' } else { '<' }))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The recent traffic one byte per line, with host milliseconds since
+    /// the first byte kept: to tell a periodic exchange from a reaction.
+    pub fn traffic_timed(&self) -> String {
+        let t = self.traffic.lock().unwrap();
+        let Some(&(_, _, _, t0)) = t.front() else { return String::new() };
+        t.iter()
+            .map(|&(p, out, b, at)| {
+                format!("{:9.1} {p}{}{b:02x}\n", at.duration_since(t0).as_secs_f64() * 1000.0, if out { '>' } else { '<' })
+            })
+            .collect()
     }
 
     /// Keyboard status reads with nothing waiting, since the last byte.

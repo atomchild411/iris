@@ -545,6 +545,12 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
                 }
             }
         }
+        // `ps2log PATH`: the PS/2 ports' recent traffic, `1>f4` a byte to
+        // port 1's device, `1<fa` one from it.
+        "ps2log" => match std::fs::write(arg, bus.ps2.traffic_timed()) {
+            Ok(()) => "ok".into(),
+            Err(e) => format!("err {e}"),
+        },
         "watchdump" => match std::fs::write(arg, bus.watch_text()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),

@@ -4019,6 +4019,22 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     pub fn step_jit(&mut self) -> ExecStatus {
         let pc = self.core.pc;
 
+        // IRIS_JIT_SKIP=lo-hi (hex, the low 32 bits of the PC): interpret
+        // that range rather than run it compiled. A bisection tool for a
+        // guest that behaves under the interpreter and not under the JIT.
+        static SKIP: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+        let skip = *SKIP.get_or_init(|| {
+            let v = std::env::var("IRIS_JIT_SKIP").ok()?;
+            let (a, b) = v.split_once('-')?;
+            let p = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+            Some((p(a)?, p(b)?))
+        });
+        if let Some((lo, hi)) = skip {
+            if (lo..hi).contains(&(pc as u32)) {
+                return self.step_int();
+            }
+        }
+
         let fetch = self.jit_entry_fetch(pc);
         // Retired AFTER fetch_instr, not before: fetch_instr's own
         // nanotlb_translate is what runs jitv2_track_pcp, the thing that
