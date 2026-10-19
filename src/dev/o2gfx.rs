@@ -863,6 +863,44 @@ struct Buf {
     bd: u32,
 }
 
+/// The screen masks of [`CrimeRe::clip_ok`], decoded once per primitive:
+/// testing every pixel against the registers was a sixth of the CPU
+/// thread's time under GL.
+struct Clip {
+    inside: [[i32; 4]; 5],
+    n_inside: usize,
+    outside: [[i32; 4]; 5],
+    n_outside: usize,
+}
+
+impl Clip {
+    fn new(r: &[u32]) -> Self {
+        let mode = r[(CLIP_MODE / 4) as usize];
+        let mut c = Clip { inside: [[0; 4]; 5], n_inside: 0, outside: [[0; 4]; 5], n_outside: 0 };
+        for i in 0..5 {
+            if mode & (1 << (5 + i)) == 0 {
+                continue;
+            }
+            let (x0, y0) = CrimeRe::xy(r[((CLIP_RECT0 + 8 * i) / 4) as usize]);
+            let (x1, y1) = CrimeRe::xy(r[((CLIP_RECT0 + 8 * i) / 4 + 1) as usize]);
+            if mode & (1 << i) != 0 {
+                c.inside[c.n_inside] = [x0, y0, x1, y1];
+                c.n_inside += 1;
+            } else {
+                c.outside[c.n_outside] = [x0, y0, x1, y1];
+                c.n_outside += 1;
+            }
+        }
+        c
+    }
+
+    #[inline]
+    fn ok(&self, x: i32, y: i32) -> bool {
+        let hit = |b: &[i32; 4]| x >= b[0] && x < b[2] && y >= b[1] && y < b[3];
+        (self.n_inside == 0 || self.inside[..self.n_inside].iter().any(hit)) && !self.outside[..self.n_outside].iter().any(hit)
+    }
+}
+
 impl CrimeRe {
     pub fn new(ram: Arc<Mutex<O2Memory>>) -> Self {
         // byteMask resets to all ones: NetBSD's MTE clears never write it.
@@ -1066,11 +1104,7 @@ impl CrimeRe {
     }
 
     fn get_px(mem: &O2Memory, o: usize, bd: u32) -> u32 {
-        match bd {
-            1 => mem[o] as u32,
-            2 => u16::from_be_bytes([mem[o], mem[o + 1]]) as u32,
-            _ => u32::from_be_bytes([mem[o], mem[o + 1], mem[o + 2], mem[o + 3]]),
-        }
+        mem.get_be(o, bd)
     }
 
     /// A register colour as a pixel of `bd` bytes: its low bytes, wherever
@@ -1106,18 +1140,19 @@ impl CrimeRe {
     /// byte-lane enables.
     fn put(r: &[u32], mem: &mut O2Memory, o: usize, bd: u32, src: u32) {
         let dm = r[(DRAWMODE / 4) as usize];
-        let old = Self::get_px(mem, o, bd);
+        let reads = dm & (draw::LOGIC_OP | draw::PLANE_MASK) != 0;
+        let old = if reads { Self::get_px(mem, o, bd) } else { 0 };
         let mut v = if dm & draw::LOGIC_OP != 0 { Self::logic(r[(LOGIC_OP / 4) as usize], src, old) } else { src };
         if dm & draw::PLANE_MASK != 0 {
             let m = Self::lane(r[(COLOR_MASK / 4) as usize], o, bd);
             v = (v & m) | (old & !m);
         }
-        let bytes = v.to_be_bytes();
-        let bytes = &bytes[4 - bd as usize..];
         let lanes = (dm >> 3) & 0xf;
         if lanes == 0xf {
-            mem.write(o, bytes);
+            mem.put_be(o, bd, v);
         } else {
+            let bytes = v.to_be_bytes();
+            let bytes = &bytes[4 - bd as usize..];
             for (k, b) in bytes.iter().enumerate() {
                 let a = o + k;
                 if lanes & (1 << (3 - (a & 3))) != 0 {
@@ -1143,27 +1178,7 @@ impl CrimeRe {
     /// the icon picture, and redraws a whole frame with all five (0x3ff):
     /// mask 4 is the title bar, so reading only four left titles blank.
     fn clip_ok(r: &[u32], x: i32, y: i32) -> bool {
-        let mode = r[(CLIP_MODE / 4) as usize];
-        let enabled = (mode >> 5) & 0x1f;
-        if enabled == 0 {
-            return true;
-        }
-        let (mut any_inside, mut in_inside) = (false, false);
-        for i in 0..5 {
-            if enabled & (1 << i) == 0 {
-                continue;
-            }
-            let (x0, y0) = Self::xy(r[((CLIP_RECT0 + 8 * i) / 4) as usize]);
-            let (x1, y1) = Self::xy(r[((CLIP_RECT0 + 8 * i) / 4 + 1) as usize]);
-            let inside = (x0..x1).contains(&x) && (y0..y1).contains(&y);
-            if mode & (1 << i) != 0 {
-                any_inside = true;
-                in_inside |= inside;
-            } else if inside {
-                return false;
-            }
-        }
-        in_inside || !any_inside
+        Clip::new(r).ok(x, y)
     }
 
     /// A window offset: two signed 16-bit halves. IRIX's GL windows sit at
@@ -1206,6 +1221,7 @@ impl CrimeRe {
     /// and 4 + (16 - width) x 4: a 64-byte pitch whatever the width.
     fn xfer_linear(&self, r: &[u32]) {
         let g = |off: u32| r[(off / 4) as usize];
+        let clip = Clip::new(r);
         let (sm, dmode) = (g(BUFMODE_SRC), g(BUFMODE_DST));
         let (sb, db) = ((sm >> 10) & 7, (dmode >> 10) & 7);
         let (sbd, dbd) = (1u32 << ((sm >> 8) & 3).min(2), 1u32 << ((dmode >> 8) & 3).min(2));
@@ -1268,7 +1284,7 @@ impl CrimeRe {
         for y in ya..=yb {
             for x in xa..=xb {
                 let v = it.next().unwrap_or(0);
-                if !Self::clip_ok(r, x, y) {
+                if !clip.ok(x, y) {
                     continue;
                 }
                 if let Some(o) = dst_at(mem, x, y) {
@@ -1280,10 +1296,13 @@ impl CrimeRe {
 
     fn pixel_pipe(&self) {
         self.drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let r = self.regs.lock().unwrap().clone();
+        // The registers stay locked for the primitive: copying all 24 KB of
+        // them per primitive was a tenth of the CPU thread under X.
+        let r = self.regs.lock().unwrap();
         let g = |off: u32| r[(off / 4) as usize];
         let dm = g(DRAWMODE);
         let prim = g(PRIMITIVE);
+        let clip = Clip::new(&r);
         if dm & draw::PIXEL_XFER != 0 && (prim >> 24) & 3 == 3 {
             let (sb, db) = ((g(BUFMODE_SRC) >> 10) & 7, (g(BUFMODE_DST) >> 10) & 7);
             if matches!(sb, 4 | 5) || matches!(db, 4 | 5) {
@@ -1351,7 +1370,7 @@ impl CrimeRe {
         match (prim >> 24) & 3 {
             // Point.
             0 => {
-                if !Self::clip_ok(&r, x0, y0) {
+                if !clip.ok(x0, y0) {
                     return;
                 }
                 if let Some(o) = Self::locate(&r, mem, dst, x0.max(0) as u32, y0.max(0) as u32) {
@@ -1371,7 +1390,7 @@ impl CrimeRe {
                 let (mut x, mut y, mut err, mut k) = (x0, y0, dx + dy, 0u32);
                 loop {
                     let last = x == x1 && y == y1;
-                    if !(last && skip_last) && x >= 0 && y >= 0 && Self::clip_ok(&r, x, y) {
+                    if !(last && skip_last) && x >= 0 && y >= 0 && clip.ok(x, y) {
                         if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
                             if let Some(v) = colour_at(mem, o, k, stippled) {
                                 paint(mem, o, v);
@@ -1423,7 +1442,7 @@ impl CrimeRe {
                     for y in ya..=yb {
                         for x in xa..=xb {
                             let v = it.next().unwrap_or(0);
-                            if !Self::clip_ok(&r, x as i32, y as i32) {
+                            if !clip.ok(x as i32, y as i32) {
                                 continue;
                             }
                             if let Some(o) = Self::locate(&r, mem, dst, x, y) {
@@ -1435,7 +1454,7 @@ impl CrimeRe {
                     let stippled = dm & draw::POLY_STIPPLE != 0;
                     for y in ya..=yb {
                         for (k, x) in (xa..=xb).enumerate() {
-                            if !Self::clip_ok(&r, x as i32, y as i32) {
+                            if !clip.ok(x as i32, y as i32) {
                                 continue;
                             }
                             if let Some(o) = Self::locate(&r, mem, dst, x, y) {
@@ -1603,7 +1622,7 @@ impl CrimeRe {
                             let e = edge(a, b, px, py);
                             e > 0.0 || (e == 0.0 && top_left(a, b))
                         });
-                        if inside && Self::clip_ok(&r, x, y) {
+                        if inside && clip.ok(x, y) {
                             if depth {
                                 let zs = (z0 + dzdx * (px - rx) + dzdy * (py - ry)).clamp(0.0, 16_777_215.0) as u32;
                                 if let Some(zo) = Self::locate(&r, mem, zbuf, x as u32, y as u32) {
@@ -1650,6 +1669,7 @@ impl CrimeRe {
     /// 4Dwm and the desktop outline their vector icons this way, black at
     /// full alpha into the 32-bit window.
     fn gl_line(r: &[u32], mem: &mut O2Memory, dst: Buf, ox: i32, oy: i32, skip_last: bool) {
+        let clip = Clip::new(r);
         let g = |off: u32| r[(off / 4) as usize];
         let dm = g(DRAWMODE);
         let fv = |off: u32| -> (f64, f64) {
@@ -1690,7 +1710,7 @@ impl CrimeRe {
         let half_off = if dmode & 1 == 0 { 2 } else { 0 };
         let blend = dm & draw::BLEND != 0 && dst.bd == 4 && (fmt != 0 || half);
         let mut plot = |x: i32, y: i32, cov: f64| {
-            if x < 0 || y < 0 || cov <= 0.0 || !Self::clip_ok(r, x, y) {
+            if x < 0 || y < 0 || cov <= 0.0 || !clip.ok(x, y) {
                 return;
             }
             let Some(o) = Self::locate(r, mem, dst, x as u32, y as u32) else { return };
@@ -1812,7 +1832,9 @@ impl CrimeRe {
 
     fn mte(&self) {
         self.drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let r = self.regs.lock().unwrap().clone();
+        // The registers stay locked for the primitive: copying all 24 KB of
+        // them per primitive was a tenth of the CPU thread under X.
+        let r = self.regs.lock().unwrap();
         let g = |off: u32| r[(off / 4) as usize];
         let mode = g(MTE_MODE);
         let copy = mode & (1 << 11) != 0;

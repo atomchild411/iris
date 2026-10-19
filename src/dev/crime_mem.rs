@@ -185,6 +185,39 @@ impl O2Memory {
         }
     }
 
+    /// The big-endian value of the `n`-byte item (1, 2 or 4) at `off`,
+    /// which must be aligned to `n`, in one host access: each word's bytes
+    /// sit reversed, so an aligned word is a host u32 as it stands and an
+    /// aligned halfword a host u16 at `off ^ 2`. For the rendering engine,
+    /// which moved pixels a byte at a time.
+    #[inline]
+    pub fn get_be(&self, off: usize, n: u32) -> u32 {
+        assert!(off + n as usize <= self.total && off % n as usize == 0, "O2 memory read {off:#x}/{n}");
+        unsafe {
+            match n {
+                1 => *self.host.add(off ^ 3) as u32,
+                2 => (self.host.add(off ^ 2) as *const u16).read_unaligned() as u32,
+                _ => (self.host.add(off) as *const u32).read_unaligned(),
+            }
+        }
+    }
+
+    /// Store the low `n` bytes of `v` (1, 2 or 4) at `off`, aligned to `n`,
+    /// big-endian, as [`Self::write`] would.
+    #[inline]
+    pub fn put_be(&mut self, off: usize, n: u32, v: u32) {
+        assert!(off + n as usize <= self.total && off % n as usize == 0, "O2 memory write {off:#x}/{n}");
+        unsafe {
+            match n {
+                1 => *self.host.add(off ^ 3) = v as u8,
+                2 => (self.host.add(off ^ 2) as *mut u16).write_unaligned(v as u16),
+                _ => (self.host.add(off) as *mut u32).write_unaligned(v),
+            }
+        }
+        #[cfg(feature = "jitv2")]
+        self.store.bump_gen_off(off);
+    }
+
     /// The generation counter for the page holding byte offset `off`.
     #[cfg(feature = "jitv2")]
     pub fn gen_ptr(&self, off: usize) -> *const std::sync::atomic::AtomicU64 {
@@ -401,6 +434,21 @@ pub fn all_fittings() -> Vec<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_access_matches_the_byte_view() {
+        let mut m = O2Memory::single(1 << 20);
+        m.write(0x100, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        assert_eq!(m.get_be(0x100, 4), 0x1122_3344);
+        assert_eq!(m.get_be(0x104, 2), 0x5566);
+        assert_eq!(m.get_be(0x106, 2), 0x7788);
+        assert_eq!(m.get_be(0x105, 1), 0x66);
+        m.put_be(0x100, 4, 0xaabb_ccdd);
+        m.put_be(0x106, 2, 0x1234);
+        m.put_be(0x104, 1, 0xee);
+        assert_eq!(m.bytes(0x100, 8), [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x66, 0x12, 0x34]);
+    }
+
 
     /// The CPU's window shows each byte where the decode puts it: both banks
     /// at RAM_BASE, the first 256 MB again from 0, and the mapped bitmap the

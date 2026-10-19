@@ -16,7 +16,7 @@
 //!
 //! See `docs/ip32-o2-bringup.md`.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR};
@@ -2671,8 +2671,10 @@ pub struct Ip32Bus {
     sizemem: Mutex<Vec<(u32, bool, u64, u32)>>,
     /// A physical-address watch range, from `IRIS_IP32_WATCHMEM=lo[:hi]`.
     /// Every access within it is logged as `(addr, is_write, value, pc)`.
-    /// Cheap to leave in: one range compare on the RAM path.
+    /// `watching` says whether there is one, so the RAM path checks a flag
+    /// rather than taking a lock.
     watch: Mutex<Option<(u32, u32)>>,
+    watching: AtomicBool,
     watch_log: Mutex<Vec<(u32, bool, u64, u32, u64, u8)>>,
     /// Entries kept (IRIS_IP32_WATCHMEM_CAP, default 256) and whether reads
     /// are left out (IRIS_IP32_WATCHMEM_WRITES).
@@ -2742,6 +2744,7 @@ impl Ip32Bus {
                 let p = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
                 Some((p(a)?, p(b)? + 8))
             })),
+            watching: AtomicBool::new(std::env::var("IRIS_IP32_WATCHMEM").is_ok()),
             watch_log: Mutex::new(Vec::new()),
             watch_cap: std::env::var("IRIS_IP32_WATCHMEM_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(256),
             watch_writes_only: std::env::var("IRIS_IP32_WATCHMEM_WRITES").is_ok(),
@@ -2891,9 +2894,15 @@ impl Ip32Bus {
         }
     }
 
+    /// After a device write, bring interrupts up to date. Not after the
+    /// rendering engine's or GBE's registers: neither drives a device line
+    /// (GBE's vertical-timing interrupts come from the beam, which the
+    /// service thread watches), and a GL scene writes the engine millions
+    /// of times a second, each refresh taking the interrupt lock the
+    /// service thread holds too.
     #[inline]
     fn after_write(&self, addr: u32) {
-        if self.irq_sink.get().is_some() && !Self::is_ram_addr(addr) {
+        if self.irq_sink.get().is_some() && !Self::is_ram_addr(addr) && !self.in_crime_re(addr) && !self.in_gbe(addr) {
             self.refresh_irq();
         }
     }
@@ -3084,6 +3093,9 @@ impl Ip32Bus {
 
     /// Record an access if it falls in the watch range.
     fn watch_hit(&self, addr: u32, write: bool, val: u64, n: usize) {
+        if !self.watching.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some((lo, hi)) = *self.watch.lock().unwrap() {
             // (0, 0) watches whatever the display is scanning out.
             let hit = if (lo, hi) == (0, 0) {
@@ -3110,6 +3122,7 @@ impl Ip32Bus {
     /// now on, with an empty log; None stops watching.
     pub fn set_watch(&self, range: Option<(u32, u32)>) {
         *self.watch.lock().unwrap() = range;
+        self.watching.store(range.is_some(), Ordering::Relaxed);
         self.watch_log.lock().unwrap().clear();
     }
 
