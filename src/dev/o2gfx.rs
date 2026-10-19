@@ -369,8 +369,9 @@ impl Gbe {
 
         // The overlay planes: 8-bit pixels over the normal ones, in their own
         // tile list (same width-in-tiles layout as the normal planes). Zero is
-        // clear; anything else is colour map entry 0x1100 + the pixel. The X
-        // server draws its pop-up menus here.
+        // clear; anything else is colour map entry 0x1100 + the pixel, always
+        // through the gamma map (GBE spec). The X server draws its pop-up
+        // menus here.
         let ovr = g(OVR_CONTROL);
         let ovr_tile = g(OVR_WIDTH_TILE);
         let ovr_rhs = (ovr_tile & 0x1f) as usize;
@@ -490,7 +491,7 @@ impl Gbe {
                 let ov = ovr_at(x, y);
                 if ov != 0 {
                     let c = cmap(0x1100 + ov);
-                    (rr, gg, bb) = (c >> 24, (c >> 16) & 0xff, (c >> 8) & 0xff);
+                    (rr, gg, bb) = (gmap(c >> 24, 24), gmap((c >> 16) & 0xff, 16), gmap((c >> 8) & 0xff, 8));
                 }
                 if crs_on {
                     let (dx, dy) = (x as i32 - cx, y as i32 - cy);
@@ -1812,6 +1813,10 @@ mod tests {
             (MODE, 0x403),
             (CMAP + 4 * 5, 0x11223300),
             (CMAP + 4 * 0x1107, 0xaabbcc00),
+            // Identity gamma for the overlay colour's three bytes.
+            (GMAP + 4 * 0xaa, 0xaaaaaa00),
+            (GMAP + 4 * 0xbb, 0xbbbbbb00),
+            (GMAP + 4 * 0xcc, 0xcccccc00),
         ] {
             g.write32(0x1600_0000 + off, v);
         }
