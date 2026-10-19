@@ -587,10 +587,14 @@ const RE_WORDS: usize = 0x6000 / 4;
 const RE_STATUS_IDLE: u32 = 0x1e00_0000;
 
 mod draw {
+    pub const GL: u32 = 1 << 22;
     pub const PIXEL_XFER: u32 = 1 << 21;
     pub const LINE_STIPPLE: u32 = 1 << 19;
     pub const POLY_STIPPLE: u32 = 1 << 18;
     pub const OPAQUE_STIPPLE: u32 = 1 << 17;
+    pub const SHADE: u32 = 1 << 16;
+    pub const ANTIALIAS_LINE: u32 = 1 << 12;
+    pub const BLEND: u32 = 1 << 10;
     pub const LOGIC_OP: u32 = 1 << 9;
     pub const PLANE_MASK: u32 = 1 << 7;
 }
@@ -981,6 +985,10 @@ impl CrimeRe {
                 }
             }
             // Line, Bresenham, the end pixel unless told to skip it.
+            1 if dm & draw::GL != 0 => {
+                let skip_last = prim & (1 << 18) != 0;
+                Self::gl_line(&r, mem, dst, ox, oy, skip_last);
+            }
             1 => {
                 let stippled = dm & draw::LINE_STIPPLE != 0;
                 let skip_last = prim & (1 << 18) != 0;
@@ -1146,6 +1154,94 @@ impl CrimeRe {
         }
     }
 
+    /// A GL line: float ends at 0x2080/0x2088 (as the triangle's, biased by
+    /// 2^17), coloured by the shade registers. With antialiasing on (draw
+    /// mode bit 12) each step along the major axis covers the two pixels
+    /// straddling the line in proportion, blended by coverage times alpha.
+    /// 4Dwm and the desktop outline their vector icons this way, black at
+    /// full alpha into the 32-bit window.
+    fn gl_line(r: &[u32], mem: &mut O2Memory, dst: Buf, ox: i32, oy: i32, skip_last: bool) {
+        let g = |off: u32| r[(off / 4) as usize];
+        let dm = g(DRAWMODE);
+        let fv = |off: u32| -> (f64, f64) {
+            let f = |w: u32| f32::from_bits(w) as f64 - 131072.0;
+            (f(g(off)) + ox as f64, f(g(off + 4)) + oy as f64)
+        };
+        let (a, b) = (fv(TRI_V0), fv(TRI_V0 + 8));
+        let ch = |off: u32| (g(off) >> 12) & 0xff;
+        let (cr, cg, cb, ca) = if dm & draw::SHADE != 0 {
+            (ch(SHADE_R), ch(SHADE_R + 4), ch(SHADE_R + 8), ch(SHADE_R + 12))
+        } else {
+            let fg = g(FG);
+            (fg >> 24, (fg >> 16) & 0xff, (fg >> 8) & 0xff, fg & 0xff)
+        };
+        let fmt = (g(BUFMODE_DST) >> 4) & 0xf;
+        // Pack and unpack the destination's pixel type (as for triangles).
+        let pack = |r8: u32, g8: u32, b8: u32, a8: u32| -> u32 {
+            let rgba = (r8 << 24) | (g8 << 16) | (b8 << 8) | a8;
+            match fmt {
+                0 => r8,
+                1 => rgba >> 8,
+                3 => rgba.swap_bytes(),
+                _ => rgba,
+            }
+        };
+        let unpack = |v: u32| -> (u32, u32, u32) {
+            let v = match fmt {
+                1 => v << 8,
+                3 => v.swap_bytes(),
+                _ => v,
+            };
+            (v >> 24, (v >> 16) & 0xff, (v >> 8) & 0xff)
+        };
+        let blend = dm & draw::BLEND != 0 && dst.bd == 4 && fmt != 0;
+        let mut plot = |x: i32, y: i32, cov: f64| {
+            if x < 0 || y < 0 || cov <= 0.0 || !Self::clip_ok(r, x, y) {
+                return;
+            }
+            let Some(o) = Self::locate(r, mem, dst, x as u32, y as u32) else { return };
+            let alpha = cov.min(1.0) * ca as f64 / 255.0;
+            let v = if blend {
+                let (dr, dg, db) = unpack(Self::get_px(mem, o, 4));
+                let mix = |s: u32, d: u32| (s as f64 * alpha + d as f64 * (1.0 - alpha)).round() as u32;
+                pack(mix(cr, dr), mix(cg, dg), mix(cb, db), ca)
+            } else if alpha >= 0.5 {
+                pack(cr, cg, cb, ca)
+            } else {
+                return;
+            };
+            Self::put(r, mem, o, dst.bd, v);
+        };
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let steep = dy.abs() > dx.abs();
+        // Walk the major axis from a's end to b's, one pixel centre a step.
+        let (ma, mb, na, nb) = if steep { (a.1, b.1, a.0, b.0) } else { (a.0, b.0, a.1, b.1) };
+        let (s0, s1) = (ma.round() as i32, mb.round() as i32);
+        let step = if s1 >= s0 { 1 } else { -1 };
+        let slope = if mb != ma { (nb - na) / (mb - ma) } else { 0.0 };
+        let aa = dm & draw::ANTIALIAS_LINE != 0;
+        let mut m = s0;
+        loop {
+            if m == s1 && skip_last && s1 != s0 {
+                break;
+            }
+            let n = na + slope * (m as f64 - ma);
+            let mut put2 = |mm: i32, nn: i32, cov: f64| if steep { plot(nn, mm, cov) } else { plot(mm, nn, cov) };
+            if aa {
+                let lo = n.floor();
+                let f = n - lo;
+                put2(m, lo as i32, 1.0 - f);
+                put2(m, lo as i32 + 1, f);
+            } else {
+                put2(m, n.round() as i32, 1.0);
+            }
+            if m == s1 || (m - s0).abs() > 8192 {
+                break;
+            }
+            m += step;
+        }
+    }
+
     /// Run the memory transfer engine's current transfer (NetBSD's clears
     /// and scrolls).
     /// RAM offset of byte `addr` of linear buffer `which` (0 = A, 1 = B).
@@ -1263,14 +1359,15 @@ impl CrimeRe {
                     // A stippled clear writes only the pixels whose mask bit
                     // is set: one bit per pixel, most significant first,
                     // counted from the 32-byte block holding the row's first
-                    // byte (eight pixels at 32 bpp, 32 at 8 bpp). IRIX's X
-                    // server draws text a row and a mask at a time; replaying
-                    // its recorded draws, only this count spells the login
-                    // screen's labels (from the row start, letters that do
-                    // not begin on a block boundary come out shifted).
+                    // byte (eight pixels at 32 bpp, 32 at 8 bpp) and wrapping
+                    // after bit 31. IRIX's X server draws text a row and a
+                    // mask at a time: from the row start, the login screen's
+                    // 8-bit labels come out shifted; without the wrap, the
+                    // 32-pixel spans of a 32-bit terminal lose their last
+                    // seven pixels, most of every fourth character.
                     if stippled {
-                        let k = (x - (xa & !31)) as u32 / bpp;
-                        if k >= 32 || (stipple >> (31 - k)) & 1 == 0 {
+                        let k = ((x - (xa & !31)) as u32 / bpp) % 32;
+                        if (stipple >> (31 - k)) & 1 == 0 {
                             continue;
                         }
                     }
@@ -1404,6 +1501,7 @@ mod tests {
         let mut rgba = vec![0u8; (w * h * 4) as usize];
         // RE_REPLAY_BUF=1 or 2: an 8-bit buffer through TLB B or C (the
         // overlay is C) instead, each index as its own grey.
+        let low = std::env::var("RE_REPLAY_LOW").is_ok();
         let eight: u32 = std::env::var("RE_REPLAY_BUF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         for y in 0..h {
             for x in 0..w {
@@ -1416,6 +1514,10 @@ mod tests {
                 } else if let Some(o) = CrimeRe::locate(&r, &mem, Buf { tlb: TLB_A, bd: 4 }, x, y) {
                     rgba[i..i + 3].copy_from_slice(&mem[o..o + 3]);
                     rgba[i + 3] = 255;
+                    // RE_REPLAY_LOW=1: the low byte (an 8-bit window's index) as grey.
+                    if low {
+                        rgba[i..i + 3].copy_from_slice(&[mem[o + 3]; 3]);
+                    }
                 }
             }
         }
