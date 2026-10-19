@@ -751,7 +751,8 @@ pub mod re_reg {
     pub const BUFMODE_SRC: u32 = 0x2000;
     pub const BUFMODE_DST: u32 = 0x2008;
     pub const DRAWMODE: u32 = 0x2018;
-    /// Clip mode (low four bits enable the rectangles) and the rectangles.
+    /// Clip mode (bits 9:5 enable screen masks 0-4, bits 4:0 inside or
+    /// outside) and the five screen-mask rectangles.
     pub const CLIP_MODE: u32 = 0x2010;
     pub const CLIP_RECT0: u32 = 0x2020;
     pub const WINOFFSET_SRC: u32 = 0x2050;
@@ -1130,25 +1131,39 @@ impl CrimeRe {
         ((v >> 16) as i32, (v & 0xffff) as i32)
     }
 
-    /// Whether the clip rectangles let pixel (x, y) be drawn. CLIP_MODE's
-    /// low four bits enable rectangles 0-3 (CLIP_RECT0 on, 64 bits each:
-    /// x0, y0 high, x1, y1 low, inclusive); with any enabled, a pixel must
-    /// lie in one of them. 4Dwm fills a minimized window's frame with the
-    /// four rectangles around the icon picture enabled (mode 0x1ef), which
-    /// keeps the fill off the picture it has just copied in.
+    /// Whether the screen masks let pixel (x, y) be drawn. CLIP_MODE bit
+    /// 5 + i enables ScrMask[i] (CLIP_RECT0 + 8i, 64 bits: x0, y0 high, x1,
+    /// y1 low, the max edges exclusive) and bit i says whether a pixel must
+    /// be inside it (1) or outside it (0). A pixel must lie in one of the
+    /// enabled inside masks, if there are any, and in none of the outside
+    /// ones. The spec's table numbers the masks the other way round; IRIX
+    /// pairs bit 5 with ScrMask[0] (mode 0x21 clips to the Icon Catalog's
+    /// rectangle in mask 0, the other four zero). 4Dwm fills a minimized
+    /// window's frame with masks 0-3 (mode 0x1ef), which keeps the fill off
+    /// the icon picture, and redraws a whole frame with all five (0x3ff):
+    /// mask 4 is the title bar, so reading only four left titles blank.
     fn clip_ok(r: &[u32], x: i32, y: i32) -> bool {
         let mode = r[(CLIP_MODE / 4) as usize];
-        if mode & 0xf == 0 {
+        let enabled = (mode >> 5) & 0x1f;
+        if enabled == 0 {
             return true;
         }
-        (0..4).any(|i| {
-            if mode & (1 << i) == 0 {
-                return false;
+        let (mut any_inside, mut in_inside) = (false, false);
+        for i in 0..5 {
+            if enabled & (1 << i) == 0 {
+                continue;
             }
             let (x0, y0) = Self::xy(r[((CLIP_RECT0 + 8 * i) / 4) as usize]);
             let (x1, y1) = Self::xy(r[((CLIP_RECT0 + 8 * i) / 4 + 1) as usize]);
-            (x0..=x1).contains(&x) && (y0..=y1).contains(&y)
-        })
+            let inside = (x0..x1).contains(&x) && (y0..y1).contains(&y);
+            if mode & (1 << i) != 0 {
+                any_inside = true;
+                in_inside |= inside;
+            } else if inside {
+                return false;
+            }
+        }
+        in_inside || !any_inside
     }
 
     /// A window offset: two signed 16-bit halves. IRIX's GL windows sit at
@@ -1317,7 +1332,10 @@ impl CrimeRe {
         // Write a register colour: its low bytes for a narrow pixel, or, in a
         // double-pix window (as for triangles), the colour (RGBA, R high) as
         // A1R5G5B5 into the half the buffer mode picks. perfly's panel text
-        // is FG 0x190c19ff into such a window.
+        // is FG 0x190c19ff into such a window. A 32-bit pixel takes the
+        // colour in the destination's pixel type, as triangles do: X fills
+        // its ABGR windows with FG 0x00d4d4d4, and storing that unchanged
+        // showed the grey as 0x00d4d4 (the cyan Motif bevels).
         let dmode = g(BUFMODE_DST);
         let half = dmode & 2 != 0 && (dmode >> 2) & 3 == 1 && dst.bd == 4;
         let half_off = if dmode & 1 == 0 { 2 } else { 0 };
@@ -1326,7 +1344,7 @@ impl CrimeRe {
                 let v = (((c & 0xff) >= 0x80) as u32) << 15 | ((c >> 27) & 31) << 10 | ((c >> 19) & 31) << 5 | ((c >> 11) & 31);
                 Self::put(&r, mem, o + half_off, 2, v);
             } else {
-                Self::put(&r, mem, o, dst.bd, Self::lane(c, o, dst.bd));
+                Self::put(&r, mem, o, dst.bd, Self::lane(Self::convert(c, 0x20, dmode, dst.bd), o, dst.bd));
             }
         };
 
@@ -2105,6 +2123,50 @@ mod tests {
         assert_eq!(CrimeRe::convert(0x1122_3344, 0x228, 0x1618, 4), 0x0011_2233);
         assert_eq!(CrimeRe::convert(0x1122_3344, 0x228, 0x238, 4), 0x4433_2211);
         assert_eq!(CrimeRe::convert(0x1122_3344, 0x228, 0x228, 4), 0x1122_3344);
+    }
+
+    /// 4Dwm redraws jot's frame with all five screen masks (mode 0x3ff, as
+    /// IRIX set them): the four border strips and the title bar in mask 4.
+    #[test]
+    fn all_five_screen_masks_clip_and_their_max_edges_are_exclusive() {
+        let mut r = vec![0u32; 0x4000 / 4];
+        let rects = [(24, 676, 378, 684), (24, 294, 32, 676), (866, 32, 874, 294), (24, 32, 32, 294), (24, 0, 874, 32)];
+        for (i, (x0, y0, x1, y1)) in rects.into_iter().enumerate() {
+            r[(CLIP_RECT0 / 4) as usize + 2 * i] = (x0 << 16) | y0;
+            r[(CLIP_RECT0 / 4) as usize + 2 * i + 1] = (x1 << 16) | y1;
+        }
+        r[(CLIP_MODE / 4) as usize] = 0x3ff;
+        assert!(CrimeRe::clip_ok(&r, 400, 15), "the title bar, in mask 4");
+        assert!(CrimeRe::clip_ok(&r, 24, 100), "the left border");
+        assert!(!CrimeRe::clip_ok(&r, 874, 15), "max x is exclusive");
+        assert!(!CrimeRe::clip_ok(&r, 400, 100), "the client area is not in any mask");
+        // Mode 0x21: mask 0 alone, inside; 0x20: mask 0 alone, outside.
+        r[(CLIP_MODE / 4) as usize] = 0x21;
+        assert!(CrimeRe::clip_ok(&r, 30, 680) && !CrimeRe::clip_ok(&r, 400, 15));
+        r[(CLIP_MODE / 4) as usize] = 0x20;
+        assert!(!CrimeRe::clip_ok(&r, 30, 680) && CrimeRe::clip_ok(&r, 400, 15));
+    }
+
+    /// The X server's Motif bevel: a rectangle into the 32-bit ABGR screen
+    /// with FG 0x00d4d4d4 must land as the grey 0xd4d4d400 the RGB8 window
+    /// shows, and into an RGBA window FG goes in unchanged.
+    #[test]
+    fn rectangles_store_fg_in_the_destination_pixel_type() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        re.write32(base + DRAWMODE, 0x0000_0278);
+        re.write32(base + LOGIC_OP, 3);
+        re.write32(base + PRIMITIVE, 0x0300_0000);
+        for (mode, fg, want) in [(0x238, 0x00d4_d4d4u32, [0xd4, 0xd4, 0xd4, 0]), (0x228, 0xc0c0_c000, [0xc0, 0xc0, 0xc0, 0])] {
+            re.write32(base + BUFMODE_DST, mode);
+            re.write32(base + FG, fg);
+            re.write32(base + VERTEX_0, (4 << 16) | 0);
+            re.write32(base + (VERTEX_1 | 0x800), (5 << 16) | 0);
+            let m = ram.lock().unwrap();
+            assert_eq!(&m.bytes(0x0100_0000 + 16, 4), &want, "mode {mode:#x}");
+        }
     }
 
     /// IRIX zeroes pages with the MTE: linear A mapped onto the pages in
