@@ -197,6 +197,12 @@ impl O2Machine {
             LAST_REGS[33].store(exec.core.cp0_cause as u64, Ordering::Relaxed);
             LAST_REGS[34].store(exec.core.cp0_epc, Ordering::Relaxed);
             LAST_REGS[35].store(exec.core.cp0_badvaddr, Ordering::Relaxed);
+            // The timer, for the input stall: Count as last materialized,
+            // Compare, the pending-interrupt word and the Compare-match count.
+            LAST_REGS[36].store(exec.core.cp0_count, Ordering::Relaxed);
+            LAST_REGS[37].store(exec.core.cp0_compare, Ordering::Relaxed);
+            LAST_REGS[38].store(exec.core.hot.interrupts.load(Ordering::Relaxed), Ordering::Relaxed);
+            LAST_REGS[39].store(exec.core.fasttick_count.load(Ordering::Relaxed), Ordering::Relaxed);
             if !post_done {
                 // POST is over once the firmware it loaded into RAM runs.
                 if (FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN).contains(&pc) {
@@ -483,8 +489,8 @@ pub(crate) static LAST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::Ato
 static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The general registers at the same moment, then Status, Cause, EPC and
 /// BadVAddr: what a polling loop is polling.
-static LAST_REGS: [std::sync::atomic::AtomicU64; 36] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 36];
+static LAST_REGS: [std::sync::atomic::AtomicU64; 40] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 40];
 
 fn control_server(listener: std::net::TcpListener, bus: Arc<Ip32Bus>) {
     use std::io::{BufRead, BufReader, Write};
@@ -529,6 +535,7 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
                 s.push_str(&format!(" r{i}=0x{v:x}"));
             }
             s.push_str(&format!(" sr=0x{:x} cause=0x{:x} epc=0x{:x} badva=0x{:x}", r[32], r[33], r[34], r[35]));
+            s.push_str(&format!(" count=0x{:x} compare=0x{:x} irq=0x{:x} ticks={}", r[36], r[37], r[38], r[39]));
             s
         }
         // `peek ADDR LEN PATH`: LEN bytes of the physical address space from

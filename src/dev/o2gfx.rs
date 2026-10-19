@@ -908,6 +908,13 @@ impl CrimeRe {
             .expect("CRIME-RE thread");
     }
 
+    /// Wait until every queued write has been carried out.
+    fn drain(&self) {
+        while self.busy() {
+            std::thread::yield_now();
+        }
+    }
+
     /// Whether queued writes are still being carried out.
     fn busy(&self) -> bool {
         self.queue.get().is_some()
@@ -982,7 +989,13 @@ impl CrimeRe {
             // empty (the queue's own back-pressure stands in for its level).
             STATUS | 0x4004 => if self.busy() { 0 } else { RE_STATUS_IDLE },
             IB_CONTROL | 0x0404 => 0,
-            o if self.queue.get().is_some() => self.shadow.lock().unwrap().get((o / 4) as usize).copied().unwrap_or(0),
+            // Any other read waits for the engine to catch up, as a read
+            // through CRIME's interface buffer would: drivers can use one as
+            // a barrier before touching what the engine draws.
+            o if self.queue.get().is_some() => {
+                self.drain();
+                self.shadow.lock().unwrap().get((o / 4) as usize).copied().unwrap_or(0)
+            }
             o => self.regs.lock().unwrap().get((o / 4) as usize).copied().unwrap_or(0),
         }
     }
