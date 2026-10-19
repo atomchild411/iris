@@ -2836,7 +2836,7 @@ impl Ip32Bus {
     /// GBE's picture out of RAM into `out` (R, G, B, A bytes), or None while
     /// the display is off. See [`crate::dev::o2gfx::Gbe::render`].
     pub fn render_screen(&self, out: &mut [u8]) -> Option<(u32, u32)> {
-        self.gbe.render(&self.ram.lock().unwrap(), out)
+        self.gbe.render_from(&self.ram, out)
     }
 
     /// Where IP2 goes when CRIME's output changes, for a machine whose CPU
@@ -5839,7 +5839,7 @@ mod bringup {
                 && last_frame.elapsed() >= std::time::Duration::from_millis(40)
             {
                 last_frame = std::time::Instant::now();
-                let size = bus.gbe.render(&bus.ram.lock().unwrap(), &mut frame);
+                let size = bus.gbe.render_from(&bus.ram, &mut frame);
                 let (w, h) = size.unwrap_or((0, 0));
                 if let Some(s) = screen.as_mut() {
                     let n = (w * h * 4) as usize;
@@ -5950,7 +5950,7 @@ mod bringup {
         eprintln!("ip32: crime-re primitives run: {}", bus.crime_re.drawn.load(Ordering::Relaxed));
         eprintln!("ip32: gbe {}", bus.gbe.summary());
         eprintln!("ip32: ps2 traffic (port>to device, port<from device): {}", bus.ps2.traffic());
-        let shown = bus.gbe.render(&bus.ram.lock().unwrap(), &mut frame);
+        let shown = bus.gbe.render_from(&bus.ram, &mut frame);
         eprintln!("ip32: gbe would show {shown:?}");
         if let (Some(p), Some((w, h))) = (png_path.as_ref(), shown) {
             let _ = crate::ip32_screen::save_png(p, &frame[..(w * h * 4) as usize], w, h);

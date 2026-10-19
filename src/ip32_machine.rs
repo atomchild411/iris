@@ -134,7 +134,7 @@ impl O2Machine {
 
         bus.gbe.use_cpu_clock(cpu.cycles_ptr(), o2.cpu_mhz);
         let running = Arc::new(AtomicBool::new(false));
-        let display = Arc::new(O2Display::new(bus.clone(), cpu.cycles_ptr(), running.clone()));
+        let display = Arc::new(O2Display::new(bus.clone(), cpu.cycles_ptr(), cpu.fasttick_count(), running.clone()));
         if let Some(port) = o2.control_port {
             match std::net::TcpListener::bind(("127.0.0.1", port)) {
                 Ok(l) => {
@@ -318,17 +318,21 @@ pub struct O2Display {
     screen: Mutex<Rex3Screen>,
     screenshot_pending: AtomicBool,
     cycles: CyclesPtr,
+    /// The CPU's Compare-match count: IRIX's clock tick on the O2, which has
+    /// no 8254. The status bar's Hz.
+    ticks: Arc<std::sync::atomic::AtomicU64>,
     running: Arc<AtomicBool>,
 }
 
 impl O2Display {
-    fn new(bus: Arc<Ip32Bus>, cycles: CyclesPtr, running: Arc<AtomicBool>) -> Self {
+    fn new(bus: Arc<Ip32Bus>, cycles: CyclesPtr, ticks: Arc<std::sync::atomic::AtomicU64>, running: Arc<AtomicBool>) -> Self {
         Self {
             bus,
             renderer: Mutex::new(None),
             screen: Mutex::new(Rex3Screen::new()),
             screenshot_pending: AtomicBool::new(false),
             cycles,
+            ticks,
             running,
         }
     }
@@ -386,7 +390,7 @@ impl O2Display {
                     now: start,
                     hb: 0,
                     cycles: self.cycles.get(),
-                    fasttick: 0,
+                    fasttick: self.ticks.load(Ordering::Relaxed),
                     decoded_delta: 0,
                     l1i_hits: 0,
                     l1i_fetches: 0,

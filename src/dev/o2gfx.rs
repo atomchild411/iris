@@ -53,6 +53,40 @@ pub mod gbe_reg {
 
 use gbe_reg::*;
 
+/// What scan-out reads memory through: all of RAM, or a [`ScanSnapshot`] of
+/// the pages one frame needs.
+pub trait ScanMem {
+    fn dma_offset(&self, addr: u32) -> Option<usize>;
+}
+
+impl ScanMem for O2Memory {
+    fn dma_offset(&self, addr: u32) -> Option<usize> {
+        O2Memory::dma_offset(self, addr)
+    }
+}
+
+/// The 64 KB pages one frame of scan-out reads (tile lists, tiles, the DID
+/// table), copied out of RAM under its lock so the scan itself runs without
+/// it. Scanning straight out of locked RAM kept the CPU, which takes the same
+/// lock for every load and store, waiting most of the time.
+pub struct ScanSnapshot {
+    slot: std::collections::HashMap<u32, usize>,
+    bytes: Vec<u8>,
+}
+
+impl ScanMem for ScanSnapshot {
+    fn dma_offset(&self, addr: u32) -> Option<usize> {
+        self.slot.get(&(addr >> 16)).map(|s| s * 0x10000 + (addr & 0xffff) as usize)
+    }
+}
+
+impl std::ops::Deref for ScanSnapshot {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Offsets 0 to the end of the video-capture block.
 const GBE_WORDS: usize = 0x81000 / 4;
 const VT_FREEZE: u32 = 1 << 31;
@@ -296,10 +330,69 @@ impl Gbe {
         )
     }
 
+    /// Render from `ram` holding its lock only to copy the frame's pages.
+    pub fn render_from(&self, ram: &Mutex<O2Memory>, out: &mut [u8]) -> Option<(u32, u32)> {
+        let snap = {
+            let m = ram.lock().unwrap();
+            self.snapshot(&m)
+        };
+        self.render(&snap, out)
+    }
+
+    /// Copy the pages the next [`Self::render`] reads.
+    pub fn snapshot(&self, mem: &O2Memory) -> ScanSnapshot {
+        let r = {
+            let mut s = self.s.lock().unwrap();
+            self.latch(&mut s);
+            s.r.clone()
+        };
+        let g = |off: u32| Self::get(&r, off);
+        let h = ((g(VT_VCMAP) >> 12) & 0xfff) as u32;
+        let mut pages: Vec<u32> = Vec::new();
+        let rd16 = |a: u32| {
+            mem.dma_offset(a).filter(|&o| o + 1 < mem.len()).map(|o| u16::from_be_bytes([mem[o], mem[o + 1]])).unwrap_or(0)
+        };
+        // A tile list and its tiles: `ctl` holds the list address and the
+        // DMA enable, `tile` the width in tiles and the partial tile.
+        let list = |ctl: u32, tile: u32, rows: u32, pages: &mut Vec<u32>| {
+            let per_row = ((tile >> 5) & 0xff) + ((tile & 0x1f) != 0) as u32;
+            if ctl & 1 == 0 || per_row == 0 {
+                return;
+            }
+            let base = ctl & 0xffff_ffe0;
+            let n = (per_row * rows.div_ceil(128)).min(65536);
+            for p in (base >> 16)..=((base + 2 * n) >> 16) {
+                pages.push(p);
+            }
+            for i in 0..n {
+                let e = rd16(base + 2 * i) as u32;
+                if e != 0 {
+                    pages.push(e);
+                }
+            }
+        };
+        list(g(FRM_CONTROL), g(FRM_SIZE_TILE), g(FRM_SIZE_PIXEL) >> 16, &mut pages);
+        list(g(OVR_CONTROL), g(OVR_WIDTH_TILE), h, &mut pages);
+        let did = g(DID_CONTROL);
+        if did & (1 << 16) != 0 {
+            pages.push(did & 0xffff);
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        let mut snap = ScanSnapshot { slot: std::collections::HashMap::new(), bytes: Vec::with_capacity(pages.len() * 0x10000) };
+        for p in pages {
+            if let Some(o) = mem.dma_offset(p << 16).filter(|&o| o + 0x10000 <= mem.len()) {
+                snap.slot.insert(p, snap.slot.len());
+                snap.bytes.extend_from_slice(&mem[o..o + 0x10000]);
+            }
+        }
+        snap
+    }
+
     /// Scan the frame out of RAM into `out` (R, G, B, A bytes, row 0 at the
     /// top), as GBE would. Returns the size drawn, or None when the display
     /// is off. `out` must hold the largest mode (2048 x 2048 pixels).
-    pub fn render(&self, mem: &O2Memory, out: &mut [u8]) -> Option<(u32, u32)> {
+    pub fn render<M: ScanMem + std::ops::Deref<Target = [u8]>>(&self, mem: &M, out: &mut [u8]) -> Option<(u32, u32)> {
         let r = {
             let mut s = self.s.lock().unwrap();
             self.latch(&mut s);
@@ -1755,7 +1848,7 @@ mod tests {
             g.write32(0x1600_0000 + off, v);
         }
         let mut out = vec![0u8; 2048 * 2048 * 4];
-        let (w, h) = g.render(&ram.lock().unwrap(), &mut out).expect("display on");
+        let (w, h) = g.render(&*ram.lock().unwrap(), &mut out).expect("display on");
         assert_eq!((w, h), (512, 128));
         let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
         assert_eq!(px(10, 20), [0x11, 0x22, 0x33]);
@@ -1821,7 +1914,7 @@ mod tests {
             g.write32(0x1600_0000 + off, v);
         }
         let mut out = vec![0u8; 2048 * 2048 * 4];
-        g.render(&ram.lock().unwrap(), &mut out).expect("display on");
+        g.render(&*ram.lock().unwrap(), &mut out).expect("display on");
         let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
         assert_eq!(px(3, 4), [0xaa, 0xbb, 0xcc], "overlay colour from entry 0x1100 + 7");
         assert_eq!(px(4, 4), [0x11, 0x22, 0x33], "overlay 0 shows the normal planes");
