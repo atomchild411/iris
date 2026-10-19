@@ -811,6 +811,8 @@ use re_reg::*;
 const RE_WORDS: usize = 0x6000 / 4;
 /// Idle everywhere, interface buffer empty.
 const RE_STATUS_IDLE: u32 = 0x1e00_0000;
+/// Entries in CRIME's host interface buffer.
+const IB_DEPTH: usize = 128;
 
 mod draw {
     pub const GL: u32 = 1 << 22;
@@ -861,6 +863,35 @@ pub struct CrimeRe {
 struct Buf {
     tlb: u32,
     bd: u32,
+}
+
+/// Pixel offsets along a row of a buffer, located once per tile: a tile row
+/// is contiguous, so the rest of it is the first pixel's offset plus a
+/// stride. Locating every pixel was a sixth of the CPU thread under GL.
+struct RowCursor {
+    buf: Buf,
+    y: u32,
+    x_lo: u32,
+    x_hi: u32,
+    base: Option<usize>,
+}
+
+impl RowCursor {
+    fn new(buf: Buf) -> Self {
+        RowCursor { buf, y: u32::MAX, x_lo: 1, x_hi: 0, base: None }
+    }
+
+    #[inline]
+    fn at(&mut self, r: &[u32], mem: &O2Memory, x: u32, y: u32) -> Option<usize> {
+        if y != self.y || x < self.x_lo || x > self.x_hi {
+            let tw = 512 / self.buf.bd;
+            self.y = y;
+            self.x_lo = x - x % tw;
+            self.x_hi = self.x_lo + tw - 1;
+            self.base = CrimeRe::locate(r, mem, self.buf, self.x_lo, y);
+        }
+        self.base.map(|b| b + ((x - self.x_lo) * self.buf.bd) as usize)
+    }
 }
 
 /// The screen masks of [`CrimeRe::clip_ok`], decoded once per primitive:
@@ -925,9 +956,13 @@ impl CrimeRe {
     /// engine alive for the worker, which reaches it through `get`.
     pub fn start_async<O: Send + Sync + 'static>(&self, owner: Arc<O>, get: fn(&O) -> &CrimeRe) {
         *self.shadow.lock().unwrap() = self.regs.lock().unwrap().clone();
-        // About a frame of perfly's writes; a full queue holds the CPU, as
-        // the interface buffer's back-pressure does.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, u64, u8)>(1 << 16);
+        // As deep as CRIME's interface buffer (IntfBuf.data[128]): a full
+        // queue holds the CPU, as the buffer's stall does. Software relies
+        // on the engine never trailing it by more than that: 64K entries
+        // let it fall a frame behind, and the X server reused a staging
+        // buffer the engine had not read yet (icons drawn from the wrong
+        // picture).
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, u64, u8)>(IB_DEPTH);
         if self.queue.set(tx).is_err() {
             return;
         }
@@ -1608,6 +1643,7 @@ impl CrimeRe {
                 let ymin = v.iter().map(|p| p.1).fold(f64::MAX, f64::min).floor().max(0.0) as i32;
                 let ymax = v.iter().map(|p| p.1).fold(f64::MIN, f64::max).ceil().min(4095.0) as i32;
                 let edges = [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])];
+                let (mut crow, mut zrow) = (RowCursor::new(dst), RowCursor::new(zbuf));
                 for y in ymin..=ymax {
                     // Narrow the row to where every edge function can be
                     // non-negative (each is linear in x), a pixel wider each
@@ -1640,7 +1676,7 @@ impl CrimeRe {
                         if inside && clip.ok(x, y) {
                             if depth {
                                 let zs = (z0 + dzdx * (px - rx) + dzdy * (py - ry)).clamp(0.0, 16_777_215.0) as u32;
-                                if let Some(zo) = Self::locate(&r, mem, zbuf, x as u32, y as u32) {
+                                if let Some(zo) = zrow.at(&r, mem, x as u32, y as u32) {
                                     let old = Self::get_px(mem, zo, 4);
                                     let zd = old & 0xff_ffff;
                                     let pass = match zfunc {
@@ -1661,7 +1697,7 @@ impl CrimeRe {
                                     }
                                 }
                             }
-                            if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
+                            if let Some(o) = crow.at(&r, mem, x as u32, y as u32) {
                                 let colour = colour_at(mem, px, py);
                                 if half {
                                     Self::put(&r, mem, o + half_off, 2, colour);
