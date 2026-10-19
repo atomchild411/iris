@@ -739,6 +739,16 @@ pub struct CrimeRe {
     /// driver does with parts the model does not know yet.
     trace: Mutex<Vec<(u32, u64, u8)>>,
     trace_cap: usize,
+    /// Asynchronous mode ([`Self::start_async`]): register writes go, in
+    /// order, to a worker thread that owns `regs` and draws, as the real
+    /// engine works through its interface buffer while the CPU runs on. The
+    /// CPU reads its own copy of the registers (`shadow`) and a STATUS that
+    /// says busy until every write it has queued (`queued`) has been carried
+    /// out (`done`). Without it (tests, replays) writes act at once.
+    queue: std::sync::OnceLock<std::sync::mpsc::SyncSender<(u32, u64, u8)>>,
+    shadow: Mutex<Vec<u32>>,
+    queued: std::sync::atomic::AtomicU64,
+    done: std::sync::atomic::AtomicU64,
 }
 
 /// A buffer the RE draws through: which TLB, and bytes per pixel word.
@@ -754,7 +764,11 @@ impl CrimeRe {
         let mut regs = vec![0; RE_WORDS];
         regs[(MTE_BYTEMASK / 4) as usize] = 0xffff_ffff;
         Self {
+            shadow: Mutex::new(regs.clone()),
             regs: Mutex::new(regs),
+            queue: std::sync::OnceLock::new(),
+            queued: std::sync::atomic::AtomicU64::new(0),
+            done: std::sync::atomic::AtomicU64::new(0),
             hot: Mutex::new(BTreeMap::new()),
             ram,
             unhandled: Mutex::new(BTreeMap::new()),
@@ -762,6 +776,64 @@ impl CrimeRe {
             trace: Mutex::new(Vec::new()),
             trace_cap: std::env::var("IRIS_IP32_RE_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         }
+    }
+
+    /// Run the engine on its own thread from now on. `owner` keeps this
+    /// engine alive for the worker, which reaches it through `get`.
+    pub fn start_async<O: Send + Sync + 'static>(&self, owner: Arc<O>, get: fn(&O) -> &CrimeRe) {
+        *self.shadow.lock().unwrap() = self.regs.lock().unwrap().clone();
+        // About a frame of perfly's writes; a full queue holds the CPU, as
+        // the interface buffer's back-pressure does.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, u64, u8)>(1 << 16);
+        if self.queue.set(tx).is_err() {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("CRIME-RE".into())
+            .spawn(move || {
+                let re = get(&owner);
+                while let Ok((off, val, width)) = rx.recv() {
+                    if width == 64 {
+                        re.apply64(off, val);
+                    } else {
+                        re.write_reg(off, val as u32);
+                    }
+                    re.done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+            })
+            .expect("CRIME-RE thread");
+    }
+
+    /// Whether queued writes are still being carried out.
+    fn busy(&self) -> bool {
+        self.queue.get().is_some()
+            && self.done.load(std::sync::atomic::Ordering::Acquire) != self.queued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A CPU write: carried out now, or queued with the CPU's copy updated.
+    fn cpu_write(&self, off: u32, val: u64, width: u8) {
+        let Some(tx) = self.queue.get() else {
+            if width == 64 {
+                self.apply64(off, val);
+            } else {
+                self.write_reg(off, val as u32);
+            }
+            return;
+        };
+        {
+            let page = off & 0xf000;
+            let start = (page == 0x2000 || page == 0x3000) && off & 0x800 != 0;
+            let reg = if start { off & !0x800 } else { off };
+            let mut r = self.shadow.lock().unwrap();
+            let words: &[u32] = if width == 64 { &[(val >> 32) as u32, val as u32] } else { &[val as u32] };
+            for (i, &w) in words.iter().enumerate() {
+                if let Some(slot) = r.get_mut((reg / 4) as usize + i) {
+                    *slot = w;
+                }
+            }
+        }
+        self.queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = tx.send((off, val, width));
     }
 
     fn record(&self, off: u32, val: u64, width: u8) {
@@ -801,8 +873,11 @@ impl CrimeRe {
     fn read_reg(&self, off: u32) -> u32 {
         *self.hot.lock().unwrap().entry(off & !3).or_insert(0) += 1;
         match off & !3 {
-            STATUS | 0x4004 => RE_STATUS_IDLE,
+            // Busy: the four idle bits clear, the interface buffer reported
+            // empty (the queue's own back-pressure stands in for its level).
+            STATUS | 0x4004 => if self.busy() { 0 } else { RE_STATUS_IDLE },
             IB_CONTROL | 0x0404 => 0,
+            o if self.queue.get().is_some() => self.shadow.lock().unwrap().get((o / 4) as usize).copied().unwrap_or(0),
             o => self.regs.lock().unwrap().get((o / 4) as usize).copied().unwrap_or(0),
         }
     }
@@ -1641,20 +1716,27 @@ impl BusDevice for CrimeRe {
     fn read64(&self, addr: u32) -> BusRead64 {
         let a = addr & 0x7ff8;
         if a == STATUS {
-            return BusRead64::ok(RE_STATUS_IDLE as u64);
+            return BusRead64::ok(self.read_reg(STATUS) as u64);
         }
         BusRead64::ok((self.read_reg(a) as u64) << 32 | self.read_reg(a + 4) as u64)
     }
     fn write32(&self, addr: u32, val: u32) -> u32 {
         self.record(addr & 0x7ffc, val as u64, 32);
-        self.write_reg(addr & 0x7ffc, val);
+        self.cpu_write(addr & 0x7ffc, val as u64, 32);
         BUS_OK
     }
     fn write64(&self, addr: u32, val: u64) -> u32 {
-        // Both halves land before a start acts, so a 64-bit write to a start
-        // address (vertices 0 and 1 at once) draws with both.
         let a = addr & 0x7ff8;
         self.record(a, val, 64);
+        self.cpu_write(a, val, 64);
+        BUS_OK
+    }
+}
+
+impl CrimeRe {
+    /// Both halves land before a start acts, so a 64-bit write to a start
+    /// address (vertices 0 and 1 at once) draws with both.
+    fn apply64(&self, a: u32, val: u64) {
         let page = a & 0xf000;
         let start = (page == 0x2000 || page == 0x3000) && a & 0x800 != 0;
         let base = if start { a & !0x800 } else { a };
@@ -1674,7 +1756,6 @@ impl BusDevice for CrimeRe {
                 self.mte();
             }
         }
-        BUS_OK
     }
 }
 

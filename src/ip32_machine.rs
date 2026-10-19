@@ -153,6 +153,8 @@ impl O2Machine {
         }
 
         bus.gbe.use_cpu_clock(cpu.cycles_ptr(), o2.cpu_mhz);
+        // CRIME's rendering engine draws on its own thread, off the CPU's.
+        bus.crime_re.start_async(bus.clone(), |b: &Ip32Bus| &b.crime_re);
         let running = Arc::new(AtomicBool::new(false));
         let display = Arc::new(O2Display::new(bus.clone(), cpu.cycles_ptr(), cpu.fasttick_count(), running.clone()));
         if let Some(port) = o2.control_port {
