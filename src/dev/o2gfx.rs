@@ -636,6 +636,14 @@ impl BusDevice for Gbe {
     }
 }
 
+/// A GL vertex coordinate: 13.6 fixed point in the low 23 bits (CRIME 1.5
+/// spec). IRIX's GL writes floats biased by 2^17, whose mantissa holds
+/// exactly that; perfly's panel text writes the fixed-point value itself
+/// (0x00844140 for 4357.0), which read as a float is a denormal.
+fn gl_coord(w: u32) -> f64 {
+    (w & 0x7f_ffff) as f64 / 64.0
+}
+
 /// How Gouraud gradients are read: their fraction bits and which vertex the
 /// start colour belongs to. The replay test can try others (RE_GOURAUD).
 static GOURAUD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(12 << 8);
@@ -1060,8 +1068,15 @@ impl CrimeRe {
         }
         let Some(dst) = self.buf(&r, g(BUFMODE_DST), "dst") else { return };
         let (ox, oy) = Self::offset_xy(g(WINOFFSET_DST));
-        let (x0, y0) = Self::xy(g(VERTEX_0));
-        let (x1, y1) = Self::xy(g(VERTEX_1));
+        // In GL mode points and rectangles take their corners from the GL
+        // vertex registers too (perfly's panel text: one stippled GL
+        // rectangle per glyph row).
+        let ((x0, y0), (x1, y1)) = if dm & draw::GL != 0 {
+            let v = |off: u32| (gl_coord(g(off)).floor() as i32, gl_coord(g(off + 4)).floor() as i32);
+            (v(TRI_V0), v(TRI_V0 + 8))
+        } else {
+            (Self::xy(g(VERTEX_0)), Self::xy(g(VERTEX_1)))
+        };
         let (x0, y0, x1, y1) = (x0 + ox, y0 + oy, x1 + ox, y1 + oy);
         let fg = g(FG);
         let bg = g(BG);
@@ -1076,17 +1091,32 @@ impl CrimeRe {
         let mut ram = self.ram.lock().unwrap();
         let mem: &mut O2Memory = &mut ram;
 
-        // Where each destination pixel's value comes from.
-        let colour_at = |mem: &O2Memory, o: usize, k: u32, stippled: bool| -> Option<u32> {
+        // Which colour register a destination pixel takes, if any.
+        let colour_at = |mem: &O2Memory, _o: usize, k: u32, stippled: bool| -> Option<u32> {
+            let _ = mem;
             if stippled {
                 match stipple(k) {
-                    Some(true) => Some(Self::lane(fg, o, dst.bd)),
-                    _ if dm & draw::OPAQUE_STIPPLE != 0 => Some(Self::lane(bg, o, dst.bd)),
+                    Some(true) => Some(fg),
+                    _ if dm & draw::OPAQUE_STIPPLE != 0 => Some(bg),
                     _ => None,
                 }
             } else {
-                let _ = mem;
-                Some(Self::lane(fg, o, dst.bd))
+                Some(fg)
+            }
+        };
+        // Write a register colour: its low bytes for a narrow pixel, or, in a
+        // double-pix window (as for triangles), the colour (RGBA, R high) as
+        // A1R5G5B5 into the half the buffer mode picks. perfly's panel text
+        // is FG 0x190c19ff into such a window.
+        let dmode = g(BUFMODE_DST);
+        let half = dmode & 2 != 0 && (dmode >> 2) & 3 == 1 && dst.bd == 4;
+        let half_off = if dmode & 1 == 0 { 2 } else { 0 };
+        let paint = |mem: &mut O2Memory, o: usize, c: u32| {
+            if half {
+                let v = (((c & 0xff) >= 0x80) as u32) << 15 | ((c >> 27) & 31) << 10 | ((c >> 19) & 31) << 5 | ((c >> 11) & 31);
+                Self::put(&r, mem, o + half_off, 2, v);
+            } else {
+                Self::put(&r, mem, o, dst.bd, Self::lane(c, o, dst.bd));
             }
         };
 
@@ -1097,8 +1127,7 @@ impl CrimeRe {
                     return;
                 }
                 if let Some(o) = Self::locate(&r, mem, dst, x0.max(0) as u32, y0.max(0) as u32) {
-                    let v = Self::lane(fg, o, dst.bd);
-                    Self::put(&r, mem, o, dst.bd, v);
+                    paint(mem, o, fg);
                 }
             }
             // Line, Bresenham, the end pixel unless told to skip it.
@@ -1117,7 +1146,7 @@ impl CrimeRe {
                     if !(last && skip_last) && x >= 0 && y >= 0 && Self::clip_ok(&r, x, y) {
                         if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
                             if let Some(v) = colour_at(mem, o, k, stippled) {
-                                Self::put(&r, mem, o, dst.bd, v);
+                                paint(mem, o, v);
                             }
                         }
                     }
@@ -1183,7 +1212,7 @@ impl CrimeRe {
                             }
                             if let Some(o) = Self::locate(&r, mem, dst, x, y) {
                                 if let Some(v) = colour_at(mem, o, k as u32, stippled) {
-                                    Self::put(&r, mem, o, dst.bd, v);
+                                    paint(mem, o, v);
                                 }
                             }
                         }
@@ -1198,7 +1227,7 @@ impl CrimeRe {
             // flat-shaded and opaque.
             2 => {
                 let fv = |off: u32| -> (f64, f64) {
-                    let f = |w: u32| f32::from_bits(w) as f64 - 131072.0;
+                    let f = gl_coord;
                     (f(g(off)) + ox as f64, f(g(off + 4)) + oy as f64)
                 };
                 let v = [fv(TRI_V0), fv(TRI_V0 + 8), fv(TRI_V0 + 16)];
@@ -1337,7 +1366,7 @@ impl CrimeRe {
         let g = |off: u32| r[(off / 4) as usize];
         let dm = g(DRAWMODE);
         let fv = |off: u32| -> (f64, f64) {
-            let f = |w: u32| f32::from_bits(w) as f64 - 131072.0;
+            let f = gl_coord;
             (f(g(off)) + ox as f64, f(g(off + 4)) + oy as f64)
         };
         let (a, b) = (fv(TRI_V0), fv(TRI_V0 + 8));
@@ -1404,10 +1433,25 @@ impl CrimeRe {
         let step = if s1 >= s0 { 1 } else { -1 };
         let slope = if mb != ma { (nb - na) / (mb - ma) } else { 0.0 };
         let aa = dm & draw::ANTIALIAS_LINE != 0;
+        // Line stipple, as for X lines: one pattern bit per step from the
+        // mode's start, repeating every max + 1. perfly draws its panel text
+        // a glyph row at a time this way.
+        let stippled = dm & draw::LINE_STIPPLE != 0;
+        let smode = g(STIPPLE_MODE);
+        let (sstart, span) = ((smode >> 24) & 0x1f, ((smode >> 16) & 0x1f) + 1);
+        let pattern = g(STIPPLE_PATTERN);
         let mut m = s0;
         loop {
             if m == s1 && skip_last && s1 != s0 {
                 break;
+            }
+            let k = (m - s0).unsigned_abs();
+            if stippled && (pattern >> (31 - (sstart + k) % span)) & 1 == 0 {
+                if m == s1 || (m - s0).abs() > 8192 {
+                    break;
+                }
+                m += step;
+                continue;
             }
             let n = na + slope * (m as f64 - ma);
             let mut put2 = |mm: i32, nn: i32, cov: f64| if steep { plot(nn, mm, cov) } else { plot(mm, nn, cov) };
