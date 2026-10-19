@@ -733,12 +733,12 @@ impl CrimeRe {
         }
     }
 
-    /// A register colour's lanes for a pixel at memory offset `o` (the
-    /// 32-bit value lies over the aligned memory word).
-    fn lane(v: u32, o: usize, bd: u32) -> u32 {
-        let shift = 8 * (4 - bd - (o as u32 & 3).min(4 - bd));
-        let mask = if bd == 4 { u32::MAX } else { (1 << (8 * bd)) - 1 };
-        (v >> shift) & mask
+    /// A register colour as a pixel of `bd` bytes: its low bytes, wherever
+    /// the pixel sits in its word. IRIX's X server writes an 8-bit index as
+    /// is (FG 0x00000002); the BSDs repeat it in every byte, which reads
+    /// the same either way.
+    fn lane(v: u32, _o: usize, bd: u32) -> u32 {
+        if bd >= 4 { v } else { v & ((1 << (8 * bd)) - 1) }
     }
 
     fn logic(op: u32, s: u32, d: u32) -> u32 {
@@ -1402,10 +1402,18 @@ mod tests {
         let mem = ram.lock().unwrap();
         let (w, h) = (1280u32, 1024u32);
         let mut rgba = vec![0u8; (w * h * 4) as usize];
+        // RE_REPLAY_BUF=1 or 2: an 8-bit buffer through TLB B or C (the
+        // overlay is C) instead, each index as its own grey.
+        let eight: u32 = std::env::var("RE_REPLAY_BUF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         for y in 0..h {
             for x in 0..w {
-                if let Some(o) = CrimeRe::locate(&r, &mem, Buf { tlb: TLB_A, bd: 4 }, x, y) {
-                    let i = ((y * w + x) * 4) as usize;
+                let i = ((y * w + x) * 4) as usize;
+                if eight != 0 {
+                    if let Some(o) = CrimeRe::locate(&r, &mem, Buf { tlb: TLB_A + 0x200 * eight, bd: 1 }, x, y) {
+                        let v = mem[o].wrapping_mul(85);
+                        rgba[i..i + 4].copy_from_slice(&[v, v, v, 255]);
+                    }
+                } else if let Some(o) = CrimeRe::locate(&r, &mem, Buf { tlb: TLB_A, bd: 4 }, x, y) {
                     rgba[i..i + 3].copy_from_slice(&mem[o..o + 3]);
                     rgba[i + 3] = 255;
                 }
@@ -1556,6 +1564,29 @@ mod tests {
         let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
         assert_eq!(px(10, 20), [0x11, 0x22, 0x33]);
         assert_eq!(px(9, 20), [0, 0, 0]);
+    }
+
+    /// IRIX draws menu text into the 8-bit overlay as stippled lines with
+    /// FG 0x00000002: every set bit is index 2, whatever its byte in the word.
+    #[test]
+    fn an_8bit_stippled_line_takes_its_colour_from_the_low_byte() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let tile = 0x0010_0000u32;
+        let b = 0x1500_0000;
+        // TLB C (buffer 2), entry 16: the second row of tiles, y 128-255.
+        re.write64(b + TLB_A + 0x400 + 0x20, (0x8000u64 | (tile >> 16) as u64) << 48);
+        re.write32(b + BUFMODE_DST, 0x800);
+        re.write32(b + DRAWMODE, 0x0008_0278);
+        re.write32(b + PRIMITIVE, 0x0104_0020);
+        re.write32(b + FG, 2);
+        re.write32(b + LOGIC_OP, 3);
+        re.write32(b + STIPPLE_MODE, 0x001f_0000);
+        re.write64(b + VERTEX_0, 0x0081_00b4_0089_00b4);
+        re.write32(b + (STIPPLE_PATTERN | 0x800), 0xff00_0000);
+        let m = ram.lock().unwrap();
+        let row = (tile + (0xb4 - 128) * 512 + 0x81) as usize;
+        assert_eq!(&m[row..row + 9], &[2, 2, 2, 2, 2, 2, 2, 2, 0], "eight pixels, the end one skipped");
     }
 
     #[test]
