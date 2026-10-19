@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::dev::crime_mem::O2Memory;
+use crate::dev::crime_mem::{Batch, O2Memory};
 use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
 
 /// GBE register offsets from its base, `0x1600_0000`.
@@ -1086,20 +1086,18 @@ impl CrimeRe {
         // stays in one tile for many pixels, and resolving the tile through
         // the memory decode every pixel was a fifth of the CPU thread's time
         // under perfly (the engine runs on the CPU thread).
-        thread_local! {
-            static TILE: std::cell::Cell<(u64, usize)> = const { std::cell::Cell::new((u64::MAX, 0)) };
-        }
+        // (In the memory, not a thread-local: on macOS each thread-local
+        // access is a call.)
         let tile = e & 0x7fff;
         let key = tile | (mem.decode_gen() << 16);
-        let base = TILE.with(|c| {
-            let (k, b) = c.get();
-            if k == key {
-                return Some(b);
-            }
+        let (k, b) = mem.tile.get();
+        let base = if k == key {
+            b
+        } else {
             let b = mem.dma_offset((tile as u32) << 16).filter(|&o| o + 0x10000 <= mem.len())?;
-            c.set((key, b));
-            Some(b)
-        })?;
+            mem.tile.set((key, b));
+            b
+        };
         Some(base + ((y % 128) * 512 + (x % tw) * buf.bd) as usize)
     }
 
@@ -1153,12 +1151,7 @@ impl CrimeRe {
         } else {
             let bytes = v.to_be_bytes();
             let bytes = &bytes[4 - bd as usize..];
-            for (k, b) in bytes.iter().enumerate() {
-                let a = o + k;
-                if lanes & (1 << (3 - (a & 3))) != 0 {
-                    mem.write(a, &[*b]);
-                }
-            }
+            mem.write_span(o, bd as usize, |k| (lanes & (1 << (3 - ((o + k) & 3))) != 0).then(|| bytes[k]));
         }
     }
 
@@ -1250,7 +1243,7 @@ impl CrimeRe {
         let (sx0, sy0) = Self::xy(g(XFER_SRC));
         let src_tiled = Buf { tlb: TLB_A + 0x200 * sb.min(2), bd: sbd };
         let dst_tiled = Buf { tlb: TLB_A + 0x200 * db.min(2), bd: dbd };
-        let mut ram = self.ram.lock().unwrap();
+        let mut ram = Batch::new(self.ram.lock().unwrap());
         let mem: &mut O2Memory = &mut ram;
         let src_at = |mem: &O2Memory, x: i32, y: i32| -> Option<usize> {
             if lin(sb) {
@@ -1332,7 +1325,7 @@ impl CrimeRe {
             let idx = (sstart + k) % span.max(1);
             Some((pattern >> (31 - idx)) & 1 != 0)
         };
-        let mut ram = self.ram.lock().unwrap();
+        let mut ram = Batch::new(self.ram.lock().unwrap());
         let mem: &mut O2Memory = &mut ram;
 
         // Which colour register a destination pixel takes, if any.
@@ -1616,8 +1609,30 @@ impl CrimeRe {
                 let ymax = v.iter().map(|p| p.1).fold(f64::MIN, f64::max).ceil().min(4095.0) as i32;
                 let edges = [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])];
                 for y in ymin..=ymax {
-                    for x in xmin..=xmax {
-                        let (px, py) = (x as f64, y as f64);
+                    // Narrow the row to where every edge function can be
+                    // non-negative (each is linear in x), a pixel wider each
+                    // side for rounding, and test exactly only there:
+                    // scanning the whole bounding box tested twice the pixels
+                    // a triangle covers.
+                    let py = y as f64;
+                    let (mut lo, mut hi) = (xmin as f64, xmax as f64);
+                    for &(a, b) in &edges {
+                        let c1 = -s * (b.1 - a.1);
+                        let c0 = s * ((b.0 - a.0) * (py - a.1) + (b.1 - a.1) * a.0);
+                        if c1 > 0.0 {
+                            lo = lo.max(-c0 / c1);
+                        } else if c1 < 0.0 {
+                            hi = hi.min(-c0 / c1);
+                        } else if c0 < 0.0 {
+                            hi = lo - 4.0;
+                        }
+                    }
+                    if hi + 2.0 < lo {
+                        continue;
+                    }
+                    let (xs, xe) = ((lo.floor() as i32 - 1).max(xmin), (hi.ceil() as i32 + 1).min(xmax));
+                    for x in xs..=xe {
+                        let px = x as f64;
                         let inside = edges.iter().all(|&(a, b)| {
                             let e = edge(a, b, px, py);
                             e > 0.0 || (e == 0.0 && top_left(a, b))
@@ -1642,7 +1657,7 @@ impl CrimeRe {
                                         continue;
                                     }
                                     if zmask {
-                                        mem.write(zo, &((old & 0xff00_0000) | zs).to_be_bytes());
+                                        mem.put_be(zo, 4, (old & 0xff00_0000) | zs);
                                     }
                                 }
                             }
@@ -1810,23 +1825,35 @@ impl CrimeRe {
         let s0 = g(MTE_SRC0);
         let fg = g(MTE_FG);
         let mask = g(MTE_BYTEMASK);
-        let mut ram = self.ram.lock().unwrap();
+        let mut ram = Batch::new(self.ram.lock().unwrap());
         let mem: &mut O2Memory = &mut ram;
-        for a in d0..=d1 {
-            let lane = 24 - 8 * (a & 3);
-            if (mask >> (31 - (a & 31))) & 1 == 0 {
+        // A 4 KB page at a time: each is contiguous behind its TLB entry.
+        let mut a = d0;
+        let mut src = Vec::new();
+        while a <= d1 {
+            let end = d1.min(a | 0xfff);
+            let n = (end - a + 1) as usize;
+            let Some(o) = Self::linear(r, mem, dbuf - 4, a) else {
+                a = end + 1;
                 continue;
-            }
-            let Some(o) = Self::linear(r, mem, dbuf - 4, a) else { continue };
-            let b = if copy {
-                match Self::linear(r, mem, sbuf - 4, s0.wrapping_add(a - d0)) {
-                    Some(so) => mem[so],
-                    None => continue,
-                }
-            } else {
-                (fg >> lane) as u8
             };
-            mem.write(o, &[b]);
+            let wanted = |k: usize| (mask >> (31 - ((a as usize + k) & 31))) & 1 != 0;
+            if copy {
+                // The source byte for each, None where its page is unmapped.
+                src.clear();
+                let mut page = (u32::MAX, None);
+                for k in 0..n {
+                    let sa = s0.wrapping_add(a - d0 + k as u32);
+                    if page.0 != sa >> 12 {
+                        page = (sa >> 12, Self::linear(r, mem, sbuf - 4, sa & !0xfff));
+                    }
+                    src.push(page.1.map(|so| mem[so + (sa & 0xfff) as usize]));
+                }
+                mem.write_span(o, n, |k| if wanted(k) { src[k] } else { None });
+            } else {
+                mem.write_span(o, n, |k| wanted(k).then(|| (fg >> (24 - 8 * ((a as usize + k) & 3))) as u8));
+            }
+            a = end + 1;
         }
     }
 
@@ -1868,59 +1895,73 @@ impl CrimeRe {
         let stippled = mode & (1 << 10) != 0;
         let stipple = g(MTE_STIPPLE);
         let bpp = 1u32 << ((mode >> 8) & 3).min(2);
-        let mut ram = self.ram.lock().unwrap();
+        let mut ram = Batch::new(self.ram.lock().unwrap());
         let mem: &mut O2Memory = &mut ram;
+        let mut row = Vec::new();
         for i in 0..rows as i32 {
             let dy = dy0 + i * dstep;
             if dy < 0 {
                 continue;
             }
             if copy {
+                // The source row first, a tile's worth at a time.
                 let sy = sy0 + i * sstep;
-                let row: Vec<u8> = (xa..=xb)
-                    .map(|x| {
-                        let sx = sx0 + (x - xa);
-                        if sx < 0 || sy < 0 {
-                            return 0;
-                        }
-                        Self::locate(&r, mem, src, sx as u32, sy as u32).map(|o| mem[o]).unwrap_or(0)
-                    })
-                    .collect();
-                for (k, x) in (xa..=xb).enumerate() {
-                    if let Some(o) = Self::locate(&r, mem, dst, x as u32, dy as u32) {
-                        mem.write(o, &[row[k]]);
+                row.clear();
+                let mut x = xa;
+                while x <= xb {
+                    let sx = sx0 + (x - xa);
+                    let n = if sx < 0 { 1 } else { (xb - x + 1).min(512 - (sx & 511)) };
+                    let base = if sx < 0 || sy < 0 { None } else { Self::locate(&r, mem, src, sx as u32, sy as u32) };
+                    for k in 0..n as usize {
+                        row.push(base.map(|o| mem[o + k]).unwrap_or(0));
                     }
+                    x += n;
                 }
-            } else {
-                for x in xa..=xb {
-                    // A stippled clear writes only the pixels whose mask bit
-                    // is set: one bit per pixel, most significant first,
-                    // counted from the 32-byte block holding the row's first
-                    // byte (eight pixels at 32 bpp, 32 at 8 bpp) and wrapping
-                    // after bit 31. IRIX's X server draws text a row and a
-                    // mask at a time: from the row start, the login screen's
-                    // 8-bit labels come out shifted; without the wrap, the
-                    // 32-pixel spans of a 32-bit terminal lose their last
-                    // seven pixels, most of every fourth character.
-                    if stippled {
-                        let k = ((x - (xa & !31)) as u32 / bpp) % 32;
-                        if (stipple >> (31 - k)) & 1 == 0 {
-                            continue;
+            }
+            // The destination a tile's 512-byte row at a time.
+            let mut x = xa;
+            while x <= xb {
+                let n = (xb - x + 1).min(512 - (x & 511));
+                let Some(o) = Self::locate(&r, mem, dst, x as u32, dy as u32) else {
+                    x += n;
+                    continue;
+                };
+                let x0 = x;
+                if copy {
+                    let from = (x0 - xa) as usize;
+                    mem.write_span(o, n as usize, |k| Some(row[from + k]));
+                } else {
+                    mem.write_span(o, n as usize, |k| {
+                        let x = x0 + k as i32;
+                        // A stippled clear writes only the pixels whose mask
+                        // bit is set: one bit per pixel, most significant
+                        // first, counted from the 32-byte block holding the
+                        // row's first byte (eight pixels at 32 bpp, 32 at 8
+                        // bpp) and wrapping after bit 31. IRIX's X server
+                        // draws text a row and a mask at a time: from the row
+                        // start, the login screen's 8-bit labels come out
+                        // shifted; without the wrap, the 32-pixel spans of a
+                        // 32-bit terminal lose their last seven pixels, most
+                        // of every fourth character.
+                        if stippled {
+                            let b = ((x - (xa & !31)) as u32 / bpp) % 32;
+                            if (stipple >> (31 - b)) & 1 == 0 {
+                                return None;
+                            }
                         }
-                    }
-                    // byteMask: one bit per byte of a 32-byte block, most
-                    // significant first. The kernel's page clears pass all
-                    // ones; IRIX's X server passes 0x11111111 to clear only
-                    // the low byte of each 32-bit pixel, and writing the
-                    // whole pixel instead blacked out what it had drawn.
-                    if (bytemask >> (31 - (x as u32 & 31))) & 1 == 0 {
-                        continue;
-                    }
-                    if let Some(o) = Self::locate(&r, mem, dst, x as u32, dy as u32) {
-                        let b = (fg >> (24 - 8 * (o as u32 & 3))) as u8;
-                        mem.write(o, &[b]);
-                    }
+                        // byteMask: one bit per byte of a 32-byte block, most
+                        // significant first. The kernel's page clears pass all
+                        // ones; IRIX's X server passes 0x11111111 to clear
+                        // only the low byte of each 32-bit pixel, and writing
+                        // the whole pixel instead blacked out what it had
+                        // drawn.
+                        if (bytemask >> (31 - (x as u32 & 31))) & 1 == 0 {
+                            return None;
+                        }
+                        Some((fg >> (24 - 8 * ((o + k) as u32 & 3))) as u8)
+                    });
                 }
+                x += n;
             }
         }
     }
@@ -2012,6 +2053,52 @@ mod tests {
     }
 
     const GBE_CTRLSTAT_ADDR: u32 = 0x1600_0000;
+
+    /// How fast the engine replays a recorded trace, for comparing changes
+    /// without a guest: RE_SPEED=trace [RE_SPEED_PASSES=n]. The trace is
+    /// parsed first; only the register writes are timed.
+    #[test]
+    #[ignore]
+    fn replay_speed() {
+        let Ok(path) = std::env::var("RE_SPEED") else { return };
+        let passes: u32 = std::env::var("RE_SPEED_PASSES").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        let writes: Vec<(u32, u64, bool)> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut f = line.split_whitespace();
+                let (w, off, val) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
+                (u32::from_str_radix(off, 16).unwrap(), u64::from_str_radix(val, 16).unwrap(), w == "w64")
+            })
+            .collect();
+        let mut m = O2Memory::from_kits(&[128, 128]).unwrap();
+        m.set_ctrl(0, 0x100);
+        m.set_ctrl(2, 0x100 | 4);
+        let ram = Arc::new(Mutex::new(m));
+        let re = CrimeRe::new(ram.clone());
+        let mut best = f64::MAX;
+        for _ in 0..passes {
+            let t = std::time::Instant::now();
+            for &(off, val, w64) in &writes {
+                if w64 {
+                    re.write64(0x1500_0000 + off, val);
+                } else {
+                    re.write32(0x1500_0000 + off, val as u32);
+                }
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let drawn = re.drawn.load(std::sync::atomic::Ordering::Relaxed) / passes as u64;
+        // A hash of all of memory, to check a change draws exactly the same.
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let m = ram.lock().unwrap();
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            m.raw(0, m.len()).hash(&mut h);
+            h.finish()
+        };
+        eprintln!("replay_speed: {} writes, {drawn} primitives, best of {passes}: {:.3} s ({:.0} ns/write), memory {hash:016x}", writes.len(), best, best * 1e9 / writes.len() as f64);
+    }
 
     /// Replay a recorded register trace (IRIS_IP32_RE_TRACE, saved with the
     /// control port's `retrace`) into a fresh RE and save what TLB A shows

@@ -107,6 +107,14 @@ pub struct O2Memory {
     slots: [Slot; SLOTS],
     /// Bumped whenever the decode changes, so a device can cache an offset.
     decode_gen: u64,
+    /// Inside a [`Batch`]: pages written so far, their generations bumped
+    /// once when it ends rather than on every write.
+    batch: bool,
+    dirty: Vec<usize>,
+    /// The rendering engine's one-entry tile cache: (tile | decode
+    /// generation << 16, offset). Only touched under the memory's lock,
+    /// which is what makes the Sync below hold for it.
+    pub tile: std::cell::Cell<(u64, usize)>,
 }
 
 // The raw pointer is into `store`, which lives as long as this does; writers
@@ -160,7 +168,7 @@ impl O2Memory {
         let store = PpMemory::new((total as usize).div_ceil(1 << 20).max(1));
         let space = PpMemSpace::over(std::slice::from_ref(&store)).expect("ppmem: O2 memory window");
         let host = store.host_ptr();
-        let mut m = Self { store, host, total: total as usize, space, size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS], decode_gen: 0 };
+        let mut m = Self { store, host, total: total as usize, space, size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS], decode_gen: 0, batch: false, dirty: Vec::new(), tile: std::cell::Cell::new((u64::MAX, 0)) };
         // At reset every control is zero: all eight banks at the bottom of
         // the window, 32 MB each, so bank 0 answers there.
         m.rebuild();
@@ -176,13 +184,46 @@ impl O2Memory {
         for (k, &b) in data.iter().enumerate() {
             unsafe { *self.host.add((off + k) ^ 3) = b };
         }
-        #[cfg(feature = "jitv2")]
-        {
-            let last = (off + data.len().max(1) - 1) / PAGE;
-            for page in off / PAGE..=last {
-                self.store.bump_gen_off(page * PAGE);
+        let last = (off + data.len().max(1) - 1) / PAGE;
+        for page in off / PAGE..=last {
+            self.touch(page);
+        }
+    }
+
+    /// Write the bytes of `off..off + len` that `byte(k)` (k from 0) gives
+    /// a value for, leaving the rest, and bump each page once: the memory
+    /// engine fills and copies spans a tile row at a time, and a call per
+    /// byte through [`Self::write`] was most of its time.
+    #[inline]
+    pub fn write_span(&mut self, off: usize, len: usize, mut byte: impl FnMut(usize) -> Option<u8>) {
+        if len == 0 {
+            return;
+        }
+        assert!(off + len <= self.total, "O2 memory span {off:#x}+{len:#x} past the end");
+        for k in 0..len {
+            if let Some(b) = byte(k) {
+                unsafe { *self.host.add((off + k) ^ 3) = b };
             }
         }
+        for page in off / PAGE..=(off + len - 1) / PAGE {
+            self.touch(page);
+        }
+    }
+
+    /// Page `page` was written: bump its generation now, or note it for the
+    /// end of the batch.
+    #[inline]
+    fn touch(&mut self, page: usize) {
+        if self.batch {
+            if self.dirty.last() != Some(&page) {
+                self.dirty.push(page);
+            }
+            return;
+        }
+        #[cfg(feature = "jitv2")]
+        self.store.bump_gen_off(page * PAGE);
+        #[cfg(not(feature = "jitv2"))]
+        let _ = page;
     }
 
     /// The big-endian value of the `n`-byte item (1, 2 or 4) at `off`,
@@ -214,8 +255,7 @@ impl O2Memory {
                 _ => (self.host.add(off) as *mut u32).write_unaligned(v),
             }
         }
-        #[cfg(feature = "jitv2")]
-        self.store.bump_gen_off(off);
+        self.touch(off / PAGE);
     }
 
     /// The generation counter for the page holding byte offset `off`.
@@ -367,6 +407,46 @@ impl std::ops::IndexMut<usize> for O2Memory {
     fn index_mut(&mut self, o: usize) -> &mut u8 {
         assert!(o < self.total, "O2 memory offset {o:#x} past the end");
         unsafe { &mut *self.host.add(o ^ 3) }
+    }
+}
+
+/// The memory, locked, with page generations bumped once per page when it
+/// is dropped instead of on every write: a primitive writes thousands of
+/// pixels to a handful of pages, and an atomic add on each was a fifth of
+/// the rendering engine's time. The bumps land before the lock is released,
+/// so compiled code never outlives the bytes it came from.
+pub struct Batch<'a>(std::sync::MutexGuard<'a, O2Memory>);
+
+impl<'a> Batch<'a> {
+    pub fn new(mut m: std::sync::MutexGuard<'a, O2Memory>) -> Self {
+        m.batch = true;
+        Batch(m)
+    }
+}
+
+impl std::ops::Deref for Batch<'_> {
+    type Target = O2Memory;
+    fn deref(&self) -> &O2Memory {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Batch<'_> {
+    fn deref_mut(&mut self) -> &mut O2Memory {
+        &mut self.0
+    }
+}
+
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        let m = &mut *self.0;
+        m.batch = false;
+        let dirty = std::mem::take(&mut m.dirty);
+        for &page in &dirty {
+            m.touch(page);
+        }
+        m.dirty = dirty;
+        m.dirty.clear();
     }
 }
 
