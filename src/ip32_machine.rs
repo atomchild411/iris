@@ -125,6 +125,26 @@ impl O2Machine {
             std::mem::forget(cpu_device);
         }
 
+        // ppmem: the CPU's cache and the JIT reach RAM through the memory's
+        // window, publishing the mapped bitmap into the CPU's own fields, as
+        // the Indigo2 does. Remaps happen on the CPU thread (a CRIME bank
+        // control write), which is the window's contract.
+        {
+            use crate::ppmem::MappedMemory;
+            let ram = bus.ram.lock().unwrap();
+            let sp = ram.space();
+            unsafe {
+                sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
+                cpu.set_tcache_window(sp.window_base());
+                let bitmap = cpu.tcache_bitmap_ptr();
+                if !bitmap.is_null() {
+                    sp.set_bitmap_sink2(bitmap);
+                }
+                #[cfg(feature = "jitv2")]
+                cpu.set_tcache_gen_window(sp.gen_window_base());
+            }
+        }
+
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.ust.use_host_clock();
         {

@@ -1556,8 +1556,8 @@ mod tests {
             (0x1000u32, 0x2000u32, 0x2100u32, 0x2200u32, 0x3000u32, 0x4000u32);
         {
             let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut [u8], at: u32, v: u32| {
-                m[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
+            let put32 = |m: &mut crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
+                m.write(at as usize, &v.to_be_bytes());
             };
             // array[1] = the SCB's bus address
             put32(&mut m, array + 4, base + scb_addr);
@@ -1588,7 +1588,7 @@ mod tests {
 
         let m = ram.lock().unwrap();
         assert_eq!(m[buf as usize], 0x00, "a direct access device");
-        assert_eq!(&m[buf as usize + 8..buf as usize + 11], b"SGI",
+        assert_eq!(&m.bytes(buf as usize + 8, (buf as usize + 11) - (buf as usize + 8)), b"SGI",
                    "the inquiry data must land in the buffer the driver listed");
         assert_eq!(m[(scb_addr + scb::CONTROL as u32) as usize], 0x40,
                    "and the SCB is the driver's: nothing is written back into it");
@@ -1614,8 +1614,8 @@ mod tests {
         let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
         {
             let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut [u8], at: u32, v: u32| {
-                m[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
+            let put32 = |m: &mut crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
+                m.write(at as usize, &v.to_be_bytes());
             };
             put32(&mut m, array + 4, base + scb);
             put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
@@ -1628,7 +1628,7 @@ mod tests {
             m[cdb as usize + 8] = 1;
             put32(&mut m, sg, base + buf);
             put32(&mut m, sg + 4, BLOCK_SIZE as u32);
-            m[buf as usize..buf as usize + BLOCK_SIZE].copy_from_slice(&pattern);
+            m.write(buf as usize, &pattern);
         }
         for (i, b) in (base + array).to_le_bytes().iter().enumerate() {
             c.write(sram::SCB_ARRAY + i as u32, *b as u32, 1);
@@ -1670,8 +1670,8 @@ mod tests {
         assert!(pages > 32, "the test must cross the bound it is checking");
         {
             let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut [u8], at: u32, v: u32| {
-                m[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
+            let put32 = |m: &mut crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
+                m.write(at as usize, &v.to_be_bytes());
             };
             put32(&mut m, array + 4, base + scb);
             put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
@@ -1696,7 +1696,7 @@ mod tests {
         c.write(reg::QINFIFO, 1, 1);
 
         let m = ram.lock().unwrap();
-        let got = &m[buf as usize..buf as usize + pattern.len()];
+        let got = &m.bytes(buf as usize, (buf as usize + pattern.len()) - (buf as usize));
         assert_eq!(got, &pattern[..], "every page of the transfer must arrive");
     }
 
@@ -1745,7 +1745,7 @@ mod tests {
     fn buf_at(tag: u8) -> u32 { 0x8000 + tag as u32 * 0x200 }
 
     fn put32(ram: &Ram, at: u32, v: u32) {
-        ram.lock().unwrap()[at as usize..at as usize + 4].copy_from_slice(&v.to_be_bytes());
+        ram.lock().unwrap().write(at as usize, &v.to_be_bytes());
     }
 
     /// The HIM's signature, as it writes it: a byte at a time, little end
@@ -1781,7 +1781,7 @@ mod tests {
             c.write(off, 0x7f, 1);
         }
         c.write(reg::SCSIID, 0, 1);
-        ram.lock().unwrap()[QOUT as usize..QOUT as usize + 256].fill(QOUTFIFO_EMPTY);
+        ram.lock().unwrap().write(QOUT as usize, &vec![QOUTFIFO_EMPTY; (QOUT as usize + 256) - (QOUT as usize)]);
         (c, ram)
     }
 
@@ -1793,12 +1793,12 @@ mod tests {
         put32(ram, ARRAY + tag as u32 * 4, base + scb);
         {
             let mut m = ram.lock().unwrap();
-            m[scb as usize..scb as usize + 32].fill(0);
+            m.write(scb as usize, &vec![0; (scb as usize + 32) - (scb as usize)]);
             m[(scb + scb::SEG_COUNT as u32) as usize] = 1;
             m[(scb + scb::CDB_LEN as u32) as usize] = cdb.len() as u8;
             m[(scb + scb::CONTROL as u32) as usize] = 0x40;
             m[(scb + scb::TCL as u32) as usize] = target << 4;
-            m[cdb_at(tag) as usize..cdb_at(tag) as usize + cdb.len()].copy_from_slice(cdb);
+            m.write(cdb_at(tag) as usize, cdb);
         }
         put32(ram, scb + scb::SG_PTR as u32, base + sg_at(tag));
         // The CDB is in the low view, as the HIM points at it.
@@ -1808,7 +1808,7 @@ mod tests {
     }
 
     fn qout(ram: &Ram) -> Vec<u8> {
-        ram.lock().unwrap()[QOUT as usize..QOUT as usize + 256].to_vec()
+        ram.lock().unwrap().bytes(QOUT as usize, (QOUT as usize + 256) - (QOUT as usize)).to_vec()
     }
 
     const TUR: [u8; 6] = [0x00, 0, 0, 0, 0, 0];
@@ -1925,7 +1925,7 @@ mod tests {
         assert_ne!(c.read(reg::HCNTRL, 1) as u8 & hcntrl::PAUSE, 0, "and the sequencer has stopped");
         assert!(c.interrupting());
         assert!(qout(&ram).iter().all(|b| *b == QOUTFIFO_EMPTY), "nothing completed");
-        assert!(ram.lock().unwrap()[buf_at(2) as usize..buf_at(2) as usize + 36].iter().all(|b| *b == 0),
+        assert!(ram.lock().unwrap().bytes(buf_at(2) as usize, (buf_at(2) as usize + 36) - (buf_at(2) as usize)).iter().all(|b| *b == 0),
                 "and no data moved");
 
         // A restart before the interrupt is cleared does not take.
@@ -1964,8 +1964,7 @@ mod tests {
         put32(&ram, sense_list, sense_buf);
         put32(&ram, sense_list + 4, 18 | SG_LAST);
         put32(&ram, scb_at(tag) + scb::SG_PTR as u32, crate::ip32::RAM_BASE + sense_list);
-        ram.lock().unwrap()[cdb_at(tag) as usize..cdb_at(tag) as usize + 6]
-            .copy_from_slice(&[0x03, 0, 0, 0, 18, 0]);
+        ram.lock().unwrap().write(cdb_at(tag) as usize, &[0x03, 0, 0, 0, 18, 0]);
         c.write(reg::QINFIFO, tag as u32, 1);
         assert_eq!(c.read(reg::QINCNT, 1), 1, "held while the sequencer is stopped");
 

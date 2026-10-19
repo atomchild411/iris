@@ -577,7 +577,7 @@ mod tests {
     }
 
     fn get(ram: &Arc<Mutex<crate::dev::crime_mem::O2Memory>>, off: usize, n: usize) -> Vec<u8> {
-        ram.lock().unwrap()[off..off + n].to_vec()
+        ram.lock().unwrap().bytes(off, (off + n) - (off)).to_vec()
     }
 
     fn mii_read(m: &Mec, phy: u32, r: u32) -> u64 {

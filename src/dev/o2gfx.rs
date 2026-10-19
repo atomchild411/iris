@@ -57,11 +57,15 @@ use gbe_reg::*;
 /// the pages one frame needs.
 pub trait ScanMem {
     fn dma_offset(&self, addr: u32) -> Option<usize>;
+    fn len(&self) -> usize;
 }
 
 impl ScanMem for O2Memory {
     fn dma_offset(&self, addr: u32) -> Option<usize> {
         O2Memory::dma_offset(self, addr)
+    }
+    fn len(&self) -> usize {
+        O2Memory::len(self)
     }
 }
 
@@ -78,12 +82,16 @@ impl ScanMem for ScanSnapshot {
     fn dma_offset(&self, addr: u32) -> Option<usize> {
         self.slot.get(&(addr >> 16)).map(|s| s * 0x10000 + (addr & 0xffff) as usize)
     }
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
-impl std::ops::Deref for ScanSnapshot {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        &self.bytes
+/// The pages are copied as RAM keeps them, so byte `o` is at `o ^ 3`.
+impl std::ops::Index<usize> for ScanSnapshot {
+    type Output = u8;
+    fn index(&self, o: usize) -> &u8 {
+        &self.bytes[o ^ 3]
     }
 }
 
@@ -383,7 +391,7 @@ impl Gbe {
         for p in pages {
             if let Some(o) = mem.dma_offset(p << 16).filter(|&o| o + 0x10000 <= mem.len()) {
                 snap.slot.insert(p, snap.slot.len());
-                snap.bytes.extend_from_slice(&mem[o..o + 0x10000]);
+                snap.bytes.extend_from_slice(mem.raw(o, 0x10000));
             }
         }
         snap
@@ -392,7 +400,7 @@ impl Gbe {
     /// Scan the frame out of RAM into `out` (R, G, B, A bytes, row 0 at the
     /// top), as GBE would. Returns the size drawn, or None when the display
     /// is off. `out` must hold the largest mode (2048 x 2048 pixels).
-    pub fn render<M: ScanMem + std::ops::Deref<Target = [u8]>>(&self, mem: &M, out: &mut [u8]) -> Option<(u32, u32)> {
+    pub fn render<M: ScanMem + std::ops::Index<usize, Output = u8>>(&self, mem: &M, out: &mut [u8]) -> Option<(u32, u32)> {
         let r = {
             let mut s = self.s.lock().unwrap();
             self.latch(&mut s);
@@ -1693,7 +1701,7 @@ mod tests {
                         rgba[i..i + 4].copy_from_slice(&[v, v, v, 255]);
                     }
                 } else if let Some(o) = CrimeRe::locate(&r, &mem, Buf { tlb: TLB_A, bd: 4 }, x, y) {
-                    rgba[i..i + 3].copy_from_slice(&mem[o..o + 3]);
+                    rgba[i..i + 3].copy_from_slice(&mem.bytes(o, (o + 3) - (o)));
                     rgba[i + 3] = 255;
                     // RE_REPLAY_LOW=1: the low byte (an 8-bit window's index) as grey.
                     if low {
@@ -1748,7 +1756,7 @@ mod tests {
         re.write32(base + (XFER_SRC | 0x800), src);
         let m = ram.lock().unwrap();
         // Pixel (10, 0): word 10 of the first tile row.
-        assert_eq!(&m[0x0100_0000 + 40..0x0100_0000 + 44], &[0, 0, 0, 0x21]);
+        assert_eq!(&m.bytes(0x0100_0000 + 40, (0x0100_0000 + 44) - (0x0100_0000 + 40)), &[0, 0, 0, 0x21]);
     }
 
     #[test]
@@ -1781,7 +1789,7 @@ mod tests {
         re.write32(base + MTE_BYTEMASK, 0xffff_ffff);
         re.write32(base + (MTE_MODE | 0x800), 0x11);
         let m = ram.lock().unwrap();
-        assert!(m[addr as usize..(addr + 32 * 4096) as usize].iter().all(|&b| b == 0), "all 128 KB cleared");
+        assert!(m.bytes(addr as usize, ((addr + 32 * 4096) as usize) - (addr as usize)).iter().all(|&b| b == 0), "all 128 KB cleared");
         assert_eq!(m[addr as usize - 1], 0x55, "the byte before is untouched");
         assert_eq!(m[(addr + 32 * 4096) as usize], 0x55, "the byte after is untouched");
     }
@@ -1875,7 +1883,7 @@ mod tests {
         re.write32(b + (STIPPLE_PATTERN | 0x800), 0xff00_0000);
         let m = ram.lock().unwrap();
         let row = (tile + (0xb4 - 128) * 512 + 0x81) as usize;
-        assert_eq!(&m[row..row + 9], &[2, 2, 2, 2, 2, 2, 2, 2, 0], "eight pixels, the end one skipped");
+        assert_eq!(&m.bytes(row, (row + 9) - (row)), &[2, 2, 2, 2, 2, 2, 2, 2, 0], "eight pixels, the end one skipped");
     }
 
     #[test]

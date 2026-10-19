@@ -1402,7 +1402,7 @@ impl MaceSerialDma {
                     port.tx.ctrl &= !sdma::CTRL_ENABLE;
                     return;
                 };
-                b.copy_from_slice(&ram[i..i + sdma::BLOCK as usize]);
+                b.copy_from_slice(&ram.bytes(i, sdma::BLOCK as usize));
             }
             for pair in b.chunks_exact(8) {
                 for slot in 0..4 {
@@ -2586,7 +2586,7 @@ impl BusDevice for Stub {
 /// uses. At this stage legibility and being able to log an unmapped access are
 /// worth more than the lookup.
 pub struct Ip32Bus {
-    ram: std::sync::Arc<Mutex<O2Memory>>,
+    pub(crate) ram: std::sync::Arc<Mutex<O2Memory>>,
     /// The flash. Writable, because an O2 keeps its environment variables in
     /// it -- there is no separate NVRAM chip -- and the installer saves
     /// settings there. The user's PROM file is never touched: this is a copy.

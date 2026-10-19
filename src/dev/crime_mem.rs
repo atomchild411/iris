@@ -39,8 +39,15 @@
 //!
 //! The low 256 MB of the window also answers from physical address 0, which is
 //! where the firmware and a 32-bit kernel do most of their work.
+//!
+//! The banks live packed, in bank order, in one ppmem object, so a device
+//! addresses memory by byte offset into it (byte `o` at `host + (o ^ 3)`, the
+//! layout every iris RAM keeps). The same object is mapped into a ppmem
+//! window as the decode stands, one 32 MB slot at a time, which is what the
+//! CPU's cache and the JIT read and write directly, with no lock and no bus.
 
 use crate::ip32::{LOW_ALIAS_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
+use crate::ppmem::{MappedMemory, PpMemSpace, PpMemory};
 
 /// The unit the bank controls count in, and the size of a small bank.
 const SLOT: u32 = 32 << 20;
@@ -81,8 +88,16 @@ pub enum Decode {
 }
 
 pub struct O2Memory {
-    /// The fitted banks back to back, in bank order, in guest byte order.
-    bytes: Vec<u8>,
+    /// The fitted banks back to back, in bank order: a ppmem object, so the
+    /// window below can map it.
+    store: PpMemory,
+    /// `store`'s own mapping; byte `o` is at `host + (o ^ 3)`.
+    host: *mut u8,
+    /// Bytes fitted (the store may be rounded up to ppmem's 1 MB unit).
+    total: usize,
+    /// The CPU's view: the guest physical space with each RAM slot mapped,
+    /// rebuilt whenever a bank control changes.
+    space: PpMemSpace,
     /// Each CRIME bank's real size in bytes (0 for nothing fitted) and where
     /// it starts in `bytes`.
     size: [u32; 8],
@@ -90,12 +105,13 @@ pub struct O2Memory {
     /// The bank controls as last written.
     ctrl: [u64; 8],
     slots: [Slot; SLOTS],
-    /// One generation counter per 4 KB page of `bytes`, bumped by every write
-    /// that goes through [`Self::write`]: what jitv2 checks compiled code
-    /// against (`BusDevice::gen_ptr`). Boxed, so a pointer to one stays valid
-    /// for as long as the memory does.
-    gens: Box<[std::sync::atomic::AtomicU64]>,
 }
+
+// The raw pointer is into `store`, which lives as long as this does; writers
+// hold the memory's lock, and the CPU's direct accesses race only the way the
+// hardware's own masters do.
+unsafe impl Send for O2Memory {}
+unsafe impl Sync for O2Memory {}
 
 impl O2Memory {
     /// Memory fitted as `kits`, the size in MB of the kit in each DIMM pair
@@ -139,8 +155,10 @@ impl O2Memory {
             start[i] = total;
             total += size[i];
         }
-        let gens = (0..(total as usize).div_ceil(PAGE)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
-        let mut m = Self { bytes: vec![0u8; total as usize], size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS], gens };
+        let store = PpMemory::new((total as usize).div_ceil(1 << 20).max(1));
+        let space = PpMemSpace::over(std::slice::from_ref(&store)).expect("ppmem: O2 memory window");
+        let host = store.host_ptr();
+        let mut m = Self { store, host, total: total as usize, space, size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS] };
         // At reset every control is zero: all eight banks at the bottom of
         // the window, 32 MB each, so bank 0 answers there.
         m.rebuild();
@@ -152,21 +170,52 @@ impl O2Memory {
     /// CPU stores and DMA both come here, so compiled code never outlives the
     /// bytes it was compiled from.
     pub fn write(&mut self, off: usize, data: &[u8]) {
-        self.bytes[off..off + data.len()].copy_from_slice(data);
-        let last = (off + data.len().max(1) - 1) / PAGE;
-        for g in &self.gens[off / PAGE..=last] {
-            g.fetch_add(1, std::sync::atomic::Ordering::Release);
+        assert!(off + data.len() <= self.total, "O2 memory write past the end");
+        for (k, &b) in data.iter().enumerate() {
+            unsafe { *self.host.add((off + k) ^ 3) = b };
+        }
+        #[cfg(feature = "jitv2")]
+        {
+            let last = (off + data.len().max(1) - 1) / PAGE;
+            for page in off / PAGE..=last {
+                self.store.bump_gen_off(page * PAGE);
+            }
         }
     }
 
     /// The generation counter for the page holding byte offset `off`.
+    #[cfg(feature = "jitv2")]
     pub fn gen_ptr(&self, off: usize) -> *const std::sync::atomic::AtomicU64 {
-        &self.gens[off / PAGE]
+        self.store.gen_ptr(off as u32)
+    }
+
+    /// `n` bytes from offset `off`, in guest order.
+    pub fn bytes(&self, off: usize, n: usize) -> Vec<u8> {
+        (off..off + n).map(|o| self[o]).collect()
+    }
+
+    /// `n` bytes from `off` as the host keeps them (each 32-bit word's bytes
+    /// reversed): for copying whole words to something that reads them back
+    /// the same way. `off` and `n` must be multiples of 4.
+    pub fn raw(&self, off: usize, n: usize) -> &[u8] {
+        assert!(off % 4 == 0 && n % 4 == 0 && off + n <= self.total);
+        unsafe { std::slice::from_raw_parts(self.host.add(off), n) }
+    }
+
+    /// Bytes fitted.
+    pub fn len(&self) -> usize {
+        self.total
+    }
+
+    /// The CPU's window: guest physical `p` at `window_base() + p` wherever
+    /// the mapped bitmap says RAM is.
+    pub fn space(&self) -> &PpMemSpace {
+        &self.space
     }
 
     /// Total memory fitted, in bytes.
     pub fn total(&self) -> u32 {
-        self.bytes.len() as u32
+        self.total as u32
     }
 
     /// Each CRIME bank's real size in bytes.
@@ -195,6 +244,27 @@ impl O2Memory {
                 } else {
                     Slot::Ram { start: self.start[i], chunk: j as u32 * SLOT, mask: self.size[i] - 1 }
                 };
+            }
+        }
+        self.remap();
+    }
+
+    /// Lay the window out as the decode now stands: every slot that decodes
+    /// to RAM mapped from its bank's bytes in the store, at its place in the
+    /// window and again in the low alias. Empty and unmatched slots stay
+    /// unmapped, so the CPU reaches them through the bus as before.
+    fn remap(&mut self) {
+        self.space.clear_mappings();
+        for (s, slot) in self.slots.iter().enumerate() {
+            let Slot::Ram { start, chunk, mask } = *slot else { continue };
+            if mask < SLOT - 1 {
+                continue; // a test's bank smaller than a slot: bus only
+            }
+            let src = (start + (chunk & mask)) as u64;
+            let at = s as u64 * SLOT as u64;
+            let _ = self.space.map_range(0, src, RAM_BASE as u64 + at, SLOT as u64);
+            if at < LOW_ALIAS_SIZE as u64 {
+                let _ = self.space.map_range(0, src, at, SLOT as u64);
             }
         }
     }
@@ -239,23 +309,23 @@ impl O2Memory {
     }
 }
 
-/// `bytes` is the memory itself, so a device can index it once it has an
-/// offset.
-impl std::ops::Deref for O2Memory {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        &self.bytes
+/// A device indexes memory by byte offset once it has one.
+impl std::ops::Index<usize> for O2Memory {
+    type Output = u8;
+    fn index(&self, o: usize) -> &u8 {
+        assert!(o < self.total, "O2 memory offset {o:#x} past the end");
+        unsafe { &*self.host.add(o ^ 3) }
     }
 }
-
 
 /// Device tests set memory up by hand. Everything else writes through
 /// [`O2Memory::write`], which keeps the page generations honest; the lib
 /// built without `cfg(test)` has no other way in.
 #[cfg(test)]
-impl std::ops::DerefMut for O2Memory {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.bytes
+impl std::ops::IndexMut<usize> for O2Memory {
+    fn index_mut(&mut self, o: usize) -> &mut u8 {
+        assert!(o < self.total, "O2 memory offset {o:#x} past the end");
+        unsafe { &mut *self.host.add(o ^ 3) }
     }
 }
 
@@ -324,14 +394,39 @@ pub fn all_fittings() -> Vec<Vec<u32>> {
 mod tests {
     use super::*;
 
+    /// The CPU's window shows each byte where the decode puts it: both banks
+    /// at RAM_BASE, the first 256 MB again from 0, and the mapped bitmap the
+    /// JIT tests covers exactly those regions.
+    #[test]
+    fn the_window_shows_ram_where_the_decode_puts_it() {
+        let mut m = O2Memory::from_kits(&[256]).unwrap();
+        m.set_ctrl(0, 0x100);
+        m.set_ctrl(1, 0x100 | 4);
+        let (lo, hi) = (RAM_BASE + 0x0012_3450, RAM_BASE + 0x0900_0010);
+        let (a, b) = (m.offset(lo).unwrap(), m.offset(hi).unwrap());
+        m.write(a, &[0x11, 0x22, 0x33, 0x44]);
+        m.write(b, &[0xaa, 0xbb]);
+        let base = m.space().window_base();
+        let at = |p: u32| unsafe { *base.add(p as usize ^ 3) };
+        assert_eq!([at(lo), at(lo + 1), at(lo + 2), at(lo + 3)], [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!([at(hi), at(hi + 1)], [0xaa, 0xbb], "bank 1 at its own base");
+        assert_eq!(at(lo - RAM_BASE), 0x11, "the low alias");
+        let bits = m.space().mapped_bitmap();
+        let region = |p: u32| 1u64 << (p >> crate::ppmem::BITMAP_SHIFT);
+        assert_ne!(bits & region(RAM_BASE), 0);
+        assert_ne!(bits & region(RAM_BASE + 0x0fff_0000), 0, "both banks: 256 MB from RAM_BASE");
+        assert_ne!(bits & region(0x0800_0000), 0, "the low alias");
+        assert_eq!(bits & region(RAM_BASE + 0x1000_0000), 0, "nothing past the fitted memory");
+    }
+
     fn put(m: &mut O2Memory, addr: u32, v: u64) {
         let i = m.offset(addr).unwrap();
-        m[i..i + 8].copy_from_slice(&v.to_be_bytes());
+        m.write(i, &v.to_be_bytes());
     }
 
     fn get(m: &O2Memory, addr: u32) -> Option<u64> {
         match m.decode(addr) {
-            Decode::Ram(i) => Some(u64::from_be_bytes(m[i..i + 8].try_into().unwrap())),
+            Decode::Ram(i) => Some(u64::from_be_bytes(m.bytes(i, (i + 8) - (i)).try_into().unwrap())),
             Decode::Empty => Some(0),
             Decode::None => None,
         }
