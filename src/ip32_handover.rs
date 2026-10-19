@@ -87,7 +87,30 @@ impl HandoverCache {
         }
         self.shadow.set_llbit(self.full.get_llbit());
         self.shadow.set_lladdr(self.full.get_lladdr());
+        // Which physical ranges are RAM (the direct-path bitmap): the memory
+        // space maintains the full model's; without it the shadow model sent
+        // every instruction fetch and helper access the slow way (indirect
+        // calls ran at half speed). The bank layout is the PROM's, fixed
+        // before the kernel starts.
+        unsafe {
+            let (from, to) = (self.full.tcache_bitmap_ptr(), self.shadow.tcache_bitmap_ptr());
+            if !from.is_null() && !to.is_null() {
+                *to = *from;
+            }
+        }
         self.on_shadow.store(true, Ordering::Relaxed);
+    }
+
+    /// Back to the full model, empty, for a PROM starting over (a reboot):
+    /// POST needs a cache that holds its stack again.
+    pub fn hand_back(&self) {
+        if !self.on_shadow() {
+            return;
+        }
+        self.full.power_on();
+        self.full.set_llbit(self.shadow.get_llbit());
+        self.full.set_lladdr(self.shadow.get_lladdr());
+        self.on_shadow.store(false, Ordering::Relaxed);
     }
 }
 
@@ -184,10 +207,51 @@ impl MipsCache for HandoverCache {
         self.shadow.power_on();
         self.on_shadow.store(false, Ordering::Relaxed);
     }
+    // The ppmem windows go to both models; everything the JIT's inline
+    // path reads comes from the live one, so code compiled after the
+    // handover gets the shadow model's tagless path (window only).
+    unsafe fn set_tcache_window(&self, base: *mut u8) {
+        unsafe {
+            self.full.set_tcache_window(base);
+            self.shadow.set_tcache_window(base);
+        }
+    }
+    unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
+        unsafe {
+            self.full.set_tcache_gen_window(gen_base);
+            self.shadow.set_tcache_gen_window(gen_base);
+        }
+    }
+    /// The full model's: the one the machine registers with the memory
+    /// space, which keeps it up to date. `hand_over` copies it across.
+    fn tcache_bitmap_ptr(&self) -> *mut u64 {
+        self.full.tcache_bitmap_ptr()
+    }
+    fn tcache_base_ptr(&self) -> *mut u8 {
+        live!(self, c => c.tcache_base_ptr())
+    }
+    fn tcache_gen_ptr(&self) -> *mut u8 {
+        live!(self, c => c.tcache_gen_ptr())
+    }
+    fn jit_fast_read<const SIZE: usize>(&self, virt: u64, phys: u64) -> Option<u64> {
+        live!(self, c => c.jit_fast_read::<SIZE>(virt, phys))
+    }
+    fn jit_fast_write<const SIZE: usize>(&self, virt: u64, phys: u64, val: u64) -> bool {
+        live!(self, c => c.jit_fast_write::<SIZE>(virt, phys, val))
+    }
+    fn jit_l2_tags_ptr(&self) -> *mut u8 {
+        live!(self, c => c.jit_l2_tags_ptr())
+    }
+    fn jit_dc_tags_ptr(&self) -> *mut u8 {
+        live!(self, c => c.jit_dc_tags_ptr())
+    }
+    fn jit_dc_lru_ptr(&self) -> *mut u8 {
+        live!(self, c => c.jit_dc_lru_ptr())
+    }
     fn set_tcache_live(&self, on: bool) {
         self.full.set_tcache_live(on)
     }
     fn jit_dc_geometry(&self) -> JitDcGeometry {
-        JitDcGeometry::unsupported()
+        live!(self, c => c.jit_dc_geometry())
     }
 }

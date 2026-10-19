@@ -27,7 +27,8 @@ use parking_lot::Mutex;
 use crate::config::{CpuModel, MachineConfig};
 use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
-use crate::cpu::mips_cache_v2::{MipsCache, R10000O2Cache, R5000Cache};
+use crate::cpu::mips_cache_v2::{MipsCache, R5000Cache};
+use crate::ip32_handover::HandoverCache;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::crime_mem::O2Memory;
 use crate::dev::ng1::rex3::Renderer;
@@ -106,8 +107,23 @@ impl O2Machine {
         let sysad: Arc<dyn BusDevice> = bus.clone();
         let arcs_fpu = o2.arcs_fpu;
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
-            CpuModel::R10000 => Self::build_cpu::<R10000O2Cache>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz),
-            CpuModel::R5000 => Self::build_cpu::<R5000Cache>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz),
+            // The R10000 runs the full cache model through the PROM and
+            // IP28's tagless shadow model once the kernel is in charge: the
+            // JIT then reaches RAM through the ppmem window with no tag probe,
+            // LRU or dirty bit on every load and store (memory-bound code ran
+            // 2.5-4x slower than on IP28 with the full model).
+            CpuModel::R10000 => Self::build_cpu::<HandoverCache>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, |c, kernel| {
+                if kernel && !c.on_shadow() {
+                    c.hand_over();
+                    true
+                } else if !kernel && c.on_shadow() {
+                    c.hand_back();
+                    true
+                } else {
+                    false
+                }
+            }),
+            CpuModel::R5000 => Self::build_cpu::<R5000Cache>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, |_, _| false),
             CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
         };
 
@@ -178,7 +194,11 @@ impl O2Machine {
         Ok(Self { bus, cpu, timer_manager, display, running, threads: Vec::new() })
     }
 
-    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32) -> Arc<dyn CpuDevice>
+    /// `kernel_mode(cache, in_kernel)` switches the cache model on leaving the
+    /// firmware for the kernel (true) and on a PROM starting over (false),
+    /// returning whether it changed, so the JIT's memory pointers are
+    /// re-published.
+    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, kernel_mode: fn(&C, bool) -> bool) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
@@ -219,10 +239,24 @@ impl O2Machine {
                     return;
                 }
             }
+            // The boot PROM running again (a reboot): the full model, so POST
+            // has a cache that holds its stack.
+            if PROM_VA.contains(&pc) && kernel_mode(&exec.cache, false) {
+                post_done = false;
+                inside = true;
+                exec.cache.set_tcache_live(false);
+                #[cfg(feature = "jitv2")]
+                exec.install_jit_mem_ptrs();
+                return;
+            }
             let fw = in_firmware(pc);
             if fw != inside {
                 inside = fw;
                 exec.cache.set_tcache_live(!fw);
+                if !fw && kernel_mode(&exec.cache, true) {
+                    #[cfg(feature = "jitv2")]
+                    exec.install_jit_mem_ptrs();
+                }
                 if arcs_fpu {
                     const CU1: u32 = 1 << 29;
                     if fw {
