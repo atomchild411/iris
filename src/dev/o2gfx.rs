@@ -1194,23 +1194,34 @@ impl CrimeRe {
             };
             (v >> 24, (v >> 16) & 0xff, (v >> 8) & 0xff)
         };
-        let blend = dm & draw::BLEND != 0 && dst.bd == 4 && fmt != 0;
+        // Double-pix, as for triangles: a double-buffered GL window's 16-bit
+        // A1R5G5B5 pixel in one half of each word (the icon catalog's).
+        let dmode = g(BUFMODE_DST);
+        let half = dmode & 2 != 0 && (dmode >> 2) & 3 == 1 && dst.bd == 4;
+        let half_off = if dmode & 1 == 0 { 2 } else { 0 };
+        let blend = dm & draw::BLEND != 0 && dst.bd == 4 && (fmt != 0 || half);
         let mut plot = |x: i32, y: i32, cov: f64| {
             if x < 0 || y < 0 || cov <= 0.0 || !Self::clip_ok(r, x, y) {
                 return;
             }
             let Some(o) = Self::locate(r, mem, dst, x as u32, y as u32) else { return };
             let alpha = cov.min(1.0) * ca as f64 / 255.0;
-            let v = if blend {
-                let (dr, dg, db) = unpack(Self::get_px(mem, o, 4));
-                let mix = |s: u32, d: u32| (s as f64 * alpha + d as f64 * (1.0 - alpha)).round() as u32;
-                pack(mix(cr, dr), mix(cg, dg), mix(cb, db), ca)
-            } else if alpha >= 0.5 {
-                pack(cr, cg, cb, ca)
-            } else {
+            if !blend && alpha < 0.5 {
                 return;
-            };
-            Self::put(r, mem, o, dst.bd, v);
+            }
+            let a = if blend { alpha } else { 1.0 };
+            let mix = |s: u32, d: u32| (s as f64 * a + d as f64 * (1.0 - a)).round() as u32;
+            if half {
+                let o = o + half_off;
+                let d = Self::get_px(mem, o, 2);
+                let e = |v: u32| (v << 3) | (v >> 2);
+                let (dr, dg, db) = (e((d >> 10) & 0x1f), e((d >> 5) & 0x1f), e(d & 0x1f));
+                let v = (d & 0x8000) | ((mix(cr, dr) >> 3) << 10) | ((mix(cg, dg) >> 3) << 5) | (mix(cb, db) >> 3);
+                Self::put(r, mem, o, 2, v);
+            } else {
+                let (dr, dg, db) = unpack(Self::get_px(mem, o, 4));
+                Self::put(r, mem, o, dst.bd, pack(mix(cr, dr), mix(cg, dg), mix(cb, db), ca));
+            }
         };
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let steep = dy.abs() > dx.abs();
