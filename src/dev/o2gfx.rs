@@ -641,8 +641,9 @@ impl BusDevice for Gbe {
 /// tile matches hubcap.rgb texel for texel this way (the spec leaves texel
 /// look-up "TBD"):
 ///
-/// - s and t are 1.15 fixed point once divided by q (32768 is the whole
-///   map); u = s * width / 32768, with width = 1 << the format's u wrap shift.
+/// - s and t are 1.14 fixed point once divided by q (16384 is the whole
+///   map: perfly's hubcap centre is s 24399, t 24900, 0.49 and 0.52 once
+///   repeated); u = s * width / 16384, width = 1 << the format's u wrap shift.
 /// - 16-bit texels (A1R5G5B5) sit in 64 KB tiles laid out like frame-buffer
 ///   tiles, 128 lines of 512 bytes, in 4 x 4 blocks: texel-index bits from
 ///   the bottom are u0 u1 v0 v1 u2 u3 u4 u5 v4 v5 v2 v3 u6 - v6. Index bits
@@ -706,9 +707,9 @@ impl Texture {
         [c((p >> 10) & 31), c((p >> 5) & 31), c(p & 31), if p & 0x8000 != 0 { 255.0 } else { 0.0 }]
     }
 
-    /// The map at (s, t) in 1.15 units, bilinear or nearest.
+    /// The map at (s, t) in 1.14 units, bilinear or nearest.
     fn sample(&self, r: &[u32], mem: &O2Memory, s: f64, t: f64) -> [f64; 4] {
-        let (u, v) = (s * self.w as f64 / 32768.0 - 0.5, t * self.h as f64 / 32768.0 - 0.5);
+        let (u, v) = (s * self.w as f64 / 16384.0 - 0.5, t * self.h as f64 / 16384.0 - 0.5);
         if !self.linear {
             return self.texel(r, mem, u.round() as i64, v.round() as i64);
         }
