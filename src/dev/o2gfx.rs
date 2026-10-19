@@ -534,6 +534,15 @@ impl BusDevice for Gbe {
     }
 }
 
+/// How Gouraud gradients are read: their fraction bits and which vertex the
+/// start colour belongs to. The replay test can try others (RE_GOURAUD).
+static GOURAUD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(12 << 8);
+
+fn gouraud_model() -> (u32, usize) {
+    let v = GOURAUD.load(std::sync::atomic::Ordering::Relaxed);
+    (v >> 8, (v & 0xff) as usize)
+}
+
 /// CRIME rendering-engine register offsets from `0x1500_0000`.
 pub mod re_reg {
     pub const IB_CONTROL: u32 = 0x0400;
@@ -1085,15 +1094,24 @@ impl CrimeRe {
                     (f(g(off)) + ox as f64, f(g(off + 4)) + oy as f64)
                 };
                 let v = [fv(TRI_V0), fv(TRI_V0 + 8), fv(TRI_V0 + 16)];
-                if (0..8).any(|i| g(SHADE_GRAD + 4 * i) != 0) {
-                    self.note("gouraud triangle (drawn flat)".into());
-                }
-                let ch = |off: u32| (g(off) >> 12) & 0xff;
-                let (cr, cg, cb, ca) = (ch(SHADE_R), ch(SHADE_R + 4), ch(SHADE_R + 8), ch(SHADE_R + 12));
+                // Gouraud: each channel is its 8.12 start value plus its x and
+                // y gradients times the distance from the reference point.
+                // Register order: R0 G0 B0 A0, then dR/dx dG/dx dR/dy dG/dy
+                // dB/dx dA/dx dB/dy dA/dy.
+                let (frac, refv) = gouraud_model();
+                let grad = |i: u32| g(SHADE_GRAD + 4 * i) as i32 as f64 / (1u64 << frac) as f64;
+                let (ddx, ddy) = ([grad(0), grad(1), grad(4), grad(5)], [grad(2), grad(3), grad(6), grad(7)]);
+                let shaded = (0..8).any(|i| g(SHADE_GRAD + 4 * i) != 0);
+                let (rx, ry) = v[refv.min(2)];
+                let c0 = [0u32, 4, 8, 12].map(|o| g(SHADE_R + o) as i32 as f64 / 4096.0);
+                let channel = |k: usize, px: f64, py: f64| -> u32 {
+                    let c = if shaded { c0[k] + ddx[k] * (px - rx) + ddy[k] * (py - ry) } else { c0[k] };
+                    c.clamp(0.0, 255.0) as u32
+                };
+                let (cr, cg, cb, ca) = (channel(0, rx, ry), channel(1, rx, ry), channel(2, rx, ry), channel(3, rx, ry));
                 if dm & (1 << 10) != 0 && ca != 0xff {
                     self.note("blended triangle (drawn opaque)".into());
                 }
-                let rgba = (cr << 24) | (cg << 16) | (cb << 8) | ca;
                 let dmode = g(BUFMODE_DST);
                 // Double-pix (BufMode bit 1) with 16-bit pixels (3:2 = 1): a
                 // double-buffered GL window keeps front and back in the two
@@ -1101,15 +1119,26 @@ impl CrimeRe {
                 // low one, which IRIX's WID for it, 0x11, shows). The 16-bit
                 // pixel is A1R5G5B5, as GBE decodes it.
                 let half = dmode & 2 != 0 && (dmode >> 2) & 3 == 1 && dst.bd == 4;
-                let colour = if half {
-                    let c5 = |c: u32| c >> 3;
-                    (u32::from(ca >= 0x80) << 15) | (c5(cr) << 10) | (c5(cg) << 5) | c5(cb)
-                } else {
-                    match (dmode >> 4) & 0xf {
-                        0 => cr,
-                        1 => rgba >> 8,
-                        3 => rgba.swap_bytes(),
-                        _ => rgba,
+                let pack = |cr: u32, cg: u32, cb: u32, ca: u32| -> u32 {
+                    if half {
+                        let c5 = |c: u32| c >> 3;
+                        (u32::from(ca >= 0x80) << 15) | (c5(cr) << 10) | (c5(cg) << 5) | c5(cb)
+                    } else {
+                        let rgba = (cr << 24) | (cg << 16) | (cb << 8) | ca;
+                        match (dmode >> 4) & 0xf {
+                            0 => cr,
+                            1 => rgba >> 8,
+                            3 => rgba.swap_bytes(),
+                            _ => rgba,
+                        }
+                    }
+                };
+                let flat = pack(cr, cg, cb, ca);
+                let colour_at = |px: f64, py: f64| -> u32 {
+                    if shaded {
+                        pack(channel(0, px, py), channel(1, px, py), channel(2, px, py), channel(3, px, py))
+                    } else {
+                        flat
                     }
                 };
                 let half_off = if dmode & 1 == 0 { 2 } else { 0 };
@@ -1140,6 +1169,7 @@ impl CrimeRe {
                         });
                         if inside && Self::clip_ok(&r, x, y) {
                             if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
+                                let colour = colour_at(px, py);
                                 if half {
                                     Self::put(&r, mem, o + half_off, 2, colour);
                                 } else {
@@ -1489,6 +1519,10 @@ mod tests {
     #[ignore]
     fn replay_a_recorded_trace() {
         let Ok(path) = std::env::var("RE_REPLAY") else { return };
+        // RE_GOURAUD="frac,vertex": gradient fraction bits and reference vertex.
+        if let Some((f, v)) = std::env::var("RE_GOURAUD").ok().as_deref().and_then(|s| s.split_once(',')) {
+            GOURAUD.store(f.parse::<u32>().unwrap() << 8 | v.parse::<u32>().unwrap(), std::sync::atomic::Ordering::Relaxed);
+        }
         let out = std::env::var("RE_REPLAY_PNG").unwrap_or("replay.png".into());
         // 256 MB as two 128 MB banks, placed the way the PROM places them.
         let mut m = O2Memory::from_kits(&[128, 128]).unwrap();
@@ -1513,6 +1547,7 @@ mod tests {
         // RE_REPLAY_BUF=1 or 2: an 8-bit buffer through TLB B or C (the
         // overlay is C) instead, each index as its own grey.
         let low = std::env::var("RE_REPLAY_LOW").is_ok();
+        let half = std::env::var("RE_REPLAY_HALF").ok().map(|h| if h == "hi" { 0usize } else { 2 });
         let eight: u32 = std::env::var("RE_REPLAY_BUF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         for y in 0..h {
             for x in 0..w {
@@ -1528,6 +1563,12 @@ mod tests {
                     // RE_REPLAY_LOW=1: the low byte (an 8-bit window's index) as grey.
                     if low {
                         rgba[i..i + 3].copy_from_slice(&[mem[o + 3]; 3]);
+                    }
+                    // RE_REPLAY_HALF=lo or hi: a double-pix window's A1R5G5B5 half.
+                    if let Some(off) = half {
+                        let p = u16::from_be_bytes([mem[o + off], mem[o + off + 1]]) as u32;
+                        let e = |v: u32| ((v << 3) | (v >> 2)) as u8;
+                        rgba[i..i + 3].copy_from_slice(&[e((p >> 10) & 31), e((p >> 5) & 31), e(p & 31)]);
                     }
                 }
             }
