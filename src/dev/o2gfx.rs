@@ -837,10 +837,11 @@ pub struct CrimeRe {
     unhandled: Mutex<BTreeMap<String, u64>>,
     /// Primitives run, for the end-of-run report.
     pub drawn: std::sync::atomic::AtomicU64,
-    /// Register writes as they happen, `(offset, value, width)`, kept while
-    /// fewer than `trace_cap` (IRIS_IP32_RE_TRACE): the evidence for what a
-    /// driver does with parts the model does not know yet.
-    trace: Mutex<Vec<(u32, u64, u8)>>,
+    /// Register writes as they happen, `(offset, value, width)`: the last
+    /// `trace_cap` (IRIS_IP32_RE_TRACE) of them, the evidence for what a
+    /// driver does with parts the model does not know yet. The most recent,
+    /// so what was just drawn is in it.
+    trace: Mutex<std::collections::VecDeque<(u32, u64, u8)>>,
     trace_cap: usize,
     /// Asynchronous mode ([`Self::start_async`]): register writes go, in
     /// order, to a worker thread that owns `regs` and draws, as the real
@@ -876,7 +877,7 @@ impl CrimeRe {
             ram,
             unhandled: Mutex::new(BTreeMap::new()),
             drawn: std::sync::atomic::AtomicU64::new(0),
-            trace: Mutex::new(Vec::new()),
+            trace: Mutex::new(std::collections::VecDeque::new()),
             trace_cap: std::env::var("IRIS_IP32_RE_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         }
     }
@@ -944,9 +945,10 @@ impl CrimeRe {
             return;
         }
         let mut t = self.trace.lock().unwrap();
-        if t.len() < self.trace_cap {
-            t.push((off, val, width));
+        if t.len() >= self.trace_cap {
+            t.pop_front();
         }
+        t.push_back((off, val, width));
     }
 
     /// The recorded writes, one per line: `w32 OFFSET VALUE` (offsets from
