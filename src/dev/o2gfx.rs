@@ -32,6 +32,7 @@ pub mod gbe_reg {
     pub const VT_INTR23: u32 = 0x10024;
     pub const VT_HCMAP: u32 = 0x1003c;
     pub const VT_VCMAP: u32 = 0x10040;
+    pub const OVR_WIDTH_TILE: u32 = 0x20000;
     pub const OVR_CONTROL: u32 = 0x20004;
     pub const OVR_CONTROL_SHADOW: u32 = 0x20008;
     pub const FRM_SIZE_TILE: u32 = 0x30000;
@@ -366,6 +367,39 @@ impl Gbe {
             }
         };
 
+        // The overlay planes: 8-bit pixels over the normal ones, in their own
+        // tile list (same width-in-tiles layout as the normal planes). Zero is
+        // clear; anything else is colour map entry 0x1100 + the pixel. The X
+        // server draws its pop-up menus here.
+        let ovr = g(OVR_CONTROL);
+        let ovr_tile = g(OVR_WIDTH_TILE);
+        let ovr_rhs = (ovr_tile & 0x1f) as usize;
+        let ovr_per_row = ((ovr_tile >> 5) & 0xff) as usize + (ovr_rhs != 0) as usize;
+        let ovr_line = ((ovr_tile >> 5) & 0xff) as usize * 512 + ovr_rhs * 32;
+        let ovr_dma = ovr & 1 != 0 && ovr_per_row != 0 && ovr_line != 0;
+        let ovr_tiles: Vec<Option<usize>> = if ovr_dma {
+            let list = ovr & 0xffff_ffe0;
+            (0..(ovr_per_row * h.div_ceil(128)).min(4096))
+                .map(|i| {
+                    let e = mem
+                        .dma_offset(list + 2 * i as u32)
+                        .filter(|&o| o + 1 < mem.len())
+                        .map(|o| u16::from_be_bytes([mem[o], mem[o + 1]]))
+                        .unwrap_or(0);
+                    if e == 0 { None } else { mem.dma_offset((e as u32) << 16).filter(|&o| o + 0x10000 <= mem.len()) }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ovr_at = |x: usize, y: usize| -> u32 {
+            if !ovr_dma || x >= ovr_line {
+                return 0;
+            }
+            let Some(Some(base)) = ovr_tiles.get((y / 128) * ovr_per_row + x / 512) else { return 0 };
+            mem[base + (y % 128) * 512 + x % 512] as u32
+        };
+
         // Each pixel's WID (mode-table entry) comes from the DID tables when
         // DID DMA is on and the 32 WIDs differ; otherwise WID 0, which is
         // all the PROM and the BSD consoles use. IRIX's X server runs 8-bit
@@ -452,6 +486,11 @@ impl Gbe {
                 }
                 if gamma {
                     (rr, gg, bb) = (gmap(rr, 24), gmap(gg, 16), gmap(bb, 8));
+                }
+                let ov = ovr_at(x, y);
+                if ov != 0 {
+                    let c = cmap(0x1100 + ov);
+                    (rr, gg, bb) = (c >> 24, (c >> 16) & 0xff, (c >> 8) & 0xff);
                 }
                 if crs_on {
                     let (dx, dy) = (x as i32 - cx, y as i32 - cy);
@@ -1517,5 +1556,43 @@ mod tests {
         let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
         assert_eq!(px(10, 20), [0x11, 0x22, 0x33]);
         assert_eq!(px(9, 20), [0, 0, 0]);
+    }
+
+    #[test]
+    fn overlay_pixels_cover_the_normal_planes_and_zero_is_clear() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let g = gbe();
+        // Normal planes: one tile of 5s. Overlay: its own tile, one pixel 7.
+        let (tile, list, otile, olist) = (0x0010_0000u32, 0x0020_0000u32, 0x0030_0000u32, 0x0020_0100u32);
+        {
+            let mut m = ram.lock().unwrap();
+            m.write(list as usize, &((tile >> 16) as u16).to_be_bytes());
+            m.write(olist as usize, &((otile >> 16) as u16).to_be_bytes());
+            m.write(tile as usize, &[5u8; 0x10000]);
+            m.write((otile + 4 * 512 + 3) as usize, &[7]);
+        }
+        for (off, v) in [
+            (CTRLSTAT, 0x300a_a000u32),
+            (DOTCLOCK, 0x0010_020f),
+            (VT_XYMAX, 0x0042_9690),
+            (FRM_CONTROL_SHADOW, list | 1),
+            (OVR_CONTROL_SHADOW, olist | 1),
+            (VT_XY, 0),
+            (VT_HCMAP, 512 << 12),
+            (VT_VCMAP, 128 << 12),
+            (FRM_SIZE_TILE, 1 << 5),
+            (OVR_WIDTH_TILE, 1 << 5),
+            (FRM_SIZE_PIXEL, 128 << 16),
+            (MODE, 0x403),
+            (CMAP + 4 * 5, 0x11223300),
+            (CMAP + 4 * 0x1107, 0xaabbcc00),
+        ] {
+            g.write32(0x1600_0000 + off, v);
+        }
+        let mut out = vec![0u8; 2048 * 2048 * 4];
+        g.render(&ram.lock().unwrap(), &mut out).expect("display on");
+        let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
+        assert_eq!(px(3, 4), [0xaa, 0xbb, 0xcc], "overlay colour from entry 0x1100 + 7");
+        assert_eq!(px(4, 4), [0x11, 0x22, 0x33], "overlay 0 shows the normal planes");
     }
 }
