@@ -105,6 +105,8 @@ pub struct O2Memory {
     /// The bank controls as last written.
     ctrl: [u64; 8],
     slots: [Slot; SLOTS],
+    /// Bumped whenever the decode changes, so a device can cache an offset.
+    decode_gen: u64,
 }
 
 // The raw pointer is into `store`, which lives as long as this does; writers
@@ -158,7 +160,7 @@ impl O2Memory {
         let store = PpMemory::new((total as usize).div_ceil(1 << 20).max(1));
         let space = PpMemSpace::over(std::slice::from_ref(&store)).expect("ppmem: O2 memory window");
         let host = store.host_ptr();
-        let mut m = Self { store, host, total: total as usize, space, size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS] };
+        let mut m = Self { store, host, total: total as usize, space, size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS], decode_gen: 0 };
         // At reset every control is zero: all eight banks at the bottom of
         // the window, 32 MB each, so bank 0 answers there.
         m.rebuild();
@@ -202,6 +204,11 @@ impl O2Memory {
         unsafe { std::slice::from_raw_parts(self.host.add(off), n) }
     }
 
+    /// Changes whenever an address may decode differently.
+    pub fn decode_gen(&self) -> u64 {
+        self.decode_gen
+    }
+
     /// Bytes fitted.
     pub fn len(&self) -> usize {
         self.total
@@ -232,6 +239,7 @@ impl O2Memory {
     }
 
     fn rebuild(&mut self) {
+        self.decode_gen += 1;
         self.slots = [Slot::None; SLOTS];
         // Highest bank first, so the lowest-numbered match is the one left.
         for i in (0..8).rev() {

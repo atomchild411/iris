@@ -850,8 +850,25 @@ impl CrimeRe {
         if e & 0x8000 == 0 {
             return None;
         }
-        let pa = (((e & 0x7fff) as u32) << 16) + (y % 128) * 512 + (x % tw) * buf.bd;
-        mem.dma_offset(pa).filter(|&o| o + buf.bd as usize <= mem.len())
+        // The tile's offset in memory, from a one-entry cache: a primitive
+        // stays in one tile for many pixels, and resolving the tile through
+        // the memory decode every pixel was a fifth of the CPU thread's time
+        // under perfly (the engine runs on the CPU thread).
+        thread_local! {
+            static TILE: std::cell::Cell<(u64, usize)> = const { std::cell::Cell::new((u64::MAX, 0)) };
+        }
+        let tile = e & 0x7fff;
+        let key = tile | (mem.decode_gen() << 16);
+        let base = TILE.with(|c| {
+            let (k, b) = c.get();
+            if k == key {
+                return Some(b);
+            }
+            let b = mem.dma_offset((tile as u32) << 16).filter(|&o| o + 0x10000 <= mem.len())?;
+            c.set((key, b));
+            Some(b)
+        })?;
+        Some(base + ((y % 128) * 512 + (x % tw) * buf.bd) as usize)
     }
 
     fn get_px(mem: &O2Memory, o: usize, bd: u32) -> u32 {
