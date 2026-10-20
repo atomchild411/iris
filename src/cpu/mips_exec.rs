@@ -4703,10 +4703,22 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     ///
     /// `C::MIPS4` is the model discriminator — R5000 is the MIPS IV part,
     /// R4400 the MIPS III one — matching how the rest of this file selects
-    /// per-model behaviour.
+    /// per-model behaviour. The R10000 is MIPS IV too and has a third table
+    /// (`R10000 UM` Table 4-1), selected by `C::R10K_CACHE_OPS`.
     #[inline]
     pub(crate) fn decode_cache_attr(c: u32) -> u32 {
-        if C::MIPS4 {
+        if C::R10K_CACHE_OPS {
+            // R10000 UM Table 4-1: MIPS IV like the R5000, but its own table.
+            // 4 and 5 are the coherent algorithms, not reserved: the O2's
+            // IRIX runs KSEG0 with K0=5, and reading that as uncached sent
+            // every kernel fetch, load and store to the bus. 7 (uncached
+            // accelerated) only gathers stores; a load is a plain uncached one.
+            match c & 0x7 {
+                3     => TR_CACHEABLE,
+                4 | 5 => TR_CACHEABLE_COH,
+                _     => TR_UNCACHED, // 2 and 7; 0, 1, 6 reserved
+            }
+        } else if C::MIPS4 {
             // VR5000 Table 6-6.
             match c & 0x7 {
                 0 | 1 => TR_CACHEABLE, // write-through -> write-back (see above)

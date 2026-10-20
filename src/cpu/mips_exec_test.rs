@@ -5686,6 +5686,23 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_cache_attr_matches_the_r10000_table() {
+        type E = MipsExecutor<PassthroughTlb, crate::cpu::mips_cache_shadow::R10000ShadowCache>;
+        // R10000 UM Table 4-1: MIPS IV, but 4/5 are the coherent algorithms
+        // (the O2's IRIX runs KSEG0 with K0=5) and 0/1 are reserved.
+        for (c, want) in [(0u32, crate::cpu::mips_exec::TR_UNCACHED),
+                          (1, crate::cpu::mips_exec::TR_UNCACHED),
+                          (2, crate::cpu::mips_exec::TR_UNCACHED),
+                          (3, crate::cpu::mips_exec::TR_CACHEABLE),
+                          (4, crate::cpu::mips_exec::TR_CACHEABLE_COH),
+                          (5, crate::cpu::mips_exec::TR_CACHEABLE_COH),
+                          (6, crate::cpu::mips_exec::TR_UNCACHED),
+                          (7, crate::cpu::mips_exec::TR_UNCACHED)] {
+            assert_eq!(E::decode_cache_attr(c), want, "R10000 C={c} per UM Table 4-1");
+        }
+    }
+
+    #[test]
     fn test_decode_cache_attr_matches_the_vr5000_table() {
         let (exec, _mem) = create_executor_m4(); // PassthroughCacheM4 => MIPS4 = true
         type E = MipsExecutor<PassthroughTlb, PassthroughCacheM4>;
