@@ -25,6 +25,7 @@
 //! in force is read from scratch RAM at each doorbell, never latched,
 //! because one boot can hand the chip from one driver to the next.
 
+use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiDevice, ScsiIdentity, ScsiRequest};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -168,98 +169,9 @@ pub const SG_LAST: u32 = 0x8000_0000;
 /// in any healthy list.
 pub const SG_MAX: usize = 4096;
 
-/// A disk behind the controller.
-pub struct ScsiDisk {
-    file: Mutex<std::fs::File>,
-    pub blocks: u64,
-    /// Presented as a CD-ROM rather than a fixed disk.
-    ///
-    /// SGI's PROM greys out "Local CD-ROM" on its install menu unless
-    /// something on the bus says it is one, and the install media is the only
-    /// way in without a network.
-    pub cdrom: bool,
-    /// Bytes per logical block. A disk is 512. A CD-ROM drive starts at 2048,
-    /// as real ones do, and takes whatever a MODE SELECT block descriptor
-    /// asks for: SGI's PROM switches it to 512 (which is how an SGI CD's
-    /// volume header reads with disk arithmetic), while OpenBSD's driver
-    /// leaves it at 2048 and cannot read the disc at 512.
-    block_len: std::sync::atomic::AtomicUsize,
-    /// Size of the image in bytes.
-    bytes: u64,
-}
-
-impl ScsiDisk {
-    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        Self::open_as(path, false)
-    }
-
-    pub fn open_as(path: &std::path::Path, cdrom: bool) -> std::io::Result<Self> {
-        // Read-only media must be opened read-only: a write that silently
-        // succeeded on an install CD would be worse than one that failed.
-        let file = if cdrom {
-            std::fs::OpenOptions::new().read(true).open(path)?
-        } else {
-            std::fs::OpenOptions::new().read(true).write(true).open(path)?
-        };
-        let bytes = file.metadata()?.len();
-        let blocks = bytes / BLOCK_SIZE as u64;
-        let block_len = std::sync::atomic::AtomicUsize::new(if cdrom { 2048 } else { BLOCK_SIZE });
-        Ok(Self { file: Mutex::new(file), blocks, cdrom, block_len, bytes })
-    }
-
-    /// Bytes per logical block, as the drive is set now.
-    pub fn block_len(&self) -> usize {
-        self.block_len.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Logical blocks at the current block length.
-    pub fn capacity(&self) -> u64 {
-        self.bytes / self.block_len() as u64
-    }
-
-    /// Back to the power-on block length, as a bus reset leaves a device.
-    fn power_on_block_len(&self) {
-        let len = if self.cdrom { 2048 } else { BLOCK_SIZE };
-        self.block_len.store(len, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// A MODE SELECT's block descriptor: a CD-ROM takes the new length.
-    fn set_block_len(&self, len: usize) -> bool {
-        if !self.cdrom || !matches!(len, 512 | 1024 | 2048) {
-            return false;
-        }
-        self.block_len.store(len, std::sync::atomic::Ordering::Relaxed);
-        true
-    }
-
-    fn write_blocks(&self, lba: u64, data: &[u8]) -> bool {
-        use std::io::{Seek, SeekFrom, Write};
-        if self.cdrom {
-            return false;
-        }
-        let mut f = self.file.lock().unwrap();
-        // Refuse to write past the end rather than growing the image: a
-        // disk that silently gets bigger is not a disk.
-        let end = lba + (data.len() / BLOCK_SIZE) as u64;
-        if end > self.blocks {
-            return false;
-        }
-        f.seek(SeekFrom::Start(lba * BLOCK_SIZE as u64)).is_ok() && f.write_all(data).is_ok()
-    }
-
-    fn read_blocks(&self, lba: u64, count: usize) -> Vec<u8> {
-        use std::io::{Read, Seek, SeekFrom};
-        let bl = self.block_len();
-        let mut buf = vec![0u8; count * bl];
-        let mut f = self.file.lock().unwrap();
-        if f.seek(SeekFrom::Start(lba * bl as u64)).is_ok() {
-            // A short read at the end of the image leaves zeros, which is
-            // what reading past the end of a real disk's data would give.
-            let _ = f.read(&mut buf);
-        }
-        buf
-    }
-}
+/// What the O2's targets report in INQUIRY, disks and CD-ROMs alike.
+pub const O2_DISK: ScsiIdentity = ScsiIdentity::new(b"SGI     ", b"IRIS EMULATED   ", b"1.0 ");
+pub const O2_CDROM: ScsiIdentity = O2_DISK;
 
 /// NetBSD's sequencer program uses a different arrangement from the PROM's,
 /// and these names come from its own headers rather than from guessing.
@@ -413,9 +325,10 @@ impl Default for State {
 
 pub struct Aic7880 {
     st: Mutex<State>,
-    /// Disks by SCSI id. An install needs at least two -- the media to read
-    /// and the disk to write -- so one is not enough.
-    disks: Mutex<std::collections::BTreeMap<u8, ScsiDisk>>,
+    /// The targets on the bus, by SCSI id (the shared SCSI devices: disks,
+    /// CHDs, overlays, CD-ROMs). An install needs at least two -- the media
+    /// to read and the disk to write.
+    targets: Mutex<[Option<ScsiDevice>; 16]>,
     /// Host memory. The controller fetches its work from there rather than
     /// being handed it a register at a time, so without this it can see the
     /// tag of a command and nothing else about it.
@@ -428,13 +341,11 @@ pub struct Aic7880 {
     /// which bytes moved.
     dma_watch: Option<(u32, u32)>,
     dma_hits: Mutex<Vec<(u32, u8)>>,
-    /// Sense data for the last command that failed, as (key, ASC, ASCQ),
-    /// handed out by the next REQUEST SENSE. A check condition followed by
-    /// "no sense" tells a driver nothing went wrong, and it gives up on a
-    /// unit it cannot understand rather than skipping one command.
+    /// The controller's own sense, as (key, ASC, ASCQ): a command for a
+    /// logical unit the target does not have, handed out by the REQUEST
+    /// SENSE that follows. A check condition followed by "no sense" tells a
+    /// driver nothing went wrong. Everything else a target answers itself.
     sense: Mutex<Option<(u8, u8, u8)>>,
-    /// Opcodes already reported as unsupported, so each is logged once.
-    unsupported: Mutex<std::collections::BTreeSet<u8>>,
     /// Pages of DMA addresses already reported as not memory.
     dma_misses: Mutex<std::collections::BTreeSet<u32>>,
 }
@@ -443,7 +354,7 @@ impl Aic7880 {
     pub fn new(ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
         Self {
             st: Mutex::new(State::default()),
-            disks: Mutex::new(std::collections::BTreeMap::new()),
+            targets: Mutex::new(std::array::from_fn(|_| None)),
             ram,
             dma_watch: std::env::var("IRIS_IP32_DMAWATCH").ok().and_then(|v| {
                 let (a, b) = v.split_once(':')?;
@@ -452,7 +363,6 @@ impl Aic7880 {
             }),
             dma_hits: Mutex::new(Vec::new()),
             sense: Mutex::new(None),
-            unsupported: Mutex::new(std::collections::BTreeSet::new()),
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
             target: std::env::var("IRIS_IP32_SCSI_ID").ok()
                 .and_then(|v| v.parse().ok())
@@ -655,9 +565,14 @@ impl Aic7880 {
     pub fn attach_at(&self, target: u8, path: &std::path::Path, cdrom: bool)
         -> std::io::Result<u64>
     {
-        let d = ScsiDisk::open_as(path, cdrom)?;
-        let blocks = d.blocks;
-        self.disks.lock().unwrap().insert(target, d);
+        let path = path.to_str().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
+        let d = ScsiDevice::open(path, cdrom, Vec::new(), false, None, if cdrom { O2_CDROM } else { O2_DISK })?;
+        let blocks = d.size() / BLOCK_SIZE as u64;
+        let mut targets = self.targets.lock().unwrap();
+        let slot = targets.get_mut(target as usize).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("SCSI id {target} out of range"))
+        })?;
+        *slot = Some(d);
         Ok(blocks)
     }
 
@@ -672,9 +587,15 @@ impl Aic7880 {
         self.attach_disk_at(self.target, path)
     }
 
+    /// Whether something answers at `target`.
+    fn has_target(&self, target: u8) -> bool {
+        self.targets.lock().unwrap().get(target as usize).is_some_and(|t| t.is_some())
+    }
+
     /// The ids that have something on them.
     pub fn attached(&self) -> Vec<u8> {
-        self.disks.lock().unwrap().keys().copied().collect()
+        let t = self.targets.lock().unwrap();
+        (0..t.len() as u8).filter(|&i| t[i as usize].is_some()).collect()
     }
 
     /// Whether this address is the one disk we have.
@@ -700,7 +621,7 @@ impl Aic7880 {
     fn execute_for(&self, cdb: &[u8], who: Option<(u8, u8)>) -> (Vec<u8>, u8) {
         let present = self
             .target_of(who)
-            .map(|t| self.disks.lock().unwrap().contains_key(&t))
+            .map(|t| self.has_target(t))
             .unwrap_or(false);
         if !present {
             // The way SCSI says "nothing here": an INQUIRY answered with
@@ -716,7 +637,7 @@ impl Aic7880 {
             // A target that is there but has no such LUN says so, so the
             // REQUEST SENSE that follows explains the failure.
             if let Some((t, l)) = who {
-                if l != 0 && self.disks.lock().unwrap().contains_key(&t) {
+                if l != 0 && self.has_target(t) {
                     // ILLEGAL REQUEST, logical unit not supported.
                     *self.sense.lock().unwrap() = Some((0x05, 0x25, 0x00));
                 }
@@ -733,89 +654,16 @@ impl Aic7880 {
     }
 
     fn execute_on(&self, cdb: &[u8], target: u8) -> (Vec<u8>, u8) {
-        const GOOD: u8 = 0x00;
+        self.request(target, cdb, None)
+    }
+
+    /// A command for the target at `target`, through the shared SCSI device:
+    /// the data it returns and its status. A REQUEST SENSE first hands out
+    /// the controller's own sense, if it holds one.
+    fn request(&self, target: u8, cdb: &[u8], data_in: Option<&[u8]>) -> (Vec<u8>, u8) {
         const CHECK_CONDITION: u8 = 0x02;
-        let disks = self.disks.lock().unwrap();
-        let Some(disk) = disks.get(&target) else {
-            return (Vec::new(), CHECK_CONDITION);
-        };
-        let be16 = |i: usize| ((cdb[i] as usize) << 8) | cdb[i + 1] as usize;
-        let be32 = |i: usize| {
-            ((cdb[i] as u64) << 24) | ((cdb[i + 1] as u64) << 16)
-                | ((cdb[i + 2] as u64) << 8) | cdb[i + 3] as u64
-        };
-        match cdb[0] {
-            // TEST UNIT READY, START STOP UNIT, and the rest of the
-            // no-data commands the PROM sends while probing.
-            0x00 | 0x1b | 0x16 | 0x17 | 0x2f => (Vec::new(), GOOD),
-            // INQUIRY.
-            0x12 => {
-                let mut d = vec![0u8; 36];
-                d[0] = if disk.cdrom { 0x05 } else { 0x00 };
-                d[1] = if disk.cdrom { 0x80 } else { 0x00 }; // removable
-                d[2] = 0x02; // SCSI-2
-                d[3] = 0x02; // response format
-                d[4] = 31; // additional length
-                d[8..16].copy_from_slice(b"SGI     ");
-                d[16..32].copy_from_slice(b"IRIS EMULATED   ");
-                d[32..36].copy_from_slice(b"1.0 ");
-                let want = cdb[4] as usize;
-                d.truncate(want.min(d.len()));
-                (d, GOOD)
-            }
-            // READ CAPACITY: last addressable block, then block size.
-            0x25 => {
-                let last = disk.capacity().saturating_sub(1) as u32;
-                let mut d = Vec::with_capacity(8);
-                d.extend_from_slice(&last.to_be_bytes());
-                d.extend_from_slice(&(disk.block_len() as u32).to_be_bytes());
-                (d, GOOD)
-            }
-            // READ(6) and READ(10).
-            0x08 => {
-                let lba = (((cdb[1] & 0x1f) as u64) << 16)
-                    | ((cdb[2] as u64) << 8) | cdb[3] as u64;
-                let n = if cdb[4] == 0 { 256 } else { cdb[4] as usize };
-                (disk.read_blocks(lba, n), GOOD)
-            }
-            0x28 => (disk.read_blocks(be32(2), be16(7)), GOOD),
-            // MODE SENSE(6): an empty parameter header is enough to say
-            // "no special modes" without claiming anything untrue. A CD
-            // says it is write-protected.
-            0x1a => (vec![3, 0, if disk.cdrom { 0x80 } else { 0 }, 0], GOOD),
-            // MODE SENSE(10): the same, in the 10-byte header.
-            0x5a => {
-                let mut d = vec![0u8, 6, 0, if disk.cdrom { 0x80 } else { 0 }, 0, 0, 0, 0];
-                d.truncate(be16(7).min(8));
-                (d, GOOD)
-            }
-            // PREVENT ALLOW MEDIUM REMOVAL and SET CD SPEED: nothing to do,
-            // but a CD driver sends both on open and must not see them fail.
-            0x1e | 0xbb => (Vec::new(), GOOD),
-            // READ TOC/PMA/ATIP, format 0: one data track from block 0 and
-            // the lead-out, in LBA or MSF as asked (MSF counts 75 frames a
-            // second from a 2-second pregap, in 2048-byte frames).
-            0x43 if disk.cdrom => {
-                let msf = cdb[1] & 0x02 != 0;
-                let addr = |lba: u64| -> [u8; 4] {
-                    if msf {
-                        let f = lba * disk.block_len() as u64 / 2048 + 150;
-                        [0, (f / (75 * 60)) as u8, (f / 75 % 60) as u8, (f % 75) as u8]
-                    } else {
-                        (lba as u32).to_be_bytes()
-                    }
-                };
-                let mut d = vec![0u8, 18, 1, 1];
-                d.extend_from_slice(&[0, 0x14, 1, 0]);
-                d.extend_from_slice(&addr(0));
-                d.extend_from_slice(&[0, 0x14, 0xaa, 0]);
-                d.extend_from_slice(&addr(disk.capacity()));
-                d.truncate(be16(7));
-                (d, GOOD)
-            }
-            // REQUEST SENSE: the last failure's sense, or none.
-            0x03 => {
-                let (key, asc, ascq) = self.sense.lock().unwrap().take().unwrap_or((0, 0, 0));
+        if cdb[0] == scsi_cmd::REQUEST_SENSE {
+            if let Some((key, asc, ascq)) = self.sense.lock().unwrap().take() {
                 let mut d = vec![0u8; 18];
                 d[0] = 0x70; // current error
                 d[2] = key;
@@ -823,14 +671,18 @@ impl Aic7880 {
                 d[12] = asc;
                 d[13] = ascq;
                 d.truncate((cdb[4] as usize).max(1).min(18));
-                (d, GOOD)
+                return (d, 0x00);
             }
-            op => {
-                if self.unsupported.lock().unwrap().insert(op) {
-                    eprintln!("aic7880: target {target}: unsupported SCSI command {op:#04x} ({:02x?})", cdb);
-                }
-                // ILLEGAL REQUEST, invalid command operation code.
-                *self.sense.lock().unwrap() = Some((0x05, 0x20, 0x00));
+        }
+        let mut targets = self.targets.lock().unwrap();
+        let Some(dev) = targets.get_mut(target as usize).and_then(|t| t.as_mut()) else {
+            return (Vec::new(), CHECK_CONDITION);
+        };
+        let req = ScsiRequest { cdb: cdb.to_vec(), data_len: ScsiDataLength::Unlimited, data_in: data_in.map(|d| d.to_vec()) };
+        match dev.request(&req) {
+            Ok(r) => (r.data, r.status),
+            Err(e) => {
+                eprintln!("aic7880: target {target}: {e}");
                 (Vec::new(), CHECK_CONDITION)
             }
         }
@@ -941,57 +793,7 @@ impl Aic7880 {
     }
 
     fn execute_write_on(&self, cdb: &[u8], data: &[u8], target: u8) -> u8 {
-        const GOOD: u8 = 0x00;
-        const CHECK_CONDITION: u8 = 0x02;
-        let disks = self.disks.lock().unwrap();
-        let Some(disk) = disks.get(&target) else {
-            return CHECK_CONDITION;
-        };
-        if matches!(cdb[0], 0x15 | 0x55) {
-            // Header, then any block descriptors: the block length is the
-            // descriptor's last three bytes.
-            let (hdr, bd_len) = if cdb[0] == 0x15 {
-                (4, data.get(3).copied().unwrap_or(0) as usize)
-            } else {
-                (8, ((data.get(6).copied().unwrap_or(0) as usize) << 8) | data.get(7).copied().unwrap_or(0) as usize)
-            };
-            if bd_len >= 8 && data.len() >= hdr + 8 {
-                let d = &data[hdr..hdr + 8];
-                let len = ((d[5] as usize) << 16) | ((d[6] as usize) << 8) | d[7] as usize;
-                if disk.cdrom {
-                    if disk.set_block_len(len) {
-                        eprintln!("aic7880: target {target}: block length {len}");
-                    } else {
-                        eprintln!("aic7880: target {target}: MODE SELECT asked for block length {len}; kept {}", disk.block_len());
-                    }
-                }
-            }
-            return GOOD;
-        }
-        let lba = match cdb[0] {
-            0x0a => (((cdb[1] & 0x1f) as u64) << 16) | ((cdb[2] as u64) << 8) | cdb[3] as u64,
-            _ => {
-                ((cdb[2] as u64) << 24) | ((cdb[3] as u64) << 16)
-                    | ((cdb[4] as u64) << 8) | cdb[5] as u64
-            }
-        };
-        if disk.write_blocks(lba, data) {
-            return GOOD;
-        }
-        // Say why, so the REQUEST SENSE that follows explains the failure
-        // instead of reporting that nothing went wrong.
-        let sense = if disk.cdrom {
-            // DATA PROTECT, write protected.
-            (0x07, 0x27, 0x00)
-        } else if lba + (data.len() / BLOCK_SIZE) as u64 > disk.blocks {
-            // ILLEGAL REQUEST, logical block address out of range.
-            (0x05, 0x21, 0x00)
-        } else {
-            // MEDIUM ERROR, write error: the image itself refused it.
-            (0x03, 0x0c, 0x00)
-        };
-        *self.sense.lock().unwrap() = Some(sense);
-        CHECK_CONDITION
+        self.request(target, cdb, Some(data)).1
     }
 
     /// Consume everything the host has added to its queue-in ring.
@@ -1159,7 +961,7 @@ impl Aic7880 {
         // once, where an INQUIRY answered "no device" with GOOD status made
         // it look for a device that never comes.
         let own = st.regs[reg::SCSIID as usize] & 0x0f;
-        if errors && (target == own || !self.disks.lock().unwrap().contains_key(&target)) {
+        if errors && (target == own || !self.has_target(target)) {
             st.regs[him::WAITING_SCB as usize] = tag;
             st.sstat1 |= sstat1::SELTO;
             Self::raise_pausing(st, intstat::SCSIINT);
@@ -1311,11 +1113,11 @@ impl Aic7880 {
         // common 2048 after its reset (the PROM had left 512 behind).
         if off == reg::SCSISEQ && val & 0x01 != 0 {
             let sgi = Self::him(&self.st.lock().unwrap());
-            for d in self.disks.lock().unwrap().values() {
-                if sgi && d.cdrom {
-                    d.set_block_len(512);
+            for d in self.targets.lock().unwrap().iter_mut().flatten() {
+                if sgi && d.is_cdrom() {
+                    d.set_logical_block_size(512);
                 } else {
-                    d.power_on_block_len();
+                    d.power_on_block_size();
                 }
             }
         }
@@ -1705,8 +1507,10 @@ mod tests {
     fn a_write_past_the_end_fails_rather_than_growing_the_image() {
         let img = std::env::temp_dir().join("iris-aic7880-grow.img");
         std::fs::write(&img, vec![0u8; 8 * BLOCK_SIZE]).expect("test image");
-        let d = ScsiDisk::open(&img).expect("open");
-        assert!(!d.write_blocks(7, &vec![0xab; 4 * BLOCK_SIZE]), "refused");
+        let c = chip();
+        c.attach_at(1, &img, false).expect("attach");
+        // WRITE(10): four blocks at block 7 of eight.
+        assert_eq!(c.execute_write_on(&[0x2a, 0, 0, 0, 0, 7, 0, 0, 4, 0], &vec![0xab; 4 * BLOCK_SIZE], 1), 0x02, "refused");
         assert_eq!(std::fs::metadata(&img).unwrap().len(), (8 * BLOCK_SIZE) as u64);
     }
 
@@ -2034,9 +1838,14 @@ mod tests {
         let write10 = |lba: u8| [0x2a, 0, 0, 0, 0, lba, 0, 0, 1, 0];
         let block = vec![0u8; BLOCK_SIZE];
 
+        let sense = |t: u8| {
+            let (d, status) = c.execute_on(&[0x03, 0, 0, 0, 18, 0], t);
+            assert_eq!(status, 0x00);
+            (d[2] & 0x0f, d[12], d[13])
+        };
         assert_eq!(c.execute_write_on(&write10(0), &block, 4), 0x02);
-        assert_eq!(*c.sense.lock().unwrap(), Some((0x07, 0x27, 0x00)), "a CD is write protected");
+        assert_eq!(sense(4), (0x07, 0x27, 0x00), "a CD is write protected");
         assert_eq!(c.execute_write_on(&write10(8), &block, 1), 0x02);
-        assert_eq!(*c.sense.lock().unwrap(), Some((0x05, 0x21, 0x00)), "past the end is out of range");
+        assert_eq!(sense(1), (0x05, 0x21, 0x00), "past the end is out of range");
     }
 }
