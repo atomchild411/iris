@@ -845,9 +845,15 @@ impl Texture {
         self.typ != 5
     }
 
-    /// Level `level` at (s, t) in 1.14 units, bilinear or nearest.
+    /// Level `level` at (s, t) in 1.14 units, bilinear or nearest. IRIX's
+    /// GL hands the engine coordinates 1.0 (16384) past the map's own: the
+    /// map runs from 1.0 to 2.0. Repeating maps never showed it; a clamped
+    /// one read every texel off its far edge (distort's whole picture one
+    /// tan, Quake 3's lightmaps black), and perfly's hubcap centre is s
+    /// 1.49, not 0.49.
     fn sample_level(&self, r: &[u32], mem: &O2Memory, level: u32, linear: bool, s: f64, t: f64) -> [f64; 4] {
         let (w, h) = ((self.w >> level).max(1), (self.h >> level).max(1));
+        let (s, t) = (s - 16384.0, t - 16384.0);
         let (u, v) = (s * w as f64 / 16384.0 - 0.5, t * h as f64 / 16384.0 - 0.5);
         if !linear {
             return self.texel(r, mem, level, u.round() as i64, v.round() as i64);
@@ -1909,6 +1915,12 @@ impl CrimeRe {
                         if rho > 0.0 { rho.log2() } else { 0.0 }
                     };
                     let tx = t.sample(&r, mem, s0, t0, lod);
+                    if frag_probe() == Some((px as i32, py as i32)) {
+                        eprintln!(
+                            "o2frag {px},{py}: s {s0:.1} t {t0:.1} lod {lod:.2} -> {tx:?}; map {} max {} filter {} {}x{} base entry {} bytes {}",
+                            t.map_level, t.max_level, t.min_filter, t.w, t.h, t.base, t.bpt
+                        );
+                    }
                     // Texture function (Texture.mode 1:0), as OpenGL's for
                     // maps with and without alpha.
                     let f = [0, 1, 2, 3].map(|k| channel(k, px, py) as f64);
