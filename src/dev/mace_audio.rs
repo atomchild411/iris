@@ -95,10 +95,12 @@ struct Chan {
     start: Option<Instant>,
     done: u64,
     rate: u32,
+    /// Output: items played from an empty ring since it last had data.
+    dry: u32,
 }
 
 impl Chan {
-    const RESET: Self = Self { ctl: CTRL_RESET, rptr: 0, wptr: 0, sub: 0, msc: 0, ust: 0, start: None, done: 0, rate: 0 };
+    const RESET: Self = Self { ctl: CTRL_RESET, rptr: 0, wptr: 0, sub: 0, msc: 0, ust: 0, start: None, done: 0, rate: 0, dry: 0 };
 
     fn running(&self) -> bool {
         self.ctl & CTRL_RESET == 0 && self.ctl & CTRL_ENABLE != 0
@@ -278,7 +280,15 @@ pub struct MaceAudio {
     /// For the trace: non-zero sample pairs each output played, and when
     /// that was last reported.
     heard: [AtomicU64; 2],
+    /// For the trace: times each output's ring ran dry between sounds less
+    /// than half a second apart (the program fell behind), and the items
+    /// those gaps lasted.
+    gaps: [AtomicU64; 2],
+    gap_items: [AtomicU64; 2],
     last_report: Mutex<Option<Instant>>,
+    /// IRIS_O2_AUDIO_DUMP=<file>: every sample each output plays, at the
+    /// guest's rate, before resampling (see `dump`).
+    dump: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
 }
 
 impl Default for MaceAudio {
@@ -296,7 +306,14 @@ impl MaceAudio {
             tried_open: AtomicBool::new(false),
             underruns: Arc::new(AtomicU64::new(0)),
             heard: [AtomicU64::new(0), AtomicU64::new(0)],
+            gaps: [AtomicU64::new(0), AtomicU64::new(0)],
+            gap_items: [AtomicU64::new(0), AtomicU64::new(0)],
             last_report: Mutex::new(None),
+            dump: Mutex::new(
+                std::env::var_os("IRIS_O2_AUDIO_DUMP")
+                    .and_then(|p| std::fs::File::create(p).ok())
+                    .map(std::io::BufWriter::new),
+            ),
         }
     }
 
@@ -476,7 +493,14 @@ impl MaceAudio {
             rates[out] = rate;
             for _ in 0..c.due(now, rate) {
                 let mut item = (0i16, 0i16);
-                if c.depth() != 0 {
+                if c.depth() == 0 {
+                    c.dry = c.dry.saturating_add(1);
+                } else {
+                    if c.dry != 0 && c.dry < rate / 2 {
+                        self.gaps[out].fetch_add(1, Ordering::Relaxed);
+                        self.gap_items[out].fetch_add(c.dry as u64, Ordering::Relaxed);
+                    }
+                    c.dry = 0;
                     let addr = io.ring_base | (n as u32) << 12 | c.rptr | c.sub * 8;
                     if let Some(o) = ram.dma_offset(addr).filter(|&o| o + 8 <= ram.len()) {
                         let half = |w: u32| ((w as i32) >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
@@ -508,12 +532,42 @@ impl MaceAudio {
                 if h != [0, 0] {
                     eprintln!("o2audio: non-zero pairs played: out1 {} out2 {}", h[0], h[1]);
                 }
+                let g = [0, 1].map(|k| self.gaps[k].swap(0, Ordering::Relaxed));
+                let gi = [0, 1].map(|k| self.gap_items[k].swap(0, Ordering::Relaxed));
+                if g != [0, 0] {
+                    eprintln!("o2audio: ring ran dry: out1 {} ({} items) out2 {} ({} items)", g[0], gi[0], g[1], gi[1]);
+                }
             }
         }
         if pcm.iter().all(|p| p.is_empty()) {
             return;
         }
+        self.dump(&pcm, &rates);
         self.play(&pcm, &rates);
+    }
+
+    /// Append one record per output that played: the output (u8), its rate
+    /// and pair count (u32 each), then the pairs, all little-endian. Works
+    /// with or without host output, so a muted run can still be checked.
+    fn dump(&self, pcm: &[Vec<(i16, i16)>; 2], rates: &[u32; 2]) {
+        use std::io::Write;
+        let mut dump = self.dump.lock();
+        let Some(w) = dump.as_mut() else { return };
+        for out in 0..2 {
+            if pcm[out].is_empty() {
+                continue;
+            }
+            let mut rec = Vec::with_capacity(9 + pcm[out].len() * 4);
+            rec.push(out as u8);
+            rec.extend_from_slice(&rates[out].to_le_bytes());
+            rec.extend_from_slice(&(pcm[out].len() as u32).to_le_bytes());
+            for &(l, r) in &pcm[out] {
+                rec.extend_from_slice(&l.to_le_bytes());
+                rec.extend_from_slice(&r.to_le_bytes());
+            }
+            let _ = w.write_all(&rec);
+        }
+        let _ = w.flush();
     }
 
     /// Resample each channel to the host rate, mix and push.
