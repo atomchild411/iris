@@ -469,7 +469,9 @@ struct TcpConn {
 
 struct TcpSocketBackend {
     listener: TcpListener,
-    conn: Mutex<Option<TcpConn>>,
+    /// Every connected client: each sees all the output and may type, so a
+    /// person at the console and a script can share it.
+    conns: Mutex<Vec<TcpConn>>,
 }
 
 impl TcpSocketBackend {
@@ -492,86 +494,90 @@ impl TcpSocketBackend {
         }
         Some(Self {
             listener,
-            conn: Mutex::new(None),
+            conns: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Take any clients waiting to connect, offering each telnet character
+    /// mode. One whose handshake cannot be written is dropped; it can
+    /// reconnect.
+    fn accept_waiting(&self, conns: &mut Vec<TcpConn>) {
+        while let Ok((socket, _)) = self.listener.accept() {
+            if socket.set_nonblocking(true).is_err() {
+                continue;
+            }
+            let mut c = TcpConn { stream: socket, telnet: crate::net::telnet::TelnetFilter::new() };
+            if c.stream.write_all(&crate::net::telnet::TelnetFilter::initial_handshake()).is_ok() {
+                conns.push(c);
+            }
+        }
     }
 }
 
 impl SerialBackend for TcpSocketBackend {
     fn send_byte(&self, byte: u8) {
-        let mut guard = self.conn.lock();
-        if let Some(ref mut c) = *guard {
-            let mut buf = Vec::with_capacity(2);
-            crate::net::telnet::escape_byte(byte, &mut buf);
-            if let Err(e) = c.stream.write_all(&buf) {
-                if e.kind() != io::ErrorKind::WouldBlock {
-                    *guard = None;
-                }
-            }
+        let mut conns = self.conns.lock();
+        if conns.is_empty() {
+            return;
         }
+        let mut buf = Vec::with_capacity(2);
+        crate::net::telnet::escape_byte(byte, &mut buf);
+        conns.retain_mut(|c| match c.stream.write_all(&buf) {
+            Ok(()) => true,
+            Err(e) => e.kind() == io::ErrorKind::WouldBlock,
+        });
     }
 
     fn recv_byte(&self) -> io::Result<u8> {
-        let mut guard = self.conn.lock();
-
-        if guard.is_none() {
-            match self.listener.accept() {
-                Ok((socket, _)) => {
-                    socket.set_nonblocking(true)?;
-                    let mut c = TcpConn {
-                        stream: socket,
-                        telnet: crate::net::telnet::TelnetFilter::new(),
-                    };
-                    // Send the initial WILL/DO offers. If the write fails,
-                    // drop the connection — the client can reconnect.
-                    let hs = crate::net::telnet::TelnetFilter::initial_handshake();
-                    if c.stream.write_all(&hs).is_err() {
-                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "handshake failed"));
-                    }
-                    *guard = Some(c);
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"));
-                }
-                Err(e) => return Err(e),
-            }
+        let mut conns = self.conns.lock();
+        self.accept_waiting(&mut conns);
+        if conns.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"));
         }
-
-        // Pull bytes one at a time through the telnet filter until either a
-        // real data byte falls out or the socket has nothing more to give.
-        loop {
-            let c = guard.as_mut().unwrap();
-            let mut buf = [0u8; 1];
-            match c.stream.read(&mut buf) {
-                Ok(1) => {
-                    let mut reply = Vec::new();
-                    let data = c.telnet.feed(buf[0], &mut reply);
-                    if !reply.is_empty() {
-                        if let Err(e) = c.stream.write_all(&reply) {
-                            if e.kind() != io::ErrorKind::WouldBlock {
-                                *guard = None;
-                                return Err(e);
+        // Each client in turn: pull bytes through its telnet filter until a
+        // real data byte falls out or it has nothing more to give. A client
+        // that has gone away is dropped.
+        let mut i = 0;
+        while i < conns.len() {
+            let mut gone = false;
+            loop {
+                let c = &mut conns[i];
+                let mut buf = [0u8; 1];
+                match c.stream.read(&mut buf) {
+                    Ok(1) => {
+                        let mut reply = Vec::new();
+                        let data = c.telnet.feed(buf[0], &mut reply);
+                        if !reply.is_empty() {
+                            if let Err(e) = c.stream.write_all(&reply) {
+                                if e.kind() != io::ErrorKind::WouldBlock {
+                                    gone = true;
+                                    break;
+                                }
                             }
                         }
+                        if let Some(d) = data {
+                            return Ok(d);
+                        }
+                        // Telnet command consumed; keep reading.
                     }
-                    if let Some(d) = data {
-                        return Ok(d);
+                    Ok(_) => {
+                        gone = true;
+                        break;
                     }
-                    // Telnet command consumed; keep reading.
-                }
-                Ok(_) => {
-                    *guard = None;
-                    return Err(io::Error::new(io::ErrorKind::NotConnected, "EOF"));
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock"));
-                }
-                Err(e) => {
-                    *guard = None;
-                    return Err(e);
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        gone = true;
+                        break;
+                    }
                 }
             }
+            if gone {
+                conns.remove(i);
+            } else {
+                i += 1;
+            }
         }
+        Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock"))
     }
 }
 
@@ -1245,6 +1251,61 @@ impl SerialBackend for CiSerialBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two clients on one TCP serial console: both see every byte the guest
+    /// sends, and what either types arrives, with telnet's own commands
+    /// taken out on the way.
+    #[test]
+    fn a_tcp_console_takes_more_than_one_client() {
+        use std::io::{Read, Write};
+        let b = TcpSocketBackend::new(("127.0.0.1", 0)).expect("bind");
+        let port = b.listener.local_addr().unwrap().port();
+        let connect = || {
+            let c = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            c.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            c
+        };
+        let (mut one, mut two) = (connect(), connect());
+        // Accept both (recv_byte takes waiting clients), then read their handshakes.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let hs = crate::net::telnet::TelnetFilter::initial_handshake();
+        let mut got = vec![0u8; hs.len()];
+        let _ = b.recv_byte();
+        one.read_exact(&mut got).expect("first handshake");
+        while std::time::Instant::now() < until {
+            let _ = b.recv_byte();
+            two.set_nonblocking(true).unwrap();
+            let mut probe = [0u8; 1];
+            let ready = matches!(two.peek(&mut probe), Ok(1));
+            two.set_nonblocking(false).unwrap();
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        two.read_exact(&mut got).expect("second handshake");
+        for &c in b"ok" {
+            b.send_byte(c);
+        }
+        let mut out = [0u8; 2];
+        one.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"ok");
+        two.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"ok");
+        // Each types; IAC DO SGA in between is not input.
+        one.write_all(&[b'a', 0xff, 0xfd, 0x03]).unwrap();
+        two.write_all(b"b").unwrap();
+        let mut typed = Vec::new();
+        while typed.len() < 2 && std::time::Instant::now() < until {
+            if let Ok(c) = b.recv_byte() {
+                typed.push(c);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        typed.sort();
+        assert_eq!(typed, b"ab");
+    }
 
     /// Phase 1.7 round-trip: a fresh SCC loaded from a captured save_state must
     /// re-serialize byte-identically. Use new_null so the test doesn't bind any
