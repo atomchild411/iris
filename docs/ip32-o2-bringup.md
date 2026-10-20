@@ -1818,3 +1818,51 @@ R = 4x, G = 4y, and a mip pyramid with each level a solid colour.
 
 Polygon stipple needs nothing from the engine: IRIX's GL stipples polygons
 itself (o2gltest's stippled triangle arrives as runs of lines).
+
+## The demo sweep, and what it found (2026-10-20)
+
+Every program in IRIX's Demos icon catalog, the O2 demos (`/usr/demos/O2`),
+GLUT, perfly and the Quakes were run one at a time on the test clone,
+with screenshots, window lists, the emulator's notes and the audio dumped
+for each (`scratch/o2-sweep`, `sweep.py`). Most demos draw correctly. What
+was wrong, and what it turned out to be:
+
+- **16-bit texel types.** `Texture.mode` 23:20 also names RGBA4 (4),
+  ALPHA (5), INTENSITY (6), LUMINANCE (7) and LUMINANCE_ALPHA (8), all
+  16 bits wide here. RGBA4 has R in the top nibble and LA8 has L in the
+  high byte (spec figure 7-7). The spec draws no 16-bit A, I or L texel.
+  They are taken to sit where LA8 keeps its channels: L and I high, A low.
+  bzflag's luminance font reads cleanly that way. GLQuake's world and
+  status bar (RGBA4), buttonfly's labels (LA8), and bzflag's and Macau's
+  text (L) had drawn untextured.
+- **Texture coordinates run from 1.0 to 2.0.** IRIX's GL hands the engine
+  s and t offset by 1.0 (16384 in 1.14). A repeating map hides that. A
+  clamped map read its far edge for every pixel: distort's picture came
+  out one tan colour, and Quake 3's lightmaps came out black, and its walls
+  with them. perfly's hubcap centre, s 1.49, agrees.
+- **GL lines without blending.** Whether such a line covers a pixel is up
+  to coverage alone. Weighing coverage by the colour's alpha drew none of
+  amesh's mesh, whose IRIS GL RGB colours carry alpha 0.
+- **MACE UST counts every 960 ns** (33.3 MHz / 32, spec 7.2.2), as IRIX
+  converts it. Counting microseconds ran 4% slow against the codec.
+- **gr_osview's panel turning yellow** next to mandel is the colour map,
+  not the scan-out. mandel is a 12-bit colour-index window (I12), which
+  looks up entries 0-4095 directly, the same RAM as the 8-bit windows'
+  maps (`cm` << 8). Installing its map overwrites gr_osview's map 14
+  until 4Dwm reinstalls that one. The GBE spec describes the same sharing,
+  so a real O2 should flash the same way (unconfirmed).
+- **Quake 3** dies of SIGBUS in its RoQ cinematic: `move4_32` copies with
+  `ldc1` from a 4-byte-aligned buffer. That is an address error on real
+  hardware too, so it is a port bug, not the emulator. `IRIS_TRAP_LOG`
+  found it.
+- **Quake 2's sound** ran dry about 45 times a second for a moment each.
+  `sfplay` of a steady file at 11025 Hz ran dry 6 times in 18 s, so the
+  audio path holds. Quake 2 under emulation does not keep the port fed,
+  and `s_mixahead` does not change that.
+
+Instruments added for it: the control port's `pixel X Y` (one scanned-out
+point: frame-buffer word, DID, mode-table entry, colour map, overlay) and
+`unmapped`; `IRIS_O2_FRAG_PROBE=x,y` (every triangle fragment at a pixel,
+with texture coordinates, LOD and level); `IRIS_O2_AUDIO_DUMP` (each
+output's samples at the guest's rate); and the "ring ran dry" count in the
+audio trace.
