@@ -55,14 +55,17 @@ pub const CRIME_LINE: u32 = 6;
 mod ad1843 {
     /// Register 0: INIT (15) and PDNO (14) read 0 once the codec is up.
     pub const STATUS: usize = 0;
-    /// Register 9 / 10: DAC1 / DAC2 analog gain and mute (bit 15 left, 7 right).
+    /// Register 9 / 10: DAC1 / DAC2 analog gain (13:8 left, 5:0 right,
+    /// 1.5 dB steps, 8 unity, 0 loudest) and mute (bit 15 left, 7 right).
     pub const DAC1_GAIN: usize = 9;
     pub const DAC2_GAIN: usize = 10;
-    /// Register 11 / 12: DAC1 / DAC2 digital mute (bit 15 left, 7 right).
+    /// Register 11 / 12: DAC1 / DAC2 digital attenuation (same fields, 0 is
+    /// 0 dB) and mute.
     pub const DAC1_MUTE: usize = 11;
     pub const DAC2_MUTE: usize = 12;
-    /// Register 15: DAC1 clock source in bits 9:8, DAC2 in 11:10 (1-3: clock
-    /// generator 1-3; 0: none).
+    /// Register 15: DAC1 clock source in bits 9:8, DAC2 in 11:10, the left
+    /// and right ADCs in 3:2 and 1:0 (0: a fixed 48 kHz; 1-3: clock
+    /// generator 1-3).
     pub const CLOCK_SRC: usize = 15;
     /// Registers 17, 20, 23: clock generator 1-3 sample rate, in hertz.
     pub const CLOCK_RATE: [usize; 3] = [17, 20, 23];
@@ -87,16 +90,39 @@ struct Chan {
     sub: u32,
     msc: u32,
     ust: u32,
-    /// When the channel started playing, and the frames it has played since.
+    /// When the channel started running at `rate`, and the frames it has
+    /// moved since.
     start: Option<Instant>,
     done: u64,
+    rate: u32,
 }
 
 impl Chan {
-    const RESET: Self = Self { ctl: CTRL_RESET, rptr: 0, wptr: 0, sub: 0, msc: 0, ust: 0, start: None, done: 0 };
+    const RESET: Self = Self { ctl: CTRL_RESET, rptr: 0, wptr: 0, sub: 0, msc: 0, ust: 0, start: None, done: 0, rate: 0 };
 
     fn running(&self) -> bool {
         self.ctl & CTRL_RESET == 0 && self.ctl & CTRL_ENABLE != 0
+    }
+
+    /// Frames due at `rate` since the channel started, at most a quarter
+    /// second behind (a host stall is skipped, not replayed). A new rate
+    /// starts the count again: amesh moved a running clock from 48 to
+    /// 32 kHz, the old count passed the new target, and the difference,
+    /// unsigned, wrapped to a loop the service thread never left.
+    fn due(&mut self, now: Instant, rate: u32) -> u64 {
+        if self.start.is_none() || self.rate != rate {
+            self.start = Some(now);
+            self.done = 0;
+            self.rate = rate;
+        }
+        let target = (now - self.start.unwrap()).as_micros() as u64 * rate as u64 / 1_000_000;
+        let lag = rate as u64 / 4;
+        if target > self.done + lag {
+            self.done = target - lag;
+        }
+        let due = target.saturating_sub(self.done);
+        self.done = self.done.max(target);
+        due
     }
 
     /// Blocks in the ring: write minus read, in 32-byte units.
@@ -137,8 +163,15 @@ struct State {
 impl State {
     fn new() -> Self {
         let mut codec = [0u16; 32];
-        // Out of reset: converters powered down until software says.
+        // Out of reset: converters powered down until software says, and the
+        // clock generators at 48 kHz. IRIX resets the codec after the PROM's
+        // chime and never writes a rate for its desktop sounds; with the
+        // rates cleared the channel never drained, and the program waiting on
+        // it (the desktop, restarting) hung polling the read pointer.
         codec[ad1843::POWER] = 0x8000;
+        for r in ad1843::CLOCK_RATE {
+            codec[r] = 48000;
+        }
         Self { ctl: 1, codec_ctl: 1 << 16, mask: 0, status_in: 0, ch: [Chan::RESET; 3], codec }
     }
 
@@ -157,19 +190,48 @@ impl State {
         if c[ad1843::POWER] & 0x8000 != 0 || c[ad1843::ENABLES] & (1 << (7 + dac)) == 0 {
             return None;
         }
-        let src = (c[ad1843::CLOCK_SRC] >> (6 + 2 * dac)) & 3;
-        if src == 0 || c[ad1843::POWER] & (1 << (10 + src)) == 0 {
+        Self::clock(c, (c[ad1843::CLOCK_SRC] >> (6 + 2 * dac)) & 3)
+    }
+
+    /// The rate a converter clocked from source `src` runs at: 0 is the
+    /// fixed 48 kHz, 1-3 a clock generator, if it is on.
+    fn clock(c: &[u16; 32], src: u16) -> Option<u32> {
+        if src == 0 {
+            return Some(48000);
+        }
+        if c[ad1843::POWER] & (1 << (10 + src)) == 0 {
             return None;
         }
         let rate = c[ad1843::CLOCK_RATE[src as usize - 1]] as u32;
         (4000..=54000).contains(&rate).then_some(rate)
     }
 
-    /// Whether a DAC's left and right are muted (analog or digital).
-    fn dac_muted(&self, dac: usize) -> (bool, bool) {
-        let (g, m) = if dac == 1 { (ad1843::DAC1_GAIN, ad1843::DAC1_MUTE) } else { (ad1843::DAC2_GAIN, ad1843::DAC2_MUTE) };
-        let muted = |bit: u16| self.codec[g] & bit != 0 || self.codec[m] & bit != 0;
-        (muted(0x8000), muted(0x80))
+    /// The rate the ADC records at, or None while it is off: the left
+    /// channel's clock source (register 15 bits 3:2) and enable (27 bit 0).
+    fn adc_rate(&self) -> Option<u32> {
+        let c = &self.codec;
+        if c[ad1843::POWER] & 0x8000 != 0 || c[ad1843::ENABLES] & 1 == 0 {
+            return None;
+        }
+        Self::clock(c, (c[ad1843::CLOCK_SRC] >> 2) & 3)
+    }
+
+    /// A DAC's left and right gains as factors. The analog register's
+    /// 6-bit field (13:8 left, 5:0 right) is a gain/attenuation in 1.5 dB
+    /// steps with 8 at unity, as the codec's mixer gains are, so 0 (IRIX's
+    /// loudest) is +12 dB; the digital register's field (same bits) is an
+    /// attenuation from 0 dB. Either register's bit 15 / 7 mutes.
+    fn dac_gain(&self, dac: usize) -> (f32, f32) {
+        let (g, d) = if dac == 1 { (ad1843::DAC1_GAIN, ad1843::DAC1_MUTE) } else { (ad1843::DAC2_GAIN, ad1843::DAC2_MUTE) };
+        let one = |mute: u16, shift: u32| {
+            if self.codec[g] & mute != 0 || self.codec[d] & mute != 0 {
+                return 0.0;
+            }
+            let analog = 8.0 - ((self.codec[g] >> shift) & 0x3f) as f32;
+            let digital = -(((self.codec[d] >> shift) & 0x3f) as f32);
+            10f32.powf(1.5 * (analog + digital) / 20.0)
+        };
+        (one(0x8000, 8), one(0x80, 0))
     }
 
     /// The ISA interrupt bits: status word (0), volume (1), then each
@@ -213,6 +275,10 @@ pub struct MaceAudio {
     config: Mutex<Option<AudioConfig>>,
     tried_open: AtomicBool,
     underruns: Arc<AtomicU64>,
+    /// For the trace: non-zero sample pairs each output played, and when
+    /// that was last reported.
+    heard: [AtomicU64; 2],
+    last_report: Mutex<Option<Instant>>,
 }
 
 impl Default for MaceAudio {
@@ -229,6 +295,8 @@ impl MaceAudio {
             config: Mutex::new(None),
             tried_open: AtomicBool::new(false),
             underruns: Arc::new(AtomicU64::new(0)),
+            heard: [AtomicU64::new(0), AtomicU64::new(0)],
+            last_report: Mutex::new(None),
         }
     }
 
@@ -365,41 +433,59 @@ impl MaceAudio {
         let now = Instant::now();
         let mut pcm: [Vec<(i16, i16)>; 2] = [Vec::new(), Vec::new()];
         let mut rates = [0u32; 2];
+        let mut ram = io.ram.lock().unwrap();
+        // The input: no host capture yet, so the ADC delivers silence at its
+        // rate, as a quiet microphone would. A recording program (amesh)
+        // then sees its ring fill instead of waiting for ever.
+        match st.adc_rate() {
+            Some(rate) if st.ch[0].running() => {
+                let c = &mut st.ch[0];
+                for _ in 0..c.due(now, rate) {
+                    let next = (c.wptr + BLOCK) & PTR_MASK;
+                    if c.sub == 0 && next == c.rptr {
+                        break; // full: the engine never fills the last slot
+                    }
+                    let addr = io.ring_base | c.wptr | c.sub * 8;
+                    if let Some(o) = ram.dma_offset(addr).filter(|&o| o + 8 <= ram.len()) {
+                        // Each half: sign extension, the sample, 0xff.
+                        ram.put_be(o, 4, 0xff);
+                        ram.put_be(o + 4, 4, 0xff);
+                    }
+                    c.sub += 1;
+                    if c.sub == 4 {
+                        c.sub = 0;
+                        c.wptr = next;
+                    }
+                    c.msc = c.msc.wrapping_add(1);
+                    c.ust = io.ust;
+                }
+            }
+            _ => st.ch[0].start = None,
+        }
         for out in 0..2 {
             let n = out + 1;
-            let Some(rate) = st.dac_rate(n) else {
-                st.ch[n].start = None;
-                continue;
+            let rate = match st.dac_rate(n) {
+                Some(r) if st.ch[n].running() => r,
+                _ => {
+                    st.ch[n].start = None;
+                    continue;
+                }
             };
-            if !st.ch[n].running() {
-                st.ch[n].start = None;
-                continue;
-            }
-            let (mute_l, mute_r) = st.dac_muted(n);
+            let (gain_l, gain_r) = st.dac_gain(n);
             let c = &mut st.ch[n];
-            if c.start.is_none() {
-                c.start = Some(now);
-                c.done = 0;
-            }
-            let start = c.start.unwrap();
-            // Frames due since the channel started, at most a quarter second
-            // behind (a host stall is skipped, not replayed).
-            let target = (now - start).as_micros() as u64 * rate as u64 / 1_000_000;
-            if target > c.done + rate as u64 / 4 {
-                c.done = target - rate as u64 / 4;
-            }
-            let due = target - c.done;
-            c.done = target;
             rates[out] = rate;
-            let ram = io.ram.lock().unwrap();
-            for _ in 0..due {
+            for _ in 0..c.due(now, rate) {
                 let mut item = (0i16, 0i16);
                 if c.depth() != 0 {
                     let addr = io.ring_base | (n as u32) << 12 | c.rptr | c.sub * 8;
                     if let Some(o) = ram.dma_offset(addr).filter(|&o| o + 8 <= ram.len()) {
                         let half = |w: u32| ((w as i32) >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                         let (l, r) = (half(ram.get_be(o, 4)), half(ram.get_be(o + 4, 4)));
-                        item = (if mute_l { 0 } else { l }, if mute_r { 0 } else { r });
+                        let scale = |v: i16, g: f32| (v as f32 * g).round() as i16;
+                        item = (scale(l, gain_l), scale(r, gain_r));
+                        if l != 0 || r != 0 {
+                            self.heard[out].fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     c.sub += 1;
                     if c.sub == 4 {
@@ -412,7 +498,18 @@ impl MaceAudio {
                 pcm[out].push(item);
             }
         }
+        drop(ram);
         drop(st);
+        if tracing() {
+            let mut last = self.last_report.lock();
+            if last.is_none_or(|t| t.elapsed().as_secs() >= 1) {
+                *last = Some(now);
+                let h = [0, 1].map(|k| self.heard[k].swap(0, Ordering::Relaxed));
+                if h != [0, 0] {
+                    eprintln!("o2audio: non-zero pairs played: out1 {} out2 {}", h[0], h[1]);
+                }
+            }
+        }
         if pcm.iter().all(|p| p.is_empty()) {
             return;
         }
@@ -486,8 +583,73 @@ mod tests {
         assert_ne!(read_codec(&a, 0) & 0x4000, 0, "converters powered down");
         write_codec(&a, 28, 0x3800);
         assert_eq!(read_codec(&a, 0) & 0xc000, 0, "powered up");
+        assert_eq!(read_codec(&a, 17), 48000, "clock 1 at 48 kHz from reset");
         write_codec(&a, 17, 44100);
         assert_eq!(read_codec(&a, 17), 44100);
+    }
+
+    /// Changing a running channel's rate restarts its pacing instead of
+    /// wrapping the frame count (amesh, 48 to 32 kHz, hung the machine).
+    #[test]
+    fn a_rate_change_restarts_the_pacing() {
+        let mut c = Chan { ctl: CTRL_ENABLE, ..Chan::RESET };
+        let t0 = Instant::now();
+        assert_eq!(c.due(t0, 48000), 0);
+        let t1 = t0 + std::time::Duration::from_millis(100);
+        assert_eq!(c.due(t1, 48000), 4800);
+        let t2 = t1 + std::time::Duration::from_millis(1);
+        assert_eq!(c.due(t2, 32000), 0, "new rate: count starts again");
+        let t3 = t2 + std::time::Duration::from_millis(10);
+        assert_eq!(c.due(t3, 32000), 320);
+    }
+
+    /// With the ADC running, the input ring fills with silence (0xff in
+    /// each half) up to one block short of full.
+    #[test]
+    fn the_input_ring_fills_with_silence() {
+        let ram = std::sync::Mutex::new(O2Memory::single(8 << 20));
+        let a = MaceAudio::new();
+        a.write(MACE_AUDIO, 0);
+        write_codec(&a, 28, 0x1000); // clock 2 on, converters up
+        write_codec(&a, 20, 48000);
+        write_codec(&a, 15, 2 << 2 | 2); // ADCs from clock 2
+        write_codec(&a, 27, 3); // ADCs on
+        a.write(MACE_AUDIO + 0x20, 0);
+        a.write(MACE_AUDIO + 0x20, CTRL_ENABLE | 6 << 5); // interrupt when full
+        let ring_base = 0x0010_0000u32;
+        let io = AudioIo { ram: &ram, ring_base, ust: 1 };
+        a.poll(&io);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        a.poll(&io);
+        let wp = a.read(MACE_AUDIO + 0x30) as u32;
+        assert!(wp > 0, "the engine wrote");
+        let m = ram.lock().unwrap();
+        assert_eq!(m.get_be(m.dma_offset(ring_base).unwrap(), 4), 0xff);
+        drop(m);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        a.poll(&io);
+        assert_eq!(a.read(MACE_AUDIO + 0x38) as u32, PTR_MASK, "full: one block short");
+        assert_ne!(a.isa_bits() & 0x04, 0, "the full threshold raised the input bit");
+    }
+
+    /// The DAC gain register attenuates by 1.5 dB a step and mutes.
+    #[test]
+    fn dac_gain_attenuates_and_mutes() {
+        let a = MaceAudio::new();
+        a.write(MACE_AUDIO, 0);
+        let gains = |a: &MaceAudio| a.st.lock().dac_gain(1);
+        write_codec(&a, 9, 0x0808); // unity
+        assert_eq!(gains(&a), (1.0, 1.0));
+        write_codec(&a, 9, 0x0c0c); // 6 dB down
+        let (l, r) = gains(&a);
+        assert!((l - 0.501).abs() < 0.01 && (r - 0.501).abs() < 0.01);
+        write_codec(&a, 9, 0x0000); // IRIX's loudest: +12 dB
+        assert!((gains(&a).0 - 3.98).abs() < 0.02);
+        write_codec(&a, 9, 0x0808);
+        write_codec(&a, 11, 0x0400); // left digitally 6 dB down
+        assert!((gains(&a).0 - 0.501).abs() < 0.01 && gains(&a).1 == 1.0);
+        write_codec(&a, 9, 0x8808); // left muted
+        assert_eq!(gains(&a).0, 0.0);
     }
 
     /// An output channel plays its ring at its DAC's rate, the hardware
