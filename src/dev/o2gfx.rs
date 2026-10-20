@@ -1361,6 +1361,13 @@ impl CrimeRe {
             return;
         }
         let (step_x, step_row) = (g(XFER_STEP_X), g(XFER_STEP_ROW));
+        // A linear end is addressed in bytes, but its pixels are words of
+        // the buffer's depth; an address off that alignment is taken down
+        // to it (demograph's transfers aborted the emulator on 0x...001).
+        let skew = |b: u32, bd: u32, a: u32| lin(b) && (a | step_x | step_row) & (bd - 1) != 0;
+        if skew(sb, sbd, g(XFER_SRC)) || skew(db, dbd, g(XFER_DST)) {
+            self.note(format!("xfer unaligned linear end (src {sb}/{sbd}, dst {db}/{dbd})"));
+        }
         let width = (xb - xa) as u32;
         // Offset of pixel (x, y) from the top-left one, along the linear end.
         let lin_off = |x: i32, y: i32| -> u32 {
@@ -1375,7 +1382,7 @@ impl CrimeRe {
         let src_at = |mem: &O2Memory, x: i32, y: i32| -> Option<usize> {
             if lin(sb) {
                 let a = g(XFER_SRC).wrapping_add(lin_off(x, y));
-                Self::linear(r, mem, sb - 4, a)
+                Self::linear(r, mem, sb - 4, a & !(sbd - 1))
             } else {
                 let (px, py) = (x + sx0 - x0, y + sy0 - y0);
                 if px < 0 || py < 0 {
@@ -1387,7 +1394,7 @@ impl CrimeRe {
         let dst_at = |mem: &O2Memory, x: i32, y: i32| -> Option<usize> {
             if lin(db) {
                 let a = g(XFER_DST).wrapping_add(lin_off(x, y));
-                Self::linear(r, mem, db - 4, a)
+                Self::linear(r, mem, db - 4, a & !(dbd - 1))
             } else {
                 Self::locate(r, mem, dst_tiled, x as u32, y as u32)
             }
@@ -2381,6 +2388,32 @@ mod tests {
         let m = ram.lock().unwrap();
         // Pixel (10, 0): word 10 of the first tile row.
         assert_eq!(&m.bytes(0x0100_0000 + 40, (0x0100_0000 + 44) - (0x0100_0000 + 40)), &[0, 0, 0, 0x21]);
+    }
+
+    /// A 32-bit linear end at a byte address (a step of 1, or a start off
+    /// the word) is taken down to its word, not stored unaligned: opening
+    /// demograph aborted the emulator on a write to 0x...001.
+    #[test]
+    fn a_32bit_linear_end_off_its_word_does_not_abort() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        let dst = 0x1038_f001u32;
+        let page = 0x0050_0000u32;
+        let idx = (dst >> 12) & 31;
+        re.write64(base + TLB_LINEAR_A + 0x80 + 8 * (idx / 2), if idx & 1 == 1 { 0x8000_0000 | (page >> 12) as u64 } else { (0x8000_0000 | (page >> 12) as u64) << 32 });
+        re.write32(base + BUFMODE_SRC, 0x0200);
+        re.write32(base + BUFMODE_DST, 0x1600);
+        re.write32(base + DRAWMODE, 0x0020_0078);
+        re.write32(base + PRIMITIVE, 0x0302_0000);
+        re.write32(base + VERTEX_0, 0);
+        re.write32(base + VERTEX_1, 7 << 16);
+        re.write32(base + XFER_STEP_X, 1);
+        re.write32(base + XFER_STEP_ROW, 0);
+        re.write32(base + XFER_DST, dst);
+        re.write32(base + (XFER_SRC | 0x800), 0);
+        assert!(re.unhandled.lock().unwrap().keys().any(|k| k.starts_with("xfer unaligned linear end")));
     }
 
     #[test]
