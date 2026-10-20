@@ -937,6 +937,9 @@ mod draw {
     pub const DEPTH_TEST: u32 = 1 << 2;
     pub const DEPTH_MASK: u32 = 1 << 1;
     pub const LOGIC_OP: u32 = 1 << 9;
+    /// Dithering, set by GL (on by default in OpenGL). The spec's table
+    /// swaps this with LOGIC_OP: see docs/ip32-o2-bringup.md.
+    pub const DITHER: u32 = 1 << 8;
     pub const PLANE_MASK: u32 = 1 << 7;
 }
 
@@ -1773,6 +1776,14 @@ impl CrimeRe {
                 // low one, which IRIX's WID for it, 0x11, shows). The 16-bit
                 // pixel is A1R5G5B5, as GBE decodes it.
                 let half = dmode & 2 != 0 && (dmode >> 2) & 3 == 1 && dst.bd == 4;
+                // Dithering into the 5-bit channels of a double-pix window
+                // (Quake 2's): without it a lightmapped wall falls into a few
+                // flat steps of 8 levels each.
+                let dither = dm & draw::DITHER != 0 && half;
+                let pack_at = |x: i32, y: i32, cr: u32, cg: u32, cb: u32, ca: u32| -> u32 {
+                    let d = |c: u32| Self::dither5(c, x, y);
+                    (u32::from(ca >= 0x80) << 15) | (d(cr) << 10) | (d(cg) << 5) | d(cb)
+                };
                 let pack = |cr: u32, cg: u32, cb: u32, ca: u32| -> u32 {
                     if half {
                         let c5 = |c: u32| c >> 3;
@@ -1961,7 +1972,7 @@ impl CrimeRe {
                         if clip.ok(x, y) {
                             // GL order: the alpha test before the depth test,
                             // so a rejected fragment leaves depth alone.
-                            let src = if atest || blend { Some(rgba_at(mem, px, py)) } else { None };
+                            let src = if atest || blend || dither { Some(rgba_at(mem, px, py)) } else { None };
                             if atest && !Self::alpha_pass(afunc, aref, src.unwrap()[3]) {
                                 continue;
                             }
@@ -1993,8 +2004,9 @@ impl CrimeRe {
                                     Some(c) if blend => {
                                         let (at, n) = if half { (o + half_off, 2) } else { (o, 4) };
                                         let [r8, g8, b8, a8] = Self::blend(bfunc, bconst, c, unpack(Self::get_px(mem, at, n)));
-                                        pack(r8, g8, b8, a8)
+                                        if dither { pack_at(x, y, r8, g8, b8, a8) } else { pack(r8, g8, b8, a8) }
                                     }
+                                    Some([r8, g8, b8, a8]) if dither => pack_at(x, y, r8, g8, b8, a8),
                                     Some([r8, g8, b8, a8]) => pack(r8, g8, b8, a8),
                                     None => colour_at(mem, px, py),
                                 };
@@ -2055,6 +2067,15 @@ impl CrimeRe {
             };
             (v.clamp(0.0, 1.0) * 255.0).round() as u32
         })
+    }
+
+    /// An 8-bit channel reduced to 5 bits with a 4 x 4 ordered dither at
+    /// pixel (x, y): the threshold spreads the 8 levels each 5-bit step
+    /// drops over the cell. The spec does not give CRIME's matrix; this is
+    /// the standard Bayer one.
+    fn dither5(c: u32, x: i32, y: i32) -> u32 {
+        const BAYER: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+        ((c + BAYER[(y & 3) as usize][(x & 3) as usize] / 2) >> 3).min(31)
     }
 
     /// The alpha test: whether alpha `a` passes function `func` against `aref`.
@@ -2724,6 +2745,19 @@ mod tests {
         assert_eq!(px(&ram), &[0, 255, 0]);
         tri(16);
         assert_eq!(px(&ram), &[0, 0, 255]);
+    }
+
+    /// Ordered dithering to 5 bits: exact steps stay exact, and a value
+    /// between two steps comes out as a mix of both over a 4 x 4 cell, in
+    /// proportion (12 of 8.5 levels up from 96: 4/8 of the cell at 13).
+    #[test]
+    fn dithering_to_five_bits_mixes_neighbouring_steps() {
+        let cell = |c: u32| (0..16).map(|i| CrimeRe::dither5(c, i % 4, i / 4)).collect::<Vec<_>>();
+        assert!(cell(96).iter().all(|&v| v == 12));
+        assert!(cell(255).iter().all(|&v| v == 31));
+        let mid = cell(100);
+        assert_eq!(mid.iter().filter(|&&v| v == 13).count(), 8);
+        assert!(mid.iter().all(|&v| v == 12 || v == 13));
     }
 
     #[test]

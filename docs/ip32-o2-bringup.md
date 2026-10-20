@@ -1770,8 +1770,14 @@ The spec's DrawMode table has enLogicOp at bit 8 and enDither at bit 9.
 IRIX uses them the other way round: the X server sets bit 9 with LogicOp 3
 (COPY) on every primitive, and GL sets bit 8 (dithering is on by default in
 OpenGL) with a LogicOp of 0, which as a logic op would be CLEAR and draw
-every GL primitive black. `draw::LOGIC_OP` is bit 9, and bit 8 is ignored
-(no dithering is modelled).
+every GL primitive black. `draw::LOGIC_OP` is bit 9 and `draw::DITHER` bit 8.
+
+Dithering matters in the double-pix windows a double-buffered GL visual
+gets (BufMode 0x226/0x227: A1R5G5B5 halves): Quake 2 lightmaps every wall
+by multiplying the frame buffer (blend 0x2), and at 5 bits a channel the
+result fell into flat bands. Triangles into those windows now dither with
+a 4 x 4 ordered (Bayer) matrix (`CrimeRe::dither5`); CRIME's own matrix is
+not in the spec.
 
 ## Blending and the alpha test (2026-10-19)
 
