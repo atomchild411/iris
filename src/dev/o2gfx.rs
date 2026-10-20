@@ -1675,7 +1675,11 @@ impl CrimeRe {
                         }
                     }
                 };
-                let flat = pack(cr, cg, cb, ca);
+                // A flat colour-index triangle (pixel type 0) takes its index
+                // from FG as it stands, the low byte, as points, lines and
+                // rectangles do: read as RGBA it is the red channel, FG >> 24,
+                // which drew gr_osview's index-2 bars as index 0.
+                let flat = if (dmode >> 4) & 0xf == 0 && !smooth { fgc } else { pack(cr, cg, cb, ca) };
                 // Texture (draw mode bit 15): s/q and t/q from the same start
                 // point as the colours, modulating them (perfly's texture
                 // function; the others are not modelled yet).
@@ -2388,6 +2392,28 @@ mod tests {
         let m = ram.lock().unwrap();
         // Pixel (10, 0): word 10 of the first tile row.
         assert_eq!(&m.bytes(0x0100_0000 + 40, (0x0100_0000 + 44) - (0x0100_0000 + 40)), &[0, 0, 0, 0x21]);
+    }
+
+    /// A flat colour-index GL triangle stores FG's index as it stands, as
+    /// gr_osview's bars ask (FG 2 into a pixel-type-0 buffer).
+    #[test]
+    fn a_flat_colour_index_triangle_stores_fg_as_its_index() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        re.write32(base + BUFMODE_DST, 0x200);
+        re.write32(base + DRAWMODE, 0x0040_0178);
+        re.write32(base + PRIMITIVE, 0x0200_0000);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        re.write64(base + TRI_V0, (gl(0) as u64) << 32 | gl(0) as u64);
+        re.write64(base + TRI_V0 + 8, (gl(16) as u64) << 32 | gl(0) as u64);
+        re.write64(base + TRI_V0 + 16, (gl(0) as u64) << 32 | gl(8) as u64);
+        re.write32(base + (FG | 0x800), 2);
+        let m = ram.lock().unwrap();
+        // Pixel (2, 1): row 1 of the first tile, 512 bytes a row.
+        let o = 0x0100_0000 + 512 + 2 * 4;
+        assert_eq!(&m.bytes(o, 4), &[0, 0, 0, 2]);
     }
 
     /// A 32-bit linear end at a byte address (a step of 1, or a start off
