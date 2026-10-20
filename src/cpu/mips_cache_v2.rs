@@ -202,7 +202,7 @@ impl From<L1ITag> for u32 {
 /// `supported == false` means the cache cannot serve the inline path at all
 /// (no cache, or a shape the first implementation does not cover, e.g. R5000's
 /// 2-way L1-D — see docs/jit-inline-memory.md §4).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitDcGeometry {
     pub supported: bool,
     /// `addr >> line_shift & num_lines_mask` = tag index.
