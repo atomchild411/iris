@@ -128,6 +128,9 @@ pub struct Gbe {
     /// The 64 KB tiles the last rendered frame came from (physical >> 16),
     /// for a memory watch that wants only what is on screen.
     pub displayed: Mutex<std::collections::HashSet<u32>>,
+    /// The control port's `pixel X Y`: the point to describe on the next
+    /// frame, and what the scan-out found there.
+    pub probe: Mutex<(Option<(usize, usize)>, String)>,
 }
 
 impl Gbe {
@@ -136,7 +139,7 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), displayed: Mutex::new(Default::default()) }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), displayed: Mutex::new(Default::default()), probe: Mutex::new((None, String::new())) }
     }
 
     /// Run the beam on the CPU's instruction count at `mhz` rather than on
@@ -521,6 +524,7 @@ impl Gbe {
         let gmap = |v: u32, shift: u32| (g(GMAP + 4 * (v & 0xff)) >> shift) & 0xff;
         let crs_on = g(CRS_CTL) & 1 != 0;
         let crs = g(CRS_POS);
+        let probe_at = self.probe.lock().unwrap().0;
         let (cx, cy) = ((crs & 0xffff) as i16 as i32, (crs >> 16) as i16 as i32);
 
         for y in 0..h {
@@ -592,6 +596,13 @@ impl Gbe {
                     (rr, gg, bb) = (gmap(rr, 24), gmap(gg, 16), gmap(bb, 8));
                 }
                 let ov = ovr_at(x, y);
+                if probe_at == Some((x, y)) {
+                    let raw = fetch((y * w + x) * bpp);
+                    self.probe.lock().unwrap().1 = format!(
+                        "raw {raw:#010x} did {} wid {wid:#x} type {typ} cmap {cm} gamma {gamma} pixel {p:#x} rgb {rr:02x}{gg:02x}{bb:02x} overlay {ov:#x}",
+                        if use_did { line_did[x] as i32 } else { -1 }
+                    );
+                }
                 if ov != 0 {
                     let c = cmap(0x1100 + ov);
                     (rr, gg, bb) = (gmap(c >> 24, 24), gmap((c >> 16) & 0xff, 16), gmap((c >> 8) & 0xff, 8));

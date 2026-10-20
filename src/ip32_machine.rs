@@ -672,6 +672,19 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
                 Err(e) => format!("err {e}"),
             }
         }
+        "pixel" => {
+            // pixel X Y: what scan-out makes of one point (frame-buffer word,
+            // DID, mode-table entry, colour map, overlay).
+            let v: Vec<usize> = arg.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            if v.len() != 2 {
+                return "err pixel X Y".into();
+            }
+            *bus.gbe.probe.lock().unwrap() = (Some((v[0], v[1])), "not on screen".into());
+            bus.render_screen(rgba);
+            let mut p = bus.gbe.probe.lock().unwrap();
+            p.0 = None;
+            format!("ok {}", p.1)
+        }
         "status" => {
             let shown = bus.render_screen(rgba);
             format!("ok display {shown:?}; {}", bus.gbe.summary())
