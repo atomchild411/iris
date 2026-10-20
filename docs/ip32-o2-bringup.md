@@ -1763,3 +1763,22 @@ So the clear is skipped (the MTE notes "mte buffers src 0 dst 6") and a
 primitive drawn with the test on notes "clip-ID test (drawn unclipped)".
 When that note appears, capture the trace: it will show what IRIX writes into
 the buffer and how the ID is chosen.
+
+## DrawMode bits 8 and 9 (2026-10-19)
+
+The spec's DrawMode table has enLogicOp at bit 8 and enDither at bit 9.
+IRIX uses them the other way round: the X server sets bit 9 with LogicOp 3
+(COPY) on every primitive, and GL sets bit 8 (dithering is on by default in
+OpenGL) with a LogicOp of 0, which as a logic op would be CLEAR and draw
+every GL primitive black. `draw::LOGIC_OP` is bit 9, and bit 8 is ignored
+(no dithering is modelled).
+
+## Blending and the alpha test (2026-10-19)
+
+Blend.func (RE 0x1a8): op 11:8, source factor 7:4, destination factor 3:0,
+in the spec's (OpenGL's) order; Blend.constColor (0x1a0) RGBA, R high;
+AlphaTest (0x198): function 11:8, reference 7:0. `CrimeRe::blend` follows
+the register for triangles and GL lines; the alpha test runs before the
+depth test, as in GL. Everything IRIX 6.5.22 drew in the traces so far uses
+0x45 (ADD, SRC_ALPHA, ONE_MINUS_SRC_ALPHA), on GL lines (antialiased icon
+outlines) and triangles at alpha 255.

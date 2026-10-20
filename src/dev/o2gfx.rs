@@ -794,6 +794,14 @@ pub mod re_reg {
     pub const DEPTH_DZDX: u32 = 0x21d0;
     pub const DEPTH_DZDY: u32 = 0x21d8;
     pub const BG: u32 = 0x20d8;
+    /// Alpha test: function in 11:8 (NEVER, LESS, EQUAL, LEQUAL, GREATER,
+    /// NOTEQUAL, GEQUAL, ALWAYS), reference in 7:0.
+    pub const ALPHA_TEST: u32 = 0x2198;
+    /// Blend constant colour, RGBA with R high.
+    pub const BLEND_CONST: u32 = 0x21a0;
+    /// Blend op in 11:8, source factor in 7:4, destination factor in 3:0
+    /// (OpenGL's, in the spec's order; see `CrimeRe::blend`).
+    pub const BLEND_FUNC: u32 = 0x21a8;
     pub const LOGIC_OP: u32 = 0x21b0;
     pub const COLOR_MASK: u32 = 0x21b8;
     pub const MTE_MODE: u32 = 0x3000;
@@ -825,6 +833,7 @@ mod draw {
     pub const SHADE: u32 = 1 << 16;
     pub const TEXTURE: u32 = 1 << 15;
     pub const ANTIALIAS_LINE: u32 = 1 << 12;
+    pub const ALPHA_TEST: u32 = 1 << 11;
     pub const BLEND: u32 = 1 << 10;
     pub const DEPTH_TEST: u32 = 1 << 2;
     pub const DEPTH_MASK: u32 = 1 << 1;
@@ -1658,9 +1667,6 @@ impl CrimeRe {
                     c.clamp(0.0, 255.0) as u32
                 };
                 let (cr, cg, cb, ca) = (channel(0, rx, ry), channel(1, rx, ry), channel(2, rx, ry), channel(3, rx, ry));
-                if dm & (1 << 10) != 0 && ca != 0xff {
-                    self.note("blended triangle (drawn opaque)".into());
-                }
                 let dmode = g(BUFMODE_DST);
                 // Double-pix (BufMode bit 1) with 16-bit pixels (3:2 = 1): a
                 // double-buffered GL window keeps front and back in the two
@@ -1704,23 +1710,49 @@ impl CrimeRe {
                 let (sq0, tq0, q0) = (s64r(TEX_SQ0), s64r(TEX_TQ0), s32r(TEX_Q0));
                 let (dsx, dsy, dtx, dty) = (s64r(TEX_DSQDX), s64r(TEX_DSQDY), s64r(TEX_DTQDX), s64r(TEX_DTQDY));
                 let (dqx, dqy) = (s32r(TEX_DQDX), s32r(TEX_DQDY));
-                let colour_at = |mem: &O2Memory, px: f64, py: f64| -> u32 {
+                // The source colour at a pixel as RGBA, before packing: what
+                // the alpha test and blending work on.
+                let rgba_at = |mem: &O2Memory, px: f64, py: f64| -> [u32; 4] {
+                    let base = |px: f64, py: f64| [0, 1, 2, 3].map(|k| channel(k, px, py));
                     let Some(t) = &tex else {
-                        return if shaded {
-                            pack(channel(0, px, py), channel(1, px, py), channel(2, px, py), channel(3, px, py))
-                        } else {
-                            flat
-                        };
+                        return if shaded { base(px, py) } else { [cr, cg, cb, ca] };
                     };
                     let (dx, dy) = (px - rx, py - ry);
                     let q = q0 + dqx * dx + dqy * dy;
                     if q == 0.0 {
-                        return flat;
+                        return [cr, cg, cb, ca];
                     }
                     let tx = t.sample(&r, mem, (sq0 + dsx * dx + dsy * dy) / q, (tq0 + dtx * dx + dty * dy) / q);
                     let m = |k: usize| ((channel(k, px, py) as f64 * tx[k] / 255.0).round() as u32).min(255);
                     let a = if (g(TEX_MODE) >> 20) & 15 == 2 { m(3) } else { channel(3, px, py) };
-                    pack(m(0), m(1), m(2), a)
+                    [m(0), m(1), m(2), a]
+                };
+                let colour_at = |mem: &O2Memory, px: f64, py: f64| -> u32 {
+                    if tex.is_none() && !shaded {
+                        return flat;
+                    }
+                    let [r8, g8, b8, a8] = rgba_at(mem, px, py);
+                    pack(r8, g8, b8, a8)
+                };
+                // Alpha test and blending need the colour as RGBA; neither
+                // applies to colour index (pixel type 0).
+                let rgb_dst = (dmode >> 4) & 0xf != 0 || half;
+                let atest = dm & draw::ALPHA_TEST != 0 && rgb_dst;
+                let blend = dm & draw::BLEND != 0 && rgb_dst && dst.bd == 4;
+                let (afunc, aref) = ((g(ALPHA_TEST) >> 8) & 7, g(ALPHA_TEST) & 0xff);
+                let (bfunc, bconst) = (g(BLEND_FUNC), g(BLEND_CONST));
+                let unpack = |v: u32| -> [u32; 4] {
+                    if half {
+                        let e = |c: u32| (c << 3) | (c >> 2);
+                        [e((v >> 10) & 0x1f), e((v >> 5) & 0x1f), e(v & 0x1f), if v & 0x8000 != 0 { 255 } else { 0 }]
+                    } else {
+                        let v = match (dmode >> 4) & 0xf {
+                            1 => (v << 8) | 0xff,
+                            3 => v.swap_bytes(),
+                            _ => v,
+                        };
+                        [v >> 24, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff]
+                    }
                 };
                 let half_off = if dmode & 1 == 0 { 2 } else { 0 };
                 // Depth: Z0 and its gradients are 64-bit 25.12 (high word
@@ -1797,6 +1829,12 @@ impl CrimeRe {
                     for x in xs..=xe {
                         let px = x as f64;
                         if clip.ok(x, y) {
+                            // GL order: the alpha test before the depth test,
+                            // so a rejected fragment leaves depth alone.
+                            let src = if atest || blend { Some(rgba_at(mem, px, py)) } else { None };
+                            if atest && !Self::alpha_pass(afunc, aref, src.unwrap()[3]) {
+                                continue;
+                            }
                             if depth {
                                 let zs = (z0 + dzdx * (px - rx) + dzdy * (py - ry)).clamp(0.0, 16_777_215.0) as u32;
                                 if let Some(zo) = zrow.at(&r, mem, x as u32, y as u32) {
@@ -1821,7 +1859,15 @@ impl CrimeRe {
                                 }
                             }
                             if let Some(o) = crow.at(&r, mem, x as u32, y as u32) {
-                                let colour = colour_at(mem, px, py);
+                                let colour = match src {
+                                    Some(c) if blend => {
+                                        let (at, n) = if half { (o + half_off, 2) } else { (o, 4) };
+                                        let [r8, g8, b8, a8] = Self::blend(bfunc, bconst, c, unpack(Self::get_px(mem, at, n)));
+                                        pack(r8, g8, b8, a8)
+                                    }
+                                    Some([r8, g8, b8, a8]) => pack(r8, g8, b8, a8),
+                                    None => colour_at(mem, px, py),
+                                };
                                 if half {
                                     Self::put(&r, mem, o + half_off, 2, colour);
                                 } else {
@@ -1833,6 +1879,65 @@ impl CrimeRe {
                 }
             }
             _ => self.note("primitive type 3?".into()),
+        }
+    }
+
+    /// OpenGL blending of source `s` over destination `d` (RGBA, 0-255)
+    /// by the Blend register: op in 11:8 (ADD, MIN, MAX, SUBTRACT,
+    /// REVERSE_SUBTRACT), source factor in 7:4 and destination factor in
+    /// 3:0, numbered as the spec lists them; `konst` is the constant colour,
+    /// RGBA with R high. MIN and MAX ignore the factors, as in OpenGL.
+    fn blend(func: u32, konst: u32, s: [u32; 4], d: [u32; 4]) -> [u32; 4] {
+        let f = |v: u32| v as f64 / 255.0;
+        let (s, d) = (s.map(f), d.map(f));
+        let k = [konst >> 24, (konst >> 16) & 0xff, (konst >> 8) & 0xff, konst & 0xff].map(f);
+        // Factor `code` for channel `i`; `other` is the colour the
+        // COLOR factors name (the destination's for the source factor, the
+        // source's for the destination factor).
+        let factor = |code: u32, other: &[f64; 4], i: usize| -> f64 {
+            match code {
+                0 => 0.0,
+                1 => 1.0,
+                2 => other[i],
+                3 => 1.0 - other[i],
+                4 => s[3],
+                5 => 1.0 - s[3],
+                6 => d[3],
+                7 => 1.0 - d[3],
+                8 => k[i],
+                9 => 1.0 - k[i],
+                10 => k[3],
+                11 => 1.0 - k[3],
+                12 if i < 3 => s[3].min(1.0 - d[3]),
+                12 => 1.0,
+                _ => 1.0,
+            }
+        };
+        let (op, sf, df) = ((func >> 8) & 0xf, (func >> 4) & 0xf, func & 0xf);
+        [0, 1, 2, 3].map(|i| {
+            let (a, b) = (s[i] * factor(sf, &d, i), d[i] * factor(df, &s, i));
+            let v = match op {
+                1 => s[i].min(d[i]),
+                2 => s[i].max(d[i]),
+                3 => a - b,
+                4 => b - a,
+                _ => a + b,
+            };
+            (v.clamp(0.0, 1.0) * 255.0).round() as u32
+        })
+    }
+
+    /// The alpha test: whether alpha `a` passes function `func` against `aref`.
+    fn alpha_pass(func: u32, aref: u32, a: u32) -> bool {
+        match func {
+            0 => false,
+            1 => a < aref,
+            2 => a == aref,
+            3 => a <= aref,
+            4 => a > aref,
+            5 => a != aref,
+            6 => a >= aref,
+            _ => true,
         }
     }
 
@@ -1892,18 +1997,22 @@ impl CrimeRe {
             if !blend && alpha < 0.5 {
                 return;
             }
-            let a = if blend { alpha } else { 1.0 };
-            let mix = |s: u32, d: u32| (s as f64 * a + d as f64 * (1.0 - a)).round() as u32;
+            // Coverage scales the fragment's alpha; with blending off a
+            // fragment is drawn whole once at least half covered.
+            let sa = (alpha * 255.0).round() as u32;
+            let (func, konst) = (g(BLEND_FUNC), g(BLEND_CONST));
             if half {
                 let o = o + half_off;
                 let d = Self::get_px(mem, o, 2);
                 let e = |v: u32| (v << 3) | (v >> 2);
-                let (dr, dg, db) = (e((d >> 10) & 0x1f), e((d >> 5) & 0x1f), e(d & 0x1f));
-                let v = (d & 0x8000) | ((mix(cr, dr) >> 3) << 10) | ((mix(cg, dg) >> 3) << 5) | (mix(cb, db) >> 3);
+                let dc = [e((d >> 10) & 0x1f), e((d >> 5) & 0x1f), e(d & 0x1f), if d & 0x8000 != 0 { 255 } else { 0 }];
+                let [r8, g8, b8, _] = if blend { Self::blend(func, konst, [cr, cg, cb, sa], dc) } else { [cr, cg, cb, ca] };
+                let v = (d & 0x8000) | ((r8 >> 3) << 10) | ((g8 >> 3) << 5) | (b8 >> 3);
                 Self::put(r, mem, o, 2, v);
             } else {
                 let (dr, dg, db) = unpack(Self::get_px(mem, o, 4));
-                Self::put(r, mem, o, dst.bd, pack(mix(cr, dr), mix(cg, dg), mix(cb, db), ca));
+                let [r8, g8, b8, _] = if blend { Self::blend(func, konst, [cr, cg, cb, sa], [dr, dg, db, 255]) } else { [cr, cg, cb, ca] };
+                Self::put(r, mem, o, dst.bd, pack(r8, g8, b8, ca));
             }
         };
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
@@ -2402,6 +2511,55 @@ mod tests {
         let m = ram.lock().unwrap();
         // Pixel (10, 0): word 10 of the first tile row.
         assert_eq!(&m.bytes(0x0100_0000 + 40, (0x0100_0000 + 44) - (0x0100_0000 + 40)), &[0, 0, 0, 0x21]);
+    }
+
+    #[test]
+    fn blending_follows_the_blend_register() {
+        let (s, d) = ([200, 100, 0, 128], [0, 100, 200, 255]);
+        // ADD, SRC_ALPHA, ONE_MINUS_SRC_ALPHA: IRIX's 0x45.
+        assert_eq!(CrimeRe::blend(0x45, 0, s, d), [100, 100, 100, 191]);
+        // ADD, ONE, ONE saturates.
+        assert_eq!(CrimeRe::blend(0x11, 0, s, d), [200, 200, 200, 255]);
+        // MIN and MAX ignore the factors.
+        assert_eq!(CrimeRe::blend(0x100, 0, s, d), [0, 100, 0, 128]);
+        assert_eq!(CrimeRe::blend(0x200, 0, s, d), [200, 100, 200, 255]);
+        // REVERSE_SUBTRACT, ONE, ONE: d - s.
+        assert_eq!(CrimeRe::blend(0x411, 0, s, d), [0, 0, 200, 127]);
+        // CONSTANT_COLOR, ZERO.
+        assert_eq!(CrimeRe::blend(0x080, 0x8040_2000, [255; 4], d), [128, 64, 32, 0]);
+    }
+
+    /// A smooth GL triangle with blending 0x45 into a 32-bit RGBA buffer
+    /// mixes by source alpha; with the alpha test GREATER 0x80 a
+    /// half-transparent one draws nothing.
+    #[test]
+    fn triangles_blend_and_alpha_test() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        let o = 0x0100_0000 + 512 + 2 * 4;
+        ram.lock().unwrap().write(o, &[0, 0, 200, 255]);
+        re.write32(base + BUFMODE_DST, 0x220);
+        re.write32(base + PRIMITIVE, 0x0200_0000);
+        re.write32(base + BLEND_FUNC, 0x45);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        let tri = |dm: u32| {
+            re.write32(base + DRAWMODE, dm);
+            re.write64(base + TRI_V0, (gl(0) as u64) << 32 | gl(0) as u64);
+            re.write64(base + TRI_V0 + 8, (gl(16) as u64) << 32 | gl(0) as u64);
+            re.write64(base + TRI_V0 + 16, (gl(0) as u64) << 32 | gl(8) as u64);
+            // Smooth shading, flat values: R 200, G 0, B 0, A 128 (8.12).
+            re.write64(base + SHADE_R, (200u64 << 12) << 32);
+            re.write64(base + SHADE_R + 8, 128u64 << 12);
+            re.write32(base + (FG | 0x800), 0);
+        };
+        tri(0x0041_0478);
+        assert_eq!(&ram.lock().unwrap().bytes(o, 4), &[100, 0, 100, 191]);
+        re.write32(base + ALPHA_TEST, (4 << 8) | 0x80);
+        ram.lock().unwrap().write(o, &[0, 0, 200, 255]);
+        tri(0x0041_0878);
+        assert_eq!(&ram.lock().unwrap().bytes(o, 4), &[0, 0, 200, 255]);
     }
 
     /// A flat colour-index GL triangle stores FG's index as it stands, as
