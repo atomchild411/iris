@@ -1682,6 +1682,14 @@ impl CrimeRe {
         };
 
         match (prim >> 24) & 3 {
+            // A shaded GL point: a line from the vertex to itself, so it
+            // takes the shade colour, blending and a double-pix half as GL
+            // lines do. bz's world is shaded GL points; painted with FG
+            // they all came out black. (A flat one keeps FG as it stands,
+            // a colour index's low byte included.)
+            0 if dm & draw::GL != 0 && dm & draw::SHADE != 0 => {
+                Self::gl_line(&r, mem, dst, ox, oy, false, true);
+            }
             // Point.
             0 => {
                 if !clip.ok(x0, y0) {
@@ -1694,7 +1702,7 @@ impl CrimeRe {
             // Line, Bresenham, the end pixel unless told to skip it.
             1 if dm & draw::GL != 0 => {
                 let skip_last = prim & (1 << 18) != 0;
-                Self::gl_line(&r, mem, dst, ox, oy, skip_last);
+                Self::gl_line(&r, mem, dst, ox, oy, skip_last, false);
             }
             1 => {
                 let stippled = dm & draw::LINE_STIPPLE != 0;
@@ -2191,7 +2199,7 @@ impl CrimeRe {
     /// straddling the line in proportion, blended by coverage times alpha.
     /// 4Dwm and the desktop outline their vector icons this way, black at
     /// full alpha into the 32-bit window.
-    fn gl_line(r: &[u32], mem: &mut O2Memory, dst: Buf, ox: i32, oy: i32, skip_last: bool) {
+    fn gl_line(r: &[u32], mem: &mut O2Memory, dst: Buf, ox: i32, oy: i32, skip_last: bool, point: bool) {
         let clip = Clip::new(r);
         let g = |off: u32| r[(off / 4) as usize];
         let dm = g(DRAWMODE);
@@ -2199,7 +2207,7 @@ impl CrimeRe {
             let f = gl_coord;
             (f(g(off)) + ox as f64, f(g(off + 4)) + oy as f64)
         };
-        let (a, b) = (fv(TRI_V0), fv(TRI_V0 + 8));
+        let (a, b) = (fv(TRI_V0), if point { fv(TRI_V0) } else { fv(TRI_V0 + 8) });
         let ch = |off: u32| (g(off) >> 12) & 0xff;
         let (cr, cg, cb, ca) = if dm & draw::SHADE != 0 {
             (ch(SHADE_R), ch(SHADE_R + 4), ch(SHADE_R + 8), ch(SHADE_R + 12))
@@ -2919,6 +2927,28 @@ mod tests {
         ram.lock().unwrap().write(o, &[0, 0, 200, 255]);
         tri(0x0041_0878);
         assert_eq!(&ram.lock().unwrap().bytes(o, 4), &[0, 0, 200, 255]);
+    }
+
+    /// A shaded GL point takes its colour from the shade registers and
+    /// lands in its double-pix half, as bz's world needs.
+    #[test]
+    fn a_shaded_gl_point_takes_the_shade_colour() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        // Double-pix A1R5G5B5, the half at offset 2.
+        re.write32(base + BUFMODE_DST, 0x226);
+        re.write32(base + DRAWMODE, 0x0051_0178);
+        re.write32(base + PRIMITIVE, 0x0000_0000);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        re.write64(base + TRI_V0, (gl(2) as u64) << 32 | gl(1) as u64);
+        re.write64(base + SHADE_R, (248u64 << 12) << 32);
+        re.write64(base + SHADE_R + 8, 0);
+        re.write32(base + (FG | 0x800), 0);
+        let o = 0x0100_0000 + 512 + 2 * 4;
+        let m = ram.lock().unwrap();
+        assert_eq!(&m.bytes(o + 2, 2), &[0x7c, 0x00], "red 31 in the half at offset 2");
     }
 
     /// An unblended GL line is drawn whatever its colour's alpha: amesh's
