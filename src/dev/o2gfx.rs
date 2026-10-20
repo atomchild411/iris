@@ -661,8 +661,10 @@ struct Texture {
     repeat_t: bool,
     linear: bool,
     base: usize,
-    /// Bytes a texel: 2 (A1R5G5B5) or 4 (RGBA8, R high).
+    /// Bytes a texel: 2 (see `texel16`) or 4 (RGBA8, R high).
     bpt: u32,
+    /// Texture.mode 23:20: 1 RGB, 2 RGBA, 4 RGBA4, 8 LUMINANCE_ALPHA.
+    typ: u32,
     /// The base level counted from 1024 x 1024 (Texture.mode 17:14; 4 for
     /// 64 x 64), the last level below it (13:10), and the minification
     /// filter (9:7: NEAREST, LINEAR, then the four MIPMAP ones).
@@ -717,13 +719,32 @@ fn subtile_step(bx: u32, y: u32, stride: u32) -> u32 {
     (bx >> 9) + (y >> 7) * stride
 }
 
+/// A 16-bit texel of type `typ` (Texture.mode 23:20) as R, G, B, A, 0-255
+/// (spec figure 7-7): RGBA4 has R in the top nibble, LUMINANCE_ALPHA L in
+/// the high byte, and RGB and RGBA are A1R5G5B5.
+fn texel16(typ: u32, p: u32) -> [f64; 4] {
+    match typ {
+        4 => [12, 8, 4, 0].map(|sh| ((p >> sh) & 15) as f64 * 17.0),
+        8 => {
+            let l = (p >> 8) as f64;
+            [l, l, l, (p & 0xff) as f64]
+        }
+        _ => {
+            let c = |v: u32| ((v << 3) | (v >> 2)) as f64;
+            [c((p >> 10) & 31), c((p >> 5) & 31), c(p & 31), if p & 0x8000 != 0 { 255.0 } else { 0.0 }]
+        }
+    }
+}
+
 impl Texture {
     fn from_regs(r: &[u32]) -> Option<Texture> {
         let g = |off: u32| r[(off / 4) as usize];
         let mode = g(TEX_MODE);
         let (typ, depth) = ((mode >> 20) & 15, (mode >> 18) & 3);
-        if !matches!(depth, 1 | 2) || !matches!(typ, 1 | 2) {
-            return None; // RGBA4, alpha, luminance and intensity texels: not yet
+        // RGBA4 and LA8 come only 16 bits wide (spec figure 7-7). Alpha,
+        // intensity and luminance alone have no layout in the spec: not yet.
+        if !matches!((typ, depth), (1 | 2, 1 | 2) | (4 | 8, 1)) {
+            return None;
         }
         let fmt_hi = g(TEX_FORMAT);
         let (uw, vw) = ((fmt_hi >> 4) & 15, fmt_hi & 15);
@@ -740,6 +761,7 @@ impl Texture {
             linear: mode & (1 << 6) != 0,
             base,
             bpt: if depth == 2 { 4 } else { 2 },
+            typ,
             map_level: (mode >> 14) & 15,
             max_level: (mode >> 10) & 15,
             min_filter: (mode >> 7) & 7,
@@ -777,9 +799,13 @@ impl Texture {
         if n == 4 {
             return [mem[o], mem[o + 1], mem[o + 2], mem[o + 3]].map(|b| b as f64);
         }
-        let p = ((mem[o] as u32) << 8) | mem[o + 1] as u32;
-        let c = |v: u32| ((v << 3) | (v >> 2)) as f64;
-        [c((p >> 10) & 31), c((p >> 5) & 31), c(p & 31), if p & 0x8000 != 0 { 255.0 } else { 0.0 }]
+        texel16(self.typ, ((mem[o] as u32) << 8) | mem[o + 1] as u32)
+    }
+
+    /// Whether the map's texels carry alpha (RGBA, RGBA4, LUMINANCE_ALPHA):
+    /// an RGB map leaves the fragment's alpha alone, as in OpenGL.
+    fn has_alpha(&self) -> bool {
+        matches!(self.typ, 2 | 4 | 8)
     }
 
     /// Level `level` at (s, t) in 1.14 units, bilinear or nearest.
@@ -1847,10 +1873,9 @@ impl CrimeRe {
                     };
                     let tx = t.sample(&r, mem, s0, t0, lod);
                     // Texture function (Texture.mode 1:0), as OpenGL's for
-                    // RGB and RGBA maps; an RGB map leaves the fragment's
-                    // alpha alone.
+                    // maps with and without alpha.
                     let f = [0, 1, 2, 3].map(|k| channel(k, px, py) as f64);
-                    let rgba_map = (g(TEX_MODE) >> 20) & 15 == 2;
+                    let rgba_map = t.has_alpha();
                     let out = |v: f64| (v.round() as u32).min(255);
                     match g(TEX_MODE) & 3 {
                         // REPLACE
@@ -2753,6 +2778,17 @@ mod tests {
     /// Ordered dithering to 5 bits: exact steps stay exact, and a value
     /// between two steps comes out as a mix of both over a 4 x 4 cell, in
     /// proportion (12 of 8.5 levels up from 96: 4/8 of the cell at 13).
+    #[test]
+    fn sixteen_bit_texels_follow_their_type() {
+        // RGBA4: R in the top nibble (GLQuake's world and status bar).
+        assert_eq!(texel16(4, 0xf84c), [255.0, 136.0, 68.0, 204.0]);
+        // LUMINANCE_ALPHA: L high, A low.
+        assert_eq!(texel16(8, 0x8040), [128.0, 128.0, 128.0, 64.0]);
+        // RGB and RGBA: A1R5G5B5.
+        assert_eq!(texel16(2, 0xfc00), [255.0, 0.0, 0.0, 255.0]);
+        assert_eq!(texel16(1, 0x001f), [0.0, 0.0, 255.0, 0.0]);
+    }
+
     #[test]
     fn dithering_to_five_bits_mixes_neighbouring_steps() {
         let cell = |c: u32| (0..16).map(|i| CrimeRe::dither5(c, i % 4, i / 4)).collect::<Vec<_>>();
