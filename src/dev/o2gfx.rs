@@ -2573,6 +2573,71 @@ impl CrimeRe {
     }
 }
 
+impl crate::traits::Device for Gbe {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("gbe".to_string(), "GBE display engine: gbe status".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        use std::io::Write;
+        if cmd != "gbe" {
+            return Err("Command not found".to_string());
+        }
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                writeln!(w, "GBE: {}", self.summary()).ok();
+                Ok(())
+            }
+            _ => Err("Usage: gbe status".to_string()),
+        }
+    }
+}
+
+impl crate::traits::Device for CrimeRe {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("re".to_string(), "CRIME rendering engine: re status | re notes".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        use std::io::Write;
+        use std::sync::atomic::Ordering::Relaxed;
+        if cmd != "re" {
+            return Err("Command not found".to_string());
+        }
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                writeln!(w, "CRIME RE: {} primitives drawn, {}; trace {} of {} writes",
+                    self.drawn.load(Relaxed),
+                    if self.queue.get().is_some() {
+                        format!("asynchronous ({} queued, {} done)", self.queued.load(Relaxed), self.done.load(Relaxed))
+                    } else {
+                        "synchronous".to_string()
+                    },
+                    self.trace.lock().unwrap().len(), self.trace_cap).ok();
+            }
+            "notes" => {
+                for (what, n) in self.unhandled() {
+                    writeln!(w, "  {n:8}  {what}").ok();
+                }
+            }
+            _ => return Err("Usage: re status | notes".to_string()),
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

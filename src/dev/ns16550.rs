@@ -2,7 +2,9 @@
 
 use std::sync::Mutex;
 
-use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK};
+use std::io::Write;
+
+use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device, Resettable, BUS_OK};
 use crate::ip32::*;
 
 /// A 16550 with just enough behaviour to be written to.
@@ -30,6 +32,8 @@ pub struct Com16550 {
     /// transmitted and whose keystrokes are queued as input.
     /// Every connected console client: each sees all output and may type.
     tcp: std::sync::Arc<Mutex<Vec<std::net::TcpStream>>>,
+    /// Which UART this is (`com0`, `com1`): its monitor command.
+    name: &'static str,
 }
 
 pub mod com_reg {
@@ -84,12 +88,18 @@ impl Default for Com16550 {
 
 impl Com16550 {
     pub fn new() -> Self {
+        Self::named("com")
+    }
+
+    /// A UART answering monitor commands as `name`.
+    pub fn named(name: &'static str) -> Self {
         Self {
             out: Mutex::new(Vec::new()),
             log: Mutex::new(None),
             input: Default::default(),
             regs: Mutex::new([0u8; 8]),
             tcp: Default::default(),
+            name,
         }
     }
 
@@ -326,6 +336,53 @@ impl Com16550 {
     /// True when nothing has been received and not yet taken.
     pub(crate) fn input_empty(&self) -> bool {
         self.input.lock().unwrap().is_empty()
+    }
+}
+
+impl Device for Com16550 {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![(self.name.to_string(), format!("16550 UART: {0} status | {0} output [bytes] | {0} type <text>", self.name))]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != self.name {
+            return Err("Command not found".to_string());
+        }
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                let r = *self.regs.lock().unwrap();
+                writeln!(w, "{}: IER {:#04x} LCR {:#04x} MCR {:#04x} SCR {:#04x}{}{}; {} bytes out, {} waiting in, {} console client(s)",
+                    self.name, r[com_reg::IER as usize], r[com_reg::LCR as usize], r[4], r[7],
+                    if self.looped() { ", loopback" } else { "" }, if self.interrupting() { ", interrupting" } else { "" },
+                    self.bytes_out(), self.pending_input(), self.tcp.lock().unwrap().len()).ok();
+            }
+            "output" => {
+                let n = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(2000);
+                write!(w, "{}", self.output_tail(n)).ok();
+                writeln!(w).ok();
+            }
+            "type" => {
+                let text = args[1..].join(" ").replace("\\r", "\r").replace("\\n", "\n");
+                self.feed(text.as_bytes());
+                writeln!(w, "{}: queued {} bytes", self.name, text.len()).ok();
+            }
+            _ => return Err(format!("Usage: {0} status | output [bytes] | type <text>", self.name)),
+        }
+        Ok(())
+    }
+}
+
+impl Resettable for Com16550 {
+    /// Registers to zero; the transcript and anything a console has typed
+    /// stay, as they would on the far end of a real serial line.
+    fn power_on(&self) {
+        *self.regs.lock().unwrap() = [0u8; 8];
     }
 }
 

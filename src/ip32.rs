@@ -461,8 +461,8 @@ impl Ip32Bus {
             irq_lock: Mutex::new(()),
             // A locally-administered address; nothing depends on the value yet.
             onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
-            com0: Com16550::new(),
-            com1: Com16550::new(),
+            com0: Com16550::named("com0"),
+            com1: Com16550::named("com1"),
             sdma: MaceSerialDma::new(),
             audio: crate::dev::mace_audio::MaceAudio::new(),
             mec: std::sync::Arc::new(crate::dev::mec::Mec::new(ram.clone())),
@@ -1204,7 +1204,7 @@ macro_rules! bus_read {
 impl Ip32Bus {
     fn read8_raw(&self, addr: u32) -> BusRead8 {
         if self.in_mec(addr) {
-            return BusRead8::ok(self.mec.read_part(addr - MACE_MEC, 1) as u8);
+            return BusDevice::read8(&*self.mec, addr);
         }
         if self.in_vice(addr) {
             return self.vice.read8(addr);
@@ -1236,15 +1236,15 @@ impl Ip32Bus {
             return BusRead8::ok(self.pci_mem_read_w(addr, 1) as u8);
         }
         if self.in_ps2(addr) {
-            let v = self.ps2.read(addr);
+            let v = BusDevice::read8(&self.ps2, addr);
             self.ps2_touched();
-            return BusRead8::ok(v as u8);
+            return v;
         }
         if self.in_rtc(addr) {
             return self.rtc.read8(addr);
         }
         if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusRead8::ok(self.audio.read(addr) as u8);
+            return BusDevice::read8(&self.audio, addr);
         }
         if self.in_sdma(addr) {
             let v = self.sdma_read(addr);
@@ -1259,7 +1259,7 @@ impl Ip32Bus {
 
     fn read16_raw(&self, addr: u32) -> BusRead16 {
         if self.in_mec(addr) {
-            return BusRead16::ok(self.mec.read_part(addr - MACE_MEC, 2) as u16);
+            return BusDevice::read16(&*self.mec, addr);
         }
         if self.in_vice(addr) {
             return self.vice.read16(addr);
@@ -1286,15 +1286,15 @@ impl Ip32Bus {
             return BusRead16::ok(self.pci_mem_read_w(addr, 2) as u16);
         }
         if self.in_ps2(addr) {
-            let v = self.ps2.read(addr);
+            let v = BusDevice::read16(&self.ps2, addr);
             self.ps2_touched();
-            return BusRead16::ok(v as u16);
+            return v;
         }
         if self.in_rtc(addr) {
             return self.rtc.read16(addr);
         }
         if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusRead16::ok(self.audio.read(addr) as u16);
+            return BusDevice::read16(&self.audio, addr);
         }
         if self.in_sdma(addr) {
             let v = self.sdma_read(addr);
@@ -1309,9 +1309,7 @@ impl Ip32Bus {
 
     fn read32_raw(&self, addr: u32) -> BusRead32 {
         if self.in_mec(addr) {
-            // The registers are 64-bit; a 32-bit access is the half it names.
-            let v = self.mec.read64((addr - MACE_MEC) & !7);
-            return BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 });
+            return BusDevice::read32(&*self.mec, addr);
         }
         if self.in_vice(addr) {
             return self.vice.read32(addr);
@@ -1350,15 +1348,15 @@ impl Ip32Bus {
             return BusRead32::ok(self.pci_mem_read(addr) as u32);
         }
         if self.in_ps2(addr) {
-            let v = self.ps2.read(addr);
+            let v = BusDevice::read32(&self.ps2, addr);
             self.ps2_touched();
-            return BusRead32::ok(v as u32);
+            return v;
         }
         if self.in_rtc(addr) {
             return self.rtc.read32(addr);
         }
         if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return { let v = self.audio.read(addr); BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 }) };
+            return BusDevice::read32(&self.audio, addr);
         }
         if self.in_sdma(addr) {
             // The registers are 64-bit; a 32-bit access is the half it names.
@@ -1403,7 +1401,7 @@ impl Ip32Bus {
             return BusRead64::ok(v as u64);
         }
         if self.in_mec(addr) {
-            return BusRead64::ok(self.mec.read64(addr - MACE_MEC));
+            return BusDevice::read64(&*self.mec, addr);
         }
         if let Some(c) = self.com_for(addr) {
             return c.read64(addr);
@@ -1415,15 +1413,15 @@ impl Ip32Bus {
             return BusRead64::ok((hi << 32) | lo);
         }
         if self.in_ps2(addr) {
-            let v = self.ps2.read(addr);
+            let v = BusDevice::read64(&self.ps2, addr);
             self.ps2_touched();
-            return BusRead64::ok(v);
+            return v;
         }
         if self.in_rtc(addr) {
             return self.rtc.read64(addr);
         }
         if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusRead64::ok(self.audio.read(addr));
+            return BusDevice::read64(&self.audio, addr);
         }
         if self.in_sdma(addr) {
             let v = self.sdma_read(addr);
@@ -1440,10 +1438,7 @@ impl Ip32Bus {
 
     fn write8_raw(&self, addr: u32, val: u8) -> u32 {
         if self.in_mec(addr) {
-            // A part of a 64-bit register: IRIX writes the transmit ring's
-            // write pointer as a halfword.
-            self.mec.write_part(addr - MACE_MEC, 1, val as u64);
-            return BUS_OK;
+            return BusDevice::write8(&*self.mec, addr, val);
         }
         if self.in_vice(addr) {
             return self.vice.write8(addr, val);
@@ -1480,16 +1475,15 @@ impl Ip32Bus {
             return BUS_OK;
         }
         if self.in_ps2(addr) {
-            self.ps2.write(addr, val as u64);
+            let r = BusDevice::write8(&self.ps2, addr, val);
             self.ps2_touched();
-            return BUS_OK;
+            return r;
         }
         if self.in_rtc(addr) {
             return self.rtc.write8(addr, val);
         }
         if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            self.audio.write(addr, val as u64);
-            return BUS_OK;
+            return BusDevice::write8(&self.audio, addr, val);
         }
         if self.in_sdma(addr) {
             // A narrow store is the low end of the register.
@@ -1505,8 +1499,7 @@ impl Ip32Bus {
 
     fn write16_raw(&self, addr: u32, val: u16) -> u32 {
         if self.in_mec(addr) {
-            self.mec.write_part(addr - MACE_MEC, 2, val as u64);
-            return BUS_OK;
+            return BusDevice::write16(&*self.mec, addr, val);
         }
         if self.in_vice(addr) {
             return self.vice.write16(addr, val);
@@ -1536,16 +1529,15 @@ impl Ip32Bus {
             return BUS_OK;
         }
         if self.in_ps2(addr) {
-            self.ps2.write(addr, val as u64);
+            let r = BusDevice::write16(&self.ps2, addr, val);
             self.ps2_touched();
-            return BUS_OK;
+            return r;
         }
         if self.in_rtc(addr) {
             return self.rtc.write16(addr, val);
         }
         if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            self.audio.write(addr, val as u64);
-            return BUS_OK;
+            return BusDevice::write16(&self.audio, addr, val);
         }
         if self.in_sdma(addr) {
             // A narrow store is the low end of the register.
@@ -1561,9 +1553,7 @@ impl Ip32Bus {
 
     fn write32_raw(&self, addr: u32, val: u32) -> u32 {
         if self.in_mec(addr) {
-            // MACE takes 64-bit stores; a 32-bit one is the low word.
-            self.mec.write64((addr - MACE_MEC) & !7, val as u64);
-            return BUS_OK;
+            return BusDevice::write32(&*self.mec, addr, val);
         }
         if self.in_vice(addr) {
             return self.vice.write32(addr, val);
@@ -1609,16 +1599,15 @@ impl Ip32Bus {
             return BUS_OK;
         }
         if self.in_ps2(addr) {
-            self.ps2.write(addr, val as u64);
+            let r = BusDevice::write32(&self.ps2, addr, val);
             self.ps2_touched();
-            return BUS_OK;
+            return r;
         }
         if self.in_rtc(addr) {
             return self.rtc.write32(addr, val);
         }
         if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            self.audio.write(addr, val as u64);
-            return BUS_OK;
+            return BusDevice::write32(&self.audio, addr, val);
         }
         if self.in_sdma(addr) {
             // A narrow store is the low end of the register.
@@ -1634,8 +1623,7 @@ impl Ip32Bus {
 
     fn write64_raw(&self, addr: u32, val: u64) -> u32 {
         if self.in_mec(addr) {
-            self.mec.write64(addr - MACE_MEC, val);
-            return BUS_OK;
+            return BusDevice::write64(&*self.mec, addr, val);
         }
         if self.in_vice(addr) {
             return self.vice.write64(addr, val);
@@ -1679,16 +1667,15 @@ impl Ip32Bus {
             return BUS_OK;
         }
         if self.in_ps2(addr) {
-            self.ps2.write(addr, val as u64);
+            let r = BusDevice::write64(&self.ps2, addr, val);
             self.ps2_touched();
-            return BUS_OK;
+            return r;
         }
         if self.in_rtc(addr) {
             return self.rtc.write64(addr, val);
         }
         if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            self.audio.write(addr, val);
-            return BUS_OK;
+            return BusDevice::write64(&self.audio, addr, val);
         }
         if self.in_sdma(addr) {
             return self.sdma_write(addr, val);
@@ -1708,6 +1695,39 @@ impl Ip32Bus {
 /// read of CRIME, so INTSTAT is live, and after any write that is not RAM,
 /// so a handler's acknowledgement drops IP2 at once instead of leaving it up
 /// until the next service tick (OpenBSD: "spurious crime interrupt").
+/// The O2's devices answer the monitor through the bus that holds them,
+/// as the IOC and HPC3 pass their children's commands through on the
+/// other machines.
+impl Ip32Bus {
+    fn devices(&self) -> Vec<&dyn crate::traits::Device> {
+        vec![
+            &self.crime, &self.crime_re, &self.gbe, &self.macepci, &*self.ust, &self.rtc, &self.ps2,
+            &self.onewire, &self.com0, &self.com1, &self.sdma, &self.audio, &*self.mec,
+        ]
+    }
+}
+
+impl crate::traits::Device for Ip32Bus {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        self.devices().iter().flat_map(|d| d.register_commands()).collect()
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        for d in self.devices() {
+            if d.register_commands().iter().any(|(c, _)| c == cmd) {
+                return d.execute_command(cmd, args, writer);
+            }
+        }
+        Err("Command not found".to_string())
+    }
+}
+
 impl BusDevice for Ip32Bus {
     /// Memory pages have generations jitv2 can compile against; the PROM and
     /// devices have none, so nothing there is compiled.

@@ -365,3 +365,47 @@ impl NicTrace {
         self.events.lock().unwrap().iter().map(|&(t, g, w, v)| format!("{t} {g} {} {v:02x}\n", if w { 'W' } else { 'R' })).collect()
     }
 }
+
+impl crate::traits::Device for OneWireId {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("onewire".to_string(), "1-Wire ID chip: onewire status | onewire log".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        use std::io::Write;
+        if cmd != "onewire" {
+            return Err("Command not found".to_string());
+        }
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                let rom: Vec<String> = self.rom.iter().map(|b| format!("{b:02x}")).collect();
+                let mac: Vec<String> = self.rom[1..7].iter().map(|b| format!("{b:02x}")).collect();
+                let st = self.st.lock().unwrap();
+                writeln!(w, "1-Wire DS2502: ROM {} (Ethernet {}), phase {:?}, command {:?}",
+                    rom.join(""), mac.join(":"), st.phase, st.command).ok();
+            }
+            "log" => {
+                for l in self.protocol_log() {
+                    writeln!(w, "  {l}").ok();
+                }
+            }
+            _ => return Err("Usage: onewire status | log".to_string()),
+        }
+        Ok(())
+    }
+}
+
+impl crate::traits::Resettable for OneWireId {
+    /// The ROM and EPROM are the chip's; a reset only drops a transaction
+    /// in progress.
+    fn power_on(&self) {
+        *self.st.lock().unwrap() = Default::default();
+    }
+}
+

@@ -612,6 +612,63 @@ impl MaceAudio {
     }
 }
 
+/// The bus side: MACE's 64-bit audio registers; a 32-bit read is the half
+/// it names, narrower reads the low bits, and every store the value as
+/// given.
+impl crate::traits::BusDevice for MaceAudio {
+    fn read8(&self, addr: u32) -> crate::traits::BusRead8 { crate::traits::BusRead8::ok(self.read(addr) as u8) }
+    fn read16(&self, addr: u32) -> crate::traits::BusRead16 { crate::traits::BusRead16::ok(self.read(addr) as u16) }
+    fn read32(&self, addr: u32) -> crate::traits::BusRead32 {
+        let v = self.read(addr);
+        crate::traits::BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 })
+    }
+    fn read64(&self, addr: u32) -> crate::traits::BusRead64 { crate::traits::BusRead64::ok(self.read(addr)) }
+    fn write8(&self, addr: u32, val: u8) -> u32 { self.write(addr, val as u64); crate::traits::BUS_OK }
+    fn write16(&self, addr: u32, val: u16) -> u32 { self.write(addr, val as u64); crate::traits::BUS_OK }
+    fn write32(&self, addr: u32, val: u32) -> u32 { self.write(addr, val as u64); crate::traits::BUS_OK }
+    fn write64(&self, addr: u32, val: u64) -> u32 { self.write(addr, val); crate::traits::BUS_OK }
+}
+
+impl crate::traits::Device for MaceAudio {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("audio".to_string(), "MACE audio + AD1843: audio status | audio codec".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        use std::io::Write;
+        if cmd != "audio" {
+            return Err("Command not found".to_string());
+        }
+        let st = self.st.lock();
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                writeln!(w, "MACE audio: control {:#x}, codec control {:#x}, mask {:#x}, host output {}",
+                    st.ctl, st.codec_ctl, st.mask, if self.player.lock().is_some() { "open" } else { "closed" }).ok();
+                for (n, name) in ["input", "output 1", "output 2"].iter().enumerate() {
+                    let c = &st.ch[n];
+                    writeln!(w, "  {name}: control {:#x} read {:#05x} write {:#05x} depth {} MSC {} {}",
+                        c.ctl, c.rptr, c.wptr, c.depth(), c.msc, if c.running() { "running" } else { "stopped" }).ok();
+                }
+                let rate = |r: Option<u32>| r.map_or("off".to_string(), |r| format!("{r} Hz"));
+                writeln!(w, "  rates: DAC1 {} DAC2 {} ADC {}", rate(st.dac_rate(1)), rate(st.dac_rate(2)), rate(st.adc_rate())).ok();
+            }
+            "codec" => {
+                for (i, v) in st.codec.iter().enumerate() {
+                    writeln!(w, "  AD1843 reg {i:2}: {v:#06x}").ok();
+                }
+            }
+            _ => return Err("Usage: audio status | codec".to_string()),
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

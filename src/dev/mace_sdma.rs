@@ -419,6 +419,47 @@ impl MaceSerialDma {
     }
 }
 
+impl crate::traits::Device for MaceSerialDma {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("sdma".to_string(), "MACE serial DMA: sdma status".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        use std::io::Write;
+        if cmd != "sdma" {
+            return Err("Command not found".to_string());
+        }
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                let ports = self.ports.lock().unwrap();
+                for (n, p) in ports.iter().enumerate() {
+                    writeln!(w, "serial {n}: {}{}{}{}", if p.owned { "DMA-driven" } else { "programmed I/O" },
+                        if p.preq { ", request" } else { "" }, if p.tx_memerr { ", tx memory error" } else { "" },
+                        if p.rx_overrun { ", rx overrun" } else { "" }).ok();
+                    for (dir, c) in [("tx", &p.tx), ("rx", &p.rx)] {
+                        writeln!(w, "  {dir}: control {:#x} read {:#05x} write {:#05x}, {} blocks / {} bytes moved",
+                            c.ctrl, c.rptr, c.wptr, c.blocks, c.bytes).ok();
+                    }
+                }
+                Ok(())
+            }
+            _ => Err("Usage: sdma status".to_string()),
+        }
+    }
+}
+
+impl crate::traits::Resettable for MaceSerialDma {
+    fn power_on(&self) {
+        self.reset();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

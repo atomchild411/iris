@@ -633,6 +633,74 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// The bus side, addressed from MACE's map: the registers are 64-bit, so a
+/// 32-bit read is the half it names and a 32-bit store the low word; bytes
+/// and halfwords are parts of a register (IRIX writes the transmit ring's
+/// write pointer as a halfword).
+impl crate::traits::BusDevice for Mec {
+    fn read8(&self, addr: u32) -> crate::traits::BusRead8 {
+        crate::traits::BusRead8::ok(self.read_part(addr - crate::ip32::MACE_MEC, 1) as u8)
+    }
+    fn read16(&self, addr: u32) -> crate::traits::BusRead16 {
+        crate::traits::BusRead16::ok(self.read_part(addr - crate::ip32::MACE_MEC, 2) as u16)
+    }
+    fn read32(&self, addr: u32) -> crate::traits::BusRead32 {
+        let v = self.read64((addr - crate::ip32::MACE_MEC) & !7);
+        crate::traits::BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 })
+    }
+    fn read64(&self, addr: u32) -> crate::traits::BusRead64 {
+        crate::traits::BusRead64::ok(Mec::read64(self, addr - crate::ip32::MACE_MEC))
+    }
+    fn write8(&self, addr: u32, val: u8) -> u32 {
+        self.write_part(addr - crate::ip32::MACE_MEC, 1, val as u64);
+        crate::traits::BUS_OK
+    }
+    fn write16(&self, addr: u32, val: u16) -> u32 {
+        self.write_part(addr - crate::ip32::MACE_MEC, 2, val as u64);
+        crate::traits::BUS_OK
+    }
+    fn write32(&self, addr: u32, val: u32) -> u32 {
+        Mec::write64(self, (addr - crate::ip32::MACE_MEC) & !7, val as u64);
+        crate::traits::BUS_OK
+    }
+    fn write64(&self, addr: u32, val: u64) -> u32 {
+        Mec::write64(self, addr - crate::ip32::MACE_MEC, val);
+        crate::traits::BUS_OK
+    }
+}
+
+impl crate::traits::Device for Mec {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("mec".to_string(), "MACE Ethernet: mec status".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        use std::io::Write;
+        if cmd != "mec" {
+            return Err("Command not found".to_string());
+        }
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                let s = self.st.lock().unwrap();
+                writeln!(w, "MEC: station {:012x}, MAC control {:#x}, DMA control {:#x}, interrupt status {:#x}{}",
+                    s.station, s.mac_control, s.dma_control, s.int_status,
+                    if self.link.lock().unwrap().is_some() { ", network attached" } else { ", no network" }).ok();
+                writeln!(w, "  tx ring {:#x} read {} write {}; rx fifo {} entries, sequence {}",
+                    s.tx_ring_base, s.tx_read, s.tx_write, s.mcl_fifo.len(), s.rx_seq).ok();
+                writeln!(w, "  frames: {} sent, {} received, {} dropped", s.tx_frames, s.rx_frames, s.rx_dropped).ok();
+                Ok(())
+            }
+            _ => Err("Usage: mec status".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

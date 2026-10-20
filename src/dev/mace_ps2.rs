@@ -3,7 +3,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
+use std::io::Write;
+
 use crate::ip32::*;
+use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device, Resettable, BUS_OK};
 
 /// The pair of PS/2 ports, with nothing plugged into either.
 ///
@@ -238,6 +241,73 @@ impl MacePs2 {
             }
         }
         bits
+    }
+}
+
+/// The bus side: every width reads the register's low bits and writes its
+/// value, as MACE's 64-bit register slots do.
+impl BusDevice for MacePs2 {
+    fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.read(addr) as u8) }
+    fn read16(&self, addr: u32) -> BusRead16 { BusRead16::ok(self.read(addr) as u16) }
+    fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.read(addr) as u32) }
+    fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.read(addr)) }
+    fn write8(&self, addr: u32, val: u8) -> u32 { self.write(addr, val as u64); BUS_OK }
+    fn write16(&self, addr: u32, val: u16) -> u32 { self.write(addr, val as u64); BUS_OK }
+    fn write32(&self, addr: u32, val: u32) -> u32 { self.write(addr, val as u64); BUS_OK }
+    fn write64(&self, addr: u32, val: u64) -> u32 { self.write(addr, val); BUS_OK }
+}
+
+/// `maceps2` shows the two ports; `ps2` goes to the shared controller
+/// behind them (typing, the mouse), as the IOC passes its own through.
+impl Device for MacePs2 {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        let mut c = vec![("maceps2".to_string(), "MACE PS/2 ports: maceps2 status | maceps2 traffic".to_string())];
+        if let Some(d) = &self.dev {
+            c.extend(d.register_commands());
+        }
+        c
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "maceps2" {
+            return match &self.dev {
+                Some(d) => d.execute_command(cmd, args, w),
+                None => Err("Command not found".to_string()),
+            };
+        }
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                for (p, name) in ["keyboard", "mouse"].iter().enumerate() {
+                    let port = self.ports[p].lock().unwrap();
+                    writeln!(w, "{name}: control {:#04x} rx {:#04x}{} tx {:?}, {}",
+                        port.control, port.rx, if port.rx_full { " (full)" } else { "" }, port.tx,
+                        if self.attached(p).is_some() { "attached" } else { "nothing plugged in" }).ok();
+                }
+                writeln!(w, "idle keyboard polls: {}", self.idle_polls()).ok();
+            }
+            "traffic" => {
+                write!(w, "{}", self.traffic_timed()).ok();
+            }
+            _ => return Err("Usage: maceps2 status | traffic".to_string()),
+        }
+        Ok(())
+    }
+}
+
+impl Resettable for MacePs2 {
+    /// Both ports back to their power-on state; the devices behind them
+    /// keep what they have queued.
+    fn power_on(&self) {
+        for p in &self.ports {
+            *p.lock().unwrap() = Ps2Port::default();
+        }
+        self.reset_idle();
     }
 }
 

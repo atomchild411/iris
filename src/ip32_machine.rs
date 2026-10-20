@@ -51,6 +51,10 @@ pub struct O2Machine {
     display: Arc<O2Display>,
     running: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// The shared monitor (telnet, `monitor_port`): the CPU's commands and
+    /// every O2 device's, through the bus.
+    monitor: Arc<crate::monitor::Monitor>,
+    monitor_port: u16,
 }
 
 impl O2Machine {
@@ -196,7 +200,15 @@ impl O2Machine {
                 Err(e) => eprintln!("iris: O2 control port {port}: {e}"),
             }
         }
-        Ok(Self { bus, cpu, timer_manager, display, running, threads: Vec::new() })
+        // The shared monitor, as the other machines have it: the CPU's
+        // commands (registers, breakpoints, memory) and the O2's devices'.
+        let mut monitor = crate::monitor::Monitor::new();
+        monitor.register_device(crate::devlog::init_devlog());
+        monitor.register_device(cpu.clone().as_device());
+        monitor.register_device(bus.clone());
+        let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
+
+        Ok(Self { bus, cpu, timer_manager, display, running, threads: Vec::new(), monitor: Arc::new(monitor), monitor_port })
     }
 
     /// `kernel_mode(cache, in_kernel)` switches the cache model on leaving the
@@ -284,6 +296,7 @@ impl O2Machine {
 
     pub fn start(&mut self) {
         self.running.store(true, Ordering::SeqCst);
+        self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
         let d = self.display.clone();
         self.threads.push(std::thread::Builder::new().name("O2-Display".into()).spawn(move || d.display_loop()).unwrap());
         let bus = self.bus.clone();
@@ -366,6 +379,7 @@ impl O2Machine {
 
     pub fn stop(&mut self) {
         self.cpu.clone().as_device().stop();
+        self.monitor.shutdown();
         self.bus.save_flash();
         self.running.store(false, Ordering::SeqCst);
         for t in self.threads.drain(..) {

@@ -3,6 +3,8 @@
 use std::sync::Mutex;
 
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK};
+use std::io::Write;
+use crate::traits::{Device, Resettable};
 
 /// A Dallas-style RTC with battery-backed NVRAM.
 ///
@@ -174,6 +176,63 @@ impl MaceRtc {
     }
     pub fn poke(&self, reg: usize, val: u8) {
         self.cells.lock().unwrap()[reg & 0xff] = val;
+    }
+}
+
+impl Device for MaceRtc {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("rtc".to_string(), "DS1687 RTC: rtc status | rtc dump | rtc r <reg> | rtc w <reg> <val>".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "rtc" {
+            return Err("Command not found".to_string());
+        }
+        let num = |s: Option<&&str>| -> Result<usize, String> {
+            let s = s.ok_or("rtc: missing number")?;
+            usize::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("rtc: {s:?} is not a hex number"))
+        };
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                let t = self.now();
+                let (y, m, d) = civil_from_days(t.div_euclid(86400));
+                let s = t.rem_euclid(86400);
+                writeln!(w, "RTC: {y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} (guest), register B {:#04x} D {:#04x}{}",
+                    s / 3600, s / 60 % 60, s % 60, self.peek(rtc_reg::B), self.peek(0x0d),
+                    if self.powered_off() { ", powered off" } else { "" }).ok();
+            }
+            "dump" => {
+                for (i, row) in self.cells.lock().unwrap().chunks(16).enumerate() {
+                    let hex: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
+                    writeln!(w, "  {:02x}: {}", i * 16, hex.join(" ")).ok();
+                }
+            }
+            "r" => {
+                let r = num(args.get(1))?;
+                writeln!(w, "  {r:02x}: {:02x}", self.peek(r)).ok();
+            }
+            "w" => {
+                let (r, v) = (num(args.get(1))?, num(args.get(2))?);
+                self.poke(r, v as u8);
+                writeln!(w, "  {r:02x}: {:02x}", self.peek(r)).ok();
+            }
+            _ => return Err("Usage: rtc status | dump | r <reg> | w <reg> <val>".to_string()),
+        }
+        Ok(())
+    }
+}
+
+impl Resettable for MaceRtc {
+    /// Battery-backed: the clock and NVRAM live through a reset. Only the
+    /// power-off request is forgotten.
+    fn power_on(&self) {
+        self.powered_off.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

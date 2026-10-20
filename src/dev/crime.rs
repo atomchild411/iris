@@ -1,9 +1,10 @@
 //! CRIME's CPU interface on the O2: its interrupt controller and memory
 //! bank control (the rendering engine is `o2gfx`).
 
+use std::io::Write;
 use std::sync::Mutex;
 
-use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
+use crate::traits::{BusDevice, BusRead32, BusRead64, Device, Resettable, BUS_OK};
 use crate::ip32::*;
 
 // ── CRIME registers ─────────────────────────────────────────────────────────
@@ -222,6 +223,70 @@ impl Crime {
     /// Values written, in order.
     pub fn written(&self) -> Vec<(u32, u64)> {
         self.writes.lock().unwrap().clone()
+    }
+}
+
+impl Device for Crime {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("crime".to_string(), "CRIME: crime status | crime regs | crime irqlog [n] | crime touched".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "crime" {
+            return Err("Command not found".to_string());
+        }
+        let reg = |off: u32| self.regs.lock().unwrap()[(off / 8) as usize];
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                let (stat, mask) = (self.intstat(), reg(crime_reg::INTMASK));
+                writeln!(w, "CRIME revision {:#x}", self.revision).ok();
+                writeln!(w, "  interrupts: status {stat:#010x} mask {mask:#010x} pending {:#010x} latched {:#010x} soft {:#010x}",
+                    stat & mask, *self.latched.lock().unwrap(), reg(crime_reg::SOFTINT)).ok();
+                writeln!(w, "  control {:#x} time {:#x}", reg(crime_reg::CONTROL), self.load_inner(crime_reg::TIME)).ok();
+                for i in 0..8u32 {
+                    writeln!(w, "  bank {i}: ctrl {:#06x}", reg(crime_reg::MEM_BANK_CTRL0 + 8 * i)).ok();
+                }
+            }
+            "regs" => {
+                for (i, &v) in self.regs.lock().unwrap().iter().enumerate() {
+                    if v != 0 {
+                        writeln!(w, "  {:#06x}: {v:#018x}", i * 8).ok();
+                    }
+                }
+            }
+            "irqlog" => {
+                let n: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(32);
+                let log = self.irqlog_text();
+                let lines: Vec<&str> = log.lines().collect();
+                for l in &lines[lines.len().saturating_sub(n)..] {
+                    writeln!(w, "  {l}").ok();
+                }
+            }
+            "touched" => {
+                for (off, write) in self.touched() {
+                    writeln!(w, "  {off:#06x} {}", if write { "W" } else { "R" }).ok();
+                }
+            }
+            _ => return Err("Usage: crime status | regs | irqlog [n] | touched".to_string()),
+        }
+        Ok(())
+    }
+}
+
+impl Resettable for Crime {
+    /// Registers, latched interrupts and the counter's offset back to zero;
+    /// the revision is the chip's and stays.
+    fn power_on(&self) {
+        self.regs.lock().unwrap().fill(0);
+        *self.latched.lock().unwrap() = 0;
+        *self.time_base.lock().unwrap() = 0;
+        self.irqlog.lock().unwrap().clear();
     }
 }
 

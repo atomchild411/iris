@@ -3,6 +3,8 @@
 use std::sync::Mutex;
 
 use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
+use std::io::Write;
+use crate::traits::{Device, Resettable};
 
 /// MACE's UST/MSC counter: unadjusted system time, free-running.
 ///
@@ -124,6 +126,41 @@ impl MaceUst {
             None => *self.ticks.lock().unwrap(),
         }
     }
+}
+
+impl Device for MaceUst {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("ust".to_string(), "MACE UST: ust status".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "ust" {
+            return Err("Command not found".to_string());
+        }
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                // Read without advancing the guest clock (guest_us does).
+                let now = self.now();
+                let g = self.guest.lock().unwrap();
+                writeln!(w, "UST: {} clock, now {now} us, guest {} us ({} us held out for 1-Wire), counter {:#x} ({} ns a count)",
+                    if self.host.get().is_some() { "host" } else { "instruction" },
+                    now - g.lost, g.lost, (now - g.lost) * 1000 / MACE_UST_PERIOD_NS, MACE_UST_PERIOD_NS).ok();
+                Ok(())
+            }
+            _ => Err("Usage: ust status".to_string()),
+        }
+    }
+}
+
+impl Resettable for MaceUst {
+    /// The counter is free-running from power-up; nothing a reset clears.
+    fn power_on(&self) {}
 }
 
 impl BusDevice for MaceUst {

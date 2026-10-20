@@ -380,3 +380,47 @@ impl BusDevice for PciNativeView {
     fn write32(&self, _a: u32, _v: u32) -> u32 { *self.writes.lock().unwrap() += 1; BUS_OK }
     fn write64(&self, _a: u32, _v: u64) -> u32 { *self.writes.lock().unwrap() += 1; BUS_OK }
 }
+
+impl crate::traits::Device for MacePci {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("pci".to_string(), "MACE PCI bridge: pci status | pci config <slot>".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        use std::io::Write;
+        if cmd != "pci" {
+            return Err("Command not found".to_string());
+        }
+        match args.first().copied().unwrap_or("status") {
+            "status" => {
+                let r = self.regs.lock().unwrap();
+                let reg = |off: u32| r[(off / 4) as usize];
+                writeln!(w, "MACE PCI: control {:#010x} revision {:#x} error flags {:#x} at {:#010x}, config address {:#010x}",
+                    reg(macepci_reg::CONTROL), reg(macepci_reg::REVISION), reg(macepci_reg::ERROR_FLAGS),
+                    reg(macepci_reg::ERROR_ADDR), *self.config_addr.lock().unwrap()).ok();
+                for (slot, f) in self.slots.lock().unwrap().iter() {
+                    let id = f.read(0);
+                    let bars: Vec<String> = (0..6).map(|i| format!("{:#x}", f.bar(i))).filter(|b| b != "0x0").collect();
+                    writeln!(w, "  slot {slot}: {} {:04x}:{:04x}, command {:#06x}, BARs [{}]",
+                        f.name, id & 0xffff, id >> 16, f.read(1) & 0xffff, bars.join(", ")).ok();
+                }
+            }
+            "config" => {
+                let slot: u8 = args.get(1).and_then(|v| v.parse().ok()).ok_or("Usage: pci config <slot>")?;
+                let f = self.slot(slot).ok_or(format!("pci: nothing in slot {slot}"))?;
+                for row in 0..16 {
+                    let v: Vec<String> = (0..4).map(|k| format!("{:08x}", f.read(row * 4 + k))).collect();
+                    writeln!(w, "  {:02x}: {}", row * 16, v.join(" ")).ok();
+                }
+            }
+            _ => return Err("Usage: pci status | config <slot>".to_string()),
+        }
+        Ok(())
+    }
+}
