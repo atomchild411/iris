@@ -891,7 +891,7 @@ where
                     }
                 }
             }
-            bus.ps2_touched();
+            bus.ps2.update_irq();
             let bits = &exec.core.hot.interrupts;
             let cur = bits.load(std::sync::atomic::Ordering::Relaxed);
             let ip2 = crate::cpu::mips_core::CAUSE_IP2 as u64;

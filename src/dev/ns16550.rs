@@ -30,6 +30,8 @@ pub struct Com16550 {
     regs: Mutex<[u8; 8]>,
     /// Which UART this is (`com0`, `com1`): its monitor command.
     name: &'static str,
+    /// Its interrupt, while it is driven by PIO (MACE ISA, port 0's group).
+    irq: std::sync::OnceLock<crate::irq::IrqLine>,
 }
 
 pub mod com_reg {
@@ -95,6 +97,7 @@ impl Com16550 {
             input: Default::default(),
             regs: Mutex::new([0u8; 8]),
             name,
+            irq: std::sync::OnceLock::new(),
         }
     }
 
@@ -178,6 +181,18 @@ impl Com16550 {
     }
 
     /// True while the chip is asking for attention.
+    /// Wire the UART's interrupt (the console's: MACE ISA port 0's group).
+    pub fn connect_irq(&self, line: crate::irq::IrqLine) {
+        let _ = self.irq.set(line);
+    }
+
+    /// Drive the interrupt from the UART's state.
+    pub fn update_irq(&self) {
+        if let Some(l) = self.irq.get() {
+            l.set(self.interrupting());
+        }
+    }
+
     pub fn interrupting(&self) -> bool {
         self.iir() & com_reg::IIR_NONE == 0
     }

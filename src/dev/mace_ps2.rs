@@ -28,6 +28,9 @@ pub struct MacePs2 {
     /// The last bytes through either port, `(port, to the device?, byte)`,
     /// for working out a conversation that stalled.
     traffic: Mutex<std::collections::VecDeque<(u8, bool, u8, std::time::Instant)>>,
+    /// Its four bits of MACE's ISA status (9..12): the ports' requests and
+    /// poll flags.
+    irq: std::sync::OnceLock<Vec<crate::irq::IrqLine>>,
 }
 
 struct Ps2Port {
@@ -66,6 +69,7 @@ impl MacePs2 {
             mouse: false,
             idle_polls: AtomicU32::new(0),
             traffic: Mutex::new(std::collections::VecDeque::new()),
+            irq: std::sync::OnceLock::new(),
         }
     }
 
@@ -226,6 +230,23 @@ impl MacePs2 {
     /// The PS/2 bits of MACE's ISA interrupt status: 9 and 11 are the ports'
     /// interrupt requests (receive full with RxIEN, transmit empty with
     /// TxIEN), 10 and 12 their unmasked receive-full flags.
+    /// Wire the ports' status bits into MACE's ISA interrupt controller.
+    pub fn connect_irq(&self, isa: std::sync::Arc<dyn crate::irq::InterruptController>) {
+        let _ = self.irq.set((9..=12).map(|b| crate::irq::IrqLine::new(isa.clone(), b)).collect());
+    }
+
+    /// Drive the ports' status bits. A level left high after the handler
+    /// drained the port reads as a spurious interrupt to OpenBSD, so this
+    /// follows every register access, and the service loop's poll of what
+    /// the host has typed.
+    pub fn update_irq(&self) {
+        let (Some(lines), Some(_)) = (self.irq.get(), self.dev.as_ref()) else { return };
+        let bits = self.isa_bits();
+        for l in lines {
+            l.set(bits & (1 << l.line()) != 0);
+        }
+    }
+
     pub fn isa_bits(&self) -> u64 {
         let mut bits = 0;
         for p in 0..2 {
@@ -247,14 +268,22 @@ impl MacePs2 {
 /// The bus side: every width reads the register's low bits and writes its
 /// value, as MACE's 64-bit register slots do.
 impl BusDevice for MacePs2 {
-    fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.read(addr) as u8) }
-    fn read16(&self, addr: u32) -> BusRead16 { BusRead16::ok(self.read(addr) as u16) }
-    fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.read(addr) as u32) }
-    fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.read(addr)) }
-    fn write8(&self, addr: u32, val: u8) -> u32 { self.write(addr, val as u64); BUS_OK }
-    fn write16(&self, addr: u32, val: u16) -> u32 { self.write(addr, val as u64); BUS_OK }
-    fn write32(&self, addr: u32, val: u32) -> u32 { self.write(addr, val as u64); BUS_OK }
-    fn write64(&self, addr: u32, val: u64) -> u32 { self.write(addr, val); BUS_OK }
+    fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.read64(addr).data as u8) }
+    fn read16(&self, addr: u32) -> BusRead16 { BusRead16::ok(self.read64(addr).data as u16) }
+    fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.read64(addr).data as u32) }
+    fn read64(&self, addr: u32) -> BusRead64 {
+        let v = self.read(addr);
+        self.update_irq();
+        BusRead64::ok(v)
+    }
+    fn write8(&self, addr: u32, val: u8) -> u32 { self.write64(addr, val as u64) }
+    fn write16(&self, addr: u32, val: u16) -> u32 { self.write64(addr, val as u64) }
+    fn write32(&self, addr: u32, val: u32) -> u32 { self.write64(addr, val as u64) }
+    fn write64(&self, addr: u32, val: u64) -> u32 {
+        self.write(addr, val);
+        self.update_irq();
+        BUS_OK
+    }
 }
 
 /// `maceps2` shows the two ports; `ps2` goes to the shared controller

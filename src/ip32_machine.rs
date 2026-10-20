@@ -44,6 +44,15 @@ fn in_firmware(pc: u32) -> bool {
     PROM_VA.contains(&pc) || (FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN).contains(&pc)
 }
 
+/// The CPU's interrupt pins as a controller: line n is IPn.
+struct CpuIrq(Arc<dyn crate::traits::Device>);
+
+impl crate::irq::InterruptController for CpuIrq {
+    fn set_line(&self, line: u32, level: bool) {
+        self.0.signal(Signal::Interrupt(line, level));
+    }
+}
+
 pub struct O2Machine {
     pub bus: Arc<Ip32Bus>,
     cpu: Arc<dyn CpuDevice>,
@@ -186,10 +195,7 @@ impl O2Machine {
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.ust.use_host_clock();
-        {
-            let dev = cpu.clone().as_device();
-            bus.set_irq_sink(Box::new(move |level| dev.signal(Signal::Interrupt(2, level))));
-        }
+        bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
 
         bus.gbe.use_cpu_clock(cpu.cycles_ptr(), o2.cpu_mhz);
         // CRIME's rendering engine can draw on its own thread

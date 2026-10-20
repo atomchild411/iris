@@ -188,6 +188,9 @@ impl SdmaIo<'_> {
 /// thresholds and the latches, read through the mask, with the UART's own
 /// request held low because in DMA mode the engine consumes it.
 pub struct MaceSerialDma {
+    /// MACE's ISA interrupt controller, which reads the ports' status bits
+    /// through its mask.
+    isa: std::sync::OnceLock<std::sync::Arc<crate::dev::mace_isa::MaceIsa>>,
     ports: Mutex<[SdmaPort; 2]>,
     /// Either port owned, readable without the lock, so the per-access hooks
     /// cost nothing on a machine that never uses DMA.
@@ -200,7 +203,7 @@ impl Default for MaceSerialDma {
 
 impl MaceSerialDma {
     pub fn new() -> Self {
-        Self { ports: Mutex::new([SdmaPort::RESET; 2]), any_owned: Default::default() }
+        Self { isa: std::sync::OnceLock::new(), ports: Mutex::new([SdmaPort::RESET; 2]), any_owned: Default::default() }
     }
 
     /// Every channel back in reset and neither port owned, as at power-on.
@@ -364,6 +367,19 @@ impl MaceSerialDma {
             port.rx.blocks += 1;
             port.rx.bytes += n as u64;
             port.rx.wptr = (port.rx.wptr + sdma::BLOCK) & sdma::PTR_MASK;
+        }
+    }
+
+    /// Wire the ports' status into MACE's ISA interrupt controller.
+    pub fn connect_irq(&self, isa: std::sync::Arc<crate::dev::mace_isa::MaceIsa>) {
+        let _ = self.isa.set(isa);
+    }
+
+    /// Hand the ports' ownership and status bits to MACE's ISA controller.
+    pub fn update_irq(&self) {
+        if let Some(isa) = self.isa.get() {
+            let (owned, bits) = if self.any_owned() { self.status() } else { ([false; 2], 0) };
+            isa.set_serial_dma(owned, bits);
         }
     }
 

@@ -74,12 +74,21 @@ pub struct Crime {
     /// HARDINT, SOFTINT): `(write, offset, value)`, newest last, for the
     /// control port's `crimelog` (chasing interrupt storms).
     irqlog: Mutex<std::collections::VecDeque<(bool, u32, u64)>>,
-    pub(crate) revision: u64,
+    revision: std::sync::atomic::AtomicU64,
     /// The clock CRIME's free-running counter is derived from, so the PROM's
     /// delays take the time they ask for rather than a number of reads.
     ust: std::sync::Arc<MaceUst>,
     /// Subtracted from the counter, so a write sets what the next read sees.
     time_base: Mutex<u64>,
+    /// CRIME's one output, to the CPU's IP2 (`connect_output`), the level
+    /// last handed to it, and the lock that makes computing and handing on
+    /// one step. Unlocked, one thread could record "low" while another
+    /// raised IP2, after which every update saw no change and IP2 stayed up
+    /// with nothing behind it: IRIX re-entered its CRIME dispatcher forever
+    /// and the clock interrupt starved (the O2's input stall).
+    out: std::sync::OnceLock<crate::irq::IrqLine>,
+    out_level: std::sync::atomic::AtomicBool,
+    out_lock: Mutex<()>,
 }
 
 /// CRIME's counter runs at 66.67 MHz. The PROM's own delay routine computes
@@ -95,14 +104,55 @@ impl Crime {
             writes: Mutex::new(Vec::new()),
             latched: Mutex::new(0),
             irqlog: Mutex::new(std::collections::VecDeque::new()),
-            revision: CRIME_REV_DEFAULT,
+            revision: std::sync::atomic::AtomicU64::new(CRIME_REV_DEFAULT),
             ust,
             time_base: Mutex::new(0),
+            out: std::sync::OnceLock::new(),
+            out_level: std::sync::atomic::AtomicBool::new(false),
+            out_lock: Mutex::new(()),
         }
     }
 
     pub fn with_revision(ust: std::sync::Arc<MaceUst>, revision: u64) -> Self {
-        Self { revision, ..Self::new(ust) }
+        let c = Self::new(ust);
+        c.set_revision(revision);
+        c
+    }
+
+    /// The revision CRIME reports (0xa1 with graphics: the PROM wants it).
+    pub fn set_revision(&self, rev: u64) {
+        self.revision.store(rev, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Where CRIME's output goes: the CPU's IP2. Without one (the bring-up
+    /// harness, which polls `interrupting`) nothing is pushed.
+    pub fn connect_output(&self, line: crate::irq::IrqLine) {
+        let _ = self.out.set(line);
+    }
+
+    pub fn has_output(&self) -> bool {
+        self.out.get().is_some()
+    }
+
+    /// Hand the output on if it changed. Whoever changes CRIME's state calls
+    /// this after the change, so a caller that finds no change can leave it
+    /// to them; a change is computed and handed on under the lock.
+    pub fn update_output(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(out) = self.out.get() else { return self.interrupting() };
+        if self.interrupting() == self.out_level.load(Ordering::Acquire) {
+            return self.out_level.load(Ordering::Acquire);
+        }
+        let _held = self.out_lock.lock().unwrap();
+        let level = self.interrupting();
+        if self.out_level.swap(level, Ordering::AcqRel) != level {
+            out.set(level);
+        }
+        level
     }
 
     /// Raise or lower one of CRIME's interrupt inputs.
@@ -175,7 +225,7 @@ impl Crime {
         match off {
             // Identity. Returning zero here is the one thing guaranteed to make
             // a PROM decide it is running on hardware it does not recognise.
-            crime_reg::REVISION => self.revision,
+            crime_reg::REVISION => self.revision(),
             crime_reg::INTSTAT => self.intstat(),
             crime_reg::HARDINT => self.regs.lock().unwrap()[(crime_reg::INTSTAT / 8) as usize] | *self.latched.lock().unwrap(),
             // A free-running microsecond-ish counter. POST loops on this to time
@@ -191,6 +241,9 @@ impl Crime {
     fn store(&self, off: u32, val: u64) {
         self.log_irq(true, off, val);
         self.store_inner(off, val);
+        if matches!(off, crime_reg::INTMASK | crime_reg::SOFTINT | crime_reg::HARDINT) {
+            self.update_output();
+        }
     }
 
     fn store_inner(&self, off: u32, val: u64) {
@@ -226,6 +279,23 @@ impl Crime {
     }
 }
 
+/// CRIME collects every interrupt on the O2: MACE's (0..15, the ISA
+/// peripherals among them through MACE's own status), GBE's (16..19) and
+/// the rendering engine's. The edge-type inputs latch until software clears
+/// them in HARDINT; the rest follow their level.
+impl crate::irq::InterruptController for Crime {
+    fn set_line(&self, line: u32, level: bool) {
+        if (1u64 << line) & CRIME_LATCHED_BITS != 0 {
+            if level {
+                self.latch_int(line);
+            }
+        } else {
+            self.set_int(line, level);
+        }
+        self.update_output();
+    }
+}
+
 impl Device for Crime {
     fn step(&self, _cycles: u64) {}
     fn stop(&self) {}
@@ -245,7 +315,7 @@ impl Device for Crime {
         match args.first().copied().unwrap_or("status") {
             "status" => {
                 let (stat, mask) = (self.intstat(), reg(crime_reg::INTMASK));
-                writeln!(w, "CRIME revision {:#x}", self.revision).ok();
+                writeln!(w, "CRIME revision {:#x}", self.revision()).ok();
                 writeln!(w, "  interrupts: status {stat:#010x} mask {mask:#010x} pending {:#010x} latched {:#010x} soft {:#010x}",
                     stat & mask, *self.latched.lock().unwrap(), reg(crime_reg::SOFTINT)).ok();
                 writeln!(w, "  control {:#x} time {:#x}", reg(crime_reg::CONTROL), self.load_inner(crime_reg::TIME)).ok();

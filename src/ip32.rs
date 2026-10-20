@@ -129,6 +129,7 @@ use crate::dev::crime_mem::{Decode, O2Memory};
 // reachable here for the bus and the machine.
 pub use crate::dev::crime::*;
 pub use crate::dev::ds1687::*;
+pub use crate::dev::mace_isa::*;
 pub use crate::dev::mace_pci::*;
 pub use crate::dev::mace_ps2::*;
 pub use crate::dev::mace_sdma::*;
@@ -354,7 +355,9 @@ pub struct Ip32Bus {
     /// caller supplied: settings written by a guest belong in the user's
     /// working directory, not in their copy of the PROM.
     flash_file: Option<std::path::PathBuf>,
-    pub crime: Crime,
+    pub crime: std::sync::Arc<Crime>,
+    /// MACE's ISA interrupt status and mask, cascading into CRIME.
+    pub isa: std::sync::Arc<MaceIsa>,
     pub mace: Stub,
     /// CRIME's rendering engine: draws into RAM through its tile tables.
     pub crime_re: crate::dev::o2gfx::CrimeRe,
@@ -369,12 +372,6 @@ pub struct Ip32Bus {
     pub nic_trace: NicTrace,
     pub rtc: MaceRtc,
     pub ps2: MacePs2,
-    /// See [`Ip32Bus::set_irq_sink`].
-    irq_sink: std::sync::OnceLock<Box<dyn Fn(bool) + Send + Sync>>,
-    irq_level: std::sync::atomic::AtomicBool,
-    /// Held while CRIME's output is computed and handed to the CPU, so two
-    /// threads refreshing at once cannot leave IP2 at a stale level.
-    irq_lock: Mutex<()>,
     pub onewire: OneWireId,
     pub com0: Com16550,
     pub com1: Com16550,
@@ -438,12 +435,15 @@ impl Ip32Bus {
         let pc = std::sync::Arc::new(PcTap::default());
         let ram = std::sync::Arc::new(Mutex::new(mem));
         let ust = std::sync::Arc::new(MaceUst::new());
+        let crime = std::sync::Arc::new(Crime::new(ust.clone()));
+        let isa = std::sync::Arc::new(MaceIsa::new(crime.clone()));
         let bus = Self {
             ram: ram.clone(),
             prom: Mutex::new(prom),
             prom_writes: Mutex::new(Vec::new()),
             flash_file: opts.flash_file.clone(),
-            crime: Crime::new(ust.clone()),
+            crime,
+            isa,
             mace: Stub::new("mace"),
             crime_re: crate::dev::o2gfx::CrimeRe::new(ram.clone()),
             vice: Stub::new("vice"),
@@ -456,9 +456,6 @@ impl Ip32Bus {
             nic_trace: NicTrace::new(),
             rtc: MaceRtc::new(),
             ps2: MacePs2::new(),
-            irq_sink: std::sync::OnceLock::new(),
-            irq_level: std::sync::atomic::AtomicBool::new(false),
-            irq_lock: Mutex::new(()),
             // A locally-administered address; nothing depends on the value yet.
             onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
             com0: Com16550::named("com0"),
@@ -487,6 +484,7 @@ impl Ip32Bus {
         // and finds nothing, so it has no disk and cannot boot. Putting the
         // controller a real O2 has there is how we learn how much of it the
         // PROM insists on.
+        bus.connect_isa_devices();
         if opts.scsi {
             // The controller fetches its work from host memory, so it
             // needs to reach RAM directly rather than through the bus that
@@ -610,10 +608,10 @@ impl Ip32Bus {
         self.gbe.render_from(&self.ram, out)
     }
 
-    /// Where IP2 goes when CRIME's output changes, for a machine whose CPU
-    /// runs on its own thread. Without one (the harness) nothing here runs.
-    pub fn set_irq_sink(&self, sink: Box<dyn Fn(bool) + Send + Sync>) {
-        let _ = self.irq_sink.set(sink);
+    /// Where CRIME's output goes: the CPU's IP2, for a machine whose CPU
+    /// runs on its own thread. Without it (the harness) nothing is pushed.
+    pub fn connect_cpu_irq(&self, line: crate::irq::IrqLine) {
+        self.crime.connect_output(line);
     }
 
     /// Let aligned RAM reads go straight to the ppmem window: its base and
@@ -630,7 +628,7 @@ impl Ip32Bus {
 
     #[inline]
     fn before_read(&self, addr: u32) {
-        if self.irq_sink.get().is_some() && self.in_crime(addr) {
+        if self.crime.has_output() && self.in_crime(addr) {
             self.refresh_irq();
         }
     }
@@ -643,30 +641,16 @@ impl Ip32Bus {
     /// service thread holds too.
     #[inline]
     fn after_write(&self, addr: u32) {
-        if self.irq_sink.get().is_some() && !Self::is_ram_addr(addr) && !self.in_crime_re(addr) && !self.in_gbe(addr) {
+        if self.crime.has_output() && !Self::is_ram_addr(addr) && !self.in_crime_re(addr) && !self.in_gbe(addr) {
             self.refresh_irq();
         }
     }
 
-    /// Device lines into CRIME and, if CRIME's output changed, into the sink.
-    ///
-    /// The CPU thread (after a device access) and the service thread both
-    /// come here. Computing the level and handing it on happen under one
-    /// lock: unlocked, one thread could record "low" while another raised
-    /// IP2, after which every refresh saw no change and IP2 stayed up with
-    /// nothing behind it. IRIX then re-entered its CRIME dispatcher forever,
-    /// finding nothing, and the clock interrupt starved behind it: the O2's
-    /// input stall (no ticks, dead mouse, keyboard and serial login).
+    /// Device lines into CRIME, which hands its output on if it changed.
+    /// Returns whether CRIME is interrupting the CPU (IP2).
     pub fn refresh_irq(&self) -> bool {
         self.update_lines();
-        let _held = self.irq_lock.lock().unwrap();
-        let level = self.crime.interrupting();
-        if let Some(sink) = self.irq_sink.get() {
-            if self.irq_level.swap(level, Ordering::AcqRel) != level {
-                sink(level);
-            }
-        }
-        level
+        self.crime.update_output()
     }
 
     /// The SCSI controllers, the Ethernet, com0 and the PS/2 ports, into
@@ -676,49 +660,17 @@ impl Ip32Bus {
         let crossed = self.gbe.vt_crossings();
         for n in 0..4 {
             if crossed & (1 << n) != 0 {
-                self.crime.latch_int(16 + n);
+                crate::irq::InterruptController::set_line(&*self.crime, 16 + n, true);
             }
         }
         for (scsi, line) in self.scsi.lock().unwrap().iter() {
-            self.crime.set_int(*line, scsi.interrupting());
+            crate::irq::InterruptController::set_line(&*self.crime, *line, scsi.interrupting());
         }
-        self.crime.set_int(IP32_MEC_CRIME_INT, self.mec.interrupting());
-        self.serial_touched(true);
-        self.ps2_touched();
-        self.audio_touched();
-    }
-
-    /// The serial ports' bits of MACE's ISA status, and CRIME line 4 from
-    /// them. Only these bits are set and cleared; overwriting the whole
-    /// register would erase the guest's own and other devices' bits.
-    ///
-    /// A port the guest drives by PIO keeps the behaviour the PROM and the
-    /// BSDs boot with: all six bits follow the 16550's interrupt (`legacy`
-    /// says whether to look at it again; port 1 has never contributed), and
-    /// go to the line whatever the mask says. A port in DMA mode has the
-    /// datasheet's bits, read through the mask, and the line follows them
-    /// only while unmasked: IRIX acknowledges a level by masking it and
-    /// leaving the work to a thread, and a line that ignored the mask would
-    /// bring it straight back into the dispatcher, never letting that thread
-    /// run.
-    fn serial_touched(&self, legacy: bool) {
-        let mut isa = self.mace.cell(MACE_ISA_INT_STATUS);
-        let (owned, bits) = if self.sdma.any_owned() { self.sdma.status() } else { ([false; 2], 0) };
-        let mask = if owned.contains(&true) { self.mace.cell(MACE_ISA_INT_MASK) } else { 0 };
-        for p in 0..2 {
-            let g = sdma::group(p);
-            if owned[p] {
-                isa = (isa & !g) | (bits & g & mask);
-            } else if legacy && p == 0 {
-                // The console's receive interrupt: a kernel does not poll
-                // the UART.
-                isa = if self.com0.interrupting() { isa | g } else { isa & !g };
-            }
-        }
-        self.mace.set_cell(MACE_ISA_INT_STATUS, isa);
-        // Line 4 is serial and parallel only (bits 16..31); bits 8..15 are
-        // line 5's, from the PS/2 ports among others.
-        self.crime.set_int(IP32_ISA_CRIME_INT, isa & 0xffff_0000 != 0);
+        crate::irq::InterruptController::set_line(&*self.crime, IP32_MEC_CRIME_INT, self.mec.interrupting());
+        self.com0.update_irq();
+        self.sdma.update_irq();
+        self.ps2.update_irq();
+        self.audio.update_irq();
     }
 
     /// The engines' view of the machine.
@@ -748,18 +700,9 @@ impl Ip32Bus {
         self.sdma.write(addr, val, &self.sdma_io());
         // A pointer or control write moves the levels, and may hand the port
         // back to (or take it from) the 16550's own interrupt.
-        self.serial_touched(true);
+        self.com0.update_irq();
+        self.sdma.update_irq();
         BUS_OK
-    }
-
-    /// Before a read of a register held as a plain MACE cell: the ISA status
-    /// is brought up to date for a DMA port, so the dispatcher's one read of
-    /// it is current even between service ticks.
-    #[inline]
-    fn before_mace_read(&self, addr: u32) {
-        if addr & !7 == MACE_ISA_INT_STATUS && self.sdma.any_owned() {
-            self.serial_touched(false);
-        }
     }
 
     /// Bring every device interrupt up to date in CRIME: the SCSI
@@ -783,19 +726,16 @@ impl Ip32Bus {
         self.refresh_irq()
     }
 
-    /// After any PS/2 register access: the ports' bits of MACE's ISA
-    /// interrupt status, and CRIME line 5 from them, follow at once. A level
-    /// left high after the handler drained the port reads as a spurious
-    /// interrupt to OpenBSD.
-    pub fn ps2_touched(&self) {
-        if self.ps2.devices().is_none() {
-            return;
+    /// After a write to MACE's ISA status or mask: a status write clears the
+    /// serial DMA engine's pair-request latches it wrote as zero, and a DMA
+    /// port's bits are read through the new mask at once.
+    fn isa_wrote(&self, addr: u32) {
+        if addr & !7 == MACE_ISA_INT_STATUS {
+            self.sdma.status_written(self.isa.status_written());
         }
-        let bits = self.ps2.isa_bits();
-        let isa = (self.mace.cell_pub(MACE_ISA_INT_STATUS) & !MACE_ISA_PS2_MASK) | bits;
-        self.mace.set_cell_pub(MACE_ISA_INT_STATUS, isa);
-        let mask = self.mace.cell_pub(MACE_ISA_INT_MASK);
-        self.crime.set_int(IP32_MISC_CRIME_INT, isa & mask & 0xff00 != 0);
+        if self.sdma.any_owned() {
+            self.sdma.update_irq();
+        }
     }
 
     /// After a write to a MACE register held as a plain cell.
@@ -807,15 +747,15 @@ impl Ip32Bus {
             let v = self.mace.cell_pub(MACE_ISA_RING_BASE);
             self.mace.set_cell_pub(MACE_ISA_RING_BASE, v | MACE_REV2_BIT);
         }
-        // A DMA port's status bits are not the guest's to set, and its mask
-        // decides what it sees of them.
-        let reg = addr & !7;
-        if reg == MACE_ISA_INT_STATUS {
-            self.sdma.status_written(self.mace.cell(MACE_ISA_INT_STATUS));
-        }
-        if (reg == MACE_ISA_INT_STATUS || reg == MACE_ISA_INT_MASK) && self.sdma.any_owned() {
-            self.serial_touched(false);
-        }
+    }
+
+    /// The ISA peripherals' interrupts into MACE's ISA controller: the PS/2
+    /// ports, audio, the console UART (while driven by PIO) and serial DMA.
+    fn connect_isa_devices(&self) {
+        self.ps2.connect_irq(self.isa.clone());
+        self.audio.connect_irq(self.isa.clone());
+        self.com0.connect_irq(crate::irq::IrqLine::new(self.isa.clone(), ISA_SERIAL0_PIO));
+        self.sdma.connect_irq(self.isa.clone());
     }
 
     /// Plug in what a graphics console needs: a PS/2 keyboard on port 0, a
@@ -828,7 +768,8 @@ impl Ip32Bus {
     /// The same, with a PS/2 mouse on port 1 as well.
     pub fn enable_graphics_with_mouse(&mut self, mouse: bool) {
         self.ps2 = MacePs2::with_devices(mouse);
-        self.crime.revision = CRIME_REV_GBE;
+        self.ps2.connect_irq(self.isa.clone());
+        self.crime.set_revision(CRIME_REV_GBE);
         let v = self.mace.cell_pub(MACE_ISA_RING_BASE);
         self.mace.set_cell_pub(MACE_ISA_RING_BASE, v | MACE_REV2_BIT);
     }
@@ -1055,17 +996,6 @@ impl Ip32Bus {
         (0x20..0x38).contains(&off).then(|| ((off - 0x20) / 8) as usize)
     }
 
-    /// The audio interface's bits of MACE's ISA status (7:0), and CRIME line
-    /// 6 from them through the mask, as the PS/2 ports' are.
-    fn audio_touched(&self) {
-        use crate::dev::mace_audio::{CRIME_LINE, ISA_AUDIO_MASK};
-        let bits = self.audio.isa_bits();
-        let isa = (self.mace.cell(MACE_ISA_INT_STATUS) & !ISA_AUDIO_MASK) | bits;
-        self.mace.set_cell(MACE_ISA_INT_STATUS, isa);
-        let mask = self.mace.cell(MACE_ISA_INT_MASK);
-        self.crime.set_int(CRIME_LINE, isa & mask & ISA_AUDIO_MASK != 0);
-    }
-
     fn in_macepci(&self, addr: u32) -> bool {
         addr >= MACEPCI_BASE && addr < MACEPCI_BASE + MACEPCI_SIZE
     }
@@ -1239,9 +1169,7 @@ impl Ip32Bus {
             return BusRead8::ok(self.pci_mem_read_w(addr, 1) as u8);
         }
         if self.in_ps2(addr) {
-            let v = BusDevice::read8(&self.ps2, addr);
-            self.ps2_touched();
-            return v;
+            return BusDevice::read8(&self.ps2, addr);
         }
         if self.in_rtc(addr) {
             return self.rtc.read8(addr);
@@ -1253,8 +1181,17 @@ impl Ip32Bus {
             let v = self.sdma_read(addr);
             return BusRead8::ok(v as u8);
         }
+        if MaceIsa::contains(addr) {
+            self.mace.r();
+            self.mace.hit(addr, false);
+            // The DMA ports' bits are read as they stand now, not as of the
+            // last service tick.
+            if self.sdma.any_owned() {
+                self.sdma.update_irq();
+            }
+            return BusDevice::read8(&*self.isa, addr);
+        }
         if self.in_mace(addr) {
-            self.before_mace_read(addr);
             return self.mace.read8(addr);
         }
         bus_read!(self, addr, 1, BusRead8::ok, |v: u64| v as u8)
@@ -1289,9 +1226,7 @@ impl Ip32Bus {
             return BusRead16::ok(self.pci_mem_read_w(addr, 2) as u16);
         }
         if self.in_ps2(addr) {
-            let v = BusDevice::read16(&self.ps2, addr);
-            self.ps2_touched();
-            return v;
+            return BusDevice::read16(&self.ps2, addr);
         }
         if self.in_rtc(addr) {
             return self.rtc.read16(addr);
@@ -1303,8 +1238,17 @@ impl Ip32Bus {
             let v = self.sdma_read(addr);
             return BusRead16::ok(v as u16);
         }
+        if MaceIsa::contains(addr) {
+            self.mace.r();
+            self.mace.hit(addr, false);
+            // The DMA ports' bits are read as they stand now, not as of the
+            // last service tick.
+            if self.sdma.any_owned() {
+                self.sdma.update_irq();
+            }
+            return BusDevice::read16(&*self.isa, addr);
+        }
         if self.in_mace(addr) {
-            self.before_mace_read(addr);
             return self.mace.read16(addr);
         }
         bus_read!(self, addr, 2, BusRead16::ok, |v: u64| v as u16)
@@ -1351,9 +1295,7 @@ impl Ip32Bus {
             return BusRead32::ok(self.pci_mem_read(addr) as u32);
         }
         if self.in_ps2(addr) {
-            let v = BusDevice::read32(&self.ps2, addr);
-            self.ps2_touched();
-            return v;
+            return BusDevice::read32(&self.ps2, addr);
         }
         if self.in_rtc(addr) {
             return self.rtc.read32(addr);
@@ -1366,8 +1308,17 @@ impl Ip32Bus {
             let v = self.sdma_read(addr);
             return BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 });
         }
+        if MaceIsa::contains(addr) {
+            self.mace.r();
+            self.mace.hit(addr, false);
+            // The DMA ports' bits are read as they stand now, not as of the
+            // last service tick.
+            if self.sdma.any_owned() {
+                self.sdma.update_irq();
+            }
+            return BusDevice::read32(&*self.isa, addr);
+        }
         if self.in_mace(addr) {
-            self.before_mace_read(addr);
             return self.mace.read32(addr);
         }
         bus_read!(self, addr, 4, BusRead32::ok, |v: u64| v as u32)
@@ -1416,9 +1367,7 @@ impl Ip32Bus {
             return BusRead64::ok((hi << 32) | lo);
         }
         if self.in_ps2(addr) {
-            let v = BusDevice::read64(&self.ps2, addr);
-            self.ps2_touched();
-            return v;
+            return BusDevice::read64(&self.ps2, addr);
         }
         if self.in_rtc(addr) {
             return self.rtc.read64(addr);
@@ -1430,8 +1379,17 @@ impl Ip32Bus {
             let v = self.sdma_read(addr);
             return BusRead64::ok(v);
         }
+        if MaceIsa::contains(addr) {
+            self.mace.r();
+            self.mace.hit(addr, false);
+            // The DMA ports' bits are read as they stand now, not as of the
+            // last service tick.
+            if self.sdma.any_owned() {
+                self.sdma.update_irq();
+            }
+            return BusDevice::read64(&*self.isa, addr);
+        }
         if self.in_mace(addr) {
-            self.before_mace_read(addr);
             return self.mace.read64(addr);
         }
         let r = bus_read!(self, addr, 8, BusRead64::ok, |v: u64| v);
@@ -1478,9 +1436,7 @@ impl Ip32Bus {
             return BUS_OK;
         }
         if self.in_ps2(addr) {
-            let r = BusDevice::write8(&self.ps2, addr, val);
-            self.ps2_touched();
-            return r;
+            return BusDevice::write8(&self.ps2, addr, val);
         }
         if self.in_rtc(addr) {
             return self.rtc.write8(addr, val);
@@ -1491,6 +1447,13 @@ impl Ip32Bus {
         if self.in_sdma(addr) {
             // A narrow store is the low end of the register.
             return self.sdma_write(addr, val as u64);
+        }
+        if MaceIsa::contains(addr) {
+            self.mace.w();
+            self.mace.hit(addr, true);
+            let r = BusDevice::write8(&*self.isa, addr, val);
+            self.isa_wrote(addr);
+            return r;
         }
         if self.in_mace(addr) {
             let r = self.mace.write8(addr, val);
@@ -1532,9 +1495,7 @@ impl Ip32Bus {
             return BUS_OK;
         }
         if self.in_ps2(addr) {
-            let r = BusDevice::write16(&self.ps2, addr, val);
-            self.ps2_touched();
-            return r;
+            return BusDevice::write16(&self.ps2, addr, val);
         }
         if self.in_rtc(addr) {
             return self.rtc.write16(addr, val);
@@ -1545,6 +1506,13 @@ impl Ip32Bus {
         if self.in_sdma(addr) {
             // A narrow store is the low end of the register.
             return self.sdma_write(addr, val as u64);
+        }
+        if MaceIsa::contains(addr) {
+            self.mace.w();
+            self.mace.hit(addr, true);
+            let r = BusDevice::write16(&*self.isa, addr, val);
+            self.isa_wrote(addr);
+            return r;
         }
         if self.in_mace(addr) {
             let r = self.mace.write16(addr, val);
@@ -1602,9 +1570,7 @@ impl Ip32Bus {
             return BUS_OK;
         }
         if self.in_ps2(addr) {
-            let r = BusDevice::write32(&self.ps2, addr, val);
-            self.ps2_touched();
-            return r;
+            return BusDevice::write32(&self.ps2, addr, val);
         }
         if self.in_rtc(addr) {
             return self.rtc.write32(addr, val);
@@ -1615,6 +1581,13 @@ impl Ip32Bus {
         if self.in_sdma(addr) {
             // A narrow store is the low end of the register.
             return self.sdma_write(addr, val as u64);
+        }
+        if MaceIsa::contains(addr) {
+            self.mace.w();
+            self.mace.hit(addr, true);
+            let r = BusDevice::write32(&*self.isa, addr, val);
+            self.isa_wrote(addr);
+            return r;
         }
         if self.in_mace(addr) {
             let r = self.mace.write32(addr, val);
@@ -1670,9 +1643,7 @@ impl Ip32Bus {
             return BUS_OK;
         }
         if self.in_ps2(addr) {
-            let r = BusDevice::write64(&self.ps2, addr, val);
-            self.ps2_touched();
-            return r;
+            return BusDevice::write64(&self.ps2, addr, val);
         }
         if self.in_rtc(addr) {
             return self.rtc.write64(addr, val);
@@ -1682,6 +1653,13 @@ impl Ip32Bus {
         }
         if self.in_sdma(addr) {
             return self.sdma_write(addr, val);
+        }
+        if MaceIsa::contains(addr) {
+            self.mace.w();
+            self.mace.hit(addr, true);
+            let r = BusDevice::write64(&*self.isa, addr, val);
+            self.isa_wrote(addr);
+            return r;
         }
         if self.in_mace(addr) {
             let r = self.mace.write64(addr, val);
@@ -1704,7 +1682,7 @@ impl Ip32Bus {
 impl Ip32Bus {
     fn devices(&self) -> Vec<&dyn crate::traits::Device> {
         vec![
-            &self.crime, &self.crime_re, &self.gbe, &self.macepci, &*self.ust, &self.rtc, &self.ps2,
+            &*self.crime, &self.crime_re, &self.gbe, &self.macepci, &*self.ust, &self.rtc, &self.ps2,
             &self.onewire, &self.com0, &self.com1, &self.sdma, &self.audio, &*self.mec,
         ]
     }

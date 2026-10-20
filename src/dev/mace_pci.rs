@@ -213,26 +213,9 @@ pub const PCI_CLASS_SCSI: u32 = 0x0100_00;
 /// expected to be there.
 pub const IP32_SCSI_SLOT: u8 = 1;
 pub const IP32_SCSI_SLOT_B: u8 = 2;
-/// MACE's own interrupt status, which CRIME input 4 cascades from. NetBSD's
-/// handler reads this register and matches each device's mask against it, so
-/// raising CRIME alone is not enough -- the demultiplexer has to find
-/// something.
-pub const MACE_ISA_INT_STATUS: u32 = MACE_BASE + 0x0031_0010;
-/// CRIME input 4 is the ISA cascade; `com0` sits behind it.
-pub const IP32_ISA_CRIME_INT: u32 = 4;
-/// CRIME input for MACE ISA status bits 8..15: RTC, the PS/2 ports, UST timers.
-pub const IP32_MISC_CRIME_INT: u32 = 5;
-/// MACE ISA interrupt mask, next to [`MACE_ISA_INT_STATUS`].
-pub const MACE_ISA_INT_MASK: u32 = MACE_BASE + 0x0031_0018;
-/// The PS/2 bits of the ISA status: 9 and 11 the ports' requests, 10 and 12
-/// their poll flags.
-pub const MACE_ISA_PS2_MASK: u64 = 0x1e00;
 /// ISA ring base and reset register; bit 4 reads as the MACE revision.
 pub const MACE_ISA_RING_BASE: u32 = MACE_BASE + 0x0031_0000;
 pub const MACE_REV2_BIT: u64 = 0x10;
-/// The bits NetBSD's `com0` attaches with, as it prints them:
-/// "com0 at mace0 offset 0x390000 intr 4 intrmask 0x3f00000".
-pub const MACE_ISA_SERIAL0_MASK: u64 = 0x03f0_0000;
 /// The serial DMA channels' registers: port 0 at the start, port 1 16 KB on.
 pub const MACE_SDMA: u32 = MACE_BASE + 0x0031_8000;
 pub const MACE_SDMA_SIZE: u32 = 0x0000_8000;

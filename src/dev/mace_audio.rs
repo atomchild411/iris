@@ -289,6 +289,8 @@ pub struct MaceAudio {
     /// IRIS_O2_AUDIO_DUMP=<file>: every sample each output plays, at the
     /// guest's rate, before resampling (see `dump`).
     dump: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+    /// Its bits of MACE's ISA status (0..7).
+    irq: std::sync::OnceLock<Vec<crate::irq::IrqLine>>,
 }
 
 impl Default for MaceAudio {
@@ -314,6 +316,7 @@ impl MaceAudio {
                     .and_then(|p| std::fs::File::create(p).ok())
                     .map(std::io::BufWriter::new),
             ),
+            irq: std::sync::OnceLock::new(),
         }
     }
 
@@ -439,6 +442,21 @@ impl MaceAudio {
     }
 
     /// The low byte of the ISA interrupt status.
+    /// Wire the interface's status bits into MACE's ISA interrupt controller.
+    pub fn connect_irq(&self, isa: Arc<dyn crate::irq::InterruptController>) {
+        let _ = self.irq.set((0..8).map(|b| crate::irq::IrqLine::new(isa.clone(), b)).collect());
+    }
+
+    /// Drive the interface's status bits: after a register access and after
+    /// the service loop moves the rings.
+    pub fn update_irq(&self) {
+        let Some(lines) = self.irq.get() else { return };
+        let bits = self.isa_bits();
+        for l in lines {
+            l.set(bits & (1 << l.line()) != 0);
+        }
+    }
+
     pub fn isa_bits(&self) -> u64 {
         self.st.lock().isa_bits()
     }
