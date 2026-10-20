@@ -2608,6 +2608,18 @@ pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd:
 
     core.pc = vector_base + offset;
 
+    // A vector is a region entry, but only the 32-bit refill vector sits on
+    // a page's word 0, the one landing a page crossing marks as compile-
+    // worthy. The XTLB refill (0x080, every refill once UX is set, as on the
+    // O2) and the general vector (0x180, reached by syscalls only through
+    // their own trigger) were never requested, so every TLB refill ran in
+    // the interpreter. Once compiled, a trigger at a runnable entry costs
+    // nothing: dispatch just runs it.
+    #[cfg(feature = "jitv2")]
+    {
+        core.jit_trigger = true;
+    }
+
     // Jumping to a handler vector ends any delay slot in progress: the vector's
     // first instruction is never in one. `bd` was already consumed above (into
     // Cause.BD / EPC), so clearing here cannot lose information.
