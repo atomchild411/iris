@@ -237,11 +237,27 @@ pub struct Mec {
     ram: Arc<Mutex<crate::dev::crime_mem::O2Memory>>,
     st: Mutex<State>,
     link: Mutex<Option<Link>>,
+    /// CRIME's Ethernet input.
+    irq: std::sync::OnceLock<crate::irq::IrqLine>,
 }
 
 impl Mec {
     pub fn new(ram: Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
-        Self { ram, st: Mutex::new(State::new()), link: Mutex::new(None) }
+        Self { ram, st: Mutex::new(State::new()), link: Mutex::new(None), irq: std::sync::OnceLock::new() }
+    }
+
+    /// Wire the chip's interrupt to `line`.
+    pub fn connect_irq(&self, line: crate::irq::IrqLine) {
+        let _ = self.irq.set(line);
+        self.update_irq();
+    }
+
+    /// Drive the interrupt line to the chip's state. Called after anything
+    /// that can change it: a register write, frames received.
+    fn update_irq(&self) {
+        if let Some(l) = self.irq.get() {
+            l.set(self.interrupting());
+        }
     }
 
     /// Connect to a backend: frames sent go on `to_net`, frames on `from_net`
@@ -458,6 +474,7 @@ impl Mec {
         if send {
             self.transmit();
         }
+        self.update_irq();
     }
 
     /// Send everything from the read pointer up to the write pointer.
@@ -564,6 +581,11 @@ impl Mec {
     /// Take frames from the backend into the buffers the driver has handed
     /// over. Called from the machine's polling loop.
     pub fn poll(&self) {
+        self.receive();
+        self.update_irq();
+    }
+
+    fn receive(&self) {
         let mut link = self.link.lock().unwrap();
         let Some(link) = link.as_mut() else { return };
         loop {
@@ -758,6 +780,8 @@ mod tests {
         let (to_net, mut tx_cons) = rtrb::RingBuffer::new(8);
         let (_rx_prod, from_net) = rtrb::RingBuffer::new(8);
         m.attach(to_net, from_net, None);
+        let (irq, line) = crate::irq::LevelProbe::line();
+        m.connect_irq(line);
         let ring = 0x2000usize;
         let data = 0x8008usize;
         let frame: Vec<u8> = (0..70u8).collect();
@@ -776,13 +800,13 @@ mod tests {
         let is = m.read64(reg::INT_STATUS);
         assert_eq!((is >> 16) & 0x1ff, 1, "read pointer past the descriptor");
         assert_eq!(is & bits::INT_TX_EMPTY, 0, "hidden while its interrupt is off (IRIX's handler loops on it)");
-        assert!(!m.interrupting(), "not before the transmit interrupt is enabled");
+        assert!(!m.interrupting() && !irq.level(), "not before the transmit interrupt is enabled");
         m.write64(reg::TX_ALIAS, 1);
-        assert!(m.interrupting());
+        assert!(m.interrupting() && irq.level());
         assert_eq!(m.read64(reg::INT_STATUS) & bits::INT_TX_EMPTY, bits::INT_TX_EMPTY, "latched, so enabling later still sees it");
         assert_eq!(m.read64(reg::DMA_CONTROL) & bits::DMA_TX_DMA_ENABLE, bits::DMA_TX_DMA_ENABLE, "TX_ALIAS leaves DMA alone");
         m.write64(reg::INT_STATUS, bits::INT_TX_EMPTY);
-        assert!(!m.interrupting(), "write one to clear");
+        assert!(!m.interrupting() && !irq.level(), "write one to clear");
     }
 
     /// A received frame lands in the oldest buffer handed over: padding, the
@@ -793,6 +817,8 @@ mod tests {
         let (to_net, _tx_cons) = rtrb::RingBuffer::new(8);
         let (mut rx_prod, from_net) = rtrb::RingBuffer::new(8);
         m.attach(to_net, from_net, None);
+        let (irq, line) = crate::irq::LevelProbe::line();
+        m.connect_irq(line);
         m.write64(reg::STATION, 0x0800_6912_3456);
         let (b0, b1) = (0x4000usize, 0x5000usize);
         m.write64(reg::MCL_RX_FIFO, RAM_BASE as u64 + b0 as u64);
@@ -808,11 +834,11 @@ mod tests {
         assert_eq!(stat & 0xffff, (MIN_FRAME + 4) as u64, "padded to 60, plus the CRC");
         assert_eq!(get(&ram, b0 + 32 + 2, frame.len()), frame, "the frame at offset 34");
         assert_eq!(get(&ram, b1, 8), vec![0u8; 8], "the other frame was not for this station");
-        assert!(m.interrupting());
+        assert!(m.interrupting() && irq.level());
         assert_eq!((m.read64(reg::INT_STATUS) >> 8) & 0x1f, 1,
                    "the MCL FIFO read pointer, which OpenBSD reads to find filled buffers");
         m.write64(reg::INT_STATUS, bits::INT_RX_THRESHOLD);
-        assert!(!m.interrupting());
+        assert!(!m.interrupting() && !irq.level());
         assert_eq!(m.counts().1, 1);
     }
 }

@@ -1300,7 +1300,7 @@ where
             }
         }
     }
-    for (scsi, _) in bus.scsi.lock().unwrap().iter() {
+    for scsi in bus.scsi.lock().unwrap().iter() {
         eprintln!("ip32: SCSI controller: {} bytes of sequencer program downloaded",
                   scsi.seqram_len());
         let (c, bi, bo) = scsi.totals();

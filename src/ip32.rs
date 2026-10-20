@@ -410,7 +410,7 @@ pub struct Ip32Bus {
     watch_writes_only: bool,
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
-    pub scsi: Mutex<Vec<(std::sync::Arc<crate::dev::aic7880::Aic7880>, u32)>>,
+    pub scsi: Mutex<Vec<std::sync::Arc<crate::dev::aic7880::Aic7880>>>,
 }
 
 impl Ip32Bus {
@@ -484,7 +484,7 @@ impl Ip32Bus {
         // and finds nothing, so it has no disk and cannot boot. Putting the
         // controller a real O2 has there is how we learn how much of it the
         // PROM insists on.
-        bus.connect_isa_devices();
+        bus.connect_interrupts();
         if opts.scsi {
             // The controller fetches its work from host memory, so it
             // needs to reach RAM directly rather than through the bus that
@@ -532,9 +532,11 @@ impl Ip32Bus {
                     Err(e) => eprintln!("ip32: SCSI {at}: {}: {e}", d.path.display()),
                 }
             }
+            scsi.connect_irq(crate::irq::IrqLine::new(bus.crime.clone(), IP32_SCSI_CRIME_INT));
+            scsi_b.connect_irq(crate::irq::IrqLine::new(bus.crime.clone(), IP32_SCSI_CRIME_INT_B));
             let mut list = bus.scsi.lock().unwrap();
-            list.push((scsi, IP32_SCSI_CRIME_INT));
-            list.push((scsi_b, IP32_SCSI_CRIME_INT_B));
+            list.push(scsi);
+            list.push(scsi_b);
         }
         // A saved flash carries the guest's environment -- boot paths, console
         // choice, everything the PROM's `setenv` writes -- from one run to
@@ -653,8 +655,10 @@ impl Ip32Bus {
         self.crime.update_output()
     }
 
-    /// The SCSI controllers, the Ethernet, com0 and the PS/2 ports, into
-    /// their CRIME inputs.
+    /// The interrupts that are not yet driven by their devices' own state
+    /// changes: GBE's beam crossings (time passing), and the ISA devices
+    /// whose state moves from outside the guest (typed keys and console
+    /// input, audio buffers draining).
     fn update_lines(&self) {
         // GBE's vertical-timing interrupts: the beam crossed a VT_INTRn line.
         let crossed = self.gbe.vt_crossings();
@@ -663,10 +667,6 @@ impl Ip32Bus {
                 crate::irq::InterruptController::set_line(&*self.crime, 16 + n, true);
             }
         }
-        for (scsi, line) in self.scsi.lock().unwrap().iter() {
-            crate::irq::InterruptController::set_line(&*self.crime, *line, scsi.interrupting());
-        }
-        crate::irq::InterruptController::set_line(&*self.crime, IP32_MEC_CRIME_INT, self.mec.interrupting());
         self.com0.update_irq();
         self.sdma.update_irq();
         self.ps2.update_irq();
@@ -749,9 +749,11 @@ impl Ip32Bus {
         }
     }
 
-    /// The ISA peripherals' interrupts into MACE's ISA controller: the PS/2
-    /// ports, audio, the console UART (while driven by PIO) and serial DMA.
-    fn connect_isa_devices(&self) {
+    /// Wire the devices' interrupts: the Ethernet straight into CRIME, the
+    /// ISA peripherals (the PS/2 ports, audio, the console UART while driven
+    /// by PIO, serial DMA) into MACE's ISA controller.
+    fn connect_interrupts(&self) {
+        self.mec.connect_irq(crate::irq::IrqLine::new(self.crime.clone(), IP32_MEC_CRIME_INT));
         self.ps2.connect_irq(self.isa.clone());
         self.audio.connect_irq(self.isa.clone());
         self.com0.connect_irq(crate::irq::IrqLine::new(self.isa.clone(), ISA_SERIAL0_PIO));

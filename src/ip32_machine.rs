@@ -696,7 +696,7 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
         },
         "scsi" => {
             let mut text = String::new();
-            for (n, (c, _)) in bus.scsi.lock().unwrap().iter().enumerate() {
+            for (n, c) in bus.scsi.lock().unwrap().iter().enumerate() {
                 for line in c.notes() {
                     text.push_str(&format!("{n}: {line}\n"));
                 }

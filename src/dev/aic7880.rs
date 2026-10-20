@@ -348,6 +348,8 @@ pub struct Aic7880 {
     sense: Mutex<Option<(u8, u8, u8)>>,
     /// Pages of DMA addresses already reported as not memory.
     dma_misses: Mutex<std::collections::BTreeSet<u32>>,
+    /// The chip's interrupt pin, as the board routes it.
+    irq: std::sync::OnceLock<crate::irq::IrqLine>,
 }
 
 impl Aic7880 {
@@ -364,6 +366,7 @@ impl Aic7880 {
             dma_hits: Mutex::new(Vec::new()),
             sense: Mutex::new(None),
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
+            irq: std::sync::OnceLock::new(),
             target: std::env::var("IRIS_IP32_SCSI_ID").ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
@@ -480,6 +483,21 @@ impl Aic7880 {
     /// is about and are not an interrupt of their own.
     pub fn interrupting(&self) -> bool {
         self.st.lock().unwrap().intstat & 0x0f != 0
+    }
+
+    /// Wire the chip's interrupt pin to `line`.
+    pub fn connect_irq(&self, line: crate::irq::IrqLine) {
+        let _ = self.irq.set(line);
+        self.update_irq();
+    }
+
+    /// Drive the interrupt pin to the chip's state. Commands run to
+    /// completion inside the register write that starts them, so after a
+    /// write is the only time it can change.
+    fn update_irq(&self) {
+        if let Some(l) = self.irq.get() {
+            l.set(self.interrupting());
+        }
     }
 
     /// How many times the driver paused or restarted the sequencer.
@@ -1267,6 +1285,7 @@ impl crate::ip32::PciDeviceOps for Aic7880 {
             let shift = 8 * (width as u32 - 1 - i);
             self.write8(off + i, (val >> shift) as u8);
         }
+        self.update_irq();
     }
 }
 
@@ -1719,6 +1738,8 @@ mod tests {
     #[test]
     fn an_empty_id_times_out_its_selection() {
         let (c, ram) = him_rig("him-selto");
+        let (irq, line) = crate::irq::LevelProbe::line();
+        c.connect_irq(line);
         let inquiry = [0x12, 0, 0, 0, 36, 0];
         put_cmd(&ram, 2, 3, &inquiry, 36);
         c.write(reg::QINFIFO, 2, 1);
@@ -1727,7 +1748,7 @@ mod tests {
         assert_ne!(c.read(reg::SSTAT1, 1) as u8 & sstat1::SELTO, 0, "SSTAT1 says selection timeout");
         assert_eq!(c.read(him::WAITING_SCB, 1), 2, "for the tag being selected");
         assert_ne!(c.read(reg::HCNTRL, 1) as u8 & hcntrl::PAUSE, 0, "and the sequencer has stopped");
-        assert!(c.interrupting());
+        assert!(c.interrupting() && irq.level(), "the pin follows the chip");
         assert!(qout(&ram).iter().all(|b| *b == QOUTFIFO_EMPTY), "nothing completed");
         assert!(ram.lock().unwrap().bytes(buf_at(2) as usize, (buf_at(2) as usize + 36) - (buf_at(2) as usize)).iter().all(|b| *b == 0),
                 "and no data moved");
@@ -1742,7 +1763,7 @@ mod tests {
         assert_eq!(c.read(reg::INTSTAT, 1), 0);
         assert_eq!(c.read(reg::SSTAT1, 1), 0);
         assert_eq!(c.read(reg::HCNTRL, 1) as u8 & hcntrl::PAUSE, 0, "and it runs again");
-        assert!(!c.interrupting());
+        assert!(!c.interrupting() && !irq.level());
     }
 
     /// A failed command stops the sequencer with its status in scratch RAM.
