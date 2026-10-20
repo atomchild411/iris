@@ -300,6 +300,12 @@ pub trait ScsiCallback: Send + Sync {
 // its own.
 unsafe impl Sync for Wd33c93a {}
 
+/// What the Indy's targets report in INQUIRY. The CD-ROM matches the Sony
+/// CDU-76S the Indy shipped with: IRIX's mediad uses the vendor and product
+/// strings for feature detection (volume control, eject).
+pub const INDY_CDROM: crate::scsi::ScsiIdentity = crate::scsi::ScsiIdentity::new(b"Sony    ", b"CDU-76S         ", b"1.0 ");
+pub const INDY_DISK: crate::scsi::ScsiIdentity = crate::scsi::ScsiIdentity::new(b"SGI     ", b"IRIS EMUL DISK  ", b"1.0 ");
+
 pub struct Wd33c93a {
     state: Arc<Mutex<Wd33c93aState>>,
     cond: Arc<Condvar>,
@@ -398,61 +404,10 @@ impl Wd33c93a {
         overlay: bool,
         overlay_path_override: Option<&str>,
     ) -> std::io::Result<()> {
-        use crate::cow_disk::CowDisk;
-        use crate::scsi::DiskBackend;
-
-        // Empty CD-ROM (drive present, tray empty). Stored backend=None so
-        // TEST UNIT READY / READ CAPACITY / READ return MEDIUM NOT PRESENT,
-        // while INQUIRY still advertises the drive. Use insert_disc() to
-        // mount media later.
-        if is_cdrom && path.is_empty() {
-            let mut state = self.state.lock();
-            if id < 8 {
-                state.devices[id] = Some(crate::scsi::ScsiDevice::new_empty_cdrom());
-            }
-            return Ok(());
-        }
-        let is_chd_path = crate::chd_disk::is_chd(path);
-
-        let (backend, size) = if is_chd_path {
-            {
-                use crate::chd_disk::{ChdCd, ChdHd};
-                if is_cdrom {
-                    let cd = ChdCd::open(path)?;
-                    let sz = cd.size();
-                    (DiskBackend::ChdCd(cd), sz)
-                } else {
-                    // HD CHD. The `overlay` flag is the per-disk copy-on-write
-                    // toggle: COW on → always overlay (even an uncompressed base
-                    // gets a diff) and never auto-fold on exit (commit/roll back
-                    // manually); COW off → write in place (uncompressed) or a diff
-                    // that auto-folds on a clean exit (compressed).
-                    let hd = ChdHd::open(path, overlay)?;
-                    let sz = hd.size();
-                    (DiskBackend::ChdHd(hd), sz)
-                }
-            }
-        } else if overlay && !is_cdrom {
-            let overlay_path = overlay_path_override
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{}.overlay", path));
-            let cow = CowDisk::new(path, &overlay_path)?;
-            let sz = cow.size();
-            (DiskBackend::Cow(cow), sz)
-        } else {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(!is_cdrom)
-                .open(path)?;
-            let sz = file.metadata()?.len();
-            (DiskBackend::Direct(file), sz)
-        };
-
-        let disc_list = if is_cdrom { discs } else { vec![] };
-
+        let dev = ScsiDevice::open(path, is_cdrom, discs, overlay, overlay_path_override, if is_cdrom { INDY_CDROM } else { INDY_DISK })?;
         let mut state = self.state.lock();
         if id < 8 {
-            state.devices[id] = Some(ScsiDevice::new(backend, size, is_cdrom, path.to_string(), disc_list));
+            state.devices[id] = Some(dev);
         }
         Ok(())
     }
@@ -2512,7 +2467,7 @@ mod data_out_phase_tests {
         {
             let mut s = dev.state.lock();
             s.devices[2] = Some(ScsiDevice::new(
-                scsi::DiskBackend::Direct(file), 1 << 20, false, path.display().to_string(), Vec::new()));
+                scsi::DiskBackend::Direct(file), 1 << 20, false, path.display().to_string(), Vec::new(), INDY_DISK));
             s.advanced_mode = true;
             s.target_id = 2;
             s.regs[regs::DESTINATION_ID as usize] = 2;

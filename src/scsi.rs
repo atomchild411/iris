@@ -22,6 +22,8 @@ pub mod scsi_cmd {
     pub const WRITE_6: u8 = 0x0a;
     pub const INQUIRY: u8 = 0x12;
     pub const MODE_SELECT_6: u8 = 0x15;
+    pub const RESERVE_6: u8 = 0x16;
+    pub const RELEASE_6: u8 = 0x17;
     pub const MODE_SENSE_6: u8 = 0x1a;
     pub const START_STOP_UNIT: u8 = 0x1b;
     pub const RECEIVE_DIAGNOSTIC_RESULTS: u8 = 0x1c;
@@ -32,7 +34,9 @@ pub mod scsi_cmd {
     pub const WRITE_10: u8 = 0x2a;
     pub const VERIFY_10: u8 = 0x2f;
     pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
+    pub const MODE_SELECT_10: u8 = 0x55;
     pub const MODE_SENSE_10: u8 = 0x5a;
+    pub const SET_CD_SPEED: u8 = 0xbb;
     pub const WRITE_BUFFER: u8 = 0x3b;
     pub const READ_BUFFER: u8 = 0x3c;
     pub const READ_SUB_CHANNEL: u8 = 0x42;
@@ -138,6 +142,24 @@ pub enum DeviceKind {
     DaynaPort(Box<crate::dev::daynaport::DaynaPort>),
 }
 
+/// What a target reports of itself in INQUIRY: vendor, product and
+/// revision. The command set is the same on every machine; who a machine
+/// says its drives are is its own (the Indy's Sony CD-ROM is in
+/// `wd33c93a`), so each controller passes its identity when it attaches a
+/// device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScsiIdentity {
+    pub vendor: [u8; 8],
+    pub product: [u8; 16],
+    pub revision: [u8; 4],
+}
+
+impl ScsiIdentity {
+    pub const fn new(vendor: &[u8; 8], product: &[u8; 16], revision: &[u8; 4]) -> Self {
+        Self { vendor: *vendor, product: *product, revision: *revision }
+    }
+}
+
 pub struct ScsiDevice {
     /// None = no media loaded (CD-ROM drive present but tray is empty), or a
     /// device with no storage behind it at all (DaynaPort).
@@ -161,12 +183,14 @@ pub struct ScsiDevice {
     /// Logical block size: LBA→byte offset = lba * logical_block_size.
     /// Defaults to 512. IRIX switches via MODE SELECT (512↔2048). Persists across disc changes.
     logical_block_size: u64,
+    /// What INQUIRY reports (the attaching controller's choice).
+    identity: ScsiIdentity,
 }
 
 const SCSI_BUFFER_SIZE: usize = 0x4000; // 16KB (16384 bytes)
 
 impl ScsiDevice {
-    pub fn new(backend: DiskBackend, size: u64, is_cdrom: bool, filename: String, discs: Vec<String>) -> Self {
+    pub fn new(backend: DiskBackend, size: u64, is_cdrom: bool, filename: String, discs: Vec<String>, identity: ScsiIdentity) -> Self {
         Self {
             backend: Some(backend),
             size,
@@ -180,13 +204,76 @@ impl ScsiDevice {
             // CD-ROM drives default to 2048-byte logical blocks (Sony CDU-76S behaviour).
             // HDD defaults to 512. dksc switches CD-ROM to 512 for EFS, back to 2048 for ISO.
             logical_block_size: if is_cdrom { 2048 } else { 512 },
+            identity,
         }
+    }
+
+    /// Open a disk or CD-ROM image as a target: a CHD (hard disk or CD),
+    /// a copy-on-write overlay over `path` when `overlay` (hard disks), or
+    /// the file itself; an empty `path` is a CD-ROM drive with no disc. A
+    /// CD-ROM changer's discs are `discs`. Any controller attaches its
+    /// targets this way, with its own `identity`.
+    pub fn open(
+        path: &str,
+        is_cdrom: bool,
+        discs: Vec<String>,
+        overlay: bool,
+        overlay_path_override: Option<&str>,
+        identity: ScsiIdentity,
+    ) -> std::io::Result<Self> {
+        use crate::cow_disk::CowDisk;
+
+        // Empty CD-ROM (drive present, tray empty). Stored backend=None so
+        // TEST UNIT READY / READ CAPACITY / READ return MEDIUM NOT PRESENT,
+        // while INQUIRY still advertises the drive. Use insert_disc() to
+        // mount media later.
+        if is_cdrom && path.is_empty() {
+            return Ok(Self::new_empty_cdrom(identity));
+        }
+        let is_chd_path = crate::chd_disk::is_chd(path);
+
+        let (backend, size) = if is_chd_path {
+            {
+                use crate::chd_disk::{ChdCd, ChdHd};
+                if is_cdrom {
+                    let cd = ChdCd::open(path)?;
+                    let sz = cd.size();
+                    (DiskBackend::ChdCd(cd), sz)
+                } else {
+                    // HD CHD. The `overlay` flag is the per-disk copy-on-write
+                    // toggle: COW on → always overlay (even an uncompressed base
+                    // gets a diff) and never auto-fold on exit (commit/roll back
+                    // manually); COW off → write in place (uncompressed) or a diff
+                    // that auto-folds on a clean exit (compressed).
+                    let hd = ChdHd::open(path, overlay)?;
+                    let sz = hd.size();
+                    (DiskBackend::ChdHd(hd), sz)
+                }
+            }
+        } else if overlay && !is_cdrom {
+            let overlay_path = overlay_path_override
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}.overlay", path));
+            let cow = CowDisk::new(path, &overlay_path)?;
+            let sz = cow.size();
+            (DiskBackend::Cow(cow), sz)
+        } else {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(!is_cdrom)
+                .open(path)?;
+            let sz = file.metadata()?.len();
+            (DiskBackend::Direct(file), sz)
+        };
+
+        let disc_list = if is_cdrom { discs } else { vec![] };
+        Ok(Self::new(backend, size, is_cdrom, path.to_string(), disc_list, identity))
     }
 
     /// Construct an empty CD-ROM drive — drive present, no media inserted.
     /// IRIX will see the drive in `hinv` but `TEST UNIT READY` reports
     /// MEDIUM NOT PRESENT.
-    pub fn new_empty_cdrom() -> Self {
+    pub fn new_empty_cdrom(identity: ScsiIdentity) -> Self {
         Self {
             backend: None,
             size: 0,
@@ -198,6 +285,7 @@ impl ScsiDevice {
             unit_attention: false,
             phys_block_size: 2048,
             logical_block_size: 2048,
+            identity,
         }
     }
 
@@ -215,6 +303,8 @@ impl ScsiDevice {
             unit_attention: false,
             phys_block_size: 512,
             logical_block_size: 512,
+            // Never reported: a DaynaPort answers INQUIRY itself.
+            identity: ScsiIdentity::new(b"        ", b"                ", b"    "),
         }
     }
 
@@ -608,6 +698,13 @@ impl ScsiDevice {
             // No write-back cache to flush — our backend writes are already synchronous.
             scsi_cmd::SYNCHRONIZE_CACHE_10 => ScsiResponse { status: 0x00, data: vec![] },
             scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::MODE_SELECT_10 => self.exec_mode_select_10(&req.cdb, req.data_in.as_ref())?,
+            // Nothing to do: one initiator, no medium to check, no speed to
+            // set. PROMs send RESERVE, RELEASE and VERIFY while probing, and
+            // a CD driver SET CD SPEED on open.
+            scsi_cmd::RESERVE_6 | scsi_cmd::RELEASE_6 | scsi_cmd::VERIFY_10 | scsi_cmd::SET_CD_SPEED => {
+                ScsiResponse { status: 0x00, data: vec![] }
+            }
             scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
             scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
             scsi_cmd::SGI_EJECT => self.exec_sgi_eject(&req.cdb)?,
@@ -665,17 +762,9 @@ impl ScsiDevice {
             data[2] = 0x02; // ANSI SCSI-2
             data[3] = 0x02; // SCSI-2 response format
             data[4] = 31;   // Additional length (36 - 5)
-            if self.is_cdrom() {
-                // Match Sony CDU-76S — SGI Indy shipped with this drive and IRIX mediad
-                // uses the vendor/product strings for feature detection (volume control, eject).
-                data[8..16].copy_from_slice(b"Sony    ");
-                data[16..32].copy_from_slice(b"CDU-76S         ");
-            } else {
-                data[8..16].copy_from_slice(b"SGI     ");
-                data[16..32].copy_from_slice(b"IRIS EMUL DISK  ");
-            }
-            let rev = b"1.0 ";
-            data[32..36].copy_from_slice(rev);
+            data[8..16].copy_from_slice(&self.identity.vendor);
+            data[16..32].copy_from_slice(&self.identity.product);
+            data[32..36].copy_from_slice(&self.identity.revision);
 
             /*println!("SCSI: INQUIRY LUN={} AllcLen={} Type={:02x} Vendor={} Product={} Rev={}",
                 lun, alloc_len, data[0],
@@ -766,11 +855,14 @@ impl ScsiDevice {
     }
 
     fn perform_write(&mut self, lba: u64, count: usize, data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        // A failed write says why, so the REQUEST SENSE after it does not
+        // report "no sense".
         if self.is_cdrom() {
-            return Ok(ScsiResponse {
-                status: 0x02, // Check Condition
-                data: vec![],
-            });
+            return Ok(self.check_condition(0x07, 0x27, 0x00)); // DATA PROTECT: write protected
+        }
+        // Past the end is an error, not a bigger disk.
+        if (lba + count as u64) * self.logical_block_size > self.size {
+            return Ok(self.check_condition(0x05, 0x21, 0x00)); // ILLEGAL REQUEST: LBA out of range
         }
 
         let Some(data) = data_in else {
@@ -792,7 +884,9 @@ impl ScsiDevice {
         let Some(backend) = self.backend.as_mut() else {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
         };
-        backend.write_sectors(lba, data)?;
+        if backend.write_sectors(lba, data).is_err() {
+            return Ok(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
+        }
 
         Ok(ScsiResponse {
             status: 0x00,
@@ -1032,21 +1126,35 @@ impl ScsiDevice {
         }
 
         // Header: byte 0 = mode data length (ignored on SELECT), byte 3 = block descriptor length
-        let bd_len = data[3] as usize;
-        if bd_len >= 8 && data.len() >= 4 + bd_len {
-            // 8-byte block descriptor layout (starts at data[4]):
+        self.select_block_descriptor(data, 4, data[3] as usize);
+        Ok(ScsiResponse { status: 0x00, data: vec![] })
+    }
+
+    /// MODE SELECT(10): the same, after an 8-byte header whose bytes 6..7
+    /// give the block descriptor length.
+    fn exec_mode_select_10(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        let param_len = ((cdb[7] as usize) << 8) | cdb[8] as usize;
+        if let Some(data) = data_in.filter(|d| d.len() >= param_len && param_len >= 8) {
+            self.select_block_descriptor(data, 8, ((data[6] as usize) << 8) | data[7] as usize);
+        }
+        Ok(ScsiResponse { status: 0x00, data: vec![] })
+    }
+
+    /// A MODE SELECT block descriptor at `at`, `len` bytes: its block length
+    /// becomes the logical block size, if it is one a CD-ROM takes.
+    fn select_block_descriptor(&mut self, data: &[u8], at: usize, len: usize) {
+        if len >= 8 && data.len() >= at + len {
+            // 8-byte block descriptor layout:
             //   [0]    density code
             //   [1..3] number of blocks (0 = whole medium)
             //   [4]    reserved
             //   [5..7] block length (24-bit big-endian)
-            let desc = &data[4..4 + bd_len];
+            let desc = &data[at..at + len];
             let new_lbs = ((desc[5] as u64) << 16) | ((desc[6] as u64) << 8) | (desc[7] as u64);
-            if new_lbs == 512 || new_lbs == 2048 {
+            if matches!(new_lbs, 512 | 1024 | 2048) {
                 self.logical_block_size = new_lbs;
             }
         }
-
-        Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 
     fn exec_write_buffer(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
