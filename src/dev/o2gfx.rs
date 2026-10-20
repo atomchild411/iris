@@ -1685,9 +1685,9 @@ impl CrimeRe {
             // A shaded GL point: a line from the vertex to itself, so it
             // takes the shade colour, blending and a double-pix half as GL
             // lines do. bz's world is shaded GL points; painted with FG
-            // they all came out black. (A flat one keeps FG as it stands,
-            // a colour index's low byte included.)
-            0 if dm & draw::GL != 0 && dm & draw::SHADE != 0 => {
+            // they all came out black. (A flat one, or one into an 8-bit
+            // colour-index buffer such as flight's, keeps FG as it stands.)
+            0 if dm & draw::GL != 0 && dm & draw::SHADE != 0 && dst.bd == 4 => {
                 Self::gl_line(&r, mem, dst, ox, oy, false, true);
             }
             // Point.
@@ -2241,6 +2241,12 @@ impl CrimeRe {
         let half_off = if dmode & 1 == 0 { 2 } else { 0 };
         let blend = dm & draw::BLEND != 0 && dst.bd == 4 && (fmt != 0 || half);
         let mut plot = |x: i32, y: i32, cov: f64| {
+            if frag_probe() == Some((x, y)) {
+                eprintln!(
+                    "o2frag {x},{y}: {} dm {dm:#x} bufmode {:#x} colour {cr},{cg},{cb},{ca} cov {cov:.2} clip {}",
+                    if point { "point" } else { "line" }, g(BUFMODE_DST), x >= 0 && y >= 0 && clip.ok(x, y)
+                );
+            }
             if x < 0 || y < 0 || cov <= 0.0 || !clip.ok(x, y) {
                 return;
             }
@@ -2264,8 +2270,16 @@ impl CrimeRe {
                 let v = (d & 0x8000) | ((r8 >> 3) << 10) | ((g8 >> 3) << 5) | (b8 >> 3);
                 Self::put(r, mem, o, 2, v);
             } else {
-                let (dr, dg, db) = unpack(Self::get_px(mem, o, 4));
-                let [r8, g8, b8, _] = if blend { Self::blend(func, konst, [cr, cg, cb, sa], [dr, dg, db, 255]) } else { [cr, cg, cb, ca] };
+                // The destination is read only to blend, which needs 32-bit
+                // pixels: an 8-bit one read as a word is off its alignment
+                // (flight's shaded points into its colour-index window
+                // stopped the emulator).
+                let [r8, g8, b8, _] = if blend {
+                    let (dr, dg, db) = unpack(Self::get_px(mem, o, 4));
+                    Self::blend(func, konst, [cr, cg, cb, sa], [dr, dg, db, 255])
+                } else {
+                    [cr, cg, cb, ca]
+                };
                 Self::put(r, mem, o, dst.bd, pack(r8, g8, b8, ca));
             }
         };
@@ -2949,6 +2963,25 @@ mod tests {
         let o = 0x0100_0000 + 512 + 2 * 4;
         let m = ram.lock().unwrap();
         assert_eq!(&m.bytes(o + 2, 2), &[0x7c, 0x00], "red 31 in the half at offset 2");
+    }
+
+    /// A shaded GL point into an 8-bit colour-index buffer stores FG's
+    /// index and reads nothing as a word: flight's points read a 32-bit
+    /// destination at an odd byte and stopped the emulator.
+    #[test]
+    fn a_shaded_gl_point_into_an_8bit_buffer_keeps_fg() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        re.write32(base + BUFMODE_DST, 0x000);
+        re.write32(base + DRAWMODE, 0x0051_0178);
+        re.write32(base + PRIMITIVE, 0x0000_0000);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        re.write64(base + TRI_V0, (gl(3) as u64) << 32 | gl(1) as u64);
+        re.write64(base + SHADE_R, (248u64 << 12) << 32);
+        re.write32(base + (FG | 0x800), 7);
+        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000 + 512 + 3, 1), vec![7]);
     }
 
     /// An unblended GL line is drawn whatever its colour's alpha: amesh's
