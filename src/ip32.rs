@@ -769,6 +769,9 @@ impl Ip32Bus {
     /// service thread.
     pub fn service(&self) -> bool {
         self.mec.poll();
+        // Whatever the consoles have typed, into the UARTs.
+        self.com0.pump();
+        self.com1.pump();
         self.audio.poll(&crate::dev::mace_audio::AudioIo {
             ram: &self.ram,
             ring_base: (self.mace.cell(MACE_ISA_RING_BASE) & sdma::RING_BASE_MASK) as u32,

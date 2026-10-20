@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 use std::io::Write;
 
+use crate::dev::z85c30::SerialBackend;
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device, Resettable, BUS_OK};
 use crate::ip32::*;
 
@@ -19,19 +20,14 @@ use crate::ip32::*;
 /// rather than going anywhere.
 pub struct Com16550 {
     out: Mutex<Vec<u8>>,
-    /// A live copy of everything transmitted, flushed as it arrives.
-    /// A guest that takes half an hour to boot cannot be watched through a
-    /// dump printed at the end of the run.
-    log: Mutex<Option<std::fs::File>>,
+    /// The host end of the serial line, as the Z85C30's channels have:
+    /// a TCP console, a log tee, or nothing.
+    backend: Mutex<std::sync::Arc<dyn SerialBackend>>,
     /// Characters waiting to be read by the guest. The PROM polls LSR for
     /// data-ready and then reads the receive register, so an empty queue simply
     /// means "nobody has typed anything".
     input: std::sync::Arc<Mutex<std::collections::VecDeque<u8>>>,
     regs: Mutex<[u8; 8]>,
-    /// The client of a TCP console (`serve_tcp`), which gets every byte
-    /// transmitted and whose keystrokes are queued as input.
-    /// Every connected console client: each sees all output and may type.
-    tcp: std::sync::Arc<Mutex<Vec<std::net::TcpStream>>>,
     /// Which UART this is (`com0`, `com1`): its monitor command.
     name: &'static str,
 }
@@ -95,72 +91,28 @@ impl Com16550 {
     pub fn named(name: &'static str) -> Self {
         Self {
             out: Mutex::new(Vec::new()),
-            log: Mutex::new(None),
+            backend: Mutex::new(crate::dev::z85c30::null_serial_backend()),
             input: Default::default(),
             regs: Mutex::new([0u8; 8]),
-            tcp: Default::default(),
             name,
         }
     }
 
-    /// A live console on `127.0.0.1:port`, as IRIS's other machines have on
-    /// their serial ports: one client at a time (a new one replaces it), in
-    /// telnet character mode -- the same handshake and filter the Z85C30's
-    /// TCP backend uses, so `telnet` and `nc` both work. Everything the guest
-    /// transmits from now on goes to the client too; what the client types is
-    /// queued for the guest, as `feed` queues a script's input.
-    /// Port 0 takes any free port; the one bound is returned.
-    pub fn serve_tcp(&self, port: u16) -> std::io::Result<u16> {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
-        let bound = listener.local_addr()?.port();
-        let input = self.input.clone();
-        let client = self.tcp.clone();
-        std::thread::Builder::new().name(format!("ip32-com0-tcp-{port}")).spawn(move || {
-            // One thread per client, so a person and a script can share the
-            // console: both see everything, and whatever either types goes in.
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let _ = stream.set_nodelay(true);
-                if stream.write_all(&crate::net::telnet::TelnetFilter::initial_handshake()).is_err() {
-                    continue;
-                }
-                let Ok(writer) = stream.try_clone() else { continue };
-                client.lock().unwrap().push(writer);
-                let input = input.clone();
-                let _ = std::thread::Builder::new().name(format!("ip32-com0-client-{port}")).spawn(move || {
-                    let mut telnet = crate::net::telnet::TelnetFilter::new();
-                    let mut buf = [0u8; 256];
-                    loop {
-                        let n = match stream.read(&mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => n,
-                        };
-                        let mut reply = Vec::new();
-                        let mut typed = Vec::new();
-                        for &b in &buf[..n] {
-                            if let Some(d) = telnet.feed(b, &mut reply) {
-                                typed.push(d);
-                            }
-                        }
-                        if !reply.is_empty() && stream.write_all(&reply).is_err() {
-                            break;
-                        }
-                        input.lock().unwrap().extend(typed);
-                    }
-                    // A client that has gone is dropped on the next write
-                    // that fails.
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                });
-            }
-        })?;
-        Ok(bound)
+    /// Wire the host end of the line: a TCP console
+    /// (`z85c30::tcp_serial_backend`), a `TeeBackend` logging to a file, or
+    /// nothing.
+    pub fn set_backend(&self, backend: std::sync::Arc<dyn SerialBackend>) {
+        *self.backend.lock().unwrap() = backend;
     }
 
-    /// Mirror everything transmitted to a file as it happens.
-    pub fn log_to(&self, path: &std::path::Path) -> std::io::Result<()> {
-        *self.log.lock().unwrap() = Some(std::fs::File::create(path)?);
-        Ok(())
+    /// Move whatever the host end has typed into the receive queue. The
+    /// machine's service loop calls this, and so does a status read, so a
+    /// driver polling for data sees it at once.
+    pub fn pump(&self) {
+        let backend = self.backend.lock().unwrap().clone();
+        while let Ok(b) = backend.recv_byte() {
+            self.input.lock().unwrap().push_back(b);
+        }
     }
 
     /// Queue characters for the guest to read.
@@ -246,6 +198,7 @@ impl Com16550 {
             // Always ready to take another byte, and data-ready whenever
             // something has been typed.
             com_reg::LSR => {
+                self.pump();
                 let mut v = com_reg::LSR_THRE | com_reg::LSR_TEMT;
                 if !self.input.lock().unwrap().is_empty() {
                     v |= com_reg::LSR_DR;
@@ -301,18 +254,8 @@ impl Com16550 {
             return;
         }
         self.out.lock().unwrap().push(val);
-        if let Some(f) = self.log.lock().unwrap().as_mut() {
-            use std::io::Write;
-            let _ = f.write_all(&[val]);
-            let _ = f.flush();
-        }
-        let mut tcp = self.tcp.lock().unwrap();
-        if !tcp.is_empty() {
-            use std::io::Write;
-            let mut buf = Vec::with_capacity(2);
-            crate::net::telnet::escape_byte(val, &mut buf);
-            tcp.retain_mut(|t| t.write_all(&buf).is_ok());
-        }
+        let backend = self.backend.lock().unwrap().clone();
+        backend.send_byte(val);
     }
 
     /// Set the modem control register, for a DMA pair that names it rather
@@ -357,10 +300,10 @@ impl Device for Com16550 {
         match args.first().copied().unwrap_or("status") {
             "status" => {
                 let r = *self.regs.lock().unwrap();
-                writeln!(w, "{}: IER {:#04x} LCR {:#04x} MCR {:#04x} SCR {:#04x}{}{}; {} bytes out, {} waiting in, {} console client(s)",
+                writeln!(w, "{}: IER {:#04x} LCR {:#04x} MCR {:#04x} SCR {:#04x}{}{}; {} bytes out, {} waiting in",
                     self.name, r[com_reg::IER as usize], r[com_reg::LCR as usize], r[4], r[7],
                     if self.looped() { ", loopback" } else { "" }, if self.interrupting() { ", interrupting" } else { "" },
-                    self.bytes_out(), self.pending_input(), self.tcp.lock().unwrap().len()).ok();
+                    self.bytes_out(), self.pending_input()).ok();
             }
             "output" => {
                 let n = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(2000);
@@ -404,33 +347,35 @@ impl BusDevice for Com16550 {
 mod tests {
     use super::*;
 
-    /// The TCP console: a client gets the telnet handshake, then every byte
-    /// the guest transmits, and what it types becomes the guest's input --
-    /// with telnet's own commands taken out on the way.
+    /// The TCP console, through the shared serial backend: a client gets
+    /// the telnet handshake, then every byte the guest transmits, and what
+    /// it types becomes the guest's input -- with telnet's own commands
+    /// taken out on the way.
     #[test]
     fn a_tcp_console_carries_both_directions() {
         use std::io::{Read, Write};
         let c = Com16550::new();
-        let port = c.serve_tcp(0).expect("bind");
+        let (backend, port) = crate::dev::z85c30::tcp_serial_backend(0).expect("bind");
+        c.set_backend(backend);
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        // The backend takes the client on its next poll.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut hs = [0u8; 12];
+        c.pump();
         client.read_exact(&mut hs).expect("handshake");
         assert_eq!(hs, crate::net::telnet::TelnetFilter::initial_handshake());
         // Typed, with a telnet command (IAC DO SGA, which it already offered) in between.
         client.write_all(&[b'l', 0xff, 0xfd, 0x03, b's', b'\r']).unwrap();
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while c.pending_input() < 3 && std::time::Instant::now() < until {
+            c.pump();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(c.read8(MACE_COM0 + 7).data, b'l');
         assert_eq!(c.read8(MACE_COM0 + 7).data, b's');
         assert_eq!(c.read8(MACE_COM0 + 7).data, b'\r');
         assert_eq!(c.pending_input(), 0, "the telnet command is not input");
-        // Transmitted: reaches the client (once it is registered as the client).
-        while c.tcp.lock().unwrap().is_empty() && std::time::Instant::now() < until {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // Transmitted: reaches the client.
         for &b in b"ok" {
             c.write8(MACE_COM0 + 7, b);
         }

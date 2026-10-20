@@ -93,16 +93,26 @@ impl O2Machine {
             kits.iter().map(|k| format!("{k}")).collect::<Vec<_>>().join("+"),
             if o2.graphics { "graphics console" } else { "serial console" }
         );
-        if let Some(port) = o2.serial_port {
-            match bus.com0.serve_tcp(port) {
-                Ok(p) => eprintln!("iris: O2 serial console on 127.0.0.1:{p}"),
-                Err(e) => eprintln!("iris: O2 serial console port {port}: {e}"),
+        // The console UART's host end: the shared TCP serial backend (any
+        // number of clients), teed to the serial log when one is set.
+        {
+            let mut backend = crate::dev::z85c30::null_serial_backend();
+            if let Some(port) = o2.serial_port {
+                match crate::dev::z85c30::tcp_serial_backend(port) {
+                    Some((b, p)) => {
+                        eprintln!("iris: O2 serial console on 127.0.0.1:{p}");
+                        backend = b;
+                    }
+                    None => eprintln!("iris: O2 serial console port {port} unavailable; is another iris using it?"),
+                }
             }
-        }
-        if let Some(path) = &o2.serial_log {
-            if let Err(e) = bus.com0.log_to(std::path::Path::new(path)) {
-                eprintln!("iris: O2 serial log {path}: {e}");
+            if let Some(path) = &o2.serial_log {
+                match crate::dev::z85c30::TeeBackend::new(backend.clone(), path) {
+                    Ok(t) => backend = Arc::new(t),
+                    Err(e) => eprintln!("iris: O2 serial log {path}: {e}"),
+                }
             }
+            bus.com0.set_backend(backend);
         }
         if o2.net {
             let mut net = crate::net::GatewayConfig::default();

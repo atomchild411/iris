@@ -356,11 +356,6 @@ where
     // What to wait for before typing. The sloader prompt was the only
     // thing that ever appeared; now that the PROM reaches its menu,
     // "Option?" is the interesting one.
-    if let Ok(path) = std::env::var("IRIS_IP32_CONSOLE") {
-        if let Err(e) = bus.com0.log_to(std::path::Path::new(&path)) {
-            eprintln!("ip32: console log {path}: {e}");
-        }
-    }
     // IRIS_IP32_NET=1: the Ethernet behind IRIS's NAT gateway (DHCP,
     // DNS), with IRIS_IP32_FWD="tcp:2263:22,..." forwarding host ports
     // on 127.0.0.1 to the guest.
@@ -390,12 +385,25 @@ where
         bus.mec.start_nat(cfg);
     }
     // IRIS_IP32_SERIAL=port: com0 as a live console on 127.0.0.1:port
-    // (telnet or nc), alongside the log and any script.
-    if let Some(port) = std::env::var("IRIS_IP32_SERIAL").ok().and_then(|v| v.parse::<u16>().ok()) {
-        match bus.com0.serve_tcp(port) {
-            Ok(port) => eprintln!("ip32: com0 console on 127.0.0.1:{port} (telnet 127.0.0.1 {port})"),
-            Err(e) => eprintln!("ip32: com0 console on port {port}: {e}"),
+    // (telnet or nc), alongside any script; IRIS_IP32_CONSOLE=file logs it.
+    {
+        let mut backend = crate::dev::z85c30::null_serial_backend();
+        if let Some(port) = std::env::var("IRIS_IP32_SERIAL").ok().and_then(|v| v.parse::<u16>().ok()) {
+            match crate::dev::z85c30::tcp_serial_backend(port) {
+                Some((b, port)) => {
+                    eprintln!("ip32: com0 console on 127.0.0.1:{port} (telnet 127.0.0.1 {port})");
+                    backend = b;
+                }
+                None => eprintln!("ip32: com0 console on port {port}: unavailable"),
+            }
         }
+        if let Ok(path) = std::env::var("IRIS_IP32_CONSOLE") {
+            match crate::dev::z85c30::TeeBackend::new(backend.clone(), &path) {
+                Ok(t) => backend = std::sync::Arc::new(t),
+                Err(e) => eprintln!("ip32: console log {path}: {e}"),
+            }
+        }
+        bus.com0.set_backend(backend);
     }
     let expect = std::env::var("IRIS_IP32_EXPECT")
         .unwrap_or_else(|_| "Option?".to_string());
