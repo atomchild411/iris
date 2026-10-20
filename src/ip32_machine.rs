@@ -107,6 +107,10 @@ impl O2Machine {
                 }
             }
             if let Some(path) = &o2.serial_log {
+                // A fresh log each boot, as the O2 has always kept it (the
+                // tee appends): scripts look at its tail for this boot's
+                // prompts.
+                let _ = std::fs::File::create(path);
                 match crate::dev::z85c30::TeeBackend::new(backend.clone(), path) {
                     Ok(t) => backend = Arc::new(t),
                     Err(e) => eprintln!("iris: O2 serial log {path}: {e}"),

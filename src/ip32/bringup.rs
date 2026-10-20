@@ -398,6 +398,7 @@ where
             }
         }
         if let Ok(path) = std::env::var("IRIS_IP32_CONSOLE") {
+            let _ = std::fs::File::create(&path);
             match crate::dev::z85c30::TeeBackend::new(backend.clone(), &path) {
                 Ok(t) => backend = std::sync::Arc::new(t),
                 Err(e) => eprintln!("ip32: console log {path}: {e}"),
