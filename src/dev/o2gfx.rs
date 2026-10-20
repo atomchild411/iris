@@ -2237,12 +2237,14 @@ impl CrimeRe {
                 return;
             }
             let Some(o) = Self::locate(r, mem, dst, x as u32, y as u32) else { return };
-            let alpha = cov.min(1.0) * ca as f64 / 255.0;
-            if !blend && alpha < 0.5 {
+            // Coverage scales the fragment's alpha; with blending off a
+            // fragment is drawn whole once at least half covered, whatever
+            // its colour's alpha: IRIS GL's RGB colours carry alpha 0, and
+            // gating on the product drew none of amesh's lines.
+            if !blend && cov < 0.5 {
                 return;
             }
-            // Coverage scales the fragment's alpha; with blending off a
-            // fragment is drawn whole once at least half covered.
+            let alpha = cov.min(1.0) * ca as f64 / 255.0;
             let sa = (alpha * 255.0).round() as u32;
             let (func, konst) = (g(BLEND_FUNC), g(BLEND_CONST));
             if half {
@@ -2917,6 +2919,29 @@ mod tests {
         ram.lock().unwrap().write(o, &[0, 0, 200, 255]);
         tri(0x0041_0878);
         assert_eq!(&ram.lock().unwrap().bytes(o, 4), &[0, 0, 200, 255]);
+    }
+
+    /// An unblended GL line is drawn whatever its colour's alpha: amesh's
+    /// mesh, Gouraud lines with alpha 0 (IRIS GL RGB colours), drew nothing.
+    #[test]
+    fn an_unblended_gl_line_ignores_its_alpha() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        re.write32(base + BUFMODE_DST, 0x220);
+        // GL, shaded, no blend; a line from (0, 1) to (8, 1).
+        re.write32(base + DRAWMODE, 0x0051_0178);
+        re.write32(base + PRIMITIVE, 0x0104_0000);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        re.write64(base + TRI_V0, (gl(0) as u64) << 32 | gl(1) as u64);
+        re.write64(base + TRI_V0 + 8, (gl(8) as u64) << 32 | gl(1) as u64);
+        // R 200, G 100, B 50, A 0 (8.12), flat.
+        re.write64(base + SHADE_R, (200u64 << 12) << 32 | 100u64 << 12);
+        re.write64(base + SHADE_R + 8, (50u64 << 12) << 32);
+        re.write32(base + (FG | 0x800), 0);
+        let o = 0x0100_0000 + 512 + 2 * 4;
+        assert_eq!(&ram.lock().unwrap().bytes(o, 3), &[200, 100, 50]);
     }
 
     /// A flat colour-index GL triangle stores FG's index as it stands, as
