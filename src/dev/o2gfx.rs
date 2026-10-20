@@ -663,7 +663,8 @@ struct Texture {
     base: usize,
     /// Bytes a texel: 2 (see `texel16`) or 4 (RGBA8, R high).
     bpt: u32,
-    /// Texture.mode 23:20: 1 RGB, 2 RGBA, 4 RGBA4, 8 LUMINANCE_ALPHA.
+    /// Texture.mode 23:20: 1 RGB, 2 RGBA, 4 RGBA4, 5 ALPHA, 6 INTENSITY,
+    /// 7 LUMINANCE, 8 LUMINANCE_ALPHA.
     typ: u32,
     /// The base level counted from 1024 x 1024 (Texture.mode 17:14; 4 for
     /// 64 x 64), the last level below it (13:10), and the minification
@@ -721,14 +722,19 @@ fn subtile_step(bx: u32, y: u32, stride: u32) -> u32 {
 
 /// A 16-bit texel of type `typ` (Texture.mode 23:20) as R, G, B, A, 0-255
 /// (spec figure 7-7): RGBA4 has R in the top nibble, LUMINANCE_ALPHA L in
-/// the high byte, and RGB and RGBA are A1R5G5B5.
+/// the high byte and A in the low, and RGB and RGBA are A1R5G5B5. The
+/// spec draws no 16-bit luminance, intensity or alpha texel; they are taken
+/// to sit where LA8's L and A do (a guess: L and I high, A low). A channel
+/// the type lacks reads as 255; `Texture::has_rgb` and `has_alpha` say
+/// which the texture function uses.
 fn texel16(typ: u32, p: u32) -> [f64; 4] {
+    let (hi, lo) = ((p >> 8) as f64, (p & 0xff) as f64);
     match typ {
         4 => [12, 8, 4, 0].map(|sh| ((p >> sh) & 15) as f64 * 17.0),
-        8 => {
-            let l = (p >> 8) as f64;
-            [l, l, l, (p & 0xff) as f64]
-        }
+        5 => [255.0, 255.0, 255.0, lo],
+        6 => [hi, hi, hi, hi],
+        7 => [hi, hi, hi, 255.0],
+        8 => [hi, hi, hi, lo],
         _ => {
             let c = |v: u32| ((v << 3) | (v >> 2)) as f64;
             [c((p >> 10) & 31), c((p >> 5) & 31), c(p & 31), if p & 0x8000 != 0 { 255.0 } else { 0.0 }]
@@ -741,9 +747,10 @@ impl Texture {
         let g = |off: u32| r[(off / 4) as usize];
         let mode = g(TEX_MODE);
         let (typ, depth) = ((mode >> 20) & 15, (mode >> 18) & 3);
-        // RGBA4 and LA8 come only 16 bits wide (spec figure 7-7). Alpha,
-        // intensity and luminance alone have no layout in the spec: not yet.
-        if !matches!((typ, depth), (1 | 2, 1 | 2) | (4 | 8, 1)) {
+        // RGBA4 and LA8 come only 16 bits wide (spec figure 7-7); so do
+        // alpha, intensity and luminance alone, as IRIX uses them (bzflag's
+        // and Macau's maps), laid out as LA8 (see `texel16`).
+        if !matches!((typ, depth), (1 | 2, 1 | 2) | (4..=8, 1)) {
             return None;
         }
         let fmt_hi = g(TEX_FORMAT);
@@ -802,10 +809,17 @@ impl Texture {
         texel16(self.typ, ((mem[o] as u32) << 8) | mem[o + 1] as u32)
     }
 
-    /// Whether the map's texels carry alpha (RGBA, RGBA4, LUMINANCE_ALPHA):
-    /// an RGB map leaves the fragment's alpha alone, as in OpenGL.
+    /// Whether the map's texels carry alpha (RGBA, RGBA4, ALPHA,
+    /// INTENSITY, LUMINANCE_ALPHA): without, the fragment's alpha stays, as
+    /// in OpenGL.
     fn has_alpha(&self) -> bool {
-        matches!(self.typ, 2 | 4 | 8)
+        matches!(self.typ, 2 | 4 | 5 | 6 | 8)
+    }
+
+    /// Whether the map's texels carry colour: an ALPHA map leaves the
+    /// fragment's colour alone.
+    fn has_rgb(&self) -> bool {
+        self.typ != 5
     }
 
     /// Level `level` at (s, t) in 1.14 units, bilinear or nearest.
@@ -1879,7 +1893,10 @@ impl CrimeRe {
                     let out = |v: f64| (v.round() as u32).min(255);
                     match g(TEX_MODE) & 3 {
                         // REPLACE
-                        3 => [out(tx[0]), out(tx[1]), out(tx[2]), out(if rgba_map { tx[3] } else { f[3] })],
+                        3 => {
+                            let c = |k: usize| out(if t.has_rgb() { tx[k] } else { f[k] });
+                            [c(0), c(1), c(2), out(if rgba_map { tx[3] } else { f[3] })]
+                        }
                         // DECAL: the map over the fragment by the map's alpha.
                         1 => {
                             let ta = if rgba_map { tx[3] / 255.0 } else { 1.0 };
@@ -2782,8 +2799,11 @@ mod tests {
     fn sixteen_bit_texels_follow_their_type() {
         // RGBA4: R in the top nibble (GLQuake's world and status bar).
         assert_eq!(texel16(4, 0xf84c), [255.0, 136.0, 68.0, 204.0]);
-        // LUMINANCE_ALPHA: L high, A low.
+        // LUMINANCE_ALPHA: L high, A low; the lone ones where LA8 has them.
         assert_eq!(texel16(8, 0x8040), [128.0, 128.0, 128.0, 64.0]);
+        assert_eq!(texel16(7, 0x8040), [128.0, 128.0, 128.0, 255.0]);
+        assert_eq!(texel16(6, 0x8040), [128.0; 4]);
+        assert_eq!(texel16(5, 0x8040), [255.0, 255.0, 255.0, 64.0]);
         // RGB and RGBA: A1R5G5B5.
         assert_eq!(texel16(2, 0xfc00), [255.0, 0.0, 0.0, 255.0]);
         assert_eq!(texel16(1, 0x001f), [0.0, 0.0, 255.0, 0.0]);
