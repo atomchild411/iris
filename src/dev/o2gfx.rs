@@ -2572,8 +2572,11 @@ mod tests {
             .collect();
         let ram = Arc::new(Mutex::new(m));
         let re = CrimeRe::new(ram.clone());
+        // RE_REPLAY_PRELOAD_EVERY=N: put the tiles back every N writes
+        // (2000 by default; a large trace with many tiles wants fewer).
+        let every: usize = std::env::var("RE_REPLAY_PRELOAD_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
         for (n, line) in std::fs::read_to_string(path).unwrap().lines().enumerate() {
-            if n % 2000 == 0 {
+            if n % every == 0 {
                 let mut m = ram.lock().unwrap();
                 for (o, data) in &preload {
                     m.write(*o, data);
