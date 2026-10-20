@@ -1782,3 +1782,28 @@ the register for triangles and GL lines; the alpha test runs before the
 depth test, as in GL. Everything IRIX 6.5.22 drew in the traces so far uses
 0x45 (ADD, SRC_ALPHA, ONE_MINUS_SRC_ALPHA), on GL lines (antialiased icon
 outlines) and triangles at alpha 255.
+
+## Textures: 32-bit texels and mipmaps (2026-10-19)
+
+The spec leaves texel look-up "TBD"; both were solved with o2gltest
+(scratch/o2-bench), whose textures describe themselves: an RGBA8 map with
+R = 4x, G = 4y, and a mip pyramid with each level a solid colour.
+
+- **Layout.** One subtile layout for 16- and 32-bit texels, in byte terms
+  (`subtile_offset`): byte column (x times texel size) bits 2:0, y 1:0,
+  byte column 6:3, y 5:4, y 3:2, byte column 8:7, y 7:6, then the rest.
+  32-bit texels are RGBA8 with R high (spec figure 7-7).
+- **Mip levels** sit at fixed places for their size, not after their
+  texture (`mip_level_addr`), counted from 1024 (Texture.mode 17:14 is the
+  base level, 4 for 64 x 64; 13:10 the last level below it): 128 at TLB
+  entry 88, 64 at entry 92, 32 at 93 + 0x8000, 16 at 92 + 0xc000, 8, 4, 2
+  and 1 at 93 + 0xe000, 0xf000, 0xf800, 0xfc00. Larger sizes are guesses.
+- **Level of detail** per pixel from the texel steps to the next pixel in x
+  and y (spec 7.3.7.5); the magnification filter at LOD <= 0, otherwise the
+  minification filter (Texture.mode 9:7), nearest or blended levels as in
+  OpenGL.
+- **Texture function** (1:0): MODULATE, DECAL and REPLACE as in OpenGL;
+  BLEND is drawn as MODULATE until its environment colour is found.
+
+Polygon stipple needs nothing from the engine: IRIX's GL stipples polygons
+itself (o2gltest's stippled triangle arrives as runs of lines).

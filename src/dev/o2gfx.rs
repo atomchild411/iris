@@ -646,10 +646,11 @@ impl BusDevice for Gbe {
 /// - s and t are 1.14 fixed point once divided by q (16384 is the whole
 ///   map: perfly's hubcap centre is s 24399, t 24900, 0.49 and 0.52 once
 ///   repeated); u = s * width / 16384, width = 1 << the format's u wrap shift.
-/// - 16-bit texels (A1R5G5B5) sit in 64 KB tiles laid out like frame-buffer
-///   tiles, 128 lines of 512 bytes, in 4 x 4 blocks: texel-index bits from
-///   the bottom are u0 u1 v0 v1 u2 u3 u4 u5 v4 v5 v2 v3 u6 - v6. Index bits
-///   past those for maps over 128 texels are a guess.
+/// - Texels sit in 64 KB tiles laid out like frame-buffer tiles, 128 lines
+///   of 512 bytes, in 32-byte blocks of four rows: see `subtile_offset`.
+///   16-bit texels are A1R5G5B5, 32-bit ones RGBA8 with R high (o2gltest's
+///   self-describing 64 x 64 map, 2026-10-19). Bits past those for maps over
+///   128 rows are a guess.
 /// - The base level is at the first valid entry of the texture TLB (88 for
 ///   perfly's 128 x 128 and 128 x 64 maps; levels 1 and up follow at 92 and
 ///   93, unused here: no mipmapping yet).
@@ -660,6 +661,49 @@ struct Texture {
     repeat_t: bool,
     linear: bool,
     base: usize,
+    /// Bytes a texel: 2 (A1R5G5B5) or 4 (RGBA8, R high).
+    bpt: u32,
+    /// The base level counted from 1024 x 1024 (Texture.mode 17:14; 4 for
+    /// 64 x 64), the last level below it (13:10), and the minification
+    /// filter (9:7: NEAREST, LINEAR, then the four MIPMAP ones).
+    map_level: u32,
+    max_level: u32,
+    min_filter: u32,
+}
+
+/// Where absolute mip level `a` (0 = 1024 x 1024) starts, as a byte address
+/// in texture-TLB space (entry << 16 | offset). Levels are not packed after
+/// their texture: each size has its own place, the same for every texture.
+/// 128 is at entry 88 (perfly); 64 at entry 92 and the smaller ones in 92
+/// and 93 at fixed offsets, read off o2gltest's map with a solid colour a
+/// level (2026-10-19). 1024, 512 and 256 (entries 0, 64, 80) are where a
+/// 32-bit level of that size would fit before 88: unconfirmed.
+fn mip_level_addr(a: u32) -> u64 {
+    let at = |entry: u64, off: u64| entry << 16 | off;
+    match a {
+        0 => at(0, 0),
+        1 => at(64, 0),
+        2 => at(80, 0),
+        3 => at(88, 0),
+        4 => at(92, 0),
+        5 => at(93, 0x8000),
+        6 => at(92, 0xc000),
+        7 => at(93, 0xe000),
+        8 => at(93, 0xf000),
+        9 => at(93, 0xf800),
+        _ => at(93, 0xfc00),
+    }
+}
+
+/// Byte offset of the texel at byte column `bx` (x times the texel size)
+/// and row `y` in a subtiled texture map. One layout for 16- and 32-bit
+/// texels: byte column bits 2:0, then y 1:0, byte column 6:3, y 5:4, y 3:2,
+/// byte column 8:7, y 7:6, byte column 9 and up. Solved from IRIX's
+/// textures (the spec leaves texel look-up "TBD"): every texel of a 64x64
+/// RGBA8 map that encodes its own coordinates, and the 16-bit maps before.
+fn subtile_offset(bx: u32, y: u32) -> u32 {
+    (bx & 7) | (y & 3) << 3 | ((bx >> 3) & 15) << 5 | ((y >> 4) & 3) << 9 | ((y >> 2) & 3) << 11
+        | ((bx >> 7) & 3) << 13 | ((y >> 6) & 3) << 15 | (bx >> 9) << 17
 }
 
 impl Texture {
@@ -667,8 +711,8 @@ impl Texture {
         let g = |off: u32| r[(off / 4) as usize];
         let mode = g(TEX_MODE);
         let (typ, depth) = ((mode >> 20) & 15, (mode >> 18) & 3);
-        if depth != 1 || !matches!(typ, 1 | 2) {
-            return None; // 32-bit and luminance/intensity texels: not yet
+        if !matches!(depth, 1 | 2) || !matches!(typ, 1 | 2) {
+            return None; // RGBA4, alpha, luminance and intensity texels: not yet
         }
         let fmt_hi = g(TEX_FORMAT);
         let (uw, vw) = ((fmt_hi >> 4) & 15, fmt_hi & 15);
@@ -684,46 +728,86 @@ impl Texture {
             repeat_t: (mode >> 2) & 3 == 1,
             linear: mode & (1 << 6) != 0,
             base,
+            bpt: if depth == 2 { 4 } else { 2 },
+            map_level: (mode >> 14) & 15,
+            max_level: (mode >> 10) & 15,
+            min_filter: (mode >> 7) & 7,
         })
     }
 
-    /// The texel at integer (u, v), wrapped or clamped, as R, G, B, A.
-    fn texel(&self, r: &[u32], mem: &O2Memory, u: i64, v: i64) -> [f64; 4] {
+    /// Whether the minification filter uses mip levels.
+    fn mipmapped(&self) -> bool {
+        self.min_filter >= 2
+    }
+
+    /// The texel at integer (u, v) of mip level `level` (0 = the base),
+    /// wrapped or clamped, as R, G, B, A.
+    fn texel(&self, r: &[u32], mem: &O2Memory, level: u32, u: i64, v: i64) -> [f64; 4] {
+        let (w, h) = ((self.w >> level).max(1), (self.h >> level).max(1));
         let wrap = |c: i64, n: u32, rep: bool| if rep { c.rem_euclid(n as i64) as u32 } else { c.clamp(0, n as i64 - 1) as u32 };
-        let (u, v) = (wrap(u, self.w, self.repeat_s), wrap(v, self.h, self.repeat_t));
-        let idx = (u & 3) | (v & 3) << 2 | ((u >> 2) & 15) << 4 | ((v >> 4) & 3) << 8 | ((v >> 2) & 3) << 10
-            | ((u >> 6) & 1) << 12 | ((u >> 7) & 1) << 13 | ((v >> 6) & 1) << 14 | (v >> 7) << 15 | (u >> 8) << 16;
-        let byte = idx as usize * 2;
-        let entry = self.base + (byte >> 16);
+        let (u, v) = (wrap(u, w, self.repeat_s), wrap(v, h, self.repeat_t));
+        let start = if level == 0 { (self.base as u64) << 16 } else { mip_level_addr(self.map_level + level) };
+        let addr = start + subtile_offset(u * self.bpt, v) as u64;
+        let (entry, byte) = ((addr >> 16) as usize, (addr & 0xffff) as usize);
         let word = TLB_TEX + 8 * (entry as u32 / 4);
         let w64 = ((r[(word / 4) as usize] as u64) << 32) | r[(word / 4 + 1) as usize] as u64;
         let e = (w64 >> (48 - 16 * (entry % 4))) & 0xffff;
         if e & 0x8000 == 0 {
             return [0.0; 4];
         }
-        let Some(o) = mem.dma_offset((((e & 0x7fff) as u32) << 16) + (byte & 0xffff) as u32).filter(|&o| o + 1 < mem.len()) else {
+        let n = self.bpt as usize;
+        let Some(o) = mem.dma_offset((((e & 0x7fff) as u32) << 16) + (byte & 0xffff) as u32).filter(|&o| o + n <= mem.len()) else {
             return [0.0; 4];
         };
+        if n == 4 {
+            return [mem[o], mem[o + 1], mem[o + 2], mem[o + 3]].map(|b| b as f64);
+        }
         let p = ((mem[o] as u32) << 8) | mem[o + 1] as u32;
         let c = |v: u32| ((v << 3) | (v >> 2)) as f64;
         [c((p >> 10) & 31), c((p >> 5) & 31), c(p & 31), if p & 0x8000 != 0 { 255.0 } else { 0.0 }]
     }
 
-    /// The map at (s, t) in 1.14 units, bilinear or nearest.
-    fn sample(&self, r: &[u32], mem: &O2Memory, s: f64, t: f64) -> [f64; 4] {
-        let (u, v) = (s * self.w as f64 / 16384.0 - 0.5, t * self.h as f64 / 16384.0 - 0.5);
-        if !self.linear {
-            return self.texel(r, mem, u.round() as i64, v.round() as i64);
+    /// Level `level` at (s, t) in 1.14 units, bilinear or nearest.
+    fn sample_level(&self, r: &[u32], mem: &O2Memory, level: u32, linear: bool, s: f64, t: f64) -> [f64; 4] {
+        let (w, h) = ((self.w >> level).max(1), (self.h >> level).max(1));
+        let (u, v) = (s * w as f64 / 16384.0 - 0.5, t * h as f64 / 16384.0 - 0.5);
+        if !linear {
+            return self.texel(r, mem, level, u.round() as i64, v.round() as i64);
         }
         let (u0, v0) = (u.floor(), v.floor());
         let (fu, fv) = (u - u0, v - v0);
         let (u0, v0) = (u0 as i64, v0 as i64);
-        let (a, b, c, d) = (self.texel(r, mem, u0, v0), self.texel(r, mem, u0 + 1, v0), self.texel(r, mem, u0, v0 + 1), self.texel(r, mem, u0 + 1, v0 + 1));
+        let tx = |du: i64, dv: i64| self.texel(r, mem, level, u0 + du, v0 + dv);
+        let (a, b, c, d) = (tx(0, 0), tx(1, 0), tx(0, 1), tx(1, 1));
         let mut out = [0.0; 4];
         for k in 0..4 {
             out[k] = (a[k] * (1.0 - fu) + b[k] * fu) * (1.0 - fv) + (c[k] * (1.0 - fu) + d[k] * fu) * fv;
         }
         out
+    }
+
+    /// The map at (s, t) in 1.14 units with level of detail `lod`
+    /// (log2 of texels per pixel at the base level, the spec's rho): the
+    /// magnification filter at or below 0, the minification filter above,
+    /// choosing or blending mip levels as OpenGL does.
+    fn sample(&self, r: &[u32], mem: &O2Memory, s: f64, t: f64, lod: f64) -> [f64; 4] {
+        if lod <= 0.0 || !self.mipmapped() {
+            let linear = if lod <= 0.0 { self.linear } else { self.min_filter == 1 };
+            return self.sample_level(r, mem, 0, linear, s, t);
+        }
+        let last = self.max_level as f64;
+        // 2, 4: NEAREST within a level; 3, 5: LINEAR. 2, 3: the nearest
+        // level; 4, 5: the two either side, blended.
+        let linear = matches!(self.min_filter, 3 | 5);
+        if self.min_filter <= 3 {
+            let level = (lod + 0.5).floor().clamp(0.0, last) as u32;
+            return self.sample_level(r, mem, level, linear, s, t);
+        }
+        let l0 = lod.floor().clamp(0.0, last);
+        let l1 = (l0 + 1.0).min(last);
+        let f = (lod - l0).clamp(0.0, 1.0);
+        let (a, b) = (self.sample_level(r, mem, l0 as u32, linear, s, t), self.sample_level(r, mem, l1 as u32, linear, s, t));
+        [0, 1, 2, 3].map(|k| a[k] * (1.0 - f) + b[k] * f)
     }
 }
 
@@ -1722,10 +1806,41 @@ impl CrimeRe {
                     if q == 0.0 {
                         return [cr, cg, cb, ca];
                     }
-                    let tx = t.sample(&r, mem, (sq0 + dsx * dx + dsy * dy) / q, (tq0 + dtx * dx + dty * dy) / q);
-                    let m = |k: usize| ((channel(k, px, py) as f64 * tx[k] / 255.0).round() as u32).min(255);
-                    let a = if (g(TEX_MODE) >> 20) & 15 == 2 { m(3) } else { channel(3, px, py) };
-                    [m(0), m(1), m(2), a]
+                    let st = |dx: f64, dy: f64| {
+                        let q = q0 + dqx * dx + dqy * dy;
+                        ((sq0 + dsx * dx + dsy * dy) / q, (tq0 + dtx * dx + dty * dy) / q)
+                    };
+                    let (s0, t0) = st(dx, dy);
+                    // Level of detail from the texel steps to the next pixel
+                    // in x and y, at the base level (spec 7.3.7.5).
+                    let lod = {
+                        let ((sx, tx_), (sy, ty)) = (st(dx + 1.0, dy), st(dx, dy + 1.0));
+                        let (kw, kh) = (t.w as f64 / 16384.0, t.h as f64 / 16384.0);
+                        let rho = ((sx - s0) * kw).abs().max(((tx_ - t0) * kh).abs()).max(((sy - s0) * kw).abs()).max(((ty - t0) * kh).abs());
+                        if rho > 0.0 { rho.log2() } else { 0.0 }
+                    };
+                    let tx = t.sample(&r, mem, s0, t0, lod);
+                    // Texture function (Texture.mode 1:0), as OpenGL's for
+                    // RGB and RGBA maps; an RGB map leaves the fragment's
+                    // alpha alone.
+                    let f = [0, 1, 2, 3].map(|k| channel(k, px, py) as f64);
+                    let rgba_map = (g(TEX_MODE) >> 20) & 15 == 2;
+                    let out = |v: f64| (v.round() as u32).min(255);
+                    match g(TEX_MODE) & 3 {
+                        // REPLACE
+                        3 => [out(tx[0]), out(tx[1]), out(tx[2]), out(if rgba_map { tx[3] } else { f[3] })],
+                        // DECAL: the map over the fragment by the map's alpha.
+                        1 => {
+                            let ta = if rgba_map { tx[3] / 255.0 } else { 1.0 };
+                            let mix = |k: usize| out(f[k] * (1.0 - ta) + tx[k] * ta);
+                            [mix(0), mix(1), mix(2), out(f[3])]
+                        }
+                        // MODULATE, and BLEND until its colour is found.
+                        _ => {
+                            let m = |k: usize| out(f[k] * tx[k] / 255.0);
+                            [m(0), m(1), m(2), if rgba_map { m(3) } else { out(f[3]) }]
+                        }
+                    }
                 };
                 let colour_at = |mem: &O2Memory, px: f64, py: f64| -> u32 {
                     if tex.is_none() && !shaded {
@@ -2511,6 +2626,85 @@ mod tests {
         let m = ram.lock().unwrap();
         // Pixel (10, 0): word 10 of the first tile row.
         assert_eq!(&m.bytes(0x0100_0000 + 40, (0x0100_0000 + 44) - (0x0100_0000 + 40)), &[0, 0, 0, 0x21]);
+    }
+
+    /// The subtile layout is the 16-bit one perfly's maps were solved with,
+    /// and places 32-bit texels as o2gltest's self-describing RGBA8 map
+    /// showed (index bits x0 y0 y1 x1 x2 x3 x4 y4 y5 y2 y3 x5).
+    #[test]
+    fn texels_sit_in_the_subtile_layout() {
+        for v in 0..256u32 {
+            for u in 0..256u32 {
+                let idx = (u & 3) | (v & 3) << 2 | ((u >> 2) & 15) << 4 | ((v >> 4) & 3) << 8 | ((v >> 2) & 3) << 10
+                    | ((u >> 6) & 1) << 12 | ((u >> 7) & 1) << 13 | ((v >> 6) & 1) << 14 | (v >> 7) << 15;
+                assert_eq!(subtile_offset(u * 2, v), idx * 2, "16-bit ({u}, {v})");
+            }
+        }
+        let bit = |v: u32, b: u32| (v >> b) & 1;
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let idx = bit(x, 0) | bit(y, 0) << 1 | bit(y, 1) << 2 | bit(x, 1) << 3 | bit(x, 2) << 4 | bit(x, 3) << 5
+                    | bit(x, 4) << 6 | bit(y, 4) << 7 | bit(y, 5) << 8 | bit(y, 2) << 9 | bit(y, 3) << 10 | bit(x, 5) << 11;
+                assert_eq!(subtile_offset(x * 4, y), idx * 4, "32-bit ({x}, {y})");
+            }
+        }
+    }
+
+    /// A 64 x 64 mipmapped RGBA8 map, each level a solid colour where
+    /// o2gltest's was: drawn at 32 and 16 pixels wide it shows levels 1
+    /// and 2 (NEAREST_MIPMAP_NEAREST), at 128 the base magnified.
+    #[test]
+    fn mip_levels_come_from_their_places() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = CrimeRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        // Texture TLB entries 92 and 93 -> tiles 0x60 and 0x61.
+        re.write64(base + TLB_TEX + 8 * 23, (0x8060u64 << 48) | (0x8061u64 << 32));
+        let cols: [[u8; 4]; 3] = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+        {
+            let mut m = ram.lock().unwrap();
+            for (level, (tile, off)) in [(0x60usize, 0usize), (0x61, 0x8000), (0x60, 0xc000)].into_iter().enumerate() {
+                let n = 64u32 >> level;
+                for y in 0..n {
+                    for x in 0..n {
+                        m.write((tile << 16) + off + subtile_offset(x * 4, y) as usize, &cols[level]);
+                    }
+                }
+            }
+        }
+        // Tiled, RGBA, 32-bit, base level 4, 6 below it,
+        // NEAREST_MIPMAP_NEAREST, REPEAT, REPLACE.
+        re.write32(base + TEX_MODE, 0x0129_1917);
+        re.write64(base + TEX_FORMAT, 0x0000_4466_03ff_03ff);
+        re.write32(base + BUFMODE_DST, 0x220);
+        re.write32(base + PRIMITIVE, 0x0200_0000);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        // A right triangle `n` pixels on a side at (0, 0) whose s runs 0..1
+        // across it (1.14), so the level of detail is log2(64 / n).
+        let tri = |n: u32| {
+            re.write32(base + DRAWMODE, 0x0040_8078);
+            re.write64(base + TRI_V0, (gl(0) as u64) << 32 | gl(0) as u64);
+            re.write64(base + TRI_V0 + 8, (gl(n) as u64) << 32 | gl(0) as u64);
+            re.write64(base + TRI_V0 + 16, (gl(0) as u64) << 32 | gl(n) as u64);
+            re.write64(base + TEX_SQ0, 0);
+            re.write64(base + TEX_TQ0, 0);
+            re.write32(base + TEX_Q0, 1);
+            let step = ((16384 / n) as u64) << 0;
+            re.write64(base + TEX_DSQDX, step);
+            re.write64(base + TEX_DSQDY, 0);
+            re.write64(base + TEX_DTQDX, 0);
+            re.write64(base + TEX_DTQDY, step);
+            re.write32(base + TEX_DQDX, 0);
+            re.write32(base + (TEX_DQDY | 0x800), 0);
+        };
+        let px = |ram: &Arc<Mutex<O2Memory>>| ram.lock().unwrap().bytes(0x0100_0000 + 512 + 4, 3);
+        tri(128);
+        assert_eq!(px(&ram), &[255, 0, 0]);
+        tri(32);
+        assert_eq!(px(&ram), &[0, 255, 0]);
+        tri(16);
+        assert_eq!(px(&ram), &[0, 0, 255]);
     }
 
     #[test]
