@@ -2493,6 +2493,9 @@ const ONEWIRE_BUSY_US: u64 = 5000;
 /// emulated instructions per microsecond a bring-up run stays fast while pulse
 /// widths keep their proportions.
 pub const UST_TICKS_NUM: u64 = 1;
+
+/// Nanoseconds per count of MACE's UST counter.
+pub const MACE_UST_PERIOD_NS: u64 = 960;
 pub const UST_TICKS_DEN: u64 = 100;
 
 impl Default for MaceUst {
@@ -2518,8 +2521,12 @@ impl MaceUst {
         *self.ticks.lock().unwrap() = instructions * UST_TICKS_NUM / UST_TICKS_DEN;
     }
 
-    fn tick(&self) -> u64 {
-        self.guest_us()
+    /// The counter as MACE presents it: one count per 960 ns (the 33.3 MHz
+    /// PCI clock over 32, spec 7.2.2), which IRIX converts back at 960 ns a
+    /// count. Counted in microseconds it ran 4% slow against the audio the
+    /// codec plays, and programs that time sound by UST drifted.
+    pub fn counter(&self) -> u64 {
+        self.guest_us() * 1000 / MACE_UST_PERIOD_NS
     }
 
     /// The time the guest reads (UST, CRIME's timer): the host's, less what
@@ -2563,11 +2570,11 @@ impl MaceUst {
 
 impl BusDevice for MaceUst {
     fn read32(&self, addr: u32) -> BusRead32 {
-        let t = self.tick();
+        let t = self.counter();
         // 64-bit counter presented as two 32-bit halves.
         BusRead32::ok(if addr & 4 == 0 { (t >> 32) as u32 } else { t as u32 })
     }
-    fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::ok(self.tick()) }
+    fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::ok(self.counter()) }
     fn write32(&self, _a: u32, _v: u32) -> u32 { BUS_OK }
     fn write64(&self, _a: u32, _v: u64) -> u32 { BUS_OK }
 }
@@ -3121,7 +3128,7 @@ impl Ip32Bus {
         self.audio.poll(&crate::dev::mace_audio::AudioIo {
             ram: &self.ram,
             ring_base: (self.mace.cell(MACE_ISA_RING_BASE) & sdma::RING_BASE_MASK) as u32,
-            ust: self.ust.now() as u32,
+            ust: self.ust.counter() as u32,
         });
         if self.sdma.any_owned() {
             self.sdma.poll(&self.sdma_io());
