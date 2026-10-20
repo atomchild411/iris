@@ -731,6 +731,18 @@ fn subtile_step(bx: u32, y: u32, stride: u32) -> u32 {
     (bx >> 9) + (y >> 7) * stride
 }
 
+/// IRIS_O2_FRAG_PROBE="x,y": log every triangle fragment drawn at that
+/// buffer pixel (its state, the colours in and the result), for scenes that
+/// come out the wrong colour.
+fn frag_probe() -> Option<(i32, i32)> {
+    static P: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let v = std::env::var("IRIS_O2_FRAG_PROBE").ok()?;
+        let (x, y) = v.split_once(',')?;
+        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    })
+}
+
 /// A 16-bit texel of type `typ` (Texture.mode 23:20) as R, G, B, A, 0-255
 /// (spec figure 7-7): RGBA4 has R in the top nibble, LUMINANCE_ALPHA L in
 /// the high byte and A in the low, and RGB and RGBA are A1R5G5B5. The
@@ -2045,6 +2057,9 @@ impl CrimeRe {
                                         _ => true,
                                     };
                                     if !pass {
+                                        if frag_probe() == Some((x, y)) {
+                                            eprintln!("o2frag {x},{y}: dm {dm:#x} depth fail: func {zfunc} new {zs:#x} old {zd:#x}");
+                                        }
                                         continue;
                                     }
                                     if zmask {
@@ -2053,6 +2068,11 @@ impl CrimeRe {
                                 }
                             }
                             if let Some(o) = crow.at(&r, mem, x as u32, y as u32) {
+                                let before = if frag_probe() == Some((x, y)) {
+                                    Some(if half { Self::get_px(mem, o + half_off, 2) } else { Self::get_px(mem, o, dst.bd) })
+                                } else {
+                                    None
+                                };
                                 let colour = match src {
                                     Some(c) if blend => {
                                         let (at, n) = if half { (o + half_off, 2) } else { (o, 4) };
@@ -2063,6 +2083,14 @@ impl CrimeRe {
                                     Some([r8, g8, b8, a8]) => pack(r8, g8, b8, a8),
                                     None => colour_at(mem, px, py),
                                 };
+                                if let Some(old) = before {
+                                    eprintln!(
+                                        "o2frag {x},{y}: dm {dm:#x} tex {:#x} blend {bfunc:#x} src {:?} dst {old:#x} -> {colour:#x}{}",
+                                        g(TEX_MODE),
+                                        src.or_else(|| Some(rgba_at(mem, px, py))),
+                                        if half { " (half)" } else { "" }
+                                    );
+                                }
                                 if half {
                                     Self::put(&r, mem, o + half_off, 2, colour);
                                 } else {

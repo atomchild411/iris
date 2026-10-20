@@ -672,6 +672,13 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
                 Err(e) => format!("err {e}"),
             }
         }
+        "unmapped" => {
+            // Bus accesses that hit nothing (the first 64 distinct ones):
+            // what a guest saw as a bus error, with the PC that made it.
+            let u = bus.unmapped();
+            let list: Vec<String> = u.iter().map(|(a, w, pc)| format!("{} {a:#010x} pc {pc:#010x}", if *w { "w" } else { "r" })).collect();
+            format!("ok {} {}", u.len(), list.join("; "))
+        }
         "pixel" => {
             // pixel X Y: what scan-out makes of one point (frame-buffer word,
             // DID, mode-table entry, colour map, overlay).
