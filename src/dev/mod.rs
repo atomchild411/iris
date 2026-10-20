@@ -8,6 +8,14 @@ pub mod gl;
 pub mod gr2;
 pub mod mec;
 pub mod mace_audio;
+pub mod crime;
+pub mod ds1687;
+pub mod mace_pci;
+pub mod mace_ps2;
+pub mod mace_sdma;
+pub mod mace_ust;
+pub mod ns16550;
+pub mod onewire;
 pub mod mgras;
 pub mod ng1;
 
