@@ -2729,6 +2729,8 @@ pub struct Ip32Bus {
     pub com1: Com16550,
     /// The serial ports' DMA rings, which IRIX's console runs on.
     pub sdma: MaceSerialDma,
+    /// The audio interface and its AD1843 (dev/mace_audio.rs).
+    pub audio: crate::dev::mace_audio::MaceAudio,
     /// The Ethernet. Its frames go nowhere until `start_nat` (IRIS_IP32_NET).
     pub mec: std::sync::Arc<crate::dev::mec::Mec>,
     pub pci_view: PciNativeView,
@@ -2811,6 +2813,7 @@ impl Ip32Bus {
             com0: Com16550::new(),
             com1: Com16550::new(),
             sdma: MaceSerialDma::new(),
+            audio: crate::dev::mace_audio::MaceAudio::new(),
             mec: std::sync::Arc::new(crate::dev::mec::Mec::new(ram.clone())),
             pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
@@ -3031,6 +3034,7 @@ impl Ip32Bus {
         self.crime.set_int(IP32_MEC_CRIME_INT, self.mec.interrupting());
         self.serial_touched(true);
         self.ps2_touched();
+        self.audio_touched();
     }
 
     /// The serial ports' bits of MACE's ISA status, and CRIME line 4 from
@@ -3114,6 +3118,11 @@ impl Ip32Bus {
     /// service thread.
     pub fn service(&self) -> bool {
         self.mec.poll();
+        self.audio.poll(&crate::dev::mace_audio::AudioIo {
+            ram: &self.ram,
+            ring_base: (self.mace.cell(MACE_ISA_RING_BASE) & sdma::RING_BASE_MASK) as u32,
+            ust: self.ust.now() as u32,
+        });
         if self.sdma.any_owned() {
             self.sdma.poll(&self.sdma_io());
         }
@@ -3385,6 +3394,24 @@ impl Ip32Bus {
         addr >= MACE_UST_MSC && addr < MACE_UST_MSC + MACE_UST_MSC_SIZE
     }
 
+    /// Which audio channel's MSC/UST pair a UST-block address names: the
+    /// three at 0x20, 0x28 and 0x30 (input, output #1, output #2).
+    fn audio_msc_slot(addr: u32) -> Option<usize> {
+        let off = addr.wrapping_sub(MACE_UST_MSC);
+        (0x20..0x38).contains(&off).then(|| ((off - 0x20) / 8) as usize)
+    }
+
+    /// The audio interface's bits of MACE's ISA status (7:0), and CRIME line
+    /// 6 from them through the mask, as the PS/2 ports' are.
+    fn audio_touched(&self) {
+        use crate::dev::mace_audio::{CRIME_LINE, ISA_AUDIO_MASK};
+        let bits = self.audio.isa_bits();
+        let isa = (self.mace.cell(MACE_ISA_INT_STATUS) & !ISA_AUDIO_MASK) | bits;
+        self.mace.set_cell(MACE_ISA_INT_STATUS, isa);
+        let mask = self.mace.cell(MACE_ISA_INT_MASK);
+        self.crime.set_int(CRIME_LINE, isa & mask & ISA_AUDIO_MASK != 0);
+    }
+
     fn in_macepci(&self, addr: u32) -> bool {
         addr >= MACEPCI_BASE && addr < MACEPCI_BASE + MACEPCI_SIZE
     }
@@ -3565,6 +3592,9 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.read8(addr);
         }
+        if crate::dev::mace_audio::MaceAudio::contains(addr) {
+            return BusRead8::ok(self.audio.read(addr) as u8);
+        }
         if self.in_sdma(addr) {
             let v = self.sdma_read(addr);
             return BusRead8::ok(v as u8);
@@ -3612,6 +3642,9 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.read16(addr);
         }
+        if crate::dev::mace_audio::MaceAudio::contains(addr) {
+            return BusRead16::ok(self.audio.read(addr) as u16);
+        }
         if self.in_sdma(addr) {
             let v = self.sdma_read(addr);
             return BusRead16::ok(v as u16);
@@ -3641,6 +3674,10 @@ impl Ip32Bus {
         if self.in_crime(addr) {
             return self.crime.read32(addr);
         }
+        if let Some(n) = Self::audio_msc_slot(addr) {
+            let v = self.audio.msc_ust(n);
+            return BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 });
+        }
         if self.in_ust(addr) {
             return self.ust.read32(addr);
         }
@@ -3669,6 +3706,9 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.read32(addr);
         }
+        if crate::dev::mace_audio::MaceAudio::contains(addr) {
+            return { let v = self.audio.read(addr); BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 }) };
+        }
         if self.in_sdma(addr) {
             // The registers are 64-bit; a 32-bit access is the half it names.
             let v = self.sdma_read(addr);
@@ -3693,6 +3733,9 @@ impl Ip32Bus {
         }
         if self.in_crime(addr) {
             return self.crime.read64(addr);
+        }
+        if let Some(n) = Self::audio_msc_slot(addr) {
+            return BusRead64::ok(self.audio.msc_ust(n));
         }
         if self.in_ust(addr) {
             return self.ust.read64(addr);
@@ -3727,6 +3770,9 @@ impl Ip32Bus {
         }
         if self.in_rtc(addr) {
             return self.rtc.read64(addr);
+        }
+        if crate::dev::mace_audio::MaceAudio::contains(addr) {
+            return BusRead64::ok(self.audio.read(addr));
         }
         if self.in_sdma(addr) {
             let v = self.sdma_read(addr);
@@ -3790,6 +3836,10 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.write8(addr, val);
         }
+        if crate::dev::mace_audio::MaceAudio::contains(addr) {
+            self.audio.write(addr, val as u64);
+            return BUS_OK;
+        }
         if self.in_sdma(addr) {
             // A narrow store is the low end of the register.
             return self.sdma_write(addr, val as u64);
@@ -3842,6 +3892,10 @@ impl Ip32Bus {
         if self.in_rtc(addr) {
             return self.rtc.write16(addr, val);
         }
+        if crate::dev::mace_audio::MaceAudio::contains(addr) {
+            self.audio.write(addr, val as u64);
+            return BUS_OK;
+        }
         if self.in_sdma(addr) {
             // A narrow store is the low end of the register.
             return self.sdma_write(addr, val as u64);
@@ -3874,6 +3928,12 @@ impl Ip32Bus {
             self.crime_wrote(addr);
             return r;
         }
+        if let Some(n) = Self::audio_msc_slot(addr) {
+            let v = self.audio.msc_ust(n);
+            let v = if addr & 4 == 0 { (v & 0xffff_ffff) | (val as u64) << 32 } else { (v & !0xffff_ffff) | val as u64 };
+            self.audio.set_msc_ust(n, v);
+            return BUS_OK;
+        }
         if self.in_ust(addr) {
             return self.ust.write32(addr, val);
         }
@@ -3904,6 +3964,10 @@ impl Ip32Bus {
         }
         if self.in_rtc(addr) {
             return self.rtc.write32(addr, val);
+        }
+        if crate::dev::mace_audio::MaceAudio::contains(addr) {
+            self.audio.write(addr, val as u64);
+            return BUS_OK;
         }
         if self.in_sdma(addr) {
             // A narrow store is the low end of the register.
@@ -3936,6 +4000,10 @@ impl Ip32Bus {
             self.crime_wrote(addr);
             return r;
         }
+        if let Some(n) = Self::audio_msc_slot(addr) {
+            self.audio.set_msc_ust(n, val);
+            return BUS_OK;
+        }
         if self.in_ust(addr) {
             return self.ust.write64(addr, val);
         }
@@ -3966,6 +4034,10 @@ impl Ip32Bus {
         }
         if self.in_rtc(addr) {
             return self.rtc.write64(addr, val);
+        }
+        if crate::dev::mace_audio::MaceAudio::contains(addr) {
+            self.audio.write(addr, val);
+            return BUS_OK;
         }
         if self.in_sdma(addr) {
             return self.sdma_write(addr, val);

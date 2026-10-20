@@ -75,6 +75,10 @@ impl O2Machine {
             flash_file: o2.flash.clone().map(Into::into),
         };
         let mut bus = Ip32Bus::with_options(mem, prom, opts);
+        // MACE audio plays through the host unless audio is off.
+        if !cfg.no_audio {
+            bus.audio.enable_output(cfg.audio.clone());
+        }
         if o2.graphics {
             bus.enable_graphics_with_mouse(o2.mouse);
         }
