@@ -1430,6 +1430,13 @@ impl CrimeRe {
         let dm = g(DRAWMODE);
         let prim = g(PRIMITIVE);
         let clip = Clip::new(&r);
+        // Clip-ID testing (ClipMode bit 11) is not modelled: the buffer's
+        // layout is unknown (TLB.cid maps 8 tiles, the boot-time clear spans
+        // 256 x 1024 bytes) and nothing seen so far draws with it on, only
+        // sets the bit between primitives. Say so the first time it matters.
+        if g(CLIP_MODE) & (1 << 11) != 0 {
+            self.note("clip-ID test (drawn unclipped)".into());
+        }
         if dm & draw::PIXEL_XFER != 0 && (prim >> 24) & 3 == 3 {
             let (sb, db) = ((g(BUFMODE_SRC) >> 10) & 7, (g(BUFMODE_DST) >> 10) & 7);
             if matches!(sb, 4 | 5) || matches!(db, 4 | 5) {
@@ -2025,6 +2032,9 @@ impl CrimeRe {
             return;
         }
         if dbuf > 2 || (copy && sbuf > 2) {
+            // dst 6 is the clip-ID buffer: IRIX clears it once at boot, and
+            // without its layout (see pixel_pipe's clip-ID note) the clear
+            // is skipped rather than aimed at the wrong tiles.
             self.note(format!("mte buffers src {sbuf} dst {dbuf}"));
             return;
         }

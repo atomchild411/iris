@@ -1740,3 +1740,26 @@ IRIX's own AIC-7880 driver (adp78, with Adaptec's HIM) times out on every
 command: it uses a third host/sequencer contract the model does not know yet.
 With more than 256 MB the kernel faults earlier, walking a corrupt page frame
 list (both CPUs); not yet understood.
+
+## Clip IDs (2026-10-19, not modelled)
+
+CRIME can test each pixel against a clip-ID buffer (ClipMode bit 11, enCid;
+bit 10 cidMapSel). The spec names the enable bits, buffer type 6 ("tiled
+buffer - clipID TLB") for BufMode and the MTE, and `TLB.cid[4]` at RE 0x6e0,
+and says nothing else: no register holds the ID a pixel is compared with.
+
+What IRIX 6.5.22 does with it, from RE traces (desktop, demograph, perfly,
+gr_osview, gmemusage):
+
+- Maps 8 clip-ID tiles once at boot: `TLB.cid` = 0x106, 0x109, 0x10c, 0x10f,
+  0x112, 0x115, 0x118, 0x11b (every third 64 KB tile), the rest invalid.
+- Clears it once with the MTE: mode 0x18 (dst 6), FG 0, byte mask all ones,
+  DST0 0x01000000, DST1 0x01ff03ff: 256 bytes x 1024 rows, which does not
+  fit the framebuffer's 16-tiles-a-row layout.
+- Writes ClipMode 0x821 (clip ID + screen mask 0) a few times, but no
+  primitive has run with bit 11 set in any trace so far.
+
+So the clear is skipped (the MTE notes "mte buffers src 0 dst 6") and a
+primitive drawn with the test on notes "clip-ID test (drawn unclipped)".
+When that note appears, capture the trace: it will show what IRIX writes into
+the buffer and how the ID is chosen.
