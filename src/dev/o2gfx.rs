@@ -695,15 +695,26 @@ fn mip_level_addr(a: u32) -> u64 {
     }
 }
 
-/// Byte offset of the texel at byte column `bx` (x times the texel size)
-/// and row `y` in a subtiled texture map. One layout for 16- and 32-bit
-/// texels: byte column bits 2:0, then y 1:0, byte column 6:3, y 5:4, y 3:2,
-/// byte column 8:7, y 7:6, byte column 9 and up. Solved from IRIX's
-/// textures (the spec leaves texel look-up "TBD"): every texel of a 64x64
-/// RGBA8 map that encodes its own coordinates, and the 16-bit maps before.
+/// Byte offset within its 64 KB tile of the texel at byte column `bx`
+/// (x times the texel size) and row `y` of a subtiled texture map. One
+/// layout for 16- and 32-bit texels: byte column bits 2:0, then y 1:0,
+/// byte column 6:3, y 5:4, y 3:2, byte column 8:7, y 6. A tile is 512 bytes
+/// by 128 rows; past that, `subtile_step` says which tile. Solved from
+/// IRIX's textures (the spec leaves texel look-up "TBD"): every texel of a
+/// 64x64 RGBA8 map that encodes its own coordinates, and the 16-bit maps
+/// before.
 fn subtile_offset(bx: u32, y: u32) -> u32 {
     (bx & 7) | (y & 3) << 3 | ((bx >> 3) & 15) << 5 | ((y >> 4) & 3) << 9 | ((y >> 2) & 3) << 11
-        | ((bx >> 7) & 3) << 13 | ((y >> 6) & 3) << 15 | (bx >> 9) << 17
+        | ((bx >> 7) & 3) << 13 | ((y >> 6) & 1) << 15
+}
+
+/// The tile, counted in texture-TLB entries from a level's first, holding
+/// byte column `bx` and row `y`: a level's tiles form a grid, the next
+/// 512-byte column one entry on and the next 128 rows `stride` on. Quake 2's
+/// maps show it: 256 x 128 RGBA8 in entries 80 and 81, 256 x 256 RGBA8 in
+/// 80, 81, 84 and 85, 256 x 256 16-bit in 80 and 84.
+fn subtile_step(bx: u32, y: u32, stride: u32) -> u32 {
+    (bx >> 9) + (y >> 7) * stride
 }
 
 impl Texture {
@@ -747,7 +758,11 @@ impl Texture {
         let wrap = |c: i64, n: u32, rep: bool| if rep { c.rem_euclid(n as i64) as u32 } else { c.clamp(0, n as i64 - 1) as u32 };
         let (u, v) = (wrap(u, w, self.repeat_s), wrap(v, h, self.repeat_t));
         let start = if level == 0 { (self.base as u64) << 16 } else { mip_level_addr(self.map_level + level) };
-        let addr = start + subtile_offset(u * self.bpt, v) as u64;
+        // Grid rows are 4 entries for 256 and 512 (Quake 2's 256 maps);
+        // 1024 would need 8 (64 entries for 8 rows of tiles): unconfirmed.
+        let stride = if self.map_level + level == 0 { 8 } else { 4 };
+        let bx = u * self.bpt;
+        let addr = start + ((subtile_step(bx, v, stride) as u64) << 16) + subtile_offset(bx & 511, v & 127) as u64;
         let (entry, byte) = ((addr >> 16) as usize, (addr & 0xffff) as usize);
         let word = TLB_TEX + 8 * (entry as u32 / 4);
         let w64 = ((r[(word / 4) as usize] as u64) << 32) | r[(word / 4 + 1) as usize] as u64;
@@ -2633,13 +2648,17 @@ mod tests {
     /// showed (index bits x0 y0 y1 x1 x2 x3 x4 y4 y5 y2 y3 x5).
     #[test]
     fn texels_sit_in_the_subtile_layout() {
-        for v in 0..256u32 {
+        for v in 0..128u32 {
             for u in 0..256u32 {
                 let idx = (u & 3) | (v & 3) << 2 | ((u >> 2) & 15) << 4 | ((v >> 4) & 3) << 8 | ((v >> 2) & 3) << 10
-                    | ((u >> 6) & 1) << 12 | ((u >> 7) & 1) << 13 | ((v >> 6) & 1) << 14 | (v >> 7) << 15;
+                    | ((u >> 6) & 1) << 12 | ((u >> 7) & 1) << 13 | ((v >> 6) & 1) << 14;
                 assert_eq!(subtile_offset(u * 2, v), idx * 2, "16-bit ({u}, {v})");
             }
         }
+        // Past one tile: Quake 2's 256 x 256 RGBA8 map uses entries 80, 81,
+        // 84, 85 from 80; its 16-bit one 80 and 84.
+        assert_eq!([(0, 0), (1023, 0), (0, 255), (1023, 255)].map(|(bx, y)| subtile_step(bx, y, 4)), [0, 1, 4, 5]);
+        assert_eq!([(0, 0), (511, 255)].map(|(bx, y)| subtile_step(bx, y, 4)), [0, 4]);
         let bit = |v: u32, b: u32| (v >> b) & 1;
         for y in 0..64u32 {
             for x in 0..64u32 {

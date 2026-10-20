@@ -1791,8 +1791,13 @@ R = 4x, G = 4y, and a mip pyramid with each level a solid colour.
 
 - **Layout.** One subtile layout for 16- and 32-bit texels, in byte terms
   (`subtile_offset`): byte column (x times texel size) bits 2:0, y 1:0,
-  byte column 6:3, y 5:4, y 3:2, byte column 8:7, y 7:6, then the rest.
-  32-bit texels are RGBA8 with R high (spec figure 7-7).
+  byte column 6:3, y 5:4, y 3:2, byte column 8:7, y 6: one 64 KB tile is
+  512 bytes by 128 rows. A larger level's tiles form a grid of TLB
+  entries, the next 512-byte column one entry on and the next 128 rows
+  four on (`subtile_step`; Quake 2's 256 x 128 RGBA8 skins in entries 80
+  and 81, 256 x 256 RGBA8 in 80, 81, 84, 85). Before that rule the right
+  half of every 256-wide 32-bit skin read black. 32-bit texels are RGBA8
+  with R high (spec figure 7-7).
 - **Mip levels** sit at fixed places for their size, not after their
   texture (`mip_level_addr`), counted from 1024 (Texture.mode 17:14 is the
   base level, 4 for 64 x 64; 13:10 the last level below it): 128 at TLB
