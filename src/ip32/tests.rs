@@ -783,58 +783,18 @@ fn nvram_survives_and_decodes_maces_spacing() {
     assert_ne!(r.peek(0x0d) & 0x80, 0);
 }
 
-/// Firmware learns how much space a device wants by writing all ones to
-/// a BAR and reading back which address bits stuck. A BAR that stores
-/// whatever it is given claims four gigabytes and the bus layout
-/// collapses.
-#[test]
-fn a_bar_reports_its_size_to_a_probe() {
-    let f = PciFunction::new("t", 0x9004, 0x8078, PCI_CLASS_SCSI, 1, [0x100, 0x1000, 0, 0, 0, 0]);
-    assert_eq!(f.read(0), 0x8078_9004, "device and vendor id");
-
-    f.write(4, 0xffff_ffff);
-    assert_eq!(f.read(4), 0xffff_ff01, "256 bytes of I/O space");
-    f.write(5, 0xffff_ffff);
-    assert_eq!(f.read(5), 0xffff_f000, "4 KiB of memory space");
-    // An unimplemented BAR reads back as zero however hard it is probed.
-    f.write(6, 0xffff_ffff);
-    assert_eq!(f.read(6), 0);
-
-    f.write(5, 0x8000_1000);
-    assert_eq!(f.bar(1), 0x8000_1000, "and then holds the address assigned to it");
-}
-
 /// PCI is little-endian and this CPU is not. Without the bridge's byte
 /// lane swap the AIC-7880's bring-up reads as traffic to registers 0x84,
 /// 0x91, 0x93 and 0xbc, which are nothing; with it they are HCNTRL,
 /// CLRINT, SCBPTR and the SCB array, which is exactly right.
 #[test]
 fn the_bridge_swaps_byte_lanes_for_a_little_endian_device() {
-    assert_eq!(Ip32Bus::lane_swizzle(0x84, 1), 0x87, "HCNTRL");
-    assert_eq!(Ip32Bus::lane_swizzle(0x91, 1), 0x92, "CLRINT");
-    assert_eq!(Ip32Bus::lane_swizzle(0x93, 1), 0x90, "SCBPTR");
-    assert_eq!(Ip32Bus::lane_swizzle(0xbc, 1), 0xbf, "last byte of the SCB");
-    assert_eq!(Ip32Bus::lane_swizzle(0x84, 2), 0x86, "16-bit lanes swap in pairs");
-    assert_eq!(Ip32Bus::lane_swizzle(0x84, 4), 0x84, "a whole word needs no swap");
-}
-
-/// A device only decodes memory once it has been told it may, and only
-/// within the BAR it was assigned.
-#[test]
-fn a_device_claims_only_its_own_window_and_only_when_enabled() {
-    let pci = MacePci::new();
-    let f = std::sync::Arc::new(PciFunction::new(
-        "t", 0x9004, 0x8078, PCI_CLASS_SCSI, 1, [0x100, 0x1000, 0, 0, 0, 0]));
-    pci.attach(IP32_SCSI_SLOT, f.clone());
-    f.write(5, 0x8000_1000);
-
-    assert!(pci.mem_target(0x8000_1000).is_none(),
-            "memory decoding is off until the command register says otherwise");
-    f.write(1, 0x2);
-    let (got, off) = pci.mem_target(0x8000_1084).expect("in range");
-    assert_eq!(got.name, "t");
-    assert_eq!(off, 0x84);
-    assert!(pci.mem_target(0x8000_2000).is_none(), "past the end of the BAR");
+    assert_eq!(MacePci::lane_swizzle(0x84, 1), 0x87, "HCNTRL");
+    assert_eq!(MacePci::lane_swizzle(0x91, 1), 0x92, "CLRINT");
+    assert_eq!(MacePci::lane_swizzle(0x93, 1), 0x90, "SCBPTR");
+    assert_eq!(MacePci::lane_swizzle(0xbc, 1), 0xbf, "last byte of the SCB");
+    assert_eq!(MacePci::lane_swizzle(0x84, 2), 0x86, "16-bit lanes swap in pairs");
+    assert_eq!(MacePci::lane_swizzle(0x84, 4), 0x84, "a whole word needs no swap");
 }
 
 #[test]

@@ -33,6 +33,9 @@ pub const MACE_ISA_SERIAL0_MASK: u64 = 0x03f0_0000;
 /// The input a console UART driven by programmed I/O raises: not a status
 /// bit of its own but port 0's whole group (see [`MaceIsa`]).
 pub const ISA_SERIAL0_PIO: u32 = 64;
+/// ISA ring base and reset register; bit 4 reads as the MACE revision.
+pub const MACE_ISA_RING_BASE: u32 = MACE_BASE + 0x0031_0000;
+pub const MACE_REV2_BIT: u64 = 0x10;
 
 #[derive(Default)]
 struct State {

@@ -189,6 +189,7 @@ pub mod chd_disk;
 pub mod scsi;
 pub mod irq;
 pub mod host_audio;
+pub mod pci;
 pub mod ui;
 pub mod cpu;
 pub mod dev;

@@ -381,7 +381,6 @@ pub struct Ip32Bus {
     pub audio: crate::dev::mace_audio::MaceAudio,
     /// The Ethernet. Its frames go nowhere until `start_nat` (IRIS_IP32_NET).
     pub mec: std::sync::Arc<crate::dev::mec::Mec>,
-    pub pci_view: PciNativeView,
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write, pc)`.
     unmapped: Mutex<Vec<(u32, bool, u32)>>,
     /// The ppmem window's base and the RAM bitmap the memory space keeps
@@ -437,6 +436,7 @@ impl Ip32Bus {
         let ust = std::sync::Arc::new(MaceUst::new());
         let crime = std::sync::Arc::new(Crime::new(ust.clone()));
         let isa = std::sync::Arc::new(MaceIsa::new(crime.clone()));
+        let macepci = MacePci::new(crime.clone());
         let bus = Self {
             ram: ram.clone(),
             prom: Mutex::new(prom),
@@ -451,7 +451,7 @@ impl Ip32Bus {
                 let ust = ust.clone();
                 crate::dev::o2gfx::Gbe::new(std::sync::Arc::new(move || ust.now()))
             },
-            macepci: MacePci::new(),
+            macepci,
             ust: ust.clone(),
             nic_trace: NicTrace::new(),
             rtc: MaceRtc::new(),
@@ -463,7 +463,6 @@ impl Ip32Bus {
             sdma: MaceSerialDma::new(),
             audio: crate::dev::mace_audio::MaceAudio::new(),
             mec: std::sync::Arc::new(crate::dev::mec::Mec::new(ram.clone())),
-            pci_view: PciNativeView::new(),
             unmapped: Mutex::new(Vec::new()),
             fast_ram: std::sync::OnceLock::new(),
             pc: pc.clone(),
@@ -494,35 +493,8 @@ impl Ip32Bus {
             // anything is plugged into it, and a kernel that expects two
             // waits on the one that is missing.
             let scsi_b = std::sync::Arc::new(crate::dev::aic7880::Aic7880::new(ram.clone()));
-            bus.macepci.attach(
-                IP32_SCSI_SLOT_B,
-                std::sync::Arc::new(
-                    PciFunction::new(
-                        "aic7880-b",
-                        PCI_VENDOR_ADAPTEC,
-                        PCI_DEVICE_AIC7880,
-                        PCI_CLASS_SCSI,
-                        0x01,
-                        [0x100, 0x1000, 0, 0, 0, 0],
-                    )
-                    .with_ops(scsi_b.clone()),
-                ),
-            );
-            bus.macepci.attach(
-                IP32_SCSI_SLOT,
-                std::sync::Arc::new(
-                    PciFunction::new(
-                        "aic7880",
-                        PCI_VENDOR_ADAPTEC,
-                        PCI_DEVICE_AIC7880,
-                        PCI_CLASS_SCSI,
-                        0x01,
-                        // 256 bytes of I/O, 4 KiB of memory: what the part has.
-                        [0x100, 0x1000, 0, 0, 0, 0],
-                    )
-                    .with_ops(scsi.clone()),
-                ),
-            );
+            bus.macepci.attach(IP32_SCSI_SLOT_B, "aic7880-b", scsi_b.clone());
+            bus.macepci.attach(IP32_SCSI_SLOT, "aic7880", scsi.clone());
             for d in &opts.disks {
                 let ctl = if d.bus == 0 { &scsi } else { &scsi_b };
                 let id = d.id.unwrap_or(ctl.default_target());
@@ -532,8 +504,6 @@ impl Ip32Bus {
                     Err(e) => eprintln!("ip32: SCSI {at}: {}: {e}", d.path.display()),
                 }
             }
-            scsi.connect_irq(crate::irq::IrqLine::new(bus.crime.clone(), IP32_SCSI_CRIME_INT));
-            scsi_b.connect_irq(crate::irq::IrqLine::new(bus.crime.clone(), IP32_SCSI_CRIME_INT_B));
             let mut list = bus.scsi.lock().unwrap();
             list.push(scsi);
             list.push(scsi_b);
@@ -863,60 +833,6 @@ impl Ip32Bus {
         addr >= PROM_BASE && addr < PROM_BASE + PROM_SIZE
     }
 
-    /// Reads of PCI memory: the device that claims the address, or all ones
-    /// from the floating bus.
-    /// PCI is little-endian and this CPU is not, so the bridge swaps byte
-    /// lanes: an 8-bit access at CPU offset `A` reaches device byte `A ^ 3`,
-    /// and a 16-bit one `A ^ 2`.
-    ///
-    /// This is not cosmetic. Without it the AIC-7880's initialisation reads
-    /// as writes to registers 0x84, 0x91, 0x93 and 0xbc, which are nothing in
-    /// particular. With it they are HCNTRL (chip reset, then pause), CLRINT
-    /// (clear every interrupt), SCBPTR walking 0,1,2,... and the last byte of
-    /// each SCB being cleared — which is exactly how that chip is brought up.
-    fn lane_swizzle(off: u32, width: usize) -> u32 {
-        match width {
-            1 => off ^ 3,
-            2 => off ^ 2,
-            _ => off,
-        }
-    }
-
-    fn pci_addr_of(addr: u32) -> u32 {
-        if addr >= PCI_HI_MEM_BASE {
-            return addr;
-        }
-        PCI_MEM_PCI_BASE.wrapping_add(addr.wrapping_sub(PCI_MEM_BASE))
-    }
-
-    fn pci_mem_read_w(&self, addr: u32, width: usize) -> u32 {
-        match self.macepci.mem_target(Self::pci_addr_of(addr)) {
-            Some((f, off)) => f.mem_read(Self::lane_swizzle(off, width), width,
-                                         (self.pc.get(), self.pc.get_ra())),
-            None => 0xffff_ffff,
-        }
-    }
-
-    fn pci_mem_read(&self, addr: u32) -> u32 {
-        self.pci_mem_read_w(addr, 4)
-    }
-
-    fn pci_mem_write_w(&self, addr: u32, val: u32, width: usize) {
-        if let Some((f, off)) = self.macepci.mem_target(Self::pci_addr_of(addr)) {
-            f.mem_write(Self::lane_swizzle(off, width), val, width,
-                        (self.pc.get(), self.pc.get_ra()));
-        }
-    }
-
-    fn pci_mem_write(&self, addr: u32, val: u32) {
-        self.pci_mem_write_w(addr, val, 4)
-    }
-
-    fn in_pci_mem(&self, addr: u32) -> bool {
-        (addr >= PCI_MEM_BASE && addr < PCI_MEM_BASE.wrapping_add(PCI_MEM_SIZE))
-            || addr >= PCI_HI_MEM_BASE
-    }
-
     fn in_ps2(&self, addr: u32) -> bool {
         addr >= MACE_PS2 && addr < MACE_PS2 + MACE_PS2_SIZE
     }
@@ -1000,15 +916,6 @@ impl Ip32Bus {
 
     fn in_macepci(&self, addr: u32) -> bool {
         addr >= MACEPCI_BASE && addr < MACEPCI_BASE + MACEPCI_SIZE
-    }
-
-    /// Always false for now: the address `macereg.h` gives for the PCI native
-    /// view is where main memory actually lives on this machine, and RAM has
-    /// the stronger claim — POST writes its sizing patterns there. Kept as a
-    /// hook so the window can be restored somewhere else once its real
-    /// placement is known.
-    fn in_pci_view(&self, _addr: u32) -> bool {
-        false
     }
 
     /// Map an address through the low-memory alias, if it falls in it. The
@@ -1156,9 +1063,6 @@ impl Ip32Bus {
         if self.in_macepci(addr) {
             return BusRead8::ok(self.macepci.read32(addr & !3).data as u8);
         }
-        if self.in_pci_view(addr) {
-            return self.pci_view.read8(addr);
-        }
         if self.is_nic_reg(addr) {
             let v = self.nic_read();
             self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
@@ -1167,8 +1071,8 @@ impl Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read8(addr);
         }
-        if self.in_pci_mem(addr) {
-            return BusRead8::ok(self.pci_mem_read_w(addr, 1) as u8);
+        if MacePci::in_window(addr) {
+            return BusRead8::ok(self.macepci.window_read(addr, 1) as u8);
         }
         if self.in_ps2(addr) {
             return BusDevice::read8(&self.ps2, addr);
@@ -1218,14 +1122,11 @@ impl Ip32Bus {
         if self.in_macepci(addr) {
             return BusRead16::ok(self.macepci.read32(addr & !3).data as u16);
         }
-        if self.in_pci_view(addr) {
-            return self.pci_view.read16(addr);
-        }
         if let Some(c) = self.com_for(addr) {
             return c.read16(addr);
         }
-        if self.in_pci_mem(addr) {
-            return BusRead16::ok(self.pci_mem_read_w(addr, 2) as u16);
+        if MacePci::in_window(addr) {
+            return BusRead16::ok(self.macepci.window_read(addr, 2) as u16);
         }
         if self.in_ps2(addr) {
             return BusDevice::read16(&self.ps2, addr);
@@ -1282,9 +1183,6 @@ impl Ip32Bus {
         if self.in_macepci(addr) {
             return self.macepci.read32(addr);
         }
-        if self.in_pci_view(addr) {
-            return self.pci_view.read32(addr);
-        }
         if self.is_nic_reg(addr) {
             let v = self.nic_read();
             self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
@@ -1293,8 +1191,8 @@ impl Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read32(addr);
         }
-        if self.in_pci_mem(addr) {
-            return BusRead32::ok(self.pci_mem_read(addr) as u32);
+        if MacePci::in_window(addr) {
+            return BusRead32::ok(self.macepci.window_read(addr, 4) as u32);
         }
         if self.in_ps2(addr) {
             return BusDevice::read32(&self.ps2, addr);
@@ -1348,9 +1246,6 @@ impl Ip32Bus {
         if self.in_macepci(addr) {
             return self.macepci.read64(addr);
         }
-        if self.in_pci_view(addr) {
-            return self.pci_view.read64(addr);
-        }
         if self.is_nic_reg(addr) {
             let v = self.nic_read();
             self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
@@ -1362,11 +1257,8 @@ impl Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.read64(addr);
         }
-        if self.in_pci_mem(addr) {
-            // A 64-bit access to a 32-bit bus is two cycles.
-            let hi = self.pci_mem_read(addr) as u64;
-            let lo = self.pci_mem_read(addr.wrapping_add(4)) as u64;
-            return BusRead64::ok((hi << 32) | lo);
+        if MacePci::in_window(addr) {
+            return BusRead64::ok(self.macepci.window_read(addr, 8));
         }
         if self.in_ps2(addr) {
             return BusDevice::read64(&self.ps2, addr);
@@ -1420,9 +1312,6 @@ impl Ip32Bus {
         if self.in_macepci(addr) {
             return self.macepci.write32(addr & !3, val as u32);
         }
-        if self.in_pci_view(addr) {
-            return self.pci_view.write8(addr, val);
-        }
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val);
             self.nic_write(val);
@@ -1433,8 +1322,8 @@ impl Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.write8(addr, val);
         }
-        if self.in_pci_mem(addr) {
-            self.pci_mem_write_w(addr, val as u32, 1);
+        if MacePci::in_window(addr) {
+            self.macepci.window_write(addr, val as u64, 1);
             return BUS_OK;
         }
         if self.in_ps2(addr) {
@@ -1486,14 +1375,11 @@ impl Ip32Bus {
         if self.in_macepci(addr) {
             return self.macepci.write32(addr & !3, val as u32);
         }
-        if self.in_pci_view(addr) {
-            return self.pci_view.write16(addr, val);
-        }
         if let Some(c) = self.com_for(addr) {
             return c.write16(addr, val);
         }
-        if self.in_pci_mem(addr) {
-            self.pci_mem_write_w(addr, val as u32, 2);
+        if MacePci::in_window(addr) {
+            self.macepci.window_write(addr, val as u64, 2);
             return BUS_OK;
         }
         if self.in_ps2(addr) {
@@ -1554,9 +1440,6 @@ impl Ip32Bus {
         if self.in_macepci(addr) {
             return self.macepci.write32(addr, val);
         }
-        if self.in_pci_view(addr) {
-            return self.pci_view.write32(addr, val);
-        }
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val as u8);
             self.nic_write(val as u8);
@@ -1567,8 +1450,8 @@ impl Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.write32(addr, val);
         }
-        if self.in_pci_mem(addr) {
-            self.pci_mem_write_w(addr, val as u32, 4);
+        if MacePci::in_window(addr) {
+            self.macepci.window_write(addr, val as u64, 4);
             return BUS_OK;
         }
         if self.in_ps2(addr) {
@@ -1627,9 +1510,6 @@ impl Ip32Bus {
         if self.in_macepci(addr) {
             return self.macepci.write64(addr, val);
         }
-        if self.in_pci_view(addr) {
-            return self.pci_view.write64(addr, val);
-        }
         if self.is_nic_reg(addr) {
             self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val as u8);
             self.nic_write(val as u8);
@@ -1640,8 +1520,8 @@ impl Ip32Bus {
         if let Some(c) = self.com_for(addr) {
             return c.write64(addr, val);
         }
-        if self.in_pci_mem(addr) {
-            self.pci_mem_write_w(addr, val as u32, 4);
+        if MacePci::in_window(addr) {
+            self.macepci.window_write(addr, val, 8);
             return BUS_OK;
         }
         if self.in_ps2(addr) {

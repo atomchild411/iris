@@ -43,29 +43,9 @@ pub mod sdma {
     pub const fn rx_overrun(p: usize) -> u64 { 1 << (25 + 6 * p) }
 }
 
-/// Which of CRIME's interrupt inputs the controller in that slot drives.
-/// NetBSD works this out for itself and prints it: "interrupting at crime
-/// interrupt 8".
-pub const IP32_SCSI_CRIME_INT: u32 = 8;
-pub const IP32_SCSI_CRIME_INT_B: u32 = 9;
-
-/// The CPU-side window onto PCI memory, and the PCI address it starts at.
-///
-/// These are not the same number, which is the whole point. The PROM programs
-/// a BAR with a *PCI* address — 0x80001000 — and then reaches it through a
-/// window low in the CPU's physical map. The bus-error register dump named
-/// `0xba001084`, physical 0x1a001084, which is this window plus 0x1084, which
-/// is that BAR plus 0x84. Mapping the window one-to-one instead would put the
-/// device nowhere the firmware ever looks.
-pub const PCI_MEM_BASE: u32 = 0x1a00_0000;
-pub const PCI_MEM_SIZE: u32 = 0x0200_0000;
-pub const PCI_MEM_PCI_BASE: u32 = 0x8000_0000;
-
-/// PCI memory's second, one-to-one window, from physical 0x2_8000_0000. A
-/// 64-bit kernel (OpenBSD's) reaches devices there; the PROM and NetBSD use
-/// the low window above. Physical addresses reach this bus as 32 bits, so it
-/// arrives as 0x8000_0000 and up, where an O2 has nothing else below 4 GB.
-pub const PCI_HI_MEM_BASE: u32 = 0x8000_0000;
+/// The serial DMA channels' registers: port 0 at the start, port 1 16 KB on.
+pub const MACE_SDMA: u32 = MACE_BASE + 0x0031_8000;
+pub const MACE_SDMA_SIZE: u32 = 0x0000_8000;
 
 /// One direction of a serial port's DMA: its control register and the two
 /// pointers into its ring, as byte offsets with only bits 11:5 kept.

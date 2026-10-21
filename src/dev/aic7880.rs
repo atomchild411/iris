@@ -350,7 +350,14 @@ pub struct Aic7880 {
     dma_misses: Mutex<std::collections::BTreeSet<u32>>,
     /// The chip's interrupt pin, as the board routes it.
     irq: std::sync::OnceLock<crate::irq::IrqLine>,
+    pci: crate::pci::PciConfig,
 }
+
+/// The chip's PCI identity: Adaptec, AIC-7880.
+pub const PCI_VENDOR_ADAPTEC: u16 = 0x9004;
+pub const PCI_DEVICE_AIC7880: u16 = 0x8078;
+/// Mass storage controller, SCSI, no specific programming interface.
+pub const PCI_CLASS_SCSI: u32 = 0x0100_00;
 
 impl Aic7880 {
     pub fn new(ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
@@ -367,6 +374,13 @@ impl Aic7880 {
             sense: Mutex::new(None),
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
             irq: std::sync::OnceLock::new(),
+            // 256 bytes of I/O and 4 KiB of memory, both onto the same
+            // registers: what the part has.
+            pci: {
+                use crate::pci::{Bar, PciConfig, PCI_INTA};
+                PciConfig::new(PCI_VENDOR_ADAPTEC, PCI_DEVICE_AIC7880, PCI_CLASS_SCSI, 0x01,
+                    [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA)
+            },
             target: std::env::var("IRIS_IP32_SCSI_ID").ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
@@ -1269,8 +1283,9 @@ impl Aic7880 {
     }
 }
 
-impl crate::ip32::PciDeviceOps for Aic7880 {
-    fn read(&self, off: u32, width: usize) -> u32 {
+impl Aic7880 {
+    /// A register access of `width` bytes at `off`.
+    pub fn read(&self, off: u32, width: usize) -> u32 {
         // Everything here is byte-wide; a wider access reads consecutive
         // registers, most significant first, the way the bus presents them.
         let mut v = 0u32;
@@ -1280,7 +1295,7 @@ impl crate::ip32::PciDeviceOps for Aic7880 {
         v
     }
 
-    fn write(&self, off: u32, val: u32, width: usize) {
+    pub fn write(&self, off: u32, val: u32, width: usize) {
         for i in 0..width as u32 {
             let shift = 8 * (width as u32 - 1 - i);
             self.write8(off + i, (val >> shift) as u8);
@@ -1289,10 +1304,28 @@ impl crate::ip32::PciDeviceOps for Aic7880 {
     }
 }
 
+/// Both BARs reach the same registers.
+impl crate::pci::PciBusDevice for Aic7880 {
+    fn config(&self) -> &crate::pci::PciConfig {
+        &self.pci
+    }
+
+    fn bar_read(&self, _bar: usize, off: u32, width: usize) -> u32 {
+        self.read(off, width)
+    }
+
+    fn bar_write(&self, _bar: usize, off: u32, val: u32, width: usize) {
+        self.write(off, val, width)
+    }
+
+    fn connect_interrupt(&self, line: crate::irq::IrqLine) {
+        self.connect_irq(line);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ip32::PciDeviceOps;
 
     fn chip() -> Aic7880 {
         Aic7880::new(std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20))))

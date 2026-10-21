@@ -1215,89 +1215,19 @@ where
     eprintln!("ip32: serial DMA:\n   {}", bus.sdma.summary().replace('\n', "\n   "));
 
     for slot in 0..8u8 {
-        if let Some(f) = bus.macepci.slot(slot) {
-            let t: Vec<String> = f.touched().iter()
+        if let Some((name, f, touched)) = bus.macepci.slot(slot) {
+            let t: Vec<String> = touched.iter()
                 .map(|(r, w)| format!("{:02x}{}", r, if *w { "W" } else { "R" }))
                 .collect();
-            eprintln!("ip32: PCI slot {slot} ({}) config touched: {}", f.name, t.join(" "));
+            eprintln!("ip32: PCI slot {slot} ({name}) config touched: {}", t.join(" "));
+            let c = f.config();
             for i in 0..6 {
-                let b = f.bar(i);
+                let b = c.bar_base(i);
                 if b != 0 {
                     eprintln!("   BAR{i} programmed to 0x{b:08x}");
                 }
             }
-            eprintln!("   memory decoding {}",
-                      if f.memory_enabled() { "enabled" } else { "disabled" });
-            let ml = f.mem_log();
-            eprintln!("   {} accesses to its registers:", ml.len());
-            // Collapse repeats: a poll says one thing however often it
-            // happens, and the distinct offsets are the shopping list.
-            let mut runs: Vec<(u32, bool, u32, u32, u32)> = Vec::new();
-            for (off, w, v, pc, _) in ml.iter().copied() {
-                match runs.last_mut() {
-                    Some(r) if r.0 == off && r.1 == w && r.2 == v => r.4 += 1,
-                    _ => runs.push((off, w, v, pc, 1)),
-                }
-            }
-            {
-                // What the whole conversation touched, as a shopping
-                // list: this is the part of the chip that has to exist.
-                let mut by_off: std::collections::BTreeMap<u32, (u32, u32)> =
-                    Default::default();
-                for (off, w, _, _, _) in ml.iter() {
-                    let e = by_off.entry(*off).or_insert((0, 0));
-                    if *w { e.1 += 1 } else { e.0 += 1 }
-                }
-                let line: Vec<String> = by_off.iter()
-                    .map(|(o, (r, w))| format!("{o:02x}:{r}r/{w}w"))
-                    .collect();
-                eprintln!("      registers touched ({}): {}",
-                          by_off.len(), line.join(" "));
-            }
-            // The tail, with the poll registers dropped: HCNTRL and
-            // INTSTAT are read thousands of times and say nothing.
-            let quiet: Vec<&(u32, bool, u32, u32, u32)> = ml.iter()
-                .filter(|(o, _, _, _, _)| !matches!(*o, 0x87 | 0x91 | 0x61))
-                .collect();
-            {
-                // The sequencer's scratch RAM, as the driver left it. A
-                // four-byte run that looks like a DMA address is what we
-                // are after: the host-memory array of SCB addresses.
-                let mut sram = [0u8; 0x40];
-                for (o, w, v, _, _) in ml.iter() {
-                    if *w && (0x20..0x60).contains(o) {
-                        sram[(*o - 0x20) as usize] = *v as u8;
-                    }
-                }
-                eprint!("      sequencer scratch RAM 0x20..0x5f:");
-                for (i, b) in sram.iter().enumerate() {
-                    if i % 16 == 0 {
-                        eprint!("\n        {:02x}:", 0x20 + i);
-                    }
-                    eprint!(" {b:02x}");
-                }
-                eprintln!();
-            }
-            {
-                // The SCSI block, 0x00..0x1f: selection, transfer control
-                // and IDs. If the target a command is for is not in the
-                // SCB, it is set here.
-                let sel: Vec<String> = ml.iter()
-                    .filter(|(o, w, _, _, _)| *w && *o < 0x20)
-                    .map(|(o, _, v, _, _)| format!("{o:02x}={v:02x}"))
-                    .collect();
-                eprintln!("      SCSI block writes ({}): {}", sel.len(), sel.join(" "));
-            }
-            eprintln!("      last {} non-polling accesses:", quiet.len().min(24));
-            for (off, w, v, pc, ra) in quiet.iter().rev().take(24).rev() {
-                eprintln!("      +0x{off:03x} {} 0x{v:02x}  from PC 0x{pc:08x}<-0x{ra:08x}",
-                          if *w { "W" } else { "R" });
-            }
-            for (off, w, v, pc, n) in runs.iter().take(6) {
-                let times = if *n > 1 { format!(" x{n}") } else { String::new() };
-                eprintln!("      +0x{off:03x} {} 0x{v:08x}  from PC 0x{pc:08x}{times}",
-                          if *w { "W" } else { "R" });
-            }
+            eprintln!("   command {:#06x}", c.command());
         }
     }
     for scsi in bus.scsi.lock().unwrap().iter() {
@@ -1330,8 +1260,6 @@ where
         eprintln!("   0x{:08x}  bus {} dev {:2} fn {} reg 0x{:02x}",
                   a, (a >> 16) & 0xff, (a >> 11) & 0x1f, (a >> 8) & 7, a & 0xfc);
     }
-    let (pr, pw) = bus.pci_view.counts();
-    eprintln!("ip32: PCI native-view accesses: {pr} reads, {pw} writes");
 
     {
         let pw = bus.prom_writes();
