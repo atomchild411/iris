@@ -234,6 +234,7 @@ impl MipsCache for HandoverCache {
             self.shadow.set_tcache_window(base);
         }
     }
+    #[cfg(feature = "jitv2")]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
         unsafe {
             self.full.set_tcache_gen_window(gen_base);
@@ -248,6 +249,7 @@ impl MipsCache for HandoverCache {
     fn tcache_base_ptr(&self) -> *mut u8 {
         live!(self, c => c.tcache_base_ptr())
     }
+    #[cfg(feature = "jitv2")]
     fn tcache_gen_ptr(&self) -> *mut u8 {
         live!(self, c => c.tcache_gen_ptr())
     }
