@@ -946,6 +946,11 @@ pub mod re_reg {
     pub const TEX_SQ0: u32 = 0x2120;
     pub const TEX_TQ0: u32 = 0x2128;
     pub const TEX_Q0: u32 = 0x2130;
+    /// Bit 0: s was scaled down by 16 to fit; bit 1: t. IRIX sets them per
+    /// triangle once a coordinate passes about 16 maps (a 64-map floor sets
+    /// 2, a 1024-map triangle 3); ignored, far floors took too fine a mip
+    /// level and repeated 16 times too few.
+    pub const TEX_COORD_SCALE: u32 = 0x2134;
     pub const TEX_DSQDX: u32 = 0x2138;
     pub const TEX_DSQDY: u32 = 0x2140;
     pub const TEX_DTQDX: u32 = 0x2148;
@@ -1799,9 +1804,12 @@ impl CrimeRe {
                 // depth, texture) for: the vertex the traversal begins at,
                 // the bottom one for bottom-to-top edge types (0, 1) and the
                 // top one otherwise, the left or right one of two by the
-                // horizontal direction, at (1/16, 19/64) into its pixel.
-                // Solved from perfly's hubcap fan, where every triangle then
-                // agrees on the shared centre's texture coordinate.
+                // horizontal direction, at its pixel's corner. Fitted on GL
+                // triangles with known vertex colours and texture
+                // coordinates: every vertex comes out exact there (an
+                // earlier fit to perfly put it at (1/16, 19/64) into the
+                // pixel, before the texture scale flags below were known,
+                // and was 2-7% out at a far vertex).
                 let (rx, ry) = if refv < 3 {
                     v[refv]
                 } else {
@@ -1815,7 +1823,7 @@ impl CrimeRe {
                             Some(if better_y || tie_x { p } else { b })
                         }
                     }).unwrap();
-                    (start.0.floor() + 1.0 / 16.0, start.1.floor() + 19.0 / 64.0)
+                    (start.0.floor(), start.1.floor())
                 };
                 let fgc = g(FG);
                 let c0 = if smooth {
@@ -1879,6 +1887,11 @@ impl CrimeRe {
                 let (sq0, tq0, q0) = (s64r(TEX_SQ0), s64r(TEX_TQ0), s32r(TEX_Q0));
                 let (dsx, dsy, dtx, dty) = (s64r(TEX_DSQDX), s64r(TEX_DSQDY), s64r(TEX_DTQDX), s64r(TEX_DTQDY));
                 let (dqx, dqy) = (s32r(TEX_DQDX), s32r(TEX_DQDY));
+                // A coordinate the driver scaled down to fit the engine's
+                // range (s, t past about 16 maps) is flagged here, bit 0 for
+                // s and bit 1 for t, and read 16 times its register value.
+                let flags = g(TEX_COORD_SCALE);
+                let (ks, kt) = (if flags & 1 != 0 { 16.0 } else { 1.0 }, if flags & 2 != 0 { 16.0 } else { 1.0 });
                 // The source colour at a pixel as RGBA, before packing: what
                 // the alpha test and blending work on.
                 let rgba_at = |mem: &RamWindow, px: f64, py: f64| -> [u32; 4] {
@@ -1893,7 +1906,7 @@ impl CrimeRe {
                     }
                     let st = |dx: f64, dy: f64| {
                         let q = q0 + dqx * dx + dqy * dy;
-                        ((sq0 + dsx * dx + dsy * dy) / q, (tq0 + dtx * dx + dty * dy) / q)
+                        (ks * (sq0 + dsx * dx + dsy * dy) / q, kt * (tq0 + dtx * dx + dty * dy) / q)
                     };
                     let (s0, t0) = st(dx, dy);
                     // Level of detail from the texel steps to the next pixel
