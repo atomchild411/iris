@@ -213,7 +213,7 @@ impl O2Machine {
         if let Some(port) = o2.control_port {
             match std::net::TcpListener::bind(("127.0.0.1", port)) {
                 Ok(l) => {
-                    eprintln!("iris: O2 control on 127.0.0.1:{port} (shot, type, key, mouse, click, status, pc, regs, peek, scsi, retrace)");
+                    eprintln!("iris: O2 control on 127.0.0.1:{port} (the monitor's `o2` commands; `help o2` there lists them)");
                     let bus = bus.clone();
                     std::thread::Builder::new().name("O2-Control".into()).spawn(move || control_server(l, bus)).unwrap();
                 }
@@ -226,6 +226,7 @@ impl O2Machine {
         monitor.register_device(crate::devlog::init_devlog());
         monitor.register_device(cpu.clone().as_device());
         monitor.register_device(bus.clone());
+        monitor.register_device(Arc::new(O2Control::new(bus.clone())));
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
 
         Ok(Self { bus, cpu, timer_manager, display, running, threads: Vec::new(), monitor: Arc::new(monitor), monitor_port })
@@ -335,20 +336,6 @@ impl O2Machine {
     /// frames, keys), typing scripts, and the guest's power switch.
     fn service_loop(bus: Arc<Ip32Bus>, cpu: Arc<dyn CpuDevice>, running: Arc<AtomicBool>) {
         let dev = cpu.clone().as_device();
-        // IRIS_IP32_KEYS, as in the harness: segments split by `|`, each typed
-        // once the guest sits at a prompt (or 30 s after the last one).
-        let mut script: std::collections::VecDeque<std::collections::VecDeque<char>> = std::env::var("IRIS_IP32_KEYS")
-            .unwrap_or_default()
-            .replace("\\r", "\r")
-            .replace("\\e", "\x1b")
-            .replace("\\b", "\x08")
-            .split('|')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.chars().collect())
-            .collect();
-        let mut typing = false;
-        let mut last_seg: Option<Instant> = None;
-        let mut next_key = Instant::now();
         // The PROM's environment lives in its flash: save it once the guest
         // has written there (setenv) and the writing has stopped.
         let mut flash_seen = bus.flash_writes();
@@ -360,27 +347,6 @@ impl O2Machine {
                 if n != flash_seen {
                     flash_seen = n;
                     bus.save_flash();
-                }
-            }
-            if let Some(kb) = bus.ps2.devices() {
-                if !typing && !script.is_empty() && kb.scanning()
-                    && (bus.ps2.idle_polls() >= 20_000 || last_seg.is_some_and(|t| t.elapsed() > Duration::from_secs(30)))
-                {
-                    typing = true;
-                }
-                if typing && Instant::now() >= next_key {
-                    let seg = script.front_mut().unwrap();
-                    if let Some(ch) = seg.pop_front() {
-                        kb.type_char(ch);
-                        next_key = Instant::now() + Duration::from_millis(30);
-                    }
-                    if seg.is_empty() {
-                        script.pop_front();
-                        typing = false;
-                        last_seg = Some(Instant::now());
-                        bus.ps2.reset_idle();
-                        eprintln!("iris: O2 typed a key segment");
-                    }
                 }
             }
             // Frames from the network, and any line that changed without a
@@ -459,25 +425,9 @@ impl O2Display {
         let mut rgba = vec![0u8; 2048 * 2048 * 4];
         let mut size = (0usize, 0usize);
         let mut shots = 0u32;
-        // IRIS_IP32_PNG: the screen as a PNG every few seconds while it
-        // changes, for watching a run without its window.
-        let png = std::env::var("IRIS_IP32_PNG").ok();
-        let mut png_at = Instant::now();
-        let mut png_hash = 0u64;
         while self.running.load(Ordering::Relaxed) {
             let start = Instant::now();
             let shown = self.bus.render_screen(&mut rgba);
-            if let (Some(p), Some((w, h))) = (png.as_ref(), shown) {
-                if png_at.elapsed() >= Duration::from_secs(5) {
-                    png_at = Instant::now();
-                    let n = (w * h * 4) as usize;
-                    let hash = rgba[..n].iter().step_by(61).fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
-                    if hash != png_hash {
-                        png_hash = hash;
-                        let _ = crate::ip32_screen::save_png(p, &rgba[..n], w, h);
-                    }
-                }
-            }
             // Off: keep the last size, black.
             let (w, h) = shown.map(|(w, h)| (w as usize, h as usize)).unwrap_or(if size.0 == 0 { (1280, 1024) } else { size });
             {
@@ -577,6 +527,44 @@ static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// BadVAddr: what a polling loop is polling.
 static LAST_REGS: [std::sync::atomic::AtomicU64; 42] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 42];
+
+/// The control commands on the shared monitor, as `o2 <command> [args]`:
+/// the same commands, and replies, as the control port's.
+struct O2Control {
+    bus: Arc<Ip32Bus>,
+    rgba: Mutex<Vec<u8>>,
+}
+
+impl O2Control {
+    fn new(bus: Arc<Ip32Bus>) -> Self {
+        Self { bus, rgba: Mutex::new(vec![0u8; 2048 * 2048 * 4]) }
+    }
+}
+
+impl Device for O2Control {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("o2".to_string(), "O2 control: o2 shot PATH | status | pixel X Y | type TEXT | key|keydown|keyup NAME | \
+            mouse DX DY [BUTTONS] | click [BUTTON] | pc | regs | peek ADDR LEN PATH | watch LO HI|fb|off | watchdump PATH | \
+            retrace PATH | scsi PATH | unmapped | ps2log PATH | crimelog PATH | nictrace PATH".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "o2" {
+            return Err("Command not found".to_string());
+        }
+        let Some((sub, rest)) = args.split_first() else {
+            return Err("Usage: o2 <command> [args] (help o2)".to_string());
+        };
+        let reply = control_command(&self.bus, sub, &rest.join(" "), &mut self.rgba.lock());
+        writeln!(w, "{reply}").map_err(|e| e.to_string())
+    }
+}
 
 fn control_server(listener: std::net::TcpListener, bus: Arc<Ip32Bus>) {
     use std::io::{BufRead, BufReader, Write};

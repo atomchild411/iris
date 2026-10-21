@@ -496,11 +496,6 @@ impl Ps2Controller {
         true
     }
 
-    /// Whether the keyboard is sending keys (the guest enabled scanning).
-    pub fn scanning(&self) -> bool {
-        self.state.lock().scanning_enabled
-    }
-
     /// Send a byte straight to the keyboard (`mouse == false`) or the mouse,
     /// for a host with a separate port per device and no 8042 (the O2's
     /// MACE). Same device behaviour as the data port, without controller

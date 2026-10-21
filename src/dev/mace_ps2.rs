@@ -22,9 +22,6 @@ pub struct MacePs2 {
     /// serial-console machines run.
     dev: Option<std::sync::Arc<crate::dev::ps2::Ps2Controller>>,
     mouse: bool,
-    /// Keyboard STATUS reads with nothing to read since a byte last arrived:
-    /// a guest sitting at a prompt runs this up fast.
-    idle_polls: AtomicU32,
     /// The last bytes through either port, `(port, to the device?, byte)`,
     /// for working out a conversation that stalled.
     traffic: Mutex<std::collections::VecDeque<(u8, bool, u8, std::time::Instant)>>,
@@ -67,7 +64,6 @@ impl MacePs2 {
             ports: [Mutex::new(Ps2Port::default()), Mutex::new(Ps2Port::default())],
             dev: None,
             mouse: false,
-            idle_polls: AtomicU32::new(0),
             traffic: Mutex::new(std::collections::VecDeque::new()),
             irq: std::sync::OnceLock::new(),
         }
@@ -138,13 +134,6 @@ impl MacePs2 {
             }
             2 => port.control,
             3 => {
-                if p == 0 {
-                    if port.rx_full {
-                        self.idle_polls.store(0, Ordering::Relaxed);
-                    } else {
-                        self.idle_polls.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
                 let mut st = ps2_bit::CLOCK_SIGNAL;
                 if port.control & ps2_ctl::CLKEN != 0 && port.control & ps2_ctl::RESET == 0 {
                     st |= ps2_bit::CLOCK_INHIBIT;
@@ -216,15 +205,6 @@ impl MacePs2 {
                 format!("{:9.1} {p}{}{b:02x}\n", at.duration_since(t0).as_secs_f64() * 1000.0, if out { '>' } else { '<' })
             })
             .collect()
-    }
-
-    /// Keyboard status reads with nothing waiting, since the last byte.
-    pub fn idle_polls(&self) -> u32 {
-        self.idle_polls.load(Ordering::Relaxed)
-    }
-
-    pub fn reset_idle(&self) {
-        self.idle_polls.store(0, Ordering::Relaxed);
     }
 
     /// The PS/2 bits of MACE's ISA interrupt status: 9 and 11 are the ports'
@@ -318,7 +298,6 @@ impl Device for MacePs2 {
                         port.control, port.rx, if port.rx_full { " (full)" } else { "" }, port.tx,
                         if self.attached(p).is_some() { "attached" } else { "nothing plugged in" }).ok();
                 }
-                writeln!(w, "idle keyboard polls: {}", self.idle_polls()).ok();
             }
             "traffic" => {
                 write!(w, "{}", self.traffic_timed()).ok();
@@ -336,7 +315,6 @@ impl Resettable for MacePs2 {
         for p in &self.ports {
             *p.lock().unwrap() = Ps2Port::default();
         }
-        self.reset_idle();
     }
 }
 
