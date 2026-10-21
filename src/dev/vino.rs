@@ -23,12 +23,7 @@ use crate::dev::saa7191::Saa7191;
 use crate::dev::cdmc::Cdmc;
 use crate::devlog::{LogModule, devlog_is_active};
 use crate::video_source::{VideoSource, Field, FieldParity};
-
-/// Interrupt callback — implemented by the machine glue to assert/deassert
-/// the VINO interrupt line on the IOC.  Keeps vino.rs free of IOC details.
-pub trait VinoIrq: Send + Sync {
-    fn set_interrupt(&self, active: bool);
-}
+use crate::irq::IrqLine;
 
 // ─── GIO64 mapping ──────────────────────────────────────────────────────────
 
@@ -357,7 +352,7 @@ impl DmaWake {
 #[derive(Clone)]
 pub struct Vino {
     state:   Arc<Mutex<VinoState>>,
-    irq:     Arc<Mutex<Option<Arc<dyn VinoIrq>>>>,
+    irq:     Arc<Mutex<Option<IrqLine>>>,
     sys_mem: Arc<Mutex<Option<Arc<dyn BusDevice>>>>,
     /// D0 / composite (SAA7191 path) — defaults to black field generator.
     source_d0: Arc<Mutex<Option<Arc<dyn VideoSource>>>>,
@@ -385,7 +380,9 @@ impl Vino {
     }
 
     /// Set the interrupt callback (called from machine setup after IOC is ready).
-    pub fn set_irq(&self, irq: Arc<dyn VinoIrq>) {
+    /// Wire the interrupt to `irq` (the IOC's video line on an Indy). Keeps
+    /// vino.rs free of IOC details.
+    pub fn set_irq(&self, irq: IrqLine) {
         *self.irq.lock() = Some(irq);
     }
 
@@ -422,7 +419,7 @@ impl Vino {
 
     // ── Interrupt assertion ───────────────────────────────────────────────
 
-    fn raise_interrupt(st: &mut VinoState, irq: &Option<Arc<dyn VinoIrq>>, new_status: u32) {
+    fn raise_interrupt(st: &mut VinoState, irq: &Option<IrqLine>, new_status: u32) {
         // Only bits enabled in CONTROL (shifted right by 1) appear in int_status.
         // ctrl bits [6:1] are the six enable bits; isr bits [5:0] are the six status bits.
         let enable_mask = (st.control >> 1) & isr::MASK;
@@ -432,11 +429,11 @@ impl Vino {
         let newly_raised = !old & st.int_status;
         if newly_raised != 0 {
             if let Some(irq) = irq {
-                irq.set_interrupt(true);
+                irq.set(true);
             }
         } else if st.int_status == 0 && old != 0 {
             if let Some(irq) = irq {
-                irq.set_interrupt(false);
+                irq.set(false);
             }
         }
     }
@@ -444,7 +441,7 @@ impl Vino {
     // ── Control register write ────────────────────────────────────────────
 
     /// Returns true if a DMA channel was just enabled (caller should notify wake).
-    fn control_w(st: &mut VinoState, irq: &Option<Arc<dyn VinoIrq>>, val: u32) -> bool {
+    fn control_w(st: &mut VinoState, irq: &Option<IrqLine>, val: u32) -> bool {
         let old = st.control;
         st.control = val & ctrl::MASK;
 
@@ -496,7 +493,7 @@ impl Vino {
 
     // ── Interrupt status write (write 0 to individual bits to clear) ──────
 
-    fn intr_status_w(st: &mut VinoState, irq: &Option<Arc<dyn VinoIrq>>, val: u32) {
+    fn intr_status_w(st: &mut VinoState, irq: &Option<IrqLine>, val: u32) {
         // A 0-bit in the written value clears the corresponding status bit.
         for bit in 0..6u32 {
             if val & (1 << bit) == 0 {

@@ -634,15 +634,7 @@ impl Machine {
 
         // VINO (Video-In, No Out) — GIO64 at 0x1F080000
         let vino = crate::dev::vino::Vino::new();
-        {
-            struct VinoIrqAdapter { ioc: crate::dev::ioc::Ioc }
-            impl crate::dev::vino::VinoIrq for VinoIrqAdapter {
-                fn set_interrupt(&self, active: bool) {
-                    self.ioc.set_interrupt(crate::dev::ioc::IocInterrupt::VideoVsync, active);
-                }
-            }
-            vino.set_irq(Arc::new(VinoIrqAdapter { ioc: ioc.clone() }));
-        }
+        vino.set_irq(ioc.irq_line(crate::dev::ioc::IocInterrupt::VideoVsync));
 
         // 2. Create Physical Bus with devices
         // `cfg` is shadowed by MipsCpuConfig further down; grab this first.
