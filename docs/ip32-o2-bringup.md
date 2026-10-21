@@ -1,5 +1,31 @@
 # Bringing up IP32 (O2) in IRIS — what it would take
 
+## Today (read this first)
+
+The O2 runs as a machine like the others: `profile = "o2_ip32"` with an
+`[o2]` section (PROM, flash, `ram_mb` or `dimms`, `disks` on controllers 0
+and 1, `serial_port`, `graphics`, `mouse`, `net` and `forwards`,
+`control_port`, `cpu_mhz`, `re_async`), started with `iris --config`. Its
+devices are on the shared monitor (`monitor_port`, default 8888).
+
+The rest of this document is the bring-up journal, in order. Its middle
+chapters drive the machine through a test harness steered by `IRIS_IP32_*`
+variables (`IRIS_IP32_SCRIPT`, `_STEPS`, `_DISK`, `_DIS`, `ip32-view` and
+so on). That harness has since been removed; the findings stand, the
+commands no longer run.
+
+Diagnostics that remain, all off unless set:
+
+| variable | what it does |
+|---|---|
+| `IRIS_IP32_HOT` | per-register access counters for MACE, GBE and the rendering engine (finding a driver polling a bit nothing sets) |
+| `IRIS_IP32_WATCHMEM=lo[:hi]` | log accesses to a physical range (`0:0`: whatever GBE scans out); `_CAP` entries kept (256), `_WRITES` writes only; read with the control port's `watchdump` |
+| `IRIS_IP32_RE_TRACE=N` | keep the last N rendering-engine register writes; save with the control port's `retrace` |
+| `IRIS_IP32_MEC_TRACE` | Ethernet frames sent and received, and why a received one was dropped |
+| `IRIS_O2_AUDIO_TRACE` | audio output activity, and each time a ring ran dry between sounds |
+| `IRIS_O2_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling |
+| `IRIS_O2_AUDIO_CAPTURE=file` | what the host plays, after resampling and mixing (raw 16-bit stereo) |
+
 Assessment written 2026-09-19. Nothing implemented yet. Scope agreed with the
 owner: **run the real O2 PROM** (not a synthetic ARCS), serial console only,
 graphics explicitly out of scope.

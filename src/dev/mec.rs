@@ -326,26 +326,6 @@ impl Mec {
     }
 
     pub fn read64(&self, off: u32) -> u64 {
-        let v = self.read64_inner(off);
-        Self::trace_reg("r", off, v);
-        v
-    }
-
-    /// `IRIS_IP32_MEC_REGS`: report the first 3000 register accesses, for
-    /// learning what a driver does with the chip.
-    fn trace_reg(what: &str, off: u32, val: u64) {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static N: AtomicU32 = AtomicU32::new(0);
-        if !*ON.get_or_init(|| std::env::var_os("IRIS_IP32_MEC_REGS").is_some()) {
-            return;
-        }
-        if N.fetch_add(1, Ordering::Relaxed) < 3000 {
-            eprintln!("mec-reg: {what} {off:#05x} {val:#018x}");
-        }
-    }
-
-    fn read64_inner(&self, off: u32) -> u64 {
         let s = self.st.lock().unwrap();
         match off & !7 {
             reg::MAC_CONTROL => s.mac_control,
@@ -393,12 +373,11 @@ impl Mec {
         let base = off & !7;
         let shift = 8 * (8 - (off & 7) - size);
         let mask = ((1u64 << (8 * size)) - 1) << shift;
-        let old = if base == reg::INT_STATUS { 0 } else { self.read64_inner(base) };
+        let old = if base == reg::INT_STATUS { 0 } else { self.read64(base) };
         self.write64(base, (old & !mask) | ((val << shift) & mask));
     }
 
     pub fn write64(&self, off: u32, val: u64) {
-        Self::trace_reg("w", off, val);
         let mut send = false;
         {
             let mut s = self.st.lock().unwrap();

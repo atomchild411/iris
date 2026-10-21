@@ -797,21 +797,6 @@ fn the_bridge_swaps_byte_lanes_for_a_little_endian_device() {
     assert_eq!(MacePci::lane_swizzle(0x84, 4), 0x84, "a whole word needs no swap");
 }
 
-#[test]
-fn section_headers_parse() {
-    // Two records: a name, a version, a length.
-    let mut img = vec![0u8; 256];
-    img[8..12].copy_from_slice(b"SHDR");
-    img[12..16].copy_from_slice(&0x4000u32.to_be_bytes());
-    img[20..27].copy_from_slice(b"sloader");
-    img[52..55].copy_from_slice(b"1.0");
-    let s = parse_prom_sections(&img);
-    assert_eq!(s.len(), 1);
-    assert_eq!(s[0].name, "sloader");
-    assert_eq!(s[0].version, "1.0");
-    assert_eq!(s[0].length, 0x4000);
-}
-
 /// Every O2 device answers the monitor through the bus: its command is
 /// listed, and its status says something.
 #[test]

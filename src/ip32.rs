@@ -21,14 +21,14 @@ use std::sync::Mutex;
 
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR};
 
-// ── IP32 physical map (the part this milestone needs) ───────────────────────
+// ── IP32 physical map ───────────────────────
 /// RAM base.
 ///
 /// **Not zero.** The PROM's SizeMEM writes its probe patterns at `base + 0`,
 /// `+0x01fffff8`, `+0x02000000` and `+0x07fffff8`, and the physical address
 /// those land on is 0x40000000 — visible as the target of the `sd` at
 /// 0xbfc05c9c. This is the "RAM at a non-zero base address" the O2 is known
-/// for, and it collides with what `macereg.h` calls `MACE_PCI_NATIVE_VIEW`;
+/// for, and it collides with what NetBSD's `macereg.h` calls `MACE_PCI_NATIVE_VIEW`;
 /// main memory wins that address, so the PCI window is not mapped here.
 pub const RAM_BASE: u32 = 0x4000_0000;
 /// CRIME: memory controller, interrupt controller and video DMA.
@@ -97,10 +97,6 @@ pub const MACE_UST_MSC_SIZE: u32 = 0x0001_0000;
 /// MACE's PCI host bridge register block, at MACE + 0x080000.
 pub const MACEPCI_BASE: u32 = MACE_BASE + 0x0008_0000;
 pub const MACEPCI_SIZE: u32 = 0x0001_0000;
-/// The window where PCI memory appears 1:1 (`MACE_PCI_NATIVE_VIEW`). An O2
-/// PROM walks this while looking for the Adaptec SCSI controller.
-pub const PCI_NATIVE_VIEW_BASE: u32 = 0x4000_0000;
-pub const PCI_NATIVE_VIEW_SIZE: u32 = 0x0800_0000;
 
 /// CRIME's rendering-engine block. NetBSD's `crmfb` maps exactly
 /// `0x15000000, 0x6000` for this. Graphics are out of scope, but POST touches
@@ -147,11 +143,8 @@ pub const LOW_ALIAS_SIZE: u32 = 0x1000_0000;
 pub const PROM_BASE: u32 = 0x1fc0_0000;
 pub const PROM_SIZE: u32 = 0x0008_0000; // 512 KiB
 
-/// Where the `firmware` section's SHDR says it loads: KSEG0 0x81000000, i.e.
-/// physical 0x01000000. If sloader is meant to hand off to the ARCS monitor,
-/// this is where it would put it and where the PC would end up.
+/// Where the `firmware` section's SHDR says it loads: KSEG0 0x81000000.
 pub const FIRMWARE_LOAD_VA: u32 = 0x8100_0000;
-pub const FIRMWARE_LOAD_PA: u32 = 0x0100_0000;
 pub const FIRMWARE_SPAN: u32 = 0x0006_0000;
 
 /// The RTC and its battery-backed NVRAM, at MACE + 0x3a0000. Registers use
@@ -159,17 +152,6 @@ pub const FIRMWARE_SPAN: u32 = 0x0006_0000;
 pub const MACE_RTC: u32 = MACE_BASE + 0x003a_0000;
 pub const MACE_RTC_SIZE: u32 = 0x0001_0000;
 
-/// sloader's serial prompt: "SL", 9600 baud, 8 data bits, even parity. Seeing
-/// this means POST has completed and the PROM is waiting on console input.
-/// How often the harness looks at the CP0 timer. Every instruction would be
-/// honest and far too slow; this is fine enough that a kernel's clock ticks
-/// smoothly and coarse enough to cost nothing.
-pub const TIMER_POLL_STEPS: u64 = 256;
-
-pub const SLOADER_PROMPT: &str = "SL-9600-8E>";
-
-/// Where `post1` is loaded and entered. Reaching this PC is the milestone.
-pub const POST1_ENTRY: u32 = 0xa000_4000;
 
 /// What is plugged into an O2 beyond its memory: the SCSI controllers and
 /// their disks, and where the PROM's flash (its environment) is kept.
@@ -194,34 +176,6 @@ pub struct Ip32Disk {
     pub path: std::path::PathBuf,
     /// A CD-ROM, which the PROM's install menu insists on seeing.
     pub cdrom: bool,
-}
-
-impl Ip32Options {
-    /// IRIS_IP32_SCSI (controllers on), IRIS_IP32_DISK (one disk at the
-    /// default id), IRIS_IP32_DISKS=id=path[:cd],... (more than one: an install
-    /// needs the media on one id and the target on another), IRIS_IP32_FLASH.
-    pub fn from_env() -> Self {
-        let mut disks = Vec::new();
-        if let Ok(path) = std::env::var("IRIS_IP32_DISK") {
-            disks.push(Ip32Disk { id: None, bus: 0, path: path.into(), cdrom: false });
-        }
-        if let Ok(spec) = std::env::var("IRIS_IP32_DISKS") {
-            for entry in spec.split(',') {
-                let Some((id, path)) = entry.split_once('=') else { continue };
-                let Ok(id) = id.trim().parse::<u8>() else { continue };
-                let (path, cdrom) = match path.trim().strip_suffix(":cd") {
-                    Some(p) => (p, true),
-                    None => (path.trim(), false),
-                };
-                disks.push(Ip32Disk { id: Some(id), bus: 0, path: path.into(), cdrom });
-            }
-        }
-        Self {
-            scsi: std::env::var("IRIS_IP32_SCSI").is_ok(),
-            disks,
-            flash_file: std::env::var_os("IRIS_IP32_FLASH").map(Into::into),
-        }
-    }
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -249,11 +203,6 @@ pub struct Stub {
     hot: Mutex<std::collections::BTreeMap<u32, (u64, u64)>>,
     /// Per-offset stored value.
     cells: Mutex<std::collections::BTreeMap<u32, u64>>,
-    /// Which code touches each offset. "Polled 80,000 times" is a symptom;
-    /// the PC is what lets you go and read the loop.
-    who: Mutex<std::collections::BTreeMap<u32, Vec<(u32, u32)>>>,
-    /// Set by the owner so the PC can be attributed.
-    pc: Mutex<Option<std::sync::Arc<PcTap>>>,
 }
 
 impl Stub {
@@ -264,8 +213,6 @@ impl Stub {
             writes: std::sync::atomic::AtomicU64::new(0),
             hot: Mutex::new(std::collections::BTreeMap::new()),
             cells: Mutex::new(std::collections::BTreeMap::new()),
-            who: Mutex::new(std::collections::BTreeMap::new()),
-            pc: Mutex::new(None),
         }
     }
     pub fn counts(&self) -> (u64, u64) {
@@ -304,25 +251,6 @@ impl Stub {
         let mut h = self.hot.lock().unwrap();
         let e = h.entry(off).or_insert((0, 0));
         if write { e.1 += 1 } else { e.0 += 1 }
-        drop(h);
-        if let Some(tap) = self.pc.lock().unwrap().as_ref() {
-            let who = (tap.get(), tap.get_ra());
-            let mut w = self.who.lock().unwrap();
-            let v = w.entry(off).or_default();
-            if v.len() < 4 && !v.contains(&who) {
-                v.push(who);
-            }
-        }
-    }
-
-    /// Attribute this stub's accesses to the PC making them.
-    pub fn watch_pc(&self, tap: std::sync::Arc<PcTap>) {
-        *self.pc.lock().unwrap() = Some(tap);
-    }
-
-    /// The PCs seen touching an offset.
-    pub fn who_touched(&self, off: u32) -> Vec<(u32, u32)> {
-        self.who.lock().unwrap().get(&off).cloned().unwrap_or_default()
     }
 }
 
@@ -379,7 +307,7 @@ pub struct Ip32Bus {
     pub sdma: MaceSerialDma,
     /// The audio interface and its AD1843 (dev/mace_audio.rs).
     pub audio: crate::dev::mace_audio::MaceAudio,
-    /// The Ethernet. Its frames go nowhere until `start_nat` (IRIS_IP32_NET).
+    /// The Ethernet. Its frames go nowhere until `start_nat` (`[o2] net`).
     pub mec: std::sync::Arc<crate::dev::mec::Mec>,
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write, pc)`.
     unmapped: Mutex<Vec<(u32, bool, u32)>>,
@@ -387,15 +315,6 @@ pub struct Ip32Bus {
     /// (one bit per 64 MB region it has fully mapped), once the machine has
     /// wired them: aligned RAM reads then skip the RAM lock. See `read_bytes`.
     fast_ram: std::sync::OnceLock<(usize, usize)>,
-    /// The PC of the instruction currently executing.
-    pub pc: std::sync::Arc<PcTap>,
-    /// Count of writes into the firmware load region.
-    fw_writes: Mutex<u64>,
-    /// 64-bit RAM accesses at the addresses POST's memory sizing uses, as
-    /// `(addr, is_write, value, pc)`. The test writes `(!a << 32) | a` to each and
-    /// reads it back, so seeing both halves is what tells us whether the store
-    /// or the load is the one going wrong.
-    sizemem: Mutex<Vec<(u32, bool, u64, u32)>>,
     /// A physical-address watch range, from `IRIS_IP32_WATCHMEM=lo[:hi]`.
     /// Every access within it is logged as `(addr, is_write, value, pc)`.
     /// `watching` says whether there is one, so the RAM path checks a flag
@@ -421,17 +340,11 @@ impl Ip32Bus {
             .ok()
             .filter(|m| m.total() as usize == ram_bytes)
             .unwrap_or_else(|| O2Memory::single(ram_bytes));
-        Self::with_memory(mem, prom)
-    }
-
-    /// A machine with `mem` fitted, configured from the IRIS_IP32_* variables.
-    pub fn with_memory(mem: O2Memory, prom: Vec<u8>) -> Self {
-        Self::with_options(mem, prom, Ip32Options::from_env())
+        Self::with_options(mem, prom, Ip32Options::default())
     }
 
     /// A machine with `mem` fitted, configured by `opts`.
     pub fn with_options(mem: O2Memory, prom: Vec<u8>, opts: Ip32Options) -> Self {
-        let pc = std::sync::Arc::new(PcTap::default());
         let ram = std::sync::Arc::new(Mutex::new(mem));
         let ust = std::sync::Arc::new(MaceUst::new());
         let crime = std::sync::Arc::new(Crime::new(ust.clone()));
@@ -465,9 +378,6 @@ impl Ip32Bus {
             mec: std::sync::Arc::new(crate::dev::mec::Mec::new(ram.clone())),
             unmapped: Mutex::new(Vec::new()),
             fast_ram: std::sync::OnceLock::new(),
-            pc: pc.clone(),
-            fw_writes: Mutex::new(0),
-            sizemem: Mutex::new(Vec::new()),
             watch: Mutex::new(std::env::var("IRIS_IP32_WATCHMEM").ok().and_then(|v| {
                 let (a, b) = v.split_once(':').unwrap_or((&v, &v));
                 let p = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
@@ -521,39 +431,7 @@ impl Ip32Bus {
                 Err(_) => {}
             }
         }
-        // So a hot offset can name the code polling it.
-        bus.mace.watch_pc(pc.clone());
-        let _ = pc;
         bus
-    }
-
-    /// The addresses POST's sizing test probes.
-    pub const SIZEMEM_PROBES: [u32; 4] = [
-        RAM_BASE,
-        RAM_BASE + 0x01ff_fff8,
-        RAM_BASE + 0x0200_0000,
-        RAM_BASE + 0x07ff_fff8,
-    ];
-
-    pub fn sizemem_trace(&self) -> Vec<(u32, bool, u64, u32)> {
-        self.sizemem.lock().unwrap().clone()
-    }
-
-    /// True for POST's address/complement signature, `(!a << 32) | a`.
-    fn is_probe_pattern(val: u64) -> bool {
-        let lo = val as u32;
-        let hi = (val >> 32) as u32;
-        hi == !lo
-    }
-
-    fn note_sizemem(&self, addr: u32, write: bool, val: u64) {
-        if Self::SIZEMEM_PROBES.contains(&addr) || Self::is_probe_pattern(val) {
-            let pc = self.pc.get();
-            let mut t = self.sizemem.lock().unwrap();
-            if t.len() < 64 {
-                t.push((addr, write, val, pc));
-            }
-        }
     }
 
     pub fn unmapped(&self) -> Vec<(u32, bool, u32)> {
@@ -561,7 +439,7 @@ impl Ip32Bus {
     }
 
     fn miss(&self, addr: u32, write: bool) {
-        let pc = self.pc.get();
+        let pc = crate::ip32_machine::LAST_PC.load(Ordering::Relaxed);
         let mut u = self.unmapped.lock().unwrap();
         if u.len() < 64 && !u.iter().any(|&(a, w, _)| a == addr && w == write) {
             u.push((addr, write, pc));
@@ -769,12 +647,9 @@ impl Ip32Bus {
             if hit && (write || !self.watch_writes_only) {
                 let mut w = self.watch_log.lock().unwrap();
                 if w.len() < self.watch_cap {
-                    // The harness sets the PC every step; the machine only
-                    // knows where its last batch ended.
-                    let pc = match self.pc.get() {
-                        0 => crate::ip32_machine::LAST_PC.load(Ordering::Relaxed),
-                        pc => pc,
-                    };
+                    // Where the CPU's last batch ended: the machine knows no
+                    // finer.
+                    let pc = crate::ip32_machine::LAST_PC.load(Ordering::Relaxed);
                     w.push((addr, write, val, pc, self.ust.now(), n as u8));
                 }
             }
@@ -820,14 +695,6 @@ impl Ip32Bus {
         self.prom_writes.lock().unwrap().clone()
     }
 
-    pub fn watched(&self) -> Vec<(u32, bool, u64, u32, u64, u8)> {
-        self.watch_log.lock().unwrap().clone()
-    }
-
-    /// Writes landing where the `firmware` section would be loaded.
-    pub fn firmware_writes(&self) -> u64 {
-        *self.fw_writes.lock().unwrap()
-    }
 
     fn in_prom(&self, addr: u32) -> bool {
         addr >= PROM_BASE && addr < PROM_BASE + PROM_SIZE
@@ -987,9 +854,6 @@ impl Ip32Bus {
     }
 
     fn write_bytes(&self, addr: u32, n: usize, val: u64) -> bool {
-        if (FIRMWARE_LOAD_PA..FIRMWARE_LOAD_PA + FIRMWARE_SPAN).contains(&addr) {
-            *self.fw_writes.lock().unwrap() += 1;
-        }
         let addr = self.resolve(addr);
         self.watch_hit(addr, true, val, n);
         {
@@ -1287,7 +1151,6 @@ impl Ip32Bus {
             return self.mace.read64(addr);
         }
         let r = bus_read!(self, addr, 8, BusRead64::ok, |v: u64| v);
-        self.note_sizemem(addr, false, r.data);
         r
     }
 
@@ -1548,7 +1411,6 @@ impl Ip32Bus {
             self.mace_wrote(addr);
             return r;
         }
-        self.note_sizemem(addr, true, val);
         if self.write_bytes(addr, 8, val) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
 }
@@ -1642,219 +1504,6 @@ impl BusDevice for Ip32Bus {
     }
 }
 
-// ── Instrumentation ─────────────────────────────────────────────────────────
-//
-// Three things, each chosen because its absence cost real time during
-// bring-up:
-//
-// 1. **Every recorded access carries the PC that issued it.** The very first
-//    run bus-errored on a store to 0x40000000, and it was read as "the PROM is
-//    enumerating PCI" because a header names a PCI constant there. Had the log
-//    said the store came from inside the memory-sizing routine, the real answer
-//    — that RAM is based at 0x40000000 — would have been immediate.
-//
-// 2. **A printf tap.** post1's print routine is a stub that emits nothing, so
-//    a console cannot show POST's narrative. But the format strings are in the
-//    image and the arguments are in registers at the call. Reading them at the
-//    call site recovers the narrative the hardware never prints.
-//
-// 3. **Stall detection that says what the loop touched.** "Stopped at PC X" is
-//    nearly useless; "spun 390k times between PC A and B, reading only
-//    MACE+0x340000" names the missing device immediately.
-
-/// The PC of the instruction currently executing, published by the harness so
-/// devices can attribute accesses. A plain atomic: this is a bring-up harness,
-/// and correlating a store with its code site is worth an atomic store per
-/// instruction.
-#[derive(Default)]
-pub struct PcTap {
-    pc: AtomicU32,
-    /// `ra` as well, because the PROM reaches most registers through one-line
-    /// `ld`/`sd` accessors. Attributing a hot register to the accessor names
-    /// the same three addresses every time and says nothing; the return
-    /// address names the code that actually wanted it.
-    ra: AtomicU32,
-}
-
-impl PcTap {
-    pub fn set(&self, pc: u32) {
-        self.pc.store(pc, Ordering::Relaxed);
-    }
-    pub fn set_ra(&self, ra: u32) {
-        self.ra.store(ra, Ordering::Relaxed);
-    }
-    pub fn get(&self) -> u32 {
-        self.pc.load(Ordering::Relaxed)
-    }
-    pub fn get_ra(&self) -> u32 {
-        self.ra.load(Ordering::Relaxed)
-    }
-}
-
-/// Watches the PC for a loop that is going nowhere.
-///
-/// Keeps the distinct PCs seen in the current window. When the window fills
-/// without the set growing beyond `spread`, the guest is spinning, and the set
-/// is the loop body.
-pub struct StallDetector {
-    window: usize,
-    spread: usize,
-    seen: std::collections::BTreeSet<u32>,
-    count: usize,
-}
-
-impl StallDetector {
-    pub fn new(window: usize, spread: usize) -> Self {
-        Self { window, spread, seen: Default::default(), count: 0 }
-    }
-
-    /// Feed one PC. Returns the loop body once a stall is recognised.
-    pub fn step(&mut self, pc: u32) -> Option<Vec<u32>> {
-        self.seen.insert(pc);
-        self.count += 1;
-        if self.count < self.window {
-            return None;
-        }
-        let stalled = self.seen.len() <= self.spread;
-        let body: Vec<u32> = self.seen.iter().copied().collect();
-        self.seen.clear();
-        self.count = 0;
-        stalled.then_some(body)
-    }
-}
-
-/// Recovers POST's intended messages by reading them at the call site.
-///
-/// The PROM's print routine takes a format string in `a0` and up to three
-/// arguments in `a1`-`a3`, and — in post1 — throws them away. Catching the call
-/// and resolving `a0` against the PROM image gives the message anyway.
-pub struct PrintfTap {
-    /// Address of the routine to watch.
-    pub entry: u32,
-    lines: Mutex<Vec<String>>,
-}
-
-impl PrintfTap {
-    /// post1's print routine: saves its arguments and returns.
-    pub const POST1_PRINTF: u32 = 0xbfc0_4d74;
-
-    pub fn new(entry: u32) -> Self {
-        Self { entry, lines: Mutex::new(Vec::new()) }
-    }
-
-    /// Call when the PC reaches `entry`. `args` are a0..a3.
-    pub fn on_call(&self, prom: &[u8], args: [u64; 4]) {
-        let fmt = read_prom_cstr(prom, args[0] as u32);
-        let Some(fmt) = fmt else { return };
-        self.lines.lock().unwrap().push(format_prom(&fmt, &args[1..]));
-    }
-
-    pub fn lines(&self) -> Vec<String> {
-        self.lines.lock().unwrap().clone()
-    }
-}
-
-/// Read a NUL-terminated string out of the PROM image, given a guest address
-/// anywhere in the PROM window. Returns `None` for addresses outside it.
-pub fn read_prom_cstr(prom: &[u8], addr: u32) -> Option<String> {
-    // Accept KSEG0/KSEG1 aliases as well as the bare physical address.
-    let phys = addr & 0x1fff_ffff;
-    if !(PROM_BASE & 0x1fff_ffff..(PROM_BASE & 0x1fff_ffff) + PROM_SIZE).contains(&phys) {
-        return None;
-    }
-    let off = (phys - (PROM_BASE & 0x1fff_ffff)) as usize;
-    let end = prom[off..].iter().position(|&b| b == 0)? + off;
-    if end == off {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&prom[off..end]).to_string())
-}
-
-/// Substitute `%d`/`%x`/`%lx`/`%s` style conversions with the supplied
-/// arguments. Deliberately approximate: the point is to read the message, not
-/// to reimplement printf.
-pub fn format_prom(fmt: &str, args: &[u64]) -> String {
-    let mut out = String::new();
-    let mut it = fmt.chars().peekable();
-    let mut argi = 0usize;
-    while let Some(c) = it.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        // Skip flags, width and length modifiers.
-        let mut spec = String::new();
-        while let Some(&n) = it.peek() {
-            it.next();
-            if n.is_ascii_alphabetic() {
-                spec.push(n);
-                break;
-            }
-        }
-        let a = args.get(argi).copied().unwrap_or(0);
-        match spec.chars().last() {
-            Some('d') | Some('i') => { out.push_str(&format!("{}", a as i64)); argi += 1 }
-            Some('u') => { out.push_str(&format!("{a}")); argi += 1 }
-            Some('x') | Some('X') | Some('p') => { out.push_str(&format!("{a:x}")); argi += 1 }
-            Some('c') => { out.push(a as u8 as char); argi += 1 }
-            Some('s') => { out.push_str("<str>"); argi += 1 }
-            Some('%') => out.push('%'),
-            _ => out.push_str(&format!("%{spec}")),
-        }
-    }
-    out
-}
-
-/// MIPS CP0 Cause.ExcCode, named. An unhandled trap is usually diagnosed
-/// entirely from this plus BadVAddr.
-pub fn exc_name(code: u32) -> &'static str {
-    match code {
-        0 => "Int", 1 => "TLBMod", 2 => "TLBL", 3 => "TLBS", 4 => "AdEL",
-        5 => "AdES", 6 => "IBE", 7 => "DBE", 8 => "Sys", 9 => "Bp",
-        10 => "RI", 11 => "CpU", 12 => "Ov", 13 => "Tr", 15 => "FPE",
-        23 => "WATCH", 31 => "VCED",
-        _ => "?",
-    }
-}
-
-/// Parsed IP32 PROM section header. The PROM is a run of `SHDR` records, and
-/// knowing where `post1` and `firmware` load is what lets a trace say "it got
-/// to POST" rather than "the PC is somewhere".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromSection {
-    pub name: String,
-    pub version: String,
-    pub file_off: u32,
-    pub length: u32,
-}
-
-/// Walk the `SHDR` records. Returns them in file order.
-pub fn parse_prom_sections(prom: &[u8]) -> Vec<PromSection> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 64 <= prom.len() {
-        if &prom[i..i + 4] == b"SHDR" {
-            let length = u32::from_be_bytes([prom[i + 4], prom[i + 5], prom[i + 6], prom[i + 7]]);
-            let cstr = |off: usize, max: usize| {
-                let s = &prom[off..(off + max).min(prom.len())];
-                let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-                String::from_utf8_lossy(&s[..end]).to_string()
-            };
-            out.push(PromSection {
-                name: cstr(i + 12, 32),
-                version: cstr(i + 44, 8),
-                file_off: i as u32,
-                length,
-            });
-        }
-        i += 4;
-    }
-    out
-}
-
-
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-mod bringup;

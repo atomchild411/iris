@@ -333,14 +333,8 @@ pub struct Aic7880 {
     /// being handed it a register at a time, so without this it can see the
     /// tag of a command and nothing else about it.
     ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>,
-    /// The SCSI id the one disk answers at.
+    /// The SCSI id a disk attached without one answers at.
     target: u8,
-    /// An address range to report DMA writes for, from IRIS_IP32_DMAWATCH.
-    /// "Did the loader ever write the entry point" is not answerable from the
-    /// command log, because the log says where a transfer was aimed and not
-    /// which bytes moved.
-    dma_watch: Option<(u32, u32)>,
-    dma_hits: Mutex<Vec<(u32, u8)>>,
     /// The controller's own sense, as (key, ASC, ASCQ): a command for a
     /// logical unit the target does not have, handed out by the REQUEST
     /// SENSE that follows. A check condition followed by "no sense" tells a
@@ -365,12 +359,6 @@ impl Aic7880 {
             st: Mutex::new(State::default()),
             targets: Mutex::new(std::array::from_fn(|_| None)),
             ram,
-            dma_watch: std::env::var("IRIS_IP32_DMAWATCH").ok().and_then(|v| {
-                let (a, b) = v.split_once(':')?;
-                let p = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
-                Some((p(a)?, p(b)?))
-            }),
-            dma_hits: Mutex::new(Vec::new()),
             sense: Mutex::new(None),
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
             irq: std::sync::OnceLock::new(),
@@ -381,9 +369,7 @@ impl Aic7880 {
                 PciConfig::new(PCI_VENDOR_ADAPTEC, PCI_DEVICE_AIC7880, PCI_CLASS_SCSI, 0x01,
                     [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA)
             },
-            target: std::env::var("IRIS_IP32_SCSI_ID").ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1),
+            target: 1,
         }
     }
 
@@ -415,15 +401,6 @@ impl Aic7880 {
     }
 
     fn dma_write8(&self, addr: u32, val: u8) {
-        if let Some((lo, hi)) = self.dma_watch {
-            let a = addr & 0x1fff_ffff;
-            if a >= lo && a < hi {
-                let mut w = self.dma_hits.lock().unwrap();
-                if w.len() < 64 {
-                    w.push((addr, val));
-                }
-            }
-        }
         let mut r = self.ram.lock().unwrap();
         if let Some(i) = r.dma_offset(addr) {
             r.write(i, &[val]);
@@ -433,10 +410,6 @@ impl Aic7880 {
         }
     }
 
-    /// DMA writes seen inside the watch range, as `(address, byte)`.
-    pub fn dma_hits(&self) -> Vec<(u32, u8)> {
-        self.dma_hits.lock().unwrap().clone()
-    }
 
     /// A 32-bit word, in the order the host wrote it.
     ///

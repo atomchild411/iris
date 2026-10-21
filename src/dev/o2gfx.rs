@@ -731,18 +731,6 @@ fn subtile_step(bx: u32, y: u32, stride: u32) -> u32 {
     (bx >> 9) + (y >> 7) * stride
 }
 
-/// IRIS_O2_FRAG_PROBE="x,y": log every triangle fragment drawn at that
-/// buffer pixel (its state, the colours in and the result), for scenes that
-/// come out the wrong colour.
-fn frag_probe() -> Option<(i32, i32)> {
-    static P: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
-    *P.get_or_init(|| {
-        let v = std::env::var("IRIS_O2_FRAG_PROBE").ok()?;
-        let (x, y) = v.split_once(',')?;
-        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
-    })
-}
-
 /// A 16-bit texel of type `typ` (Texture.mode 23:20) as R, G, B, A, 0-255
 /// (spec figure 7-7): RGBA4 has R in the top nibble, LUMINANCE_ALPHA L in
 /// the high byte and A in the low, and RGB and RGBA are A1R5G5B5. The
@@ -1923,12 +1911,6 @@ impl CrimeRe {
                         if rho > 0.0 { rho.log2() } else { 0.0 }
                     };
                     let tx = t.sample(&r, mem, s0, t0, lod);
-                    if frag_probe() == Some((px as i32, py as i32)) {
-                        eprintln!(
-                            "o2frag {px},{py}: s {s0:.1} t {t0:.1} lod {lod:.2} -> {tx:?}; map {} max {} filter {} {}x{} base entry {} bytes {}",
-                            t.map_level, t.max_level, t.min_filter, t.w, t.h, t.base, t.bpt
-                        );
-                    }
                     // Texture function (Texture.mode 1:0), as OpenGL's for
                     // maps with and without alpha.
                     let f = [0, 1, 2, 3].map(|k| channel(k, px, py) as f64);
@@ -2077,9 +2059,6 @@ impl CrimeRe {
                                         _ => true,
                                     };
                                     if !pass {
-                                        if frag_probe() == Some((x, y)) {
-                                            eprintln!("o2frag {x},{y}: dm {dm:#x} depth fail: func {zfunc} new {zs:#x} old {zd:#x}");
-                                        }
                                         continue;
                                     }
                                     if zmask {
@@ -2088,11 +2067,6 @@ impl CrimeRe {
                                 }
                             }
                             if let Some(o) = crow.at(&r, mem, x as u32, y as u32) {
-                                let before = if frag_probe() == Some((x, y)) {
-                                    Some(if half { Self::get_px(mem, o + half_off, 2) } else { Self::get_px(mem, o, dst.bd) })
-                                } else {
-                                    None
-                                };
                                 let colour = match src {
                                     Some(c) if blend => {
                                         let (at, n) = if half { (o + half_off, 2) } else { (o, 4) };
@@ -2103,14 +2077,6 @@ impl CrimeRe {
                                     Some([r8, g8, b8, a8]) => pack(r8, g8, b8, a8),
                                     None => colour_at(mem, px, py),
                                 };
-                                if let Some(old) = before {
-                                    eprintln!(
-                                        "o2frag {x},{y}: dm {dm:#x} tex {:#x} blend {bfunc:#x} src {:?} dst {old:#x} -> {colour:#x}{}",
-                                        g(TEX_MODE),
-                                        src.or_else(|| Some(rgba_at(mem, px, py))),
-                                        if half { " (half)" } else { "" }
-                                    );
-                                }
                                 if half {
                                     Self::put(&r, mem, o + half_off, 2, colour);
                                 } else {
@@ -2241,12 +2207,6 @@ impl CrimeRe {
         let half_off = if dmode & 1 == 0 { 2 } else { 0 };
         let blend = dm & draw::BLEND != 0 && dst.bd == 4 && (fmt != 0 || half);
         let mut plot = |x: i32, y: i32, cov: f64| {
-            if frag_probe() == Some((x, y)) {
-                eprintln!(
-                    "o2frag {x},{y}: {} dm {dm:#x} bufmode {:#x} colour {cr},{cg},{cb},{ca} cov {cov:.2} clip {}",
-                    if point { "point" } else { "line" }, g(BUFMODE_DST), x >= 0 && y >= 0 && clip.ok(x, y)
-                );
-            }
             if x < 0 || y < 0 || cov <= 0.0 || !clip.ok(x, y) {
                 return;
             }

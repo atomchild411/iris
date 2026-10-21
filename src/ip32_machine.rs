@@ -199,13 +199,13 @@ impl O2Machine {
 
         bus.gbe.use_cpu_clock(cpu.cycles_ptr(), o2.cpu_mhz);
         // CRIME's rendering engine can draw on its own thread
-        // (IRIS_O2_RE_ASYNC=1), but by default it stays on the CPU's: the
+        // (`[o2] re_async`), but by default it stays on the CPU's: the
         // real engine checks for conflicts between its queued work and the
         // CPU's memory accesses (DrawMode enNoConflict), which is not
         // modelled, and under the JIT the CPU outran the queue and
         // overwrote pixmap data the desktop's icon transfers had yet to read
         // (the camera and mic icons lost their outlines).
-        if std::env::var("IRIS_O2_RE_ASYNC").is_ok() {
+        if o2.re_async {
             bus.crime_re.start_async(bus.clone(), |b: &Ip32Bus| &b.crime_re);
         }
         let running = Arc::new(AtomicBool::new(false));

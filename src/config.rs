@@ -717,7 +717,7 @@ pub struct O2Section {
     /// Or the kit in each DIMM pair from A, in MB (32, 64, 128 or 256).
     #[serde(default)]
     pub dimms: Option<Vec<u32>>,
-    /// Disks and CD-ROMs on the first SCSI controller.
+    /// Disks and CD-ROMs on the two SCSI controllers.
     #[serde(default)]
     pub disks: Vec<O2Disk>,
     /// A TCP port for the serial console (telnet 127.0.0.1 PORT).
@@ -751,6 +751,12 @@ pub struct O2Section {
     pub net: bool,
     #[serde(default)]
     pub forwards: Vec<PortForwardConfig>,
+    /// Experimental: run CRIME's rendering engine on a thread of its own.
+    /// Off by default because the real engine's check for conflicts between
+    /// queued work and the CPU's memory accesses is not modelled, and IRIX
+    /// relies on it (see `src/ip32_machine.rs`).
+    #[serde(default)]
+    pub re_async: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -798,6 +804,7 @@ impl Default for O2Section {
             cpu_mhz: default_o2_mhz(),
             net: true,
             forwards: Vec::new(),
+            re_async: false,
         }
     }
 }

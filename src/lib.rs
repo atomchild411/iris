@@ -170,8 +170,8 @@ pub mod prombini2;
 pub mod prombinip28;
 pub mod ppmem;
 pub mod machine;
-/// IP32 (SGI O2) bring-up scaffold -- see `docs/ip32-o2-bringup.md`. Not wired
-/// into `Physical`; it drives the CPU against its own bus.
+/// The SGI O2 (IP32): its bus and devices -- see `docs/ip32-o2-bringup.md`.
+/// Not yet wired into `Physical`; `ip32_machine` drives the CPU against it.
 pub mod ip32;
 pub mod ip32_handover;
 pub mod ip32_screen;
