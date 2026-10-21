@@ -5,7 +5,7 @@
 The O2 runs as a machine like the others: `profile = "o2_ip32"` with an
 `[o2]` section (PROM, flash, `ram_mb` or `dimms`, `disks` on controllers 0
 and 1, `serial_port`, `graphics`, `mouse`, `net` and `forwards`,
-`control_port`, `cpu_mhz`, `re_async`), started with `iris --config`. Its
+`control_port`, `cpu_mhz`), started with `iris --config`. Its
 devices are on the shared monitor (`monitor_port`, default 8888).
 
 The rest of this document is the bring-up journal, in order. Its middle

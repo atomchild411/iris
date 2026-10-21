@@ -198,15 +198,9 @@ impl O2Machine {
         bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
 
         bus.gbe.use_cpu_clock(cpu.cycles_ptr(), o2.cpu_mhz);
-        // CRIME's rendering engine can draw on its own thread
-        // (`[o2] re_async`), behind a queue as deep as the real interface
-        // buffer (128 entries; IRIX relies on that bound: a 64K-deep queue
-        // let the CPU overwrite pixmaps the icon transfers had yet to read).
-        // By default it stays on the CPU's thread, which measured faster:
-        // the async ring lost 53% on X text and 59% on GL lines.
-        if o2.re_async {
-            bus.crime_re.start_async(bus.clone(), |b: &Ip32Bus| &b.crime_re);
-        }
+        // CRIME's rendering engine draws on its own thread, fed through
+        // its interface buffer.
+        bus.crime_re.start(bus.clone(), |b: &Ip32Bus| &b.crime_re);
         let running = Arc::new(AtomicBool::new(false));
         let display = Arc::new(O2Display::new(bus.clone(), cpu.cycles_ptr(), cpu.fasttick_count(), running.clone()));
         if let Some(port) = o2.control_port {

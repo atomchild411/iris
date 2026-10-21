@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::dev::crime_mem::{Batch, O2Memory};
-use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
+use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_BUSY, BUS_OK};
 
 /// GBE register offsets from its base, `0x1600_0000`.
 pub mod gbe_reg {
@@ -1000,80 +1000,15 @@ mod draw {
     pub const PLANE_MASK: u32 = 1 << 7;
 }
 
-/// CRIME's host interface buffer for the asynchronous engine: IB_DEPTH
-/// register writes in a ring, one writer (the CPU thread) and one reader
-/// (the engine's thread). A channel cost a lock and usually a wake-up per
-/// write, which made X text slower asynchronous than synchronous; here a
-/// write is a store and a release, and the engine spins a little before it
-/// parks, so a stream of writes never sleeps it.
-struct IntfBuf {
-    slots: Box<[std::cell::UnsafeCell<(u32, u64, u8)>]>,
-    /// Writes taken (the engine) and put (the CPU), free-running.
-    head: std::sync::atomic::AtomicUsize,
-    tail: std::sync::atomic::AtomicUsize,
-    parked: std::sync::atomic::AtomicBool,
-    engine: std::sync::OnceLock<std::thread::Thread>,
-}
+/// CRIME's host interface buffer: register writes in order from the CPU to
+/// the engine's thread, `(offset | WIDE for a 64-bit write, value)`. As deep
+/// as the real one (IntfBuf.data[128]), and IRIX relies on that bound: a
+/// 64K-deep queue let the X server reuse a staging buffer the engine had
+/// not read yet (icons drawn from the wrong picture).
+type IntfBuf = crate::gfifo::GFifo<IB_DEPTH>;
 
-// One writer and one reader, each slot handed over through head and tail.
-unsafe impl Sync for IntfBuf {}
-
-impl IntfBuf {
-    fn new() -> Self {
-        IntfBuf {
-            slots: (0..IB_DEPTH).map(|_| std::cell::UnsafeCell::new((0, 0, 0))).collect(),
-            head: std::sync::atomic::AtomicUsize::new(0),
-            tail: std::sync::atomic::AtomicUsize::new(0),
-            parked: std::sync::atomic::AtomicBool::new(false),
-            engine: std::sync::OnceLock::new(),
-        }
-    }
-
-    /// Put a write, waiting while the buffer is full (the CPU stalls).
-    fn put(&self, w: (u32, u64, u8)) {
-        use std::sync::atomic::Ordering::*;
-        let t = self.tail.load(Relaxed);
-        let mut spins = 0u32;
-        while t - self.head.load(Acquire) >= IB_DEPTH {
-            spins += 1;
-            if spins < 1000 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
-        }
-        unsafe { *self.slots[t % IB_DEPTH].get() = w };
-        self.tail.store(t + 1, SeqCst);
-        if self.parked.load(SeqCst) {
-            if let Some(e) = self.engine.get() {
-                e.unpark();
-            }
-        }
-    }
-
-    /// Take the next write, spinning and then parking while there is none.
-    fn take(&self) -> (u32, u64, u8) {
-        use std::sync::atomic::Ordering::*;
-        let h = self.head.load(Relaxed);
-        let mut spins = 0u32;
-        while self.tail.load(Acquire) == h {
-            spins += 1;
-            if spins < 20_000 {
-                std::hint::spin_loop();
-                continue;
-            }
-            self.parked.store(true, SeqCst);
-            if self.tail.load(SeqCst) == h {
-                std::thread::park();
-            }
-            self.parked.store(false, SeqCst);
-            spins = 0;
-        }
-        let w = unsafe { *self.slots[h % IB_DEPTH].get() };
-        self.head.store(h + 1, Release);
-        w
-    }
-}
+/// Marks a 64-bit write in the interface buffer (offsets are below 0x8000).
+const WIDE: u32 = 1 << 31;
 
 pub struct CrimeRe {
     regs: Mutex<Vec<u32>>,
@@ -1091,16 +1026,17 @@ pub struct CrimeRe {
     /// so what was just drawn is in it.
     trace: Mutex<std::collections::VecDeque<(u32, u64, u8)>>,
     trace_cap: usize,
-    /// Asynchronous mode ([`Self::start_async`]): register writes go, in
-    /// order, to a worker thread that owns `regs` and draws, as the real
-    /// engine works through its interface buffer while the CPU runs on. The
-    /// CPU reads its own copy of the registers (`shadow`) and a STATUS that
-    /// says busy until every write it has queued (`queued`) has been carried
-    /// out (`done`). Without it (tests, replays) writes act at once.
-    queue: std::sync::OnceLock<Arc<IntfBuf>>,
-    shadow: Mutex<Vec<u32>>,
-    queued: std::sync::atomic::AtomicU64,
-    done: std::sync::atomic::AtomicU64,
+    /// The engine runs on its own thread ([`Self::start`]), working
+    /// through the writes the CPU leaves in `ib`, as the real one works
+    /// through its interface buffer while the CPU runs on. A write that
+    /// finds the buffer full, and a register read while the engine is busy,
+    /// report `BUS_BUSY`: the CPU retries them, taking interrupts meanwhile.
+    ib: Box<IntfBuf>,
+    /// The engine is carrying out a write it has taken from `ib`.
+    busy: std::sync::atomic::AtomicBool,
+    asleep: std::sync::atomic::AtomicBool,
+    started: std::sync::atomic::AtomicBool,
+    engine: std::sync::OnceLock<std::thread::Thread>,
 }
 
 /// A buffer the RE draws through: which TLB, and bytes per pixel word.
@@ -1112,7 +1048,7 @@ struct Buf {
 
 /// Pixel offsets along a row of a buffer, located once per tile: a tile row
 /// is contiguous, so the rest of it is the first pixel's offset plus a
-/// stride. Locating every pixel was a sixth of the CPU thread under GL.
+/// stride. Locating every pixel was a sixth of the engine's time under GL.
 struct RowCursor {
     buf: Buf,
     y: u32,
@@ -1140,8 +1076,8 @@ impl RowCursor {
 }
 
 /// The screen masks of [`CrimeRe::clip_ok`], decoded once per primitive:
-/// testing every pixel against the registers was a sixth of the CPU
-/// thread's time under GL.
+/// testing every pixel against the registers was a sixth of the engine's
+/// time under GL.
 struct Clip {
     inside: [[i32; 4]; 5],
     n_inside: usize,
@@ -1183,11 +1119,12 @@ impl CrimeRe {
         let mut regs = vec![0; RE_WORDS];
         regs[(MTE_BYTEMASK / 4) as usize] = 0xffff_ffff;
         Self {
-            shadow: Mutex::new(regs.clone()),
             regs: Mutex::new(regs),
-            queue: std::sync::OnceLock::new(),
-            queued: std::sync::atomic::AtomicU64::new(0),
-            done: std::sync::atomic::AtomicU64::new(0),
+            ib: Box::new(IntfBuf::new()),
+            busy: std::sync::atomic::AtomicBool::new(false),
+            asleep: std::sync::atomic::AtomicBool::new(false),
+            started: std::sync::atomic::AtomicBool::new(false),
+            engine: std::sync::OnceLock::new(),
             hot: Mutex::new(BTreeMap::new()),
             ram,
             unhandled: Mutex::new(BTreeMap::new()),
@@ -1197,77 +1134,114 @@ impl CrimeRe {
         }
     }
 
-    /// Run the engine on its own thread from now on. `owner` keeps this
-    /// engine alive for the worker, which reaches it through `get`.
-    pub fn start_async<O: Send + Sync + 'static>(&self, owner: Arc<O>, get: fn(&O) -> &CrimeRe) {
-        *self.shadow.lock().unwrap() = self.regs.lock().unwrap().clone();
-        // As deep as CRIME's interface buffer (IntfBuf.data[128]): a full
-        // queue holds the CPU, as the buffer's stall does. Software relies
-        // on the engine never trailing it by more than that: 64K entries
-        // let it fall a frame behind, and the X server reused a staging
-        // buffer the engine had not read yet (icons drawn from the wrong
-        // picture).
-        let ib = Arc::new(IntfBuf::new());
-        if self.queue.set(ib.clone()).is_err() {
+    /// Start the engine's thread. `owner` keeps this engine alive for the
+    /// thread, which reaches it through `get`. Nothing is drawn before.
+    pub fn start<O: Send + Sync + 'static>(&self, owner: Arc<O>, get: fn(&O) -> &CrimeRe) {
+        if self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
         std::thread::Builder::new()
             .name("CRIME-RE".into())
             .spawn(move || {
-                // Registered before it can ever park, so a write never
-                // misses waking it.
-                let _ = ib.engine.set(std::thread::current());
                 let re = get(&owner);
-                loop {
-                    let (off, val, width) = ib.take();
-                    if width == 64 {
-                        re.apply64(off, val);
-                    } else {
-                        re.write_reg(off, val as u32);
-                    }
-                    re.done.fetch_add(1, std::sync::atomic::Ordering::Release);
-                }
+                let _ = re.engine.set(std::thread::current());
+                re.run();
             })
             .expect("CRIME-RE thread");
     }
 
-    /// Wait until every queued write has been carried out.
-    fn drain(&self) {
-        while self.busy() {
-            std::thread::yield_now();
-        }
-    }
-
-    /// Whether queued writes are still being carried out.
-    fn busy(&self) -> bool {
-        self.queue.get().is_some()
-            && self.done.load(std::sync::atomic::Ordering::Acquire) != self.queued.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// A CPU write: carried out now, or queued with the CPU's copy updated.
-    fn cpu_write(&self, off: u32, val: u64, width: u8) {
-        let Some(ib) = self.queue.get() else {
-            if width == 64 {
-                self.apply64(off, val);
-            } else {
-                self.write_reg(off, val as u32);
-            }
-            return;
-        };
-        {
-            let page = off & 0xf000;
-            let start = (page == 0x2000 || page == 0x3000) && off & 0x800 != 0;
-            let reg = if start { off & !0x800 } else { off };
-            let mut r = self.shadow.lock().unwrap();
-            let words: &[u32] = if width == 64 { &[(val >> 32) as u32, val as u32] } else { &[val as u32] };
-            for (i, &w) in words.iter().enumerate() {
-                if let Some(slot) = r.get_mut((reg / 4) as usize + i) {
-                    *slot = w;
+    /// The engine's thread: carry out each write in order. With none left
+    /// it spins for `IDLE_SPIN` before it sleeps: drivers draw a little and
+    /// wait for idle, over and over, and waking a parked thread (tens of
+    /// microseconds on macOS) cost a GL clear a fifth of its speed. The spin
+    /// backs off between looks: looking without pause took the buffer's
+    /// tail away from the CPU on every write and lost a fifth of small
+    /// triangles.
+    fn run(&self) -> ! {
+        use std::sync::atomic::Ordering::*;
+        const IDLE_SPIN: std::time::Duration = std::time::Duration::from_micros(250);
+        let backoff = crossbeam_utils::Backoff::new();
+        let mut busy = false;
+        let mut idle_since = None;
+        loop {
+            let Some((a, val)) = self.ib.peek() else {
+                self.ib.flush_head();
+                if busy {
+                    busy = false;
+                    self.busy.store(false, Release);
                 }
+                // Stays set across sleeps, so an idle engine wakes only for
+                // the 2 ms timeout and goes straight back to sleep.
+                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() < IDLE_SPIN {
+                    backoff.spin();
+                } else {
+                    self.sleep();
+                }
+                continue;
+            };
+            idle_since = None;
+            backoff.reset();
+            if !busy {
+                busy = true;
+                self.busy.store(true, Release);
+            }
+            if a & WIDE != 0 {
+                self.apply64(a & !WIDE, val);
+            } else {
+                self.write_reg(a, val as u32);
+            }
+            self.ib.consume();
+        }
+    }
+
+    /// Park the engine's thread for up to 2 ms, unless a write came in
+    /// before `asleep` was raised. The fence pairs with [`Self::wake`]'s.
+    fn sleep(&self) {
+        use std::sync::atomic::Ordering::*;
+        self.asleep.store(true, Relaxed);
+        std::sync::atomic::fence(SeqCst);
+        if self.ib.is_empty() {
+            std::thread::park_timeout(std::time::Duration::from_millis(2));
+        }
+        self.asleep.store(false, Relaxed);
+    }
+
+    /// After a write: unpark the engine's thread if it is asleep.
+    fn wake(&self) {
+        use std::sync::atomic::Ordering::*;
+        std::sync::atomic::fence(SeqCst);
+        if self.asleep.load(Relaxed) {
+            if let Some(t) = self.engine.get() {
+                t.unpark();
             }
         }
-        self.queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ib.put((off, val, width));
+    }
+
+    /// The engine has carried out every write it was given. Whatever it
+    /// was working on is in `ib` until it is done (the head moves after
+    /// `busy` is raised), so an empty buffer with `busy` clear is idle.
+    fn idle(&self) -> bool {
+        self.ib.is_empty() && !self.busy.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait until the engine is idle (tests and replays; the CPU retries).
+    #[cfg(test)]
+    fn wait_idle(&self) {
+        let backoff = crossbeam_utils::Backoff::new();
+        while !self.idle() {
+            backoff.snooze();
+        }
+    }
+
+    /// A CPU write, into the interface buffer: `BUS_BUSY` while it is full.
+    fn cpu_write(&self, off: u32, val: u64, width: u8) -> u32 {
+        if !self.ib.try_push(if width == 64 { off | WIDE } else { off }, val) {
+            return BUS_BUSY;
+        }
+        self.record(off, val, width);
+        self.wake();
+        BUS_OK
     }
 
     fn record(&self, off: u32, val: u64, width: u8) {
@@ -1305,23 +1279,22 @@ impl CrimeRe {
         }
     }
 
-    fn read_reg(&self, off: u32) -> u32 {
+    /// A CPU read: `None` (the CPU retries) for a register while the
+    /// engine is busy.
+    fn read_reg(&self, off: u32) -> Option<u32> {
         if crate::ip32::hot_counters() {
             *self.hot.lock().unwrap().entry(off & !3).or_insert(0) += 1;
         }
         match off & !3 {
             // Busy: the four idle bits clear, the interface buffer reported
-            // empty (the queue's own back-pressure stands in for its level).
-            STATUS | 0x4004 => if self.busy() { 0 } else { RE_STATUS_IDLE },
-            IB_CONTROL | 0x0404 => 0,
+            // empty (its full stall stands in for its level).
+            STATUS | 0x4004 => Some(if self.idle() { RE_STATUS_IDLE } else { 0 }),
+            IB_CONTROL | 0x0404 => Some(0),
             // Any other read waits for the engine to catch up, as a read
             // through CRIME's interface buffer would: drivers can use one as
             // a barrier before touching what the engine draws.
-            o if self.queue.get().is_some() => {
-                self.drain();
-                self.shadow.lock().unwrap().get((o / 4) as usize).copied().unwrap_or(0)
-            }
-            o => self.regs.lock().unwrap().get((o / 4) as usize).copied().unwrap_or(0),
+            _ if !self.idle() => None,
+            o => Some(self.regs.lock().unwrap().get((o / 4) as usize).copied().unwrap_or(0)),
         }
     }
 
@@ -1370,8 +1343,8 @@ impl CrimeRe {
         }
         // The tile's offset in memory, from a one-entry cache: a primitive
         // stays in one tile for many pixels, and resolving the tile through
-        // the memory decode every pixel was a fifth of the CPU thread's time
-        // under perfly (the engine runs on the CPU thread).
+        // the memory decode every pixel was a fifth of the engine's time
+        // under perfly.
         // (In the memory, not a thread-local: on macOS each thread-local
         // access is a call.)
         let tile = e & 0x7fff;
@@ -1592,7 +1565,7 @@ impl CrimeRe {
     fn pixel_pipe(&self) {
         self.drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The registers stay locked for the primitive: copying all 24 KB of
-        // them per primitive was a tenth of the CPU thread under X.
+        // them per primitive was a tenth of the engine's time under X.
         let r = self.regs.lock().unwrap();
         let g = |off: u32| r[(off / 4) as usize];
         let dm = g(DRAWMODE);
@@ -2356,7 +2329,7 @@ impl CrimeRe {
     fn mte(&self) {
         self.drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The registers stay locked for the primitive: copying all 24 KB of
-        // them per primitive was a tenth of the CPU thread under X.
+        // them per primitive was a tenth of the engine's time under X.
         let r = self.regs.lock().unwrap();
         let g = |off: u32| r[(off / 4) as usize];
         let mode = g(MTE_MODE);
@@ -2485,25 +2458,23 @@ impl CrimeRe {
 
 impl BusDevice for CrimeRe {
     fn read32(&self, addr: u32) -> BusRead32 {
-        BusRead32::ok(self.read_reg(addr & 0x7ffc))
+        self.read_reg(addr & 0x7ffc).map_or(BusRead32::busy(), BusRead32::ok)
     }
     fn read64(&self, addr: u32) -> BusRead64 {
         let a = addr & 0x7ff8;
         if a == STATUS {
-            return BusRead64::ok(self.read_reg(STATUS) as u64);
+            return self.read_reg(STATUS).map_or(BusRead64::busy(), |v| BusRead64::ok(v as u64));
         }
-        BusRead64::ok((self.read_reg(a) as u64) << 32 | self.read_reg(a + 4) as u64)
+        match (self.read_reg(a), self.read_reg(a + 4)) {
+            (Some(hi), Some(lo)) => BusRead64::ok((hi as u64) << 32 | lo as u64),
+            _ => BusRead64::busy(),
+        }
     }
     fn write32(&self, addr: u32, val: u32) -> u32 {
-        self.record(addr & 0x7ffc, val as u64, 32);
-        self.cpu_write(addr & 0x7ffc, val as u64, 32);
-        BUS_OK
+        self.cpu_write(addr & 0x7ffc, val as u64, 32)
     }
     fn write64(&self, addr: u32, val: u64) -> u32 {
-        let a = addr & 0x7ff8;
-        self.record(a, val, 64);
-        self.cpu_write(a, val, 64);
-        BUS_OK
+        self.cpu_write(addr & 0x7ff8, val, 64)
     }
 }
 
@@ -2578,13 +2549,10 @@ impl crate::traits::Device for CrimeRe {
         }
         match args.first().copied().unwrap_or("status") {
             "status" => {
-                writeln!(w, "CRIME RE: {} primitives drawn, {}; trace {} of {} writes",
+                writeln!(w, "CRIME RE: {} primitives drawn, {}, {} of {} interface buffer entries; trace {} of {} writes",
                     self.drawn.load(Relaxed),
-                    if self.queue.get().is_some() {
-                        format!("asynchronous ({} queued, {} done)", self.queued.load(Relaxed), self.done.load(Relaxed))
-                    } else {
-                        "synchronous".to_string()
-                    },
+                    if self.idle() { "idle" } else { "busy" },
+                    self.ib.len(), IB_DEPTH - 1,
                     self.trace.lock().unwrap().len(), self.trace_cap).ok();
             }
             "notes" => {
@@ -2601,6 +2569,44 @@ impl crate::traits::Device for CrimeRe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine on its own thread, for tests: `write32`/`write64` retry
+    /// while the interface buffer is full and then wait for the engine, so
+    /// a test sees each write carried out; `put32`/`put64` only retry.
+    struct TestRe(Arc<CrimeRe>);
+
+    impl TestRe {
+        fn new(ram: Arc<Mutex<O2Memory>>) -> Self {
+            let re = Arc::new(CrimeRe::new(ram));
+            re.start(re.clone(), |r| r);
+            TestRe(re)
+        }
+        fn put32(&self, addr: u32, val: u32) {
+            while self.0.write32(addr, val) == BUS_BUSY {
+                std::hint::spin_loop();
+            }
+        }
+        fn put64(&self, addr: u32, val: u64) {
+            while self.0.write64(addr, val) == BUS_BUSY {
+                std::hint::spin_loop();
+            }
+        }
+        fn write32(&self, addr: u32, val: u32) {
+            self.put32(addr, val);
+            self.0.wait_idle();
+        }
+        fn write64(&self, addr: u32, val: u64) {
+            self.put64(addr, val);
+            self.0.wait_idle();
+        }
+    }
+
+    impl std::ops::Deref for TestRe {
+        type Target = CrimeRe;
+        fn deref(&self) -> &CrimeRe {
+            &self.0
+        }
+    }
 
     fn gbe() -> Gbe {
         let t = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2656,17 +2662,18 @@ mod tests {
         m.set_ctrl(0, 0x100);
         m.set_ctrl(2, 0x100 | 4);
         let ram = Arc::new(Mutex::new(m));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let mut best = f64::MAX;
         for _ in 0..passes {
             let t = std::time::Instant::now();
             for &(off, val, w64) in &writes {
                 if w64 {
-                    re.write64(0x1500_0000 + off, val);
+                    re.put64(0x1500_0000 + off, val);
                 } else {
-                    re.write32(0x1500_0000 + off, val as u32);
+                    re.put32(0x1500_0000 + off, val as u32);
                 }
             }
+            re.wait_idle();
             best = best.min(t.elapsed().as_secs_f64());
         }
         let drawn = re.drawn.load(std::sync::atomic::Ordering::Relaxed) / passes as u64;
@@ -2713,12 +2720,13 @@ mod tests {
             })
             .collect();
         let ram = Arc::new(Mutex::new(m));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         // RE_REPLAY_PRELOAD_EVERY=N: put the tiles back every N writes
         // (2000 by default; a large trace with many tiles wants fewer).
         let every: usize = std::env::var("RE_REPLAY_PRELOAD_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
         for (n, line) in std::fs::read_to_string(path).unwrap().lines().enumerate() {
             if n % every == 0 {
+                re.wait_idle();
                 let mut m = ram.lock().unwrap();
                 for (o, data) in &preload {
                     m.write(*o, data);
@@ -2728,11 +2736,12 @@ mod tests {
             let (w, off, val) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
             let (off, val) = (u32::from_str_radix(off, 16).unwrap(), u64::from_str_radix(val, 16).unwrap());
             if w == "w64" {
-                re.write64(0x1500_0000 + off, val);
+                re.put64(0x1500_0000 + off, val);
             } else {
-                re.write32(0x1500_0000 + off, val as u32);
+                re.put32(0x1500_0000 + off, val as u32);
             }
         }
+        re.wait_idle();
         let r = re.regs.lock().unwrap().clone();
         let mem = ram.lock().unwrap();
         let (w, h) = (1280u32, 1024u32);
@@ -2783,7 +2792,7 @@ mod tests {
     #[test]
     fn an_8bit_pixmap_copies_out_of_linear_b_into_the_root_window() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         // Screen: TLB A entry 0 at 0x0100_0000. Pixmap page at 0x0050_0000.
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
@@ -2841,7 +2850,7 @@ mod tests {
     #[test]
     fn mip_levels_come_from_their_places() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         // Texture TLB entries 92 and 93 -> tiles 0x60 and 0x61.
@@ -2941,7 +2950,7 @@ mod tests {
     #[test]
     fn triangles_blend_and_alpha_test() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         let o = 0x0100_0000 + 512 + 2 * 4;
@@ -2973,7 +2982,7 @@ mod tests {
     #[test]
     fn a_shaded_gl_point_takes_the_shade_colour() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         // Double-pix A1R5G5B5, the half at offset 2.
@@ -2996,7 +3005,7 @@ mod tests {
     #[test]
     fn a_shaded_gl_point_into_an_8bit_buffer_keeps_fg() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         re.write32(base + BUFMODE_DST, 0x000);
@@ -3014,7 +3023,7 @@ mod tests {
     #[test]
     fn an_unblended_gl_line_ignores_its_alpha() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         re.write32(base + BUFMODE_DST, 0x220);
@@ -3037,7 +3046,7 @@ mod tests {
     #[test]
     fn a_flat_colour_index_triangle_stores_fg_as_its_index() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         re.write32(base + BUFMODE_DST, 0x200);
@@ -3060,7 +3069,7 @@ mod tests {
     #[test]
     fn a_32bit_linear_end_off_its_word_does_not_abort() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         let dst = 0x1038_f001u32;
@@ -3111,35 +3120,57 @@ mod tests {
         assert!(!CrimeRe::clip_ok(&r, 30, 680) && CrimeRe::clip_ok(&r, 400, 15));
     }
 
-    /// The asynchronous engine draws what the synchronous one does, and
-    /// reads of STATUS say busy until it has.
+    /// Writes left in the interface buffer as fast as it takes them draw
+    /// what writes carried out one at a time do, and STATUS says busy
+    /// until they are done.
     #[test]
-    fn the_async_engine_draws_the_same_and_reports_idle_after() {
-        let draw = |re: &CrimeRe| {
+    fn a_pipelined_engine_draws_the_same_and_reports_idle_after() {
+        let draw = |re: &TestRe, wait: bool| {
             let base = 0x1500_0000;
+            let w = |a: u32, v: u32| if wait { re.write32(a, v) } else { re.put32(a, v) };
             re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
-            re.write32(base + DRAWMODE, 0x0000_0278);
-            re.write32(base + LOGIC_OP, 3);
-            re.write32(base + PRIMITIVE, 0x0300_0000);
-            re.write32(base + BUFMODE_DST, 0x228);
+            w(base + DRAWMODE, 0x0000_0278);
+            w(base + LOGIC_OP, 3);
+            w(base + PRIMITIVE, 0x0300_0000);
+            w(base + BUFMODE_DST, 0x228);
             for i in 0..200u32 {
-                re.write32(base + FG, 0x1020_3000 | i);
-                re.write32(base + VERTEX_0, (i % 100) << 16 | (i / 100));
-                re.write32(base + (VERTEX_1 | 0x800), ((i % 100) + 3) << 16 | (i / 100));
+                w(base + FG, 0x1020_3000 | i);
+                w(base + VERTEX_0, (i % 100) << 16 | (i / 100));
+                w(base + (VERTEX_1 | 0x800), ((i % 100) + 3) << 16 | (i / 100));
             }
         };
-        let sync_ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        draw(&CrimeRe::new(sync_ram.clone()));
+        let one_ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        draw(&TestRe::new(one_ram.clone()), true);
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = Arc::new(CrimeRe::new(ram.clone()));
-        re.start_async(re.clone(), |r| r);
-        draw(&re);
+        let re = TestRe::new(ram.clone());
+        draw(&re, false);
         let mut spins = 0;
         while re.read32(0x1500_0000 + STATUS).data != RE_STATUS_IDLE {
             spins += 1;
             assert!(spins < 50_000_000, "never idle");
         }
-        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000, 0x1000), sync_ram.lock().unwrap().bytes(0x0100_0000, 0x1000));
+        assert_eq!(re.read32(0x1500_0000 + FG).data, 0x1020_3000 | 199, "a read when idle sees the last write");
+        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000, 0x1000), one_ram.lock().unwrap().bytes(0x0100_0000, 0x1000));
+    }
+
+    /// A full interface buffer holds the CPU's write back (BUS_BUSY) with
+    /// nothing lost: 127 writes fit while the engine is not running.
+    #[test]
+    fn a_full_interface_buffer_asks_the_cpu_to_retry() {
+        let re = CrimeRe::new(Arc::new(Mutex::new(O2Memory::single(32 << 20))));
+        for i in 0..(IB_DEPTH as u32 - 1) {
+            assert_eq!(re.write32(0x1500_0000 + FG, i), BUS_OK, "write {i}");
+        }
+        assert_eq!(re.write32(0x1500_0000 + FG, 999), BUS_BUSY);
+        assert_eq!(re.read32(0x1500_0000 + STATUS).data, 0, "busy");
+        assert_eq!(re.read32(0x1500_0000 + FG).status, BUS_BUSY);
+        let re = Arc::new(re);
+        re.start(re.clone(), |r| r);
+        while re.write32(0x1500_0000 + FG, 999) == BUS_BUSY {
+            std::hint::spin_loop();
+        }
+        re.wait_idle();
+        assert_eq!(re.read32(0x1500_0000 + FG).data, 999);
     }
 
     /// The X server's Motif bevel: a rectangle into the 32-bit ABGR screen
@@ -3148,7 +3179,7 @@ mod tests {
     #[test]
     fn rectangles_store_fg_in_the_destination_pixel_type() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         re.write32(base + DRAWMODE, 0x0000_0278);
@@ -3170,7 +3201,7 @@ mod tests {
     fn the_mte_clears_pages_through_linear_a_as_irix_asks() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
         ram.lock().unwrap().write(0x0011_3fff, &[0x55; 0x2_0002]);
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         let addr = 0x0011_4000u32;
         let page = addr >> 12;
@@ -3213,7 +3244,7 @@ mod tests {
     #[test]
     fn a_filled_rectangle_comes_out_of_scanout_in_its_cmap_colour() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let g = gbe();
         // One 64 KB tile at 0x0010_0000, so a 512 x 128 screen at 8 bpp.
         let tile = 0x0010_0000u32;
@@ -3264,7 +3295,7 @@ mod tests {
     #[test]
     fn an_8bit_stippled_line_takes_its_colour_from_the_low_byte() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        let re = CrimeRe::new(ram.clone());
+        let re = TestRe::new(ram.clone());
         let tile = 0x0010_0000u32;
         let b = 0x1500_0000;
         // TLB C (buffer 2), entry 16: the second row of tiles, y 128-255.

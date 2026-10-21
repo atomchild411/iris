@@ -919,7 +919,8 @@ impl Ip32Bus {
             return BusRead8::ok(self.gbe.read32(addr & !3).data as u8);
         }
         if self.in_crime_re(addr) {
-            return BusRead8::ok(self.crime_re.read32(addr & !3).data as u8);
+            let r = self.crime_re.read32(addr & !3);
+            return BusRead8 { status: r.status, data: r.data as u8 };
         }
         if self.in_crime(addr) {
             return BusRead8::ok(self.crime.read32(addr & !3).data as u8);
@@ -978,7 +979,8 @@ impl Ip32Bus {
             return BusRead16::ok(self.gbe.read32(addr & !3).data as u16);
         }
         if self.in_crime_re(addr) {
-            return BusRead16::ok(self.crime_re.read32(addr & !3).data as u16);
+            let r = self.crime_re.read32(addr & !3);
+            return BusRead16 { status: r.status, data: r.data as u16 };
         }
         if self.in_crime(addr) {
             return BusRead16::ok(self.crime.read32(addr & !3).data as u16);
