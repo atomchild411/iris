@@ -8,6 +8,26 @@ and 1, `serial_port`, `graphics`, `mouse`, `net` and `forwards`,
 `control_port`, `cpu_mhz`), started with `iris --config`. Its
 devices are on the shared monitor (`monitor_port`, default 8888).
 
+How it is put together now:
+
+- **The bus** (`src/ip32.rs`): RAM, the PROM, GBE and VICE, and two chips
+  that claim their own space and decode it, as HPC3 does on the Indigo2:
+  `Mace` (`src/dev/mace.rs`: MACE's 8 MB and the PCI windows, with the
+  bridge, Ethernet, ISA block, PS/2, UST, audio, serial DMA, UARTs, RTC and
+  1-Wire ID) and `CrimeSpace` (`src/dev/crime.rs`: CRIME's registers and
+  the rendering engine).
+- **Memory** (`src/dev/crime_mem.rs`): the banks in one ppmem object, mapped
+  into a window as CRIME's bank controls decode them. The CPU's cache and
+  the JIT, and the rendering engine (`RamWindow`), use the window directly.
+- **The rendering engine** (`CrimeRe` in `src/dev/o2gfx.rs`) runs on its own
+  thread, fed by the shared gfifo as CRIME's 128-entry interface buffer; a
+  full buffer, or a register read while the engine is busy, makes the CPU
+  retry.
+- **The R10000's caches** (`src/ip32_handover.rs`): the full model while the
+  PROM runs, IP28's tagless shadow model once the kernel does, switched at
+  each kernel entry and PROM re-entry. The R5000 turns tcache off and on
+  instead.
+
 The rest of this document is the bring-up journal, in order. Its middle
 chapters drive the machine through a test harness steered by `IRIS_IP32_*`
 variables (`IRIS_IP32_SCRIPT`, `_STEPS`, `_DISK`, `_DIS`, `ip32-view` and

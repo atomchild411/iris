@@ -44,7 +44,8 @@
 //! addresses memory by byte offset into it (byte `o` at `host + (o ^ 3)`, the
 //! layout every iris RAM keeps). The same object is mapped into a ppmem
 //! window as the decode stands, one 32 MB slot at a time, which is what the
-//! CPU's cache and the JIT read and write directly, with no lock and no bus.
+//! CPU's cache and the JIT read and write directly, with no lock and no bus,
+//! and what the rendering engine draws through ([`RamWindow`]).
 
 use crate::ip32::{LOW_ALIAS_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
 use crate::ppmem::{MappedMemory, PpMemSpace, PpMemory};
@@ -107,18 +108,14 @@ pub struct O2Memory {
     slots: [Slot; SLOTS],
     /// Bumped whenever the decode changes, so a device can cache an offset.
     decode_gen: u64,
-    /// Inside a [`Batch`]: pages written so far, their generations bumped
-    /// once when it ends rather than on every write.
-    batch: bool,
-    dirty: Vec<usize>,
-    /// The rendering engine's one-entry tile cache: (tile | decode
-    /// generation << 16, offset). Only touched under the memory's lock,
-    /// which is what makes the Sync below hold for it.
-    pub tile: std::cell::Cell<(u64, usize)>,
+    /// What [`RamWindow`]s need to know of the decode, published as it
+    /// changes.
+    shared: std::sync::Arc<WindowState>,
 }
 
 // The raw pointer is into `store`, which lives as long as this does; writers
-// hold the memory's lock, and the CPU's direct accesses race only the way the
+// through it hold the memory's lock, and the CPU and the rendering engine,
+// which reach the same bytes through the window, race only the way the
 // hardware's own masters do.
 unsafe impl Send for O2Memory {}
 unsafe impl Sync for O2Memory {}
@@ -168,7 +165,7 @@ impl O2Memory {
         let store = PpMemory::new((total as usize).div_ceil(1 << 20).max(1));
         let space = PpMemSpace::over(std::slice::from_ref(&store)).expect("ppmem: O2 memory window");
         let host = store.host_ptr();
-        let mut m = Self { store, host, total: total as usize, space, size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS], decode_gen: 0, batch: false, dirty: Vec::new(), tile: std::cell::Cell::new((u64::MAX, 0)) };
+        let mut m = Self { store, host, total: total as usize, space, size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS], decode_gen: 0, shared: Default::default() };
         // At reset every control is zero: all eight banks at the bottom of
         // the window, 32 MB each, so bank 0 answers there.
         m.rebuild();
@@ -229,16 +226,9 @@ impl O2Memory {
         }
     }
 
-    /// Page `page` was written: bump its generation now, or note it for the
-    /// end of the batch.
+    /// Page `page` was written: bump its generation.
     #[inline]
     fn touch(&mut self, page: usize) {
-        if self.batch {
-            if self.dirty.last() != Some(&page) {
-                self.dirty.push(page);
-            }
-            return;
-        }
         #[cfg(feature = "jitv2")]
         self.store.bump_gen_off(page * PAGE);
         #[cfg(not(feature = "jitv2"))]
@@ -354,7 +344,10 @@ impl O2Memory {
     /// window and again in the low alias. Empty and unmatched slots stay
     /// unmapped, so the CPU reaches them through the bus as before.
     fn remap(&mut self) {
+        use std::sync::atomic::Ordering::Release;
+        self.shared.mapped.store(0, Release);
         self.space.clear_mappings();
+        let mut mapped = 0u32;
         for (s, slot) in self.slots.iter().enumerate() {
             let Slot::Ram { start, chunk, mask } = *slot else { continue };
             if mask < SLOT - 1 {
@@ -362,10 +355,29 @@ impl O2Memory {
             }
             let src = (start + (chunk & mask)) as u64;
             let at = s as u64 * SLOT as u64;
-            let _ = self.space.map_range(0, src, RAM_BASE as u64 + at, SLOT as u64);
+            if self.space.map_range(0, src, RAM_BASE as u64 + at, SLOT as u64).is_ok() {
+                mapped |= 1 << s;
+            }
             if at < LOW_ALIAS_SIZE as u64 {
                 let _ = self.space.map_range(0, src, at, SLOT as u64);
             }
+        }
+        self.shared.decode_gen.store(self.decode_gen, Release);
+        self.shared.mapped.store(mapped, Release);
+    }
+
+    /// A view of memory through the window, for a master on its own thread
+    /// (the rendering engine).
+    pub fn window(&self) -> RamWindow {
+        RamWindow {
+            base: self.space.window_base(),
+            #[cfg(feature = "jitv2")]
+            gens: self.space.gen_window_base(),
+            shared: self.shared.clone(),
+            mapped: 0,
+            decode_gen: 0,
+            dirty: Vec::new(),
+            tile: std::cell::Cell::new((u64::MAX, 0)),
         }
     }
 
@@ -429,45 +441,212 @@ impl std::ops::IndexMut<usize> for O2Memory {
     }
 }
 
-/// The memory, locked, with page generations bumped once per page when it
-/// is dropped instead of on every write: a primitive writes thousands of
-/// pixels to a handful of pages, and an atomic add on each was a fifth of
-/// the rendering engine's time. The bumps land before the lock is released,
-/// so compiled code never outlives the bytes it came from.
-pub struct Batch<'a>(std::sync::MutexGuard<'a, O2Memory>);
+/// Which 32 MB slots of the RAM window are mapped (bit n: `RAM_BASE + n *
+/// 32 MB`) and the decode generation, as [`O2Memory`] last laid the window
+/// out.
+#[derive(Default)]
+pub struct WindowState {
+    mapped: std::sync::atomic::AtomicU32,
+    decode_gen: std::sync::atomic::AtomicU64,
+}
 
-impl<'a> Batch<'a> {
-    pub fn new(mut m: std::sync::MutexGuard<'a, O2Memory>) -> Self {
-        m.batch = true;
-        Batch(m)
+/// Memory as a master on its own thread sees it: guest physical addresses
+/// in the ppmem window the CPU reads and writes, with no lock, as the
+/// hardware's masters share memory. Offsets are guest physical addresses,
+/// byte `p` at `base + (p ^ 3)`. Only the slots mapped when [`Self::begin`]
+/// last ran are reachable: an address in any other faults in the window, so
+/// every offset comes from [`Self::dma_offset`] and is checked against them.
+/// Page generations are bumped once per page at [`Self::end`], through the
+/// generation window, so compiled code never outlives the bytes it came
+/// from.
+pub struct RamWindow {
+    base: *mut u8,
+    #[cfg(feature = "jitv2")]
+    gens: *mut std::sync::atomic::AtomicU64,
+    shared: std::sync::Arc<WindowState>,
+    mapped: u32,
+    decode_gen: u64,
+    dirty: Vec<usize>,
+    /// A one-entry cache for the user: (key, offset), keys built with
+    /// [`Self::decode_gen`] so a remap misses.
+    pub tile: std::cell::Cell<(u64, usize)>,
+}
+
+// The pointers are into the window and its generation counters, which live
+// as long as the memory; one thread draws through a window at a time.
+unsafe impl Send for RamWindow {}
+
+impl RamWindow {
+    /// Start a run of accesses: take the decode as it stands now.
+    pub fn begin(&mut self) {
+        use std::sync::atomic::Ordering::Acquire;
+        self.mapped = self.shared.mapped.load(Acquire);
+        self.decode_gen = self.shared.decode_gen.load(Acquire);
+    }
+
+    /// End it: bump the generation of every page written since `begin`.
+    pub fn end(&mut self) {
+        #[cfg(feature = "jitv2")]
+        for &page in &self.dirty {
+            unsafe { (*self.gens.add(page)).fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
+        }
+        self.dirty.clear();
+    }
+
+    pub fn decode_gen(&self) -> u64 {
+        self.decode_gen
+    }
+
+    /// Whether `n` bytes from guest physical `p` are all in mapped slots.
+    #[inline]
+    pub fn holds(&self, p: usize, n: usize) -> bool {
+        let slot = |a: usize| a.wrapping_sub(RAM_BASE as usize) / SLOT as usize;
+        let (a, b) = (slot(p), slot(p + n.max(1) - 1));
+        a < 32 && b < 32 && self.mapped & (1 << a) != 0 && self.mapped & (1 << b) != 0
+    }
+
+    /// Whether guest physical `p` is in a mapped slot: one item of up to 4
+    /// bytes aligned to its size never leaves the slot it starts in.
+    #[inline(always)]
+    fn holds_at(&self, p: usize) -> bool {
+        let s = p.wrapping_sub(RAM_BASE as usize) >> 25;
+        s < 32 && (self.mapped >> s) & 1 != 0
+    }
+
+    /// The guest physical address a bus address reaches, as
+    /// [`O2Memory::dma_offset`] decodes it, if it is in mapped memory.
+    #[inline]
+    pub fn dma_offset(&self, addr: u32) -> Option<usize> {
+        let p = if addr < RAM_WINDOW_SIZE { RAM_BASE.wrapping_add(addr) } else { addr } as usize;
+        self.holds(p, 1).then_some(p)
+    }
+
+    #[inline]
+    fn touch(&mut self, page: usize) {
+        if self.dirty.last() != Some(&page) {
+            self.dirty.push(page);
+        }
+    }
+
+    /// As [`O2Memory::get_be`].
+    #[inline]
+    pub fn get_be(&self, p: usize, n: u32) -> u32 {
+        assert!(self.holds_at(p) && p % n as usize == 0, "O2 memory read {p:#x}/{n}");
+        unsafe {
+            match n {
+                1 => *self.base.add(p ^ 3) as u32,
+                2 => (self.base.add(p ^ 2) as *const u16).read_unaligned() as u32,
+                _ => (self.base.add(p) as *const u32).read_unaligned(),
+            }
+        }
+    }
+
+    /// As [`O2Memory::put_be`].
+    #[inline]
+    pub fn put_be(&mut self, p: usize, n: u32, v: u32) {
+        assert!(self.holds_at(p) && p % n as usize == 0, "O2 memory write {p:#x}/{n}");
+        unsafe {
+            match n {
+                1 => *self.base.add(p ^ 3) = v as u8,
+                2 => (self.base.add(p ^ 2) as *mut u16).write_unaligned(v as u16),
+                _ => (self.base.add(p) as *mut u32).write_unaligned(v),
+            }
+        }
+        self.touch(p / PAGE);
+    }
+
+    /// As [`O2Memory::write`].
+    pub fn write(&mut self, p: usize, data: &[u8]) {
+        assert!(self.holds(p, data.len()), "O2 memory write {p:#x}+{:#x}", data.len());
+        for (k, &b) in data.iter().enumerate() {
+            unsafe { *self.base.add((p + k) ^ 3) = b };
+        }
+        for page in p / PAGE..=(p + data.len().max(1) - 1) / PAGE {
+            self.touch(page);
+        }
+    }
+
+    /// As [`O2Memory::write_span`].
+    #[inline]
+    pub fn write_span(&mut self, p: usize, len: usize, mut byte: impl FnMut(usize) -> Option<u8>) {
+        if len == 0 {
+            return;
+        }
+        assert!(self.holds(p, len), "O2 memory span {p:#x}+{len:#x}");
+        for k in 0..len {
+            if let Some(b) = byte(k) {
+                unsafe { *self.base.add((p + k) ^ 3) = b };
+            }
+        }
+        for page in p / PAGE..=(p + len - 1) / PAGE {
+            self.touch(page);
+        }
+    }
+
+    /// As [`O2Memory::fill_words_masked`].
+    pub fn fill_words_masked(&mut self, p: usize, words: usize, val: u32, mask: u32) {
+        if words == 0 {
+            return;
+        }
+        assert!(p % 4 == 0 && self.holds(p, 4 * words), "O2 memory fill {p:#x}+{words} words");
+        for i in 0..words {
+            unsafe {
+                let q = self.base.add(p + 4 * i) as *mut u32;
+                q.write_unaligned((q.read_unaligned() & !mask) | (val & mask));
+            }
+        }
+        for page in p / PAGE..=(p + 4 * words - 1) / PAGE {
+            self.touch(page);
+        }
     }
 }
 
-impl std::ops::Deref for Batch<'_> {
-    type Target = O2Memory;
-    fn deref(&self) -> &O2Memory {
+impl RamWindow {
+    /// `n` bytes from guest physical `p`, in guest order.
+    pub fn bytes(&self, p: usize, n: usize) -> Vec<u8> {
+        (p..p + n).map(|o| self[o]).collect()
+    }
+}
+
+/// A byte, by guest physical address.
+impl std::ops::Index<usize> for RamWindow {
+    type Output = u8;
+    fn index(&self, p: usize) -> &u8 {
+        assert!(self.holds_at(p), "O2 memory read {p:#x}");
+        unsafe { &*self.base.add(p ^ 3) }
+    }
+}
+
+/// A [`RamWindow`] for one primitive: the decode taken when it starts, the
+/// pages it wrote bumped when it ends.
+pub struct Draw<'a>(std::sync::MutexGuard<'a, RamWindow>);
+
+impl<'a> Draw<'a> {
+    pub fn new(mut w: std::sync::MutexGuard<'a, RamWindow>) -> Self {
+        w.begin();
+        Draw(w)
+    }
+}
+
+impl std::ops::Deref for Draw<'_> {
+    type Target = RamWindow;
+    fn deref(&self) -> &RamWindow {
         &self.0
     }
 }
 
-impl std::ops::DerefMut for Batch<'_> {
-    fn deref_mut(&mut self) -> &mut O2Memory {
+impl std::ops::DerefMut for Draw<'_> {
+    fn deref_mut(&mut self) -> &mut RamWindow {
         &mut self.0
     }
 }
 
-impl Drop for Batch<'_> {
+impl Drop for Draw<'_> {
     fn drop(&mut self) {
-        let m = &mut *self.0;
-        m.batch = false;
-        let dirty = std::mem::take(&mut m.dirty);
-        for &page in &dirty {
-            m.touch(page);
-        }
-        m.dirty = dirty;
-        m.dirty.clear();
+        self.0.end();
     }
 }
+
 
 /// Whether `kits` is a fitting SGI's rules allow.
 pub fn check_kits(kits: &[u32]) -> Result<(), String> {

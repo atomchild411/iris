@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::dev::crime_mem::{Batch, O2Memory};
+use crate::dev::crime_mem::{Draw, O2Memory, RamWindow};
 use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_BUSY, BUS_OK};
 
 /// GBE register offsets from its base, `0x1600_0000`.
@@ -793,7 +793,7 @@ impl Texture {
 
     /// The texel at integer (u, v) of mip level `level` (0 = the base),
     /// wrapped or clamped, as R, G, B, A.
-    fn texel(&self, r: &[u32], mem: &O2Memory, level: u32, u: i64, v: i64) -> [f64; 4] {
+    fn texel(&self, r: &[u32], mem: &RamWindow, level: u32, u: i64, v: i64) -> [f64; 4] {
         let (w, h) = ((self.w >> level).max(1), (self.h >> level).max(1));
         let wrap = |c: i64, n: u32, rep: bool| if rep { c.rem_euclid(n as i64) as u32 } else { c.clamp(0, n as i64 - 1) as u32 };
         let (u, v) = (wrap(u, w, self.repeat_s), wrap(v, h, self.repeat_t));
@@ -811,7 +811,7 @@ impl Texture {
             return [0.0; 4];
         }
         let n = self.bpt as usize;
-        let Some(o) = mem.dma_offset((((e & 0x7fff) as u32) << 16) + (byte & 0xffff) as u32).filter(|&o| o + n <= mem.len()) else {
+        let Some(o) = mem.dma_offset((((e & 0x7fff) as u32) << 16) + (byte & 0xffff) as u32).filter(|&o| mem.holds(o, n)) else {
             return [0.0; 4];
         };
         if n == 4 {
@@ -839,7 +839,7 @@ impl Texture {
     /// one read every texel off its far edge (distort's whole picture one
     /// tan, Quake 3's lightmaps black), and perfly's hubcap centre is s
     /// 1.49, not 0.49.
-    fn sample_level(&self, r: &[u32], mem: &O2Memory, level: u32, linear: bool, s: f64, t: f64) -> [f64; 4] {
+    fn sample_level(&self, r: &[u32], mem: &RamWindow, level: u32, linear: bool, s: f64, t: f64) -> [f64; 4] {
         let (w, h) = ((self.w >> level).max(1), (self.h >> level).max(1));
         let (s, t) = (s - 16384.0, t - 16384.0);
         let (u, v) = (s * w as f64 / 16384.0 - 0.5, t * h as f64 / 16384.0 - 0.5);
@@ -862,7 +862,7 @@ impl Texture {
     /// (log2 of texels per pixel at the base level, the spec's rho): the
     /// magnification filter at or below 0, the minification filter above,
     /// choosing or blending mip levels as OpenGL does.
-    fn sample(&self, r: &[u32], mem: &O2Memory, s: f64, t: f64, lod: f64) -> [f64; 4] {
+    fn sample(&self, r: &[u32], mem: &RamWindow, s: f64, t: f64, lod: f64) -> [f64; 4] {
         if lod <= 0.0 || !self.mipmapped() {
             let linear = if lod <= 0.0 { self.linear } else { self.min_filter == 1 };
             return self.sample_level(r, mem, 0, linear, s, t);
@@ -1014,7 +1014,10 @@ pub struct CrimeRe {
     regs: Mutex<Vec<u32>>,
     /// Reads per register offset, for finding a driver spinning on one.
     pub hot: Mutex<BTreeMap<u32, u64>>,
-    ram: Arc<Mutex<O2Memory>>,
+    /// Memory, through the ppmem window: the engine draws without the
+    /// memory's lock, as the CPU reads and writes it. Only the engine's
+    /// thread takes this.
+    win: Mutex<RamWindow>,
     /// What the guest asked for that is not modelled, with counts, so a
     /// missing primitive shows up instead of drawing nothing silently.
     unhandled: Mutex<BTreeMap<String, u64>>,
@@ -1063,7 +1066,7 @@ impl RowCursor {
     }
 
     #[inline]
-    fn at(&mut self, r: &[u32], mem: &O2Memory, x: u32, y: u32) -> Option<usize> {
+    fn at(&mut self, r: &[u32], mem: &RamWindow, x: u32, y: u32) -> Option<usize> {
         if y != self.y || x < self.x_lo || x > self.x_hi {
             let tw = 512 / self.buf.bd;
             self.y = y;
@@ -1126,7 +1129,7 @@ impl CrimeRe {
             started: std::sync::atomic::AtomicBool::new(false),
             engine: std::sync::OnceLock::new(),
             hot: Mutex::new(BTreeMap::new()),
-            ram,
+            win: Mutex::new(ram.lock().unwrap().window()),
             unhandled: Mutex::new(BTreeMap::new()),
             drawn: std::sync::atomic::AtomicU64::new(0),
             trace: Mutex::new(std::collections::VecDeque::new()),
@@ -1329,7 +1332,7 @@ impl CrimeRe {
     }
 
     /// Byte offset in `mem` of pixel (x, y) of `buf`, through its tile TLB.
-    fn locate(r: &[u32], mem: &O2Memory, buf: Buf, x: u32, y: u32) -> Option<usize> {
+    fn locate(r: &[u32], mem: &RamWindow, buf: Buf, x: u32, y: u32) -> Option<usize> {
         let tw = 512 / buf.bd;
         let entry = (y / 128) * 16 + x / tw;
         if entry >= 256 {
@@ -1353,14 +1356,14 @@ impl CrimeRe {
         let base = if k == key {
             b
         } else {
-            let b = mem.dma_offset((tile as u32) << 16).filter(|&o| o + 0x10000 <= mem.len())?;
+            let b = mem.dma_offset((tile as u32) << 16).filter(|&o| mem.holds(o, 0x10000))?;
             mem.tile.set((key, b));
             b
         };
         Some(base + ((y % 128) * 512 + (x % tw) * buf.bd) as usize)
     }
 
-        fn get_px(mem: &O2Memory, o: usize, bd: u32) -> u32 {
+        fn get_px(mem: &RamWindow, o: usize, bd: u32) -> u32 {
         mem.get_be(o, bd)
     }
 
@@ -1395,7 +1398,7 @@ impl CrimeRe {
 
     /// Write `src` to the pixel at `o`, through the logic op, plane mask and
     /// byte-lane enables.
-        fn put(r: &[u32], mem: &mut O2Memory, o: usize, bd: u32, src: u32) {
+        fn put(r: &[u32], mem: &mut RamWindow, o: usize, bd: u32, src: u32) {
         let dm = r[(DRAWMODE / 4) as usize];
         let reads = dm & (draw::LOGIC_OP | draw::PLANE_MASK) != 0;
         let old = if reads { Self::get_px(mem, o, bd) } else { 0 };
@@ -1518,9 +1521,9 @@ impl CrimeRe {
         let (sx0, sy0) = Self::xy(g(XFER_SRC));
         let src_tiled = Buf { tlb: TLB_A + 0x200 * sb.min(2), bd: sbd };
         let dst_tiled = Buf { tlb: TLB_A + 0x200 * db.min(2), bd: dbd };
-        let mut ram = Batch::new(self.ram.lock().unwrap());
-        let mem: &mut O2Memory = &mut ram;
-        let src_at = |mem: &O2Memory, x: i32, y: i32| -> Option<usize> {
+        let mut ram = Draw::new(self.win.lock().unwrap());
+        let mem: &mut RamWindow = &mut ram;
+        let src_at = |mem: &RamWindow, x: i32, y: i32| -> Option<usize> {
             if lin(sb) {
                 let a = g(XFER_SRC).wrapping_add(lin_off(x, y));
                 Self::linear(r, mem, sb - 4, a & !(sbd - 1))
@@ -1532,7 +1535,7 @@ impl CrimeRe {
                 Self::locate(r, mem, src_tiled, px as u32, py as u32)
             }
         };
-        let dst_at = |mem: &O2Memory, x: i32, y: i32| -> Option<usize> {
+        let dst_at = |mem: &RamWindow, x: i32, y: i32| -> Option<usize> {
             if lin(db) {
                 let a = g(XFER_DST).wrapping_add(lin_off(x, y));
                 Self::linear(r, mem, db - 4, a & !(dbd - 1))
@@ -1607,11 +1610,11 @@ impl CrimeRe {
             let idx = (sstart + k) % span.max(1);
             Some((pattern >> (31 - idx)) & 1 != 0)
         };
-        let mut ram = Batch::new(self.ram.lock().unwrap());
-        let mem: &mut O2Memory = &mut ram;
+        let mut ram = Draw::new(self.win.lock().unwrap());
+        let mem: &mut RamWindow = &mut ram;
 
         // Which colour register a destination pixel takes, if any.
-        let colour_at = |mem: &O2Memory, _o: usize, k: u32, stippled: bool| -> Option<u32> {
+        let colour_at = |mem: &RamWindow, _o: usize, k: u32, stippled: bool| -> Option<u32> {
             let _ = mem;
             if stippled {
                 match stipple(k) {
@@ -1633,7 +1636,7 @@ impl CrimeRe {
         let dmode = g(BUFMODE_DST);
         let half = dmode & 2 != 0 && (dmode >> 2) & 3 == 1 && dst.bd == 4;
         let half_off = if dmode & 1 == 0 { 2 } else { 0 };
-        let paint = |mem: &mut O2Memory, o: usize, c: u32| {
+        let paint = |mem: &mut RamWindow, o: usize, c: u32| {
             if half {
                 let v = (((c & 0xff) >= 0x80) as u32) << 15 | ((c >> 27) & 31) << 10 | ((c >> 19) & 31) << 5 | ((c >> 11) & 31);
                 Self::put(&r, mem, o + half_off, 2, v);
@@ -1860,7 +1863,7 @@ impl CrimeRe {
                 let (dqx, dqy) = (s32r(TEX_DQDX), s32r(TEX_DQDY));
                 // The source colour at a pixel as RGBA, before packing: what
                 // the alpha test and blending work on.
-                let rgba_at = |mem: &O2Memory, px: f64, py: f64| -> [u32; 4] {
+                let rgba_at = |mem: &RamWindow, px: f64, py: f64| -> [u32; 4] {
                     let base = |px: f64, py: f64| [0, 1, 2, 3].map(|k| channel(k, px, py));
                     let Some(t) = &tex else {
                         return if shaded { base(px, py) } else { [cr, cg, cb, ca] };
@@ -1908,7 +1911,7 @@ impl CrimeRe {
                         }
                     }
                 };
-                let colour_at = |mem: &O2Memory, px: f64, py: f64| -> u32 {
+                let colour_at = |mem: &RamWindow, px: f64, py: f64| -> u32 {
                     if tex.is_none() && !shaded {
                         return flat;
                     }
@@ -2138,7 +2141,7 @@ impl CrimeRe {
     /// straddling the line in proportion, blended by coverage times alpha.
     /// 4Dwm and the desktop outline their vector icons this way, black at
     /// full alpha into the 32-bit window.
-    fn gl_line(r: &[u32], mem: &mut O2Memory, dst: Buf, ox: i32, oy: i32, skip_last: bool, point: bool) {
+    fn gl_line(r: &[u32], mem: &mut RamWindow, dst: Buf, ox: i32, oy: i32, skip_last: bool, point: bool) {
         let clip = Clip::new(r);
         let g = |off: u32| r[(off / 4) as usize];
         let dm = g(DRAWMODE);
@@ -2271,7 +2274,7 @@ impl CrimeRe {
     /// the byte is at `page << 12 | addr & 0xfff`. IRIX maps a buffer onto
     /// the pages it is about to clear or copy, with the page number equal to
     /// the address it then hands the MTE.
-    fn linear(r: &[u32], mem: &O2Memory, which: u32, addr: u32) -> Option<usize> {
+    fn linear(r: &[u32], mem: &RamWindow, which: u32, addr: u32) -> Option<usize> {
         let idx = (addr >> 12) & 31;
         let word = TLB_LINEAR_A + 0x80 * which + 8 * (idx / 2);
         let e = r[(word / 4 + (idx & 1)) as usize];
@@ -2294,8 +2297,8 @@ impl CrimeRe {
         let s0 = g(MTE_SRC0);
         let fg = g(MTE_FG);
         let mask = g(MTE_BYTEMASK);
-        let mut ram = Batch::new(self.ram.lock().unwrap());
-        let mem: &mut O2Memory = &mut ram;
+        let mut ram = Draw::new(self.win.lock().unwrap());
+        let mem: &mut RamWindow = &mut ram;
         // A 4 KB page at a time: each is contiguous behind its TLB entry.
         let mut a = d0;
         let mut src = Vec::new();
@@ -2367,8 +2370,8 @@ impl CrimeRe {
         let stippled = mode & (1 << 10) != 0;
         let stipple = g(MTE_STIPPLE);
         let bpp = 1u32 << ((mode >> 8) & 3).min(2);
-        let mut ram = Batch::new(self.ram.lock().unwrap());
-        let mem: &mut O2Memory = &mut ram;
+        let mut ram = Draw::new(self.win.lock().unwrap());
+        let mem: &mut RamWindow = &mut ram;
         let mut row = Vec::new();
         for i in 0..rows as i32 {
             let dy = dy0 + i * dstep;
@@ -2743,7 +2746,8 @@ mod tests {
         }
         re.wait_idle();
         let r = re.regs.lock().unwrap().clone();
-        let mem = ram.lock().unwrap();
+        let mut mem = ram.lock().unwrap().window();
+        mem.begin();
         let (w, h) = (1280u32, 1024u32);
         let mut rgba = vec![0u8; (w * h * 4) as usize];
         // RE_REPLAY_BUF=1 or 2: an 8-bit buffer through TLB B or C (the
