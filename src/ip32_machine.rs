@@ -199,12 +199,11 @@ impl O2Machine {
 
         bus.gbe.use_cpu_clock(cpu.cycles_ptr(), o2.cpu_mhz);
         // CRIME's rendering engine can draw on its own thread
-        // (`[o2] re_async`), but by default it stays on the CPU's: the
-        // real engine checks for conflicts between its queued work and the
-        // CPU's memory accesses (DrawMode enNoConflict), which is not
-        // modelled, and under the JIT the CPU outran the queue and
-        // overwrote pixmap data the desktop's icon transfers had yet to read
-        // (the camera and mic icons lost their outlines).
+        // (`[o2] re_async`), behind a queue as deep as the real interface
+        // buffer (128 entries; IRIX relies on that bound: a 64K-deep queue
+        // let the CPU overwrite pixmaps the icon transfers had yet to read).
+        // By default it stays on the CPU's thread, which measured faster:
+        // the async ring lost 53% on X text and 59% on GL lines.
         if o2.re_async {
             bus.crime_re.start_async(bus.clone(), |b: &Ip32Bus| &b.crime_re);
         }

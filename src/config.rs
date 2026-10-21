@@ -751,10 +751,9 @@ pub struct O2Section {
     pub net: bool,
     #[serde(default)]
     pub forwards: Vec<PortForwardConfig>,
-    /// Experimental: run CRIME's rendering engine on a thread of its own.
-    /// Off by default because the real engine's check for conflicts between
-    /// queued work and the CPU's memory accesses is not modelled, and IRIX
-    /// relies on it (see `src/ip32_machine.rs`).
+    /// Experimental: run CRIME's rendering engine on a thread of its own,
+    /// behind a queue bounded like the real interface buffer. Off by default
+    /// because it measured slower (see `src/ip32_machine.rs`).
     #[serde(default)]
     pub re_async: bool,
 }
