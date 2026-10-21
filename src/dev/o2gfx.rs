@@ -999,8 +999,13 @@ use re_reg::*;
 const RE_WORDS: usize = 0x6000 / 4;
 /// Idle everywhere, interface buffer empty.
 const RE_STATUS_IDLE: u32 = 0x1e00_0000;
-/// Entries in CRIME's host interface buffer.
-const IB_DEPTH: usize = 128;
+/// Entries the interface buffer holds here: far more than CRIME's, so the
+/// CPU seldom waits on the engine (as the other boards' GFIFOs do).
+const IB_DEPTH: usize = 65536;
+/// CRIME's own interface buffer depth, the most software is shown.
+const IB_HW_DEPTH: usize = 64;
+/// The interface buffer level field of the status word (24:18).
+const RE_STATUS_IB_LEVEL_SHIFT: u32 = 18;
 
 mod draw {
     pub const GL: u32 = 1 << 22;
@@ -1024,10 +1029,12 @@ mod draw {
 }
 
 /// CRIME's host interface buffer: register writes in order from the CPU to
-/// the engine's thread, `(offset | WIDE for a 64-bit write, value)`. As deep
-/// as the real one (IntfBuf.data[128]), and IRIX relies on that bound: a
-/// 64K-deep queue let the X server reuse a staging buffer the engine had
-/// not read yet (icons drawn from the wrong picture).
+/// the engine's thread, `(offset | WIDE for a 64-bit write, value)`. Far
+/// deeper than CRIME's 64 entries, with the status word showing software no
+/// more than those (see `read_reg`). Software that reuses memory the engine
+/// reads waits for the idle bits, which stay clear until everything queued
+/// is done. (An early asynchronous engine with a 64K queue but no busy
+/// status drew icons from a staging buffer the X server had reused.)
 type IntfBuf = crate::gfifo::GFifo<IB_DEPTH>;
 
 /// Marks a 64-bit write in the interface buffer (offsets are below 0x8000).
@@ -1312,9 +1319,18 @@ impl CrimeRe {
             *self.hot.lock().unwrap().entry(off & !3).or_insert(0) += 1;
         }
         match off & !3 {
-            // Busy: the four idle bits clear, the interface buffer reported
-            // empty (its full stall stands in for its level).
-            STATUS | 0x4004 => Some(if self.idle() { RE_STATUS_IDLE } else { 0 }),
+            // Busy: the four idle bits clear, and the interface buffer's
+            // level as CRIME's own 64 entries would show it: what is
+            // queued while that fits, one entry past it, so software that
+            // waits for room (the kernel's MTE copies wait for 64 - level)
+            // always finds some and the CPU runs ahead of the engine.
+            STATUS | 0x4004 => Some(if self.idle() {
+                RE_STATUS_IDLE
+            } else {
+                let n = self.ib.len();
+                let shown = if n < IB_HW_DEPTH { n } else { 1 };
+                (shown as u32) << RE_STATUS_IB_LEVEL_SHIFT
+            }),
             IB_CONTROL | 0x0404 => Some(0),
             // Any other read waits for the engine to catch up, as a read
             // through CRIME's interface buffer would: drivers can use one as
@@ -3338,15 +3354,20 @@ mod tests {
     }
 
     /// A full interface buffer holds the CPU's write back (BUS_BUSY) with
-    /// nothing lost: 127 writes fit while the engine is not running.
+    /// nothing lost, and the status word shows the level as CRIME's 64
+    /// entries would: what is queued below that, one entry past it.
     #[test]
     fn a_full_interface_buffer_asks_the_cpu_to_retry() {
         let re = CrimeRe::new(Arc::new(Mutex::new(O2Memory::single(32 << 20))));
+        let level = |re: &CrimeRe| re.read32(0x1500_0000 + STATUS).data;
         for i in 0..(IB_DEPTH as u32 - 1) {
             assert_eq!(re.write32(0x1500_0000 + FG, i), BUS_OK, "write {i}");
+            if i == 9 {
+                assert_eq!(level(&re), 10 << RE_STATUS_IB_LEVEL_SHIFT, "ten queued, busy");
+            }
         }
         assert_eq!(re.write32(0x1500_0000 + FG, 999), BUS_BUSY);
-        assert_eq!(re.read32(0x1500_0000 + STATUS).data, 0, "busy");
+        assert_eq!(level(&re), 1 << RE_STATUS_IB_LEVEL_SHIFT, "full: busy, one entry shown");
         assert_eq!(re.read32(0x1500_0000 + FG).status, BUS_BUSY);
         let re = Arc::new(re);
         re.start(re.clone(), |r| r);
