@@ -10,6 +10,7 @@
 // Register model: the SEEQ status registers (rx_stat/tx_stat) hold device-level
 // OLD/NEW status for interrupt acknowledgement only.
 
+use crate::irq::IrqLine;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -144,12 +145,6 @@ pub struct SeeqState {
     pub ts:       u32,
 }
 
-// ── Interrupt callback ────────────────────────────────────────────────────────
-pub trait SeeqCallback: Send + Sync {
-    /// Raise or lower the interrupt line. Called by Seeq8003 with SeeqState lock held.
-    /// Implementor must not re-acquire SeeqState lock.
-    fn set_interrupt(&self, level: bool);
-}
 
 // ── Ring-buffer capacity (number of frames) ───────────────────────────────────
 const CHAN_CAPACITY: usize = 256;
@@ -164,7 +159,9 @@ const RX_DRAIN_CAP: usize = 256;
 // ── Main device struct ────────────────────────────────────────────────────────
 pub struct Seeq8003 {
     state:    Arc<Mutex<SeeqState>>,
-    callback: Option<Arc<dyn SeeqCallback>>,
+    /// The interrupt line. Driven with SeeqState's lock held, so whatever it
+    /// leads into must not take that lock again.
+    irq: Option<IrqLine>,
     rx_dma:   Option<Arc<dyn DmaClient>>,
     tx_dma:   Option<Arc<dyn DmaClient>>,
     sys_mem:  Mutex<Option<Arc<dyn BusDevice>>>,
@@ -211,14 +208,14 @@ enum RxPumpResult {
 
 // ── Seeq8003 ─────────────────────────────────────────────────────────────────
 impl Seeq8003 {
-    pub fn new(callback: Option<Arc<dyn SeeqCallback>>,
+    pub fn new(irq: Option<IrqLine>,
                rx_dma: Option<Arc<dyn DmaClient>>,
                tx_dma: Option<Arc<dyn DmaClient>>,
                heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_config(callback, rx_dma, tx_dma, GatewayConfig::default(), heartbeat)
+        Self::with_config(irq, rx_dma, tx_dma, GatewayConfig::default(), heartbeat)
     }
 
-    pub fn with_config(callback: Option<Arc<dyn SeeqCallback>>,
+    pub fn with_config(irq: Option<IrqLine>,
                        rx_dma: Option<Arc<dyn DmaClient>>,
                        tx_dma: Option<Arc<dyn DmaClient>>,
                        config: GatewayConfig,
@@ -242,7 +239,7 @@ impl Seeq8003 {
                 rx_nothing: 0,
                 ts:           0,
             })),
-            callback, rx_dma, tx_dma,
+            irq, rx_dma, tx_dma,
             sys_mem: Mutex::new(None),
             in_reset: Arc::new(AtomicBool::new(false)),
             config,
@@ -258,7 +255,7 @@ impl Seeq8003 {
         }
     }
 
-    fn raise_interrupt(state: &mut SeeqState, dma_irq: bool, callback: &Option<Arc<dyn SeeqCallback>>) {
+    fn raise_interrupt(state: &mut SeeqState, dma_irq: bool, irq: &Option<IrqLine>) {
         // Interrupt when status is NEW (OLD=0) and the corresponding IRQ enable bit is set.
         let rx_irq = (state.rx_stat & rx_stat::OLD) == 0 && {
             let enabled = state.rx_cmd & 0x1f;
@@ -274,10 +271,10 @@ impl Seeq8003 {
         let level = tx_irq || rx_irq || dma_irq;
         if level && !state.intpend {
             state.intpend = true;
-            if let Some(cb) = callback { cb.set_interrupt(true); }
+            if let Some(irq) = irq { irq.set(true); }
         } else if !level && state.intpend {
             state.intpend = false;
-            if let Some(cb) = callback { cb.set_interrupt(false); }
+            if let Some(irq) = irq { irq.set(false); }
         }
     }
 
@@ -301,7 +298,7 @@ impl Seeq8003 {
         st.tx_stat |= tx_stat::OLD;
         st.intpend = false;
         dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=reset_interrupt(CLRINT) rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
-        if let Some(ref cb) = self.callback { cb.set_interrupt(false); }
+        if let Some(ref irq) = self.irq { irq.set(false); }
     }
 
     /// Returns true if an unacknowledged interrupt is pending.
@@ -456,7 +453,7 @@ impl Seeq8003 {
         st.tx_cmd  = 0;
         st.ctl     = 0;
         dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=deassert_reset rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
-        Self::raise_interrupt(&mut st, false, &self.callback);
+        Self::raise_interrupt(&mut st, false, &self.irq);
     }
 
     /// Immediate reset (legacy): assert then immediately deassert.
@@ -481,14 +478,14 @@ impl Seeq8003 {
                 let v = st.rx_stat;
                 st.rx_stat |= rx_stat::OLD; // mark as read / stale
                 dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=read_rx_reg rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
-                Self::raise_interrupt(&mut st, false, &self.callback);
+                Self::raise_interrupt(&mut st, false, &self.irq);
                 v
             }
             SEEQ_TX_REG => {
                 let v = st.tx_stat;
                 st.tx_stat |= tx_stat::OLD;
                 dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=read_tx_reg rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
-                Self::raise_interrupt(&mut st, false, &self.callback);
+                Self::raise_interrupt(&mut st, false, &self.irq);
                 v
             }
             _ => 0,
@@ -529,12 +526,12 @@ impl Seeq8003 {
             SEEQ_RX_REG => {
                 st.rx_cmd = val;
                 dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=write_rx_reg rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
-                Self::raise_interrupt(&mut st, false, &self.callback);
+                Self::raise_interrupt(&mut st, false, &self.irq);
             }
             SEEQ_TX_REG => {
                 st.tx_cmd = val;
                 dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=write_tx_reg rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
-                Self::raise_interrupt(&mut st, false, &self.callback);
+                Self::raise_interrupt(&mut st, false, &self.irq);
             }
             _ => {}
         }
@@ -628,7 +625,7 @@ impl Device for Seeq8003 {
         let rx_dma        = self.rx_dma.clone();
         let sys_mem_enet: Option<Arc<dyn BusDevice>> = self.sys_mem.lock().clone();
         let state_enet    = self.state.clone();
-        let callback      = self.callback.clone();
+        let irq      = self.irq.clone();
         let rx_wake_enet  = self.rx_wake.clone();
         let tx_wake_enet  = self.tx_wake.clone();
         let heartbeat_enet = self.heartbeat.clone();
@@ -733,7 +730,7 @@ impl Device for Seeq8003 {
                 busy = tx_moved || rx_moved;
                 if did_something {
                     dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=enet_thread dma_irq={} rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, dma_irq, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
-                    Self::raise_interrupt(&mut st, dma_irq, &callback);
+                    Self::raise_interrupt(&mut st, dma_irq, &irq);
                 }
             }
         }).expect("seeq-enet spawn");

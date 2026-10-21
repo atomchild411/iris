@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use crate::irq::IrqLine;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::thread;
@@ -273,7 +274,9 @@ struct Wd33c93aState {
     // interrupt line low. This allows SELECT_ATN to push 0x11 then 0x8E as two
     // separate interrupts, matching real hardware behaviour.
     irq_fifo: VecDeque<(u8, Option<u8>, bool)>, // (status, phase, deferred) — deferred=true: worker drops lock before delivery
-    callback: Option<Arc<dyn ScsiCallback>>,
+    /// The chip's INT, as the board wires it. On the HPC3, dropping it also
+    /// settles the paired PDMA channel's half of the shared SCSI line.
+    irq: Option<IrqLine>,
     // Debug tracking: last values returned for register reads
     last_read_asr: Option<u8>,
     last_read_reg: Option<(u8, u8)>, // (register, value)
@@ -284,11 +287,6 @@ struct Wd33c93aState {
     deferred_int: Arc<AtomicBool>,
 }
 
-pub trait ScsiCallback: Send + Sync {
-    /// Set the SCSI interrupt line. Calling with false also clears any paired
-    /// PDMA completion bit (implementors handle this internally).
-    fn set_interrupt(&self, level: bool);
-}
 
 // Safety: `Cell<T>` is never `Sync` regardless of `T` (interior mutability
 // without synchronization) — needed here because `cpu_cycles` (a `Cell`,
@@ -323,17 +321,17 @@ pub struct Wd33c93a {
 }
 
 impl Wd33c93a {
-    pub fn new(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::new_with_config(dma, callback, heartbeat, true)
+    pub fn new(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>) -> Self {
+        Self::new_with_config(dma, irq, heartbeat, true)
     }
 
-    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, deferred_int: bool) -> Self {
-        Self::new_with_id(dma, callback, heartbeat, deferred_int, 0)
+    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>, deferred_int: bool) -> Self {
+        Self::new_with_id(dma, irq, heartbeat, deferred_int, 0)
     }
 
     /// Same as `new_with_config`, but tags every log line with `id` (the
     /// HPC3 SCSI controller number) — see `Wd33c93aState.id`'s doc comment.
-    pub fn new_with_id(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, deferred_int: bool, id: u8) -> Self {
+    pub fn new_with_id(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>, deferred_int: bool, id: u8) -> Self {
         let deferred_int_arc = Arc::new(AtomicBool::new(deferred_int));
         Self {
             state: Arc::new(Mutex::new(Wd33c93aState {
@@ -356,7 +354,7 @@ impl Wd33c93a {
                 xfer_direction_in: false,
                 pending_cdb: Vec::new(),
                 irq_fifo: VecDeque::new(),
-                callback,
+                irq,
                 last_read_asr: None,
                 last_read_reg: None,
                 last_cmd: 0,
@@ -1538,7 +1536,7 @@ impl Wd33c93aState {
         if new_int != old_int {
             wdt!("INT_LINE {} (asr={:02x})",
                 if new_int != 0 { "ASSERT" } else { "DEASSERT" }, self.asr);
-            if let Some(cb) = &self.callback { cb.set_interrupt(new_int != 0); }
+            if let Some(irq) = &self.irq { irq.set(new_int != 0); }
         }
     }
 
