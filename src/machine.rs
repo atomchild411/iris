@@ -621,7 +621,7 @@ impl Machine {
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
         let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = if cfg.ultra64.enabled {
-            match crate::dev::ultra64::Ultra64::new(ioc.clone()) {
+            match crate::dev::ultra64::Ultra64::new(ioc.irq_line(crate::dev::ioc::IocInterrupt::GioExp0)) {
                 Ok(dev) => Some(Arc::new(dev)),
                 Err(e)  => {
                     eprintln!("ultra64: failed to initialize ({e}); running without N64 dev board");
