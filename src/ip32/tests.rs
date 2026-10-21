@@ -267,7 +267,7 @@ fn isa_status(bus: &Ip32Bus) -> u64 {
 }
 
 fn line4(bus: &Ip32Bus) -> bool {
-    bus.crime.intstat() & (1 << IP32_ISA_CRIME_INT) != 0
+    bus.crime.regs.intstat() & (1 << IP32_ISA_CRIME_INT) != 0
 }
 
 #[test]
@@ -306,10 +306,10 @@ fn serial_dma_transmits_full_and_partial_blocks() {
     tx_block(&bus, 0, 32, b"xyz");
     sdma_set(&bus, 0, TX_CTRL, 0x200);
     sdma_set(&bus, 0, TX_WPTR, 64);
-    assert_eq!(bus.com0.output(), "0123456789abcdefxyz");
+    assert_eq!(bus.mace.com0.output(), "0123456789abcdefxyz");
     assert_eq!(sdma_get(&bus, 0, TX_RPTR), 64);
     assert_eq!(sdma_get(&bus, 0, TX_DEPTH), 0);
-    assert_eq!(bus.com1.output(), "", "port 1 is a different UART");
+    assert_eq!(bus.mace.com1.output(), "", "port 1 is a different UART");
 }
 
 #[test]
@@ -318,12 +318,12 @@ fn a_disabled_transmit_channel_is_frozen_not_lost() {
     tx_block(&bus, 0, 0, b"later");
     sdma_set(&bus, 0, TX_CTRL, 0x000);
     sdma_set(&bus, 0, TX_WPTR, 32);
-    assert_eq!(bus.com0.output(), "");
+    assert_eq!(bus.mace.com0.output(), "");
     assert_eq!(sdma_get(&bus, 0, TX_DEPTH), 32, "IRIX reads the depth as bytes");
     bus.service();
-    assert_eq!(bus.com0.output(), "", "the service tick does not run a frozen channel");
+    assert_eq!(bus.mace.com0.output(), "", "the service tick does not run a frozen channel");
     sdma_set(&bus, 0, TX_CTRL, 0x200);
-    assert_eq!(bus.com0.output(), "later");
+    assert_eq!(bus.mace.com0.output(), "later");
     assert_eq!(sdma_get(&bus, 0, TX_DEPTH), 0);
 }
 
@@ -345,7 +345,7 @@ fn the_transmit_ring_wraps() {
         sdma_set(&bus, 0, TX_WPTR, sw as u64);
         assert_eq!(sdma_get(&bus, 0, TX_DEPTH), 0);
     }
-    assert_eq!(bus.com0.output(), want);
+    assert_eq!(bus.mace.com0.output(), want);
     assert_eq!(sdma_get(&bus, 0, TX_RPTR), sw as u64);
 }
 
@@ -359,7 +359,7 @@ fn a_transmit_pair_can_set_mcr_and_ask_for_a_pair_request() {
     sdma_set(&bus, 0, TX_CTRL, 0x200);
     sdma_set(&bus, 0, TX_WPTR, 32);
     assert_eq!(bus.read8(MACE_COM0 + 0x407).data, 0x0b, "the MCR pair landed in MCR");
-    assert_eq!(bus.com0.output(), "Q");
+    assert_eq!(bus.mace.com0.output(), "Q");
     assert_ne!(isa_status(&bus) & sdma::tx_preq(0), 0, "bit 22 latched");
     assert!(line4(&bus));
     bus.write64(MACE_ISA_INT_STATUS, 0);
@@ -396,13 +396,13 @@ fn received_characters_are_packed_into_whole_blocks() {
     bus.write64(MACE_ISA_INT_MASK, sdma::rx_thir(0));
     sdma_set(&bus, 0, RX_CTRL, 0x2a0);
     assert!(!line4(&bus), "an empty ring is not 'not empty'");
-    bus.com0.feed(b"abcde");
+    bus.mace.com0.feed(b"abcde");
     bus.service();
     let words: Vec<u64> = (0..4).map(|k| bus.read64(rx_ring(0) + 8 * k).data).collect();
     assert_eq!(words, [0x8080_8080_6162_6364, 0x8000_0000_65ff_ffff, 0xffff_ffff, 0xffff_ffff]);
     assert_eq!(sdma_get(&bus, 0, RX_WPTR), 32);
     assert_eq!(sdma_get(&bus, 0, RX_DEPTH), 32);
-    assert_eq!(bus.com0.pending_input(), 0);
+    assert_eq!(bus.mace.com0.pending_input(), 0);
     assert_ne!(isa_status(&bus) & sdma::rx_thir(0), 0);
     assert!(line4(&bus));
     sdma_set(&bus, 0, RX_RPTR, 32);
@@ -410,11 +410,11 @@ fn received_characters_are_packed_into_whole_blocks() {
     assert!(!line4(&bus));
 
     // Exactly one pair, then exactly a whole block.
-    bus.com0.feed(b"wxyz");
+    bus.mace.com0.feed(b"wxyz");
     bus.service();
     let w: Vec<u64> = (0..4).map(|k| bus.read64(rx_ring(0) + 32 + 8 * k).data).collect();
     assert_eq!(w, [0x8080_8080_7778_797a, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff]);
-    bus.com0.feed(b"0123456789ABCDEF");
+    bus.mace.com0.feed(b"0123456789ABCDEF");
     bus.service();
     let w: Vec<u64> = (0..4).map(|k| bus.read64(rx_ring(0) + 64 + 8 * k).data).collect();
     assert_eq!(w, [0x8080_8080_3031_3233, 0x8080_8080_3435_3637,
@@ -460,10 +460,10 @@ fn a_long_paste_arrives_intact_through_an_irix_style_reader() {
     let bus = sdma_bus();
     sdma_set(&bus, 0, RX_CTRL, 0x2a0);
     let sent: Vec<u8> = (0..3000).map(|i| b'!' + (i % 90) as u8).collect();
-    bus.com0.feed(&sent);
+    bus.mace.com0.feed(&sent);
     bus.service();
     assert_eq!(sdma_get(&bus, 0, RX_DEPTH), 0xfe0, "full is one block short of the ring");
-    assert_eq!(bus.com0.pending_input(), 3000 - 127 * 16, "the rest waits in the queue");
+    assert_eq!(bus.mace.com0.pending_input(), 3000 - 127 * 16, "the rest waits in the queue");
     let mut got = Vec::new();
     let mut sw = 0;
     for _ in 0..10_000 {
@@ -480,7 +480,7 @@ fn a_long_paste_arrives_intact_through_an_irix_style_reader() {
     }
     assert_eq!(got.len(), sent.len());
     assert!(got == sent, "characters out of order or damaged");
-    assert_eq!(bus.com0.pending_input(), 0);
+    assert_eq!(bus.mace.com0.pending_input(), 0);
 }
 
 /// Without receive DMA running, typed characters stay where the PROM, the
@@ -492,7 +492,7 @@ fn without_receive_dma_input_stays_on_the_pio_path() {
         if let Some(c) = ctrl {
             sdma_set(&bus, 0, RX_CTRL, c);
         }
-        bus.com0.feed(b"hi");
+        bus.mace.com0.feed(b"hi");
         bus.service();
         let lsr = MACE_COM0 + 0x507;
         assert_ne!(bus.read8(lsr).data & com_reg::LSR_DR, 0, "{ctrl:?}: data ready");
@@ -532,7 +532,7 @@ fn a_pio_port_keeps_the_unmasked_six_bit_behaviour() {
         bus.write64(MACE_ISA_INT_MASK, mask);
         bus.write64(MACE_ISA_INT_STATUS, 0);
         bus.write8(MACE_COM0 + 0x107, com_reg::IER_RX);
-        bus.com0.feed(b"x");
+        bus.mace.com0.feed(b"x");
         bus.service();
         assert_eq!(isa_status(&bus) & 0xffff_0000, 0x03f0_0000, "mask {mask:x}");
         assert!(line4(&bus), "mask {mask:x}");
@@ -560,7 +560,7 @@ fn a_polled_write_between_batches_keeps_its_place() {
     sdma_set(&bus, 0, TX_CTRL, saved);
     tx_block(&bus, 0, 32, b"EF");
     sdma_set(&bus, 0, TX_WPTR, 64);
-    assert_eq!(bus.com0.output(), "ABcdEF");
+    assert_eq!(bus.mace.com0.output(), "ABcdEF");
 }
 
 #[test]
@@ -582,7 +582,7 @@ fn resetting_a_channel_clears_its_pointers_latches_and_level() {
     assert_eq!(sdma_get(&bus, 0, TX_WPTR), 0);
     assert_eq!(isa_status(&bus) & sdma::group(0), 0);
     assert!(!line4(&bus));
-    assert_eq!(bus.com0.output(), "!");
+    assert_eq!(bus.mace.com0.output(), "!");
 }
 
 

@@ -19,6 +19,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
+use crate::dev::mace::Mace;
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR};
 
 // ── IP32 physical map ───────────────────────
@@ -34,17 +35,15 @@ pub const RAM_BASE: u32 = 0x4000_0000;
 /// CRIME: memory controller, interrupt controller and video DMA.
 pub const CRIME_BASE: u32 = 0x1400_0000;
 pub const CRIME_SIZE: u32 = 0x0000_1000;
-/// MACE: the I/O ASIC. Only present here so probes read as empty rather than
-/// taking a bus error — none of it is implemented yet.
-/// GBE, the graphics back end. We drive the machine on serial and have no
-/// interest in its output, but the firmware probes it during startup, so it
-/// has to answer. A storing register file is enough for that.
+/// GBE, the graphics back end, which scans the frame buffer out of RAM
+/// (`crate::dev::o2gfx::Gbe`).
 pub const GBE_BASE: u32 = 0x1600_0000;
 pub const GBE_SIZE: u32 = 0x0010_0000;
 /// VICE, the video and image compression engine.
 pub const VICE_BASE: u32 = 0x1700_0000;
 pub const VICE_SIZE: u32 = 0x0100_0000;
 
+/// MACE, the I/O ASIC (`crate::dev::mace`): PCI, Ethernet, the ISA block.
 pub const MACE_BASE: u32 = 0x1f00_0000;
 pub const MACE_SIZE: u32 = 0x0080_0000;
 /// MACE's ISA-block register holding the flash write-enable and the Dallas
@@ -98,9 +97,8 @@ pub const MACE_UST_MSC_SIZE: u32 = 0x0001_0000;
 pub const MACEPCI_BASE: u32 = MACE_BASE + 0x0008_0000;
 pub const MACEPCI_SIZE: u32 = 0x0001_0000;
 
-/// CRIME's rendering-engine block. NetBSD's `crmfb` maps exactly
-/// `0x15000000, 0x6000` for this. Graphics are out of scope, but POST touches
-/// it regardless, so it is present and inert rather than absent.
+/// CRIME's rendering-engine block (`crate::dev::o2gfx::CrimeRe`). NetBSD's
+/// `crmfb` maps exactly `0x15000000, 0x6000` for this.
 pub const CRIME_RE_BASE: u32 = 0x1500_0000;
 pub const CRIME_RE_SIZE: u32 = 0x0000_6000;
 
@@ -225,13 +223,13 @@ impl Stub {
         v.sort_by_key(|&(_, r, w)| std::cmp::Reverse(r + w));
         v
     }
-    fn r(&self) {
+    pub(crate) fn r(&self) {
         self.reads.fetch_add(1, Ordering::Relaxed);
     }
-    fn w(&self) {
+    pub(crate) fn w(&self) {
         self.writes.fetch_add(1, Ordering::Relaxed);
     }
-    fn cell(&self, addr: u32) -> u64 {
+    pub(crate) fn cell(&self, addr: u32) -> u64 {
         *self.cells.lock().unwrap().get(&(addr & 0x007f_ffff & !7)).unwrap_or(&0)
     }
     pub fn cell_pub(&self, addr: u32) -> u64 {
@@ -243,7 +241,7 @@ impl Stub {
     fn set_cell(&self, addr: u32, val: u64) {
         self.cells.lock().unwrap().insert(addr & 0x007f_ffff & !7, val);
     }
-    fn hit(&self, addr: u32, write: bool) {
+    pub(crate) fn hit(&self, addr: u32, write: bool) {
         if !hot_counters() {
             return;
         }
@@ -265,11 +263,11 @@ impl BusDevice for Stub {
     fn write64(&self, a: u32, v: u64) -> u32 { self.w(); self.hit(a, true); self.set_cell(a, v); BUS_OK }
 }
 
-/// The IP32 physical bus for bring-up: RAM, CRIME, a MACE stub and the PROM.
-///
-/// Deliberately a flat `match` rather than the 64 KB dispatch table `Physical`
-/// uses. At this stage legibility and being able to log an unmapped access are
-/// worth more than the lookup.
+/// The IP32 physical bus: RAM and the PROM, and the chips that claim the
+/// rest, CRIME (with its rendering engine), GBE, VICE and MACE, each of
+/// which decodes its own space as HPC3 does on the Indigo2. A short chain
+/// of range checks rather than the 64 KB dispatch table `Physical` uses:
+/// there are five regions, and an unmapped access is easy to log.
 pub struct Ip32Bus {
     pub(crate) ram: std::sync::Arc<Mutex<O2Memory>>,
     /// The flash. Writable, because an O2 keeps its environment variables in
@@ -283,32 +281,17 @@ pub struct Ip32Bus {
     /// caller supplied: settings written by a guest belong in the user's
     /// working directory, not in their copy of the PROM.
     flash_file: Option<std::path::PathBuf>,
-    pub crime: std::sync::Arc<Crime>,
-    /// MACE's ISA interrupt status and mask, cascading into CRIME.
-    pub isa: std::sync::Arc<MaceIsa>,
-    pub mace: Stub,
-    /// CRIME's rendering engine: draws into RAM through its tile tables.
-    pub crime_re: crate::dev::o2gfx::CrimeRe,
+    /// CRIME: its registers (interrupts, memory banks) and its rendering
+    /// engine, which draws into RAM through its tile tables.
+    pub crime: CrimeSpace,
     /// The display back end: scans the frame buffer out of RAM.
     pub gbe: crate::dev::o2gfx::Gbe,
     /// VICE, the video/image compression engine: a register file for now.
     /// IRIX probes it at boot (OpenBSD and NetBSD never look), and a bus
     /// error there panics the kernel.
     pub vice: Stub,
-    pub macepci: MacePci,
-    pub ust: std::sync::Arc<MaceUst>,
-    pub nic_trace: NicTrace,
-    pub rtc: MaceRtc,
-    pub ps2: MacePs2,
-    pub onewire: OneWireId,
-    pub com0: Com16550,
-    pub com1: Com16550,
-    /// The serial ports' DMA rings, which IRIX's console runs on.
-    pub sdma: MaceSerialDma,
-    /// The audio interface and its AD1843 (dev/mace_audio.rs).
-    pub audio: crate::dev::mace_audio::MaceAudio,
-    /// The Ethernet. Its frames go nowhere until `start_nat` (`[o2] net`).
-    pub mec: std::sync::Arc<crate::dev::mec::Mec>,
+    /// MACE, the I/O ASIC, and every block behind it.
+    pub mace: Mace,
     /// Accesses that hit nothing, first 64 kept, as `(addr, is_write, pc)`.
     unmapped: Mutex<Vec<(u32, bool, u32)>>,
     /// The ppmem window's base and the RAM bitmap the memory space keeps
@@ -348,34 +331,18 @@ impl Ip32Bus {
         let ram = std::sync::Arc::new(Mutex::new(mem));
         let ust = std::sync::Arc::new(MaceUst::new());
         let crime = std::sync::Arc::new(Crime::new(ust.clone()));
-        let isa = std::sync::Arc::new(MaceIsa::new(crime.clone()));
-        let macepci = MacePci::new(crime.clone());
         let bus = Self {
             ram: ram.clone(),
             prom: Mutex::new(prom),
             prom_writes: Mutex::new(Vec::new()),
             flash_file: opts.flash_file.clone(),
-            crime,
-            isa,
-            mace: Stub::new("mace"),
-            crime_re: crate::dev::o2gfx::CrimeRe::new(ram.clone()),
+            crime: CrimeSpace::new(crime.clone(), ram.clone()),
             vice: Stub::new("vice"),
             gbe: {
                 let ust = ust.clone();
                 crate::dev::o2gfx::Gbe::new(std::sync::Arc::new(move || ust.now()))
             },
-            macepci,
-            ust: ust.clone(),
-            nic_trace: NicTrace::new(),
-            rtc: MaceRtc::new(),
-            ps2: MacePs2::new(),
-            // A locally-administered address; nothing depends on the value yet.
-            onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
-            com0: Com16550::named("com0"),
-            com1: Com16550::named("com1"),
-            sdma: MaceSerialDma::new(),
-            audio: crate::dev::mace_audio::MaceAudio::new(),
-            mec: std::sync::Arc::new(crate::dev::mec::Mec::new(ram.clone())),
+            mace: Mace::new(ram.clone(), crime, ust),
             unmapped: Mutex::new(Vec::new()),
             fast_ram: std::sync::OnceLock::new(),
             watch: Mutex::new(std::env::var("IRIS_IP32_WATCHMEM").ok().and_then(|v| {
@@ -393,7 +360,6 @@ impl Ip32Bus {
         // and finds nothing, so it has no disk and cannot boot. Putting the
         // controller a real O2 has there is how we learn how much of it the
         // PROM insists on.
-        bus.connect_interrupts();
         if opts.scsi {
             // The controller fetches its work from host memory, so it
             // needs to reach RAM directly rather than through the bus that
@@ -403,8 +369,8 @@ impl Ip32Bus {
             // anything is plugged into it, and a kernel that expects two
             // waits on the one that is missing.
             let scsi_b = std::sync::Arc::new(crate::dev::aic7880::Aic7880::new(ram.clone()));
-            bus.macepci.attach(IP32_SCSI_SLOT_B, "aic7880-b", scsi_b.clone());
-            bus.macepci.attach(IP32_SCSI_SLOT, "aic7880", scsi.clone());
+            bus.mace.pci.attach(IP32_SCSI_SLOT_B, "aic7880-b", scsi_b.clone());
+            bus.mace.pci.attach(IP32_SCSI_SLOT, "aic7880", scsi.clone());
             for d in &opts.disks {
                 let ctl = if d.bus == 0 { &scsi } else { &scsi_b };
                 let id = d.id.unwrap_or(ctl.default_target());
@@ -461,7 +427,7 @@ impl Ip32Bus {
     /// Where CRIME's output goes: the CPU's IP2, for a machine whose CPU
     /// runs on its own thread. Without it (the harness) nothing is pushed.
     pub fn connect_cpu_irq(&self, line: crate::irq::IrqLine) {
-        self.crime.connect_output(line);
+        self.crime.regs.connect_output(line);
     }
 
     /// Let aligned RAM reads go straight to the ppmem window: its base and
@@ -478,7 +444,7 @@ impl Ip32Bus {
 
     #[inline]
     fn before_read(&self, addr: u32) {
-        if self.crime.has_output() && self.in_crime(addr) {
+        if self.crime.regs.has_output() && CrimeSpace::in_regs(addr) {
             self.refresh_irq();
         }
     }
@@ -491,7 +457,7 @@ impl Ip32Bus {
     /// service thread holds too.
     #[inline]
     fn after_write(&self, addr: u32) {
-        if self.crime.has_output() && !Self::is_ram_addr(addr) && !self.in_crime_re(addr) && !self.in_gbe(addr) {
+        if self.crime.regs.has_output() && !Self::is_ram_addr(addr) && !CrimeSpace::in_re(addr) && !self.in_gbe(addr) {
             self.refresh_irq();
         }
     }
@@ -500,7 +466,7 @@ impl Ip32Bus {
     /// Returns whether CRIME is interrupting the CPU (IP2).
     pub fn refresh_irq(&self) -> bool {
         self.update_lines();
-        self.crime.update_output()
+        self.crime.regs.update_output()
     }
 
     /// The interrupts that are not yet driven by their devices' own state
@@ -512,45 +478,10 @@ impl Ip32Bus {
         let crossed = self.gbe.vt_crossings();
         for n in 0..4 {
             if crossed & (1 << n) != 0 {
-                crate::irq::InterruptController::set_line(&*self.crime, 16 + n, true);
+                crate::irq::InterruptController::set_line(&*self.crime.regs, 16 + n, true);
             }
         }
-        self.com0.update_irq();
-        self.sdma.update_irq();
-        self.ps2.update_irq();
-        self.audio.update_irq();
-    }
-
-    /// The engines' view of the machine.
-    fn sdma_io(&self) -> SdmaIo<'_> {
-        SdmaIo {
-            ram: &self.ram,
-            com: [&self.com0, &self.com1],
-            ring_base: (self.mace.cell(MACE_ISA_RING_BASE) & sdma::RING_BASE_MASK) as u32,
-        }
-    }
-
-    fn in_sdma(&self, addr: u32) -> bool {
-        (MACE_SDMA..MACE_SDMA + MACE_SDMA_SIZE).contains(&addr)
-    }
-
-    /// A serial DMA register, read. Counted with MACE's other offsets, so a
-    /// guest polling one shows up where every other hot register does.
-    fn sdma_read(&self, addr: u32) -> u64 {
-        self.mace.r();
-        self.mace.hit(addr, false);
-        self.sdma.read(addr)
-    }
-
-    fn sdma_write(&self, addr: u32, val: u64) -> u32 {
-        self.mace.w();
-        self.mace.hit(addr, true);
-        self.sdma.write(addr, val, &self.sdma_io());
-        // A pointer or control write moves the levels, and may hand the port
-        // back to (or take it from) the 16550's own interrupt.
-        self.com0.update_irq();
-        self.sdma.update_irq();
-        BUS_OK
+        self.mace.update_lines();
     }
 
     /// Bring every device interrupt up to date in CRIME: the SCSI
@@ -559,53 +490,8 @@ impl Ip32Bus {
     /// The harness calls it every 256 instructions, the machine from its
     /// service thread.
     pub fn service(&self) -> bool {
-        self.mec.poll();
-        // Whatever the consoles have typed, into the UARTs.
-        self.com0.pump();
-        self.com1.pump();
-        self.audio.poll(&crate::dev::mace_audio::AudioIo {
-            ram: &self.ram,
-            ring_base: (self.mace.cell(MACE_ISA_RING_BASE) & sdma::RING_BASE_MASK) as u32,
-            ust: self.ust.counter() as u32,
-        });
-        if self.sdma.any_owned() {
-            self.sdma.poll(&self.sdma_io());
-        }
+        self.mace.service();
         self.refresh_irq()
-    }
-
-    /// After a write to MACE's ISA status or mask: a status write clears the
-    /// serial DMA engine's pair-request latches it wrote as zero, and a DMA
-    /// port's bits are read through the new mask at once.
-    fn isa_wrote(&self, addr: u32) {
-        if addr & !7 == MACE_ISA_INT_STATUS {
-            self.sdma.status_written(self.isa.status_written());
-        }
-        if self.sdma.any_owned() {
-            self.sdma.update_irq();
-        }
-    }
-
-    /// After a write to a MACE register held as a plain cell.
-    fn mace_wrote(&self, addr: u32) {
-        // MACE revision 2 or later: SGI software reads bit 4 of the ISA ring
-        // base register as that, and with it clear shifts every PS/2 reply
-        // right one bit to work around revision 1.
-        if addr & !7 == MACE_ISA_RING_BASE && self.ps2.devices().is_some() {
-            let v = self.mace.cell_pub(MACE_ISA_RING_BASE);
-            self.mace.set_cell_pub(MACE_ISA_RING_BASE, v | MACE_REV2_BIT);
-        }
-    }
-
-    /// Wire the devices' interrupts: the Ethernet straight into CRIME, the
-    /// ISA peripherals (the PS/2 ports, audio, the console UART while driven
-    /// by PIO, serial DMA) into MACE's ISA controller.
-    fn connect_interrupts(&self) {
-        self.mec.connect_irq(crate::irq::IrqLine::new(self.crime.clone(), IP32_MEC_CRIME_INT));
-        self.ps2.connect_irq(self.isa.clone());
-        self.audio.connect_irq(self.isa.clone());
-        self.com0.connect_irq(crate::irq::IrqLine::new(self.isa.clone(), ISA_SERIAL0_PIO));
-        self.sdma.connect_irq(self.isa.clone());
     }
 
     /// Plug in what a graphics console needs: a PS/2 keyboard on port 0, a
@@ -617,19 +503,8 @@ impl Ip32Bus {
 
     /// The same, with a PS/2 mouse on port 1 as well.
     pub fn enable_graphics_with_mouse(&mut self, mouse: bool) {
-        self.ps2 = MacePs2::with_devices(mouse);
-        self.ps2.connect_irq(self.isa.clone());
-        self.crime.set_revision(CRIME_REV_GBE);
-        let v = self.mace.cell_pub(MACE_ISA_RING_BASE);
-        self.mace.set_cell_pub(MACE_ISA_RING_BASE, v | MACE_REV2_BIT);
-    }
-
-    fn crime_wrote(&self, addr: u32) {
-        let off = (addr - CRIME_BASE) & !7;
-        if (crime_reg::MEM_BANK_CTRL0..crime_reg::MEM_BANK_CTRL0 + 8 * 8).contains(&off) {
-            let v = self.crime.load(off);
-            self.ram.lock().unwrap().set_ctrl(((off - crime_reg::MEM_BANK_CTRL0) / 8) as usize, v);
-        }
+        self.mace.enable_ps2(mouse);
+        self.crime.regs.set_revision(CRIME_REV_GBE);
     }
 
     /// Record an access if it falls in the watch range.
@@ -650,7 +525,7 @@ impl Ip32Bus {
                     // Where the CPU's last batch ended: the machine knows no
                     // finer.
                     let pc = crate::ip32_machine::LAST_PC.load(Ordering::Relaxed);
-                    w.push((addr, write, val, pc, self.ust.now(), n as u8));
+                    w.push((addr, write, val, pc, self.mace.ust.now(), n as u8));
                 }
             }
         }
@@ -700,89 +575,12 @@ impl Ip32Bus {
         addr >= PROM_BASE && addr < PROM_BASE + PROM_SIZE
     }
 
-    fn in_ps2(&self, addr: u32) -> bool {
-        addr >= MACE_PS2 && addr < MACE_PS2 + MACE_PS2_SIZE
-    }
-
     fn in_vice(&self, addr: u32) -> bool {
         addr >= VICE_BASE && addr < VICE_BASE + VICE_SIZE
     }
 
     fn in_gbe(&self, addr: u32) -> bool {
         addr >= GBE_BASE && addr < GBE_BASE + GBE_SIZE
-    }
-
-    fn in_crime_re(&self, addr: u32) -> bool {
-        addr >= CRIME_RE_BASE && addr < CRIME_RE_BASE + CRIME_RE_SIZE
-    }
-
-    fn in_crime(&self, addr: u32) -> bool {
-        addr >= CRIME_BASE && addr < CRIME_BASE + CRIME_SIZE
-    }
-
-    fn in_mec(&self, addr: u32) -> bool {
-        (MACE_MEC..MACE_MEC + MACE_MEC_SIZE).contains(&addr)
-    }
-
-    fn in_mace(&self, addr: u32) -> bool {
-        addr >= MACE_BASE && addr < MACE_BASE + MACE_SIZE
-    }
-
-    fn com_for(&self, addr: u32) -> Option<&Com16550> {
-        if (MACE_COM0..MACE_COM0 + MACE_COM_SIZE).contains(&addr) {
-            Some(&self.com0)
-        } else if (MACE_COM1..MACE_COM1 + MACE_COM_SIZE).contains(&addr) {
-            Some(&self.com1)
-        } else {
-            None
-        }
-    }
-
-    fn is_nic_reg(&self, addr: u32) -> bool {
-        (addr & !3) == MACE_ISA_FLASH_NIC_REG
-    }
-
-    fn in_rtc(&self, addr: u32) -> bool {
-        addr >= MACE_RTC && addr < MACE_RTC + MACE_RTC_SIZE
-    }
-
-    /// Feed a write of the NIC register through to the 1-Wire device, and
-    /// report what the master should read back on the data line.
-    fn nic_write(&self, val: u8) {
-        // DEASSERT alone decides it: clear means the master is pulling the
-        // line down, set means it has let go. The firmware writes DATA=1 in
-        // both cases, so DATA is an input here, not a level to drive — which
-        // is exactly what the bus trace shows (only 0x08 and 0x0c are ever
-        // written).
-        let low = val & nic_bit::DEASSERT == 0;
-        self.ust.onewire_busy();
-        self.onewire.master_drive(self.ust.guest_us(), low);
-    }
-
-    fn nic_read(&self) -> u8 {
-        let mut v = self.mace.cell(MACE_ISA_FLASH_NIC_REG) as u8;
-        self.ust.onewire_busy();
-        if self.onewire.line_level(self.ust.guest_us()) {
-            v |= nic_bit::DATA;
-        } else {
-            v &= !nic_bit::DATA;
-        }
-        v
-    }
-
-    fn in_ust(&self, addr: u32) -> bool {
-        addr >= MACE_UST_MSC && addr < MACE_UST_MSC + MACE_UST_MSC_SIZE
-    }
-
-    /// Which audio channel's MSC/UST pair a UST-block address names: the
-    /// three at 0x20, 0x28 and 0x30 (input, output #1, output #2).
-    fn audio_msc_slot(addr: u32) -> Option<usize> {
-        let off = addr.wrapping_sub(MACE_UST_MSC);
-        (0x20..0x38).contains(&off).then(|| ((off - 0x20) / 8) as usize)
-    }
-
-    fn in_macepci(&self, addr: u32) -> bool {
-        addr >= MACEPCI_BASE && addr < MACEPCI_BASE + MACEPCI_SIZE
     }
 
     /// Map an address through the low-memory alias, if it falls in it. The
@@ -894,7 +692,7 @@ impl Ip32Bus {
 macro_rules! bus_read {
     ($self:ident, $addr:expr, $n:expr, $ok:path, $conv:expr) => {{
         let addr = $addr;
-        if $self.in_crime(addr) || $self.in_mace(addr) {
+        if CrimeSpace::contains(addr) || crate::dev::mace::Mace::contains(addr) {
             unreachable!("device reads are dispatched before this point")
         }
         match $self.read_bytes(addr, $n) {
@@ -907,511 +705,134 @@ macro_rules! bus_read {
     }};
 }
 
+// The address map: CRIME (its registers and the rendering engine), GBE,
+// VICE and MACE (with the PCI bridge's windows) each decode their own
+// space; what is left is memory and the PROM.
 impl Ip32Bus {
     fn read8_raw(&self, addr: u32) -> BusRead8 {
-        if self.in_mec(addr) {
-            return BusDevice::read8(&*self.mec, addr);
-        }
-        if self.in_vice(addr) {
-            return self.vice.read8(addr);
+        if CrimeSpace::contains(addr) {
+            return self.crime.read8(addr);
         }
         if self.in_gbe(addr) {
             return BusRead8::ok(self.gbe.read32(addr & !3).data as u8);
         }
-        if self.in_crime_re(addr) {
-            let r = self.crime_re.read32(addr & !3);
-            return BusRead8 { status: r.status, data: r.data as u8 };
+        if self.in_vice(addr) {
+            return self.vice.read8(addr);
         }
-        if self.in_crime(addr) {
-            return BusRead8::ok(self.crime.read32(addr & !3).data as u8);
-        }
-        if self.in_macepci(addr) {
-            return BusRead8::ok(self.macepci.read32(addr & !3).data as u8);
-        }
-        if self.is_nic_reg(addr) {
-            let v = self.nic_read();
-            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
-            return BusRead8::ok(v);
-        }
-        if let Some(c) = self.com_for(addr) {
-            return c.read8(addr);
-        }
-        if MacePci::in_window(addr) {
-            return BusRead8::ok(self.macepci.window_read(addr, 1) as u8);
-        }
-        if self.in_ps2(addr) {
-            return BusDevice::read8(&self.ps2, addr);
-        }
-        if self.in_rtc(addr) {
-            return self.rtc.read8(addr);
-        }
-        if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusDevice::read8(&self.audio, addr);
-        }
-        if self.in_sdma(addr) {
-            let v = self.sdma_read(addr);
-            return BusRead8::ok(v as u8);
-        }
-        if MaceIsa::contains(addr) {
-            self.mace.r();
-            self.mace.hit(addr, false);
-            // The DMA ports' bits are read as they stand now, not as of the
-            // last service tick.
-            if self.sdma.any_owned() {
-                self.sdma.update_irq();
-            }
-            return BusDevice::read8(&*self.isa, addr);
-        }
-        if self.in_mace(addr) {
+        if Mace::contains(addr) {
             return self.mace.read8(addr);
         }
         bus_read!(self, addr, 1, BusRead8::ok, |v: u64| v as u8)
     }
 
     fn read16_raw(&self, addr: u32) -> BusRead16 {
-        if self.in_mec(addr) {
-            return BusDevice::read16(&*self.mec, addr);
-        }
-        if self.in_vice(addr) {
-            return self.vice.read16(addr);
+        if CrimeSpace::contains(addr) {
+            return self.crime.read16(addr);
         }
         if self.in_gbe(addr) {
             return BusRead16::ok(self.gbe.read32(addr & !3).data as u16);
         }
-        if self.in_crime_re(addr) {
-            let r = self.crime_re.read32(addr & !3);
-            return BusRead16 { status: r.status, data: r.data as u16 };
+        if self.in_vice(addr) {
+            return self.vice.read16(addr);
         }
-        if self.in_crime(addr) {
-            return BusRead16::ok(self.crime.read32(addr & !3).data as u16);
-        }
-        if self.in_macepci(addr) {
-            return BusRead16::ok(self.macepci.read32(addr & !3).data as u16);
-        }
-        if let Some(c) = self.com_for(addr) {
-            return c.read16(addr);
-        }
-        if MacePci::in_window(addr) {
-            return BusRead16::ok(self.macepci.window_read(addr, 2) as u16);
-        }
-        if self.in_ps2(addr) {
-            return BusDevice::read16(&self.ps2, addr);
-        }
-        if self.in_rtc(addr) {
-            return self.rtc.read16(addr);
-        }
-        if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusDevice::read16(&self.audio, addr);
-        }
-        if self.in_sdma(addr) {
-            let v = self.sdma_read(addr);
-            return BusRead16::ok(v as u16);
-        }
-        if MaceIsa::contains(addr) {
-            self.mace.r();
-            self.mace.hit(addr, false);
-            // The DMA ports' bits are read as they stand now, not as of the
-            // last service tick.
-            if self.sdma.any_owned() {
-                self.sdma.update_irq();
-            }
-            return BusDevice::read16(&*self.isa, addr);
-        }
-        if self.in_mace(addr) {
+        if Mace::contains(addr) {
             return self.mace.read16(addr);
         }
         bus_read!(self, addr, 2, BusRead16::ok, |v: u64| v as u16)
     }
 
     fn read32_raw(&self, addr: u32) -> BusRead32 {
-        if self.in_mec(addr) {
-            return BusDevice::read32(&*self.mec, addr);
-        }
-        if self.in_vice(addr) {
-            return self.vice.read32(addr);
+        if CrimeSpace::contains(addr) {
+            return self.crime.read32(addr);
         }
         if self.in_gbe(addr) {
             return self.gbe.read32(addr);
         }
-        if self.in_crime_re(addr) {
-            return self.crime_re.read32(addr);
+        if self.in_vice(addr) {
+            return self.vice.read32(addr);
         }
-        if self.in_crime(addr) {
-            return self.crime.read32(addr);
-        }
-        if let Some(n) = Self::audio_msc_slot(addr) {
-            let v = self.audio.msc_ust(n);
-            return BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 });
-        }
-        if self.in_ust(addr) {
-            return self.ust.read32(addr);
-        }
-        if self.in_macepci(addr) {
-            return self.macepci.read32(addr);
-        }
-        if self.is_nic_reg(addr) {
-            let v = self.nic_read();
-            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
-            return BusRead32::ok(v as u32);
-        }
-        if let Some(c) = self.com_for(addr) {
-            return c.read32(addr);
-        }
-        if MacePci::in_window(addr) {
-            return BusRead32::ok(self.macepci.window_read(addr, 4) as u32);
-        }
-        if self.in_ps2(addr) {
-            return BusDevice::read32(&self.ps2, addr);
-        }
-        if self.in_rtc(addr) {
-            return self.rtc.read32(addr);
-        }
-        if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusDevice::read32(&self.audio, addr);
-        }
-        if self.in_sdma(addr) {
-            // The registers are 64-bit; a 32-bit access is the half it names.
-            let v = self.sdma_read(addr);
-            return BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 });
-        }
-        if MaceIsa::contains(addr) {
-            self.mace.r();
-            self.mace.hit(addr, false);
-            // The DMA ports' bits are read as they stand now, not as of the
-            // last service tick.
-            if self.sdma.any_owned() {
-                self.sdma.update_irq();
-            }
-            return BusDevice::read32(&*self.isa, addr);
-        }
-        if self.in_mace(addr) {
+        if Mace::contains(addr) {
             return self.mace.read32(addr);
         }
         bus_read!(self, addr, 4, BusRead32::ok, |v: u64| v as u32)
     }
 
     fn read64_raw(&self, addr: u32) -> BusRead64 {
-        if self.in_vice(addr) {
-            return self.vice.read64(addr);
+        if CrimeSpace::contains(addr) {
+            return self.crime.read64(addr);
         }
         if self.in_gbe(addr) {
             return self.gbe.read64(addr);
         }
-        if self.in_crime_re(addr) {
-            return self.crime_re.read64(addr);
+        if self.in_vice(addr) {
+            return self.vice.read64(addr);
         }
-        if self.in_crime(addr) {
-            return self.crime.read64(addr);
-        }
-        if let Some(n) = Self::audio_msc_slot(addr) {
-            return BusRead64::ok(self.audio.msc_ust(n));
-        }
-        if self.in_ust(addr) {
-            return self.ust.read64(addr);
-        }
-        if self.in_macepci(addr) {
-            return self.macepci.read64(addr);
-        }
-        if self.is_nic_reg(addr) {
-            let v = self.nic_read();
-            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
-            return BusRead64::ok(v as u64);
-        }
-        if self.in_mec(addr) {
-            return BusDevice::read64(&*self.mec, addr);
-        }
-        if let Some(c) = self.com_for(addr) {
-            return c.read64(addr);
-        }
-        if MacePci::in_window(addr) {
-            return BusRead64::ok(self.macepci.window_read(addr, 8));
-        }
-        if self.in_ps2(addr) {
-            return BusDevice::read64(&self.ps2, addr);
-        }
-        if self.in_rtc(addr) {
-            return self.rtc.read64(addr);
-        }
-        if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusDevice::read64(&self.audio, addr);
-        }
-        if self.in_sdma(addr) {
-            let v = self.sdma_read(addr);
-            return BusRead64::ok(v);
-        }
-        if MaceIsa::contains(addr) {
-            self.mace.r();
-            self.mace.hit(addr, false);
-            // The DMA ports' bits are read as they stand now, not as of the
-            // last service tick.
-            if self.sdma.any_owned() {
-                self.sdma.update_irq();
-            }
-            return BusDevice::read64(&*self.isa, addr);
-        }
-        if self.in_mace(addr) {
+        if Mace::contains(addr) {
             return self.mace.read64(addr);
         }
-        let r = bus_read!(self, addr, 8, BusRead64::ok, |v: u64| v);
-        r
+        bus_read!(self, addr, 8, BusRead64::ok, |v: u64| v)
     }
 
     fn write8_raw(&self, addr: u32, val: u8) -> u32 {
-        if self.in_mec(addr) {
-            return BusDevice::write8(&*self.mec, addr, val);
-        }
-        if self.in_vice(addr) {
-            return self.vice.write8(addr, val);
+        if CrimeSpace::contains(addr) {
+            return self.crime.write8(addr, val);
         }
         if self.in_gbe(addr) {
             return self.gbe.write32(addr & !3, val as u32);
         }
-        if self.in_crime_re(addr) {
-            return self.crime_re.write32(addr & !3, val as u32);
+        if self.in_vice(addr) {
+            return self.vice.write8(addr, val);
         }
-        if self.in_crime(addr) {
-            let r = self.crime.write32(addr & !3, val as u32);
-            self.crime_wrote(addr);
-            return r;
-        }
-        if self.in_macepci(addr) {
-            return self.macepci.write32(addr & !3, val as u32);
-        }
-        if self.is_nic_reg(addr) {
-            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val);
-            self.nic_write(val);
-            let r = self.mace.write8(addr, val);
-            self.mace_wrote(addr);
-            return r;
-        }
-        if let Some(c) = self.com_for(addr) {
-            return c.write8(addr, val);
-        }
-        if MacePci::in_window(addr) {
-            self.macepci.window_write(addr, val as u64, 1);
-            return BUS_OK;
-        }
-        if self.in_ps2(addr) {
-            return BusDevice::write8(&self.ps2, addr, val);
-        }
-        if self.in_rtc(addr) {
-            return self.rtc.write8(addr, val);
-        }
-        if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusDevice::write8(&self.audio, addr, val);
-        }
-        if self.in_sdma(addr) {
-            // A narrow store is the low end of the register.
-            return self.sdma_write(addr, val as u64);
-        }
-        if MaceIsa::contains(addr) {
-            self.mace.w();
-            self.mace.hit(addr, true);
-            let r = BusDevice::write8(&*self.isa, addr, val);
-            self.isa_wrote(addr);
-            return r;
-        }
-        if self.in_mace(addr) {
-            let r = self.mace.write8(addr, val);
-            self.mace_wrote(addr);
-            return r;
+        if Mace::contains(addr) {
+            return self.mace.write8(addr, val);
         }
         if self.write_bytes(addr, 1, val as u64) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
 
     fn write16_raw(&self, addr: u32, val: u16) -> u32 {
-        if self.in_mec(addr) {
-            return BusDevice::write16(&*self.mec, addr, val);
-        }
-        if self.in_vice(addr) {
-            return self.vice.write16(addr, val);
+        if CrimeSpace::contains(addr) {
+            return self.crime.write16(addr, val);
         }
         if self.in_gbe(addr) {
             return self.gbe.write32(addr & !3, val as u32);
         }
-        if self.in_crime_re(addr) {
-            return self.crime_re.write32(addr & !3, val as u32);
+        if self.in_vice(addr) {
+            return self.vice.write16(addr, val);
         }
-        if self.in_crime(addr) {
-            let r = self.crime.write32(addr & !3, val as u32);
-            self.crime_wrote(addr);
-            return r;
-        }
-        if self.in_macepci(addr) {
-            return self.macepci.write32(addr & !3, val as u32);
-        }
-        if let Some(c) = self.com_for(addr) {
-            return c.write16(addr, val);
-        }
-        if MacePci::in_window(addr) {
-            self.macepci.window_write(addr, val as u64, 2);
-            return BUS_OK;
-        }
-        if self.in_ps2(addr) {
-            return BusDevice::write16(&self.ps2, addr, val);
-        }
-        if self.in_rtc(addr) {
-            return self.rtc.write16(addr, val);
-        }
-        if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusDevice::write16(&self.audio, addr, val);
-        }
-        if self.in_sdma(addr) {
-            // A narrow store is the low end of the register.
-            return self.sdma_write(addr, val as u64);
-        }
-        if MaceIsa::contains(addr) {
-            self.mace.w();
-            self.mace.hit(addr, true);
-            let r = BusDevice::write16(&*self.isa, addr, val);
-            self.isa_wrote(addr);
-            return r;
-        }
-        if self.in_mace(addr) {
-            let r = self.mace.write16(addr, val);
-            self.mace_wrote(addr);
-            return r;
+        if Mace::contains(addr) {
+            return self.mace.write16(addr, val);
         }
         if self.write_bytes(addr, 2, val as u64) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
 
     fn write32_raw(&self, addr: u32, val: u32) -> u32 {
-        if self.in_mec(addr) {
-            return BusDevice::write32(&*self.mec, addr, val);
-        }
-        if self.in_vice(addr) {
-            return self.vice.write32(addr, val);
+        if CrimeSpace::contains(addr) {
+            return self.crime.write32(addr, val);
         }
         if self.in_gbe(addr) {
             return self.gbe.write32(addr, val);
         }
-        if self.in_crime_re(addr) {
-            return self.crime_re.write32(addr, val);
+        if self.in_vice(addr) {
+            return self.vice.write32(addr, val);
         }
-        if self.in_crime(addr) {
-            let r = self.crime.write32(addr, val);
-            self.crime_wrote(addr);
-            return r;
-        }
-        if let Some(n) = Self::audio_msc_slot(addr) {
-            let v = self.audio.msc_ust(n);
-            let v = if addr & 4 == 0 { (v & 0xffff_ffff) | (val as u64) << 32 } else { (v & !0xffff_ffff) | val as u64 };
-            self.audio.set_msc_ust(n, v);
-            return BUS_OK;
-        }
-        if self.in_ust(addr) {
-            return self.ust.write32(addr, val);
-        }
-        if self.in_macepci(addr) {
-            return self.macepci.write32(addr, val);
-        }
-        if self.is_nic_reg(addr) {
-            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val as u8);
-            self.nic_write(val as u8);
-            let r = self.mace.write32(addr, val);
-            self.mace_wrote(addr);
-            return r;
-        }
-        if let Some(c) = self.com_for(addr) {
-            return c.write32(addr, val);
-        }
-        if MacePci::in_window(addr) {
-            self.macepci.window_write(addr, val as u64, 4);
-            return BUS_OK;
-        }
-        if self.in_ps2(addr) {
-            return BusDevice::write32(&self.ps2, addr, val);
-        }
-        if self.in_rtc(addr) {
-            return self.rtc.write32(addr, val);
-        }
-        if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusDevice::write32(&self.audio, addr, val);
-        }
-        if self.in_sdma(addr) {
-            // A narrow store is the low end of the register.
-            return self.sdma_write(addr, val as u64);
-        }
-        if MaceIsa::contains(addr) {
-            self.mace.w();
-            self.mace.hit(addr, true);
-            let r = BusDevice::write32(&*self.isa, addr, val);
-            self.isa_wrote(addr);
-            return r;
-        }
-        if self.in_mace(addr) {
-            let r = self.mace.write32(addr, val);
-            self.mace_wrote(addr);
-            return r;
+        if Mace::contains(addr) {
+            return self.mace.write32(addr, val);
         }
         if self.write_bytes(addr, 4, val as u64) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
 
     fn write64_raw(&self, addr: u32, val: u64) -> u32 {
-        if self.in_mec(addr) {
-            return BusDevice::write64(&*self.mec, addr, val);
-        }
-        if self.in_vice(addr) {
-            return self.vice.write64(addr, val);
+        if CrimeSpace::contains(addr) {
+            return self.crime.write64(addr, val);
         }
         if self.in_gbe(addr) {
             return self.gbe.write64(addr, val);
         }
-        if self.in_crime_re(addr) {
-            return self.crime_re.write64(addr, val);
+        if self.in_vice(addr) {
+            return self.vice.write64(addr, val);
         }
-        if self.in_crime(addr) {
-            let r = self.crime.write64(addr, val);
-            self.crime_wrote(addr);
-            return r;
-        }
-        if let Some(n) = Self::audio_msc_slot(addr) {
-            self.audio.set_msc_ust(n, val);
-            return BUS_OK;
-        }
-        if self.in_ust(addr) {
-            return self.ust.write64(addr, val);
-        }
-        if self.in_macepci(addr) {
-            return self.macepci.write64(addr, val);
-        }
-        if self.is_nic_reg(addr) {
-            self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val as u8);
-            self.nic_write(val as u8);
-            let r = self.mace.write64(addr, val);
-            self.mace_wrote(addr);
-            return r;
-        }
-        if let Some(c) = self.com_for(addr) {
-            return c.write64(addr, val);
-        }
-        if MacePci::in_window(addr) {
-            self.macepci.window_write(addr, val, 8);
-            return BUS_OK;
-        }
-        if self.in_ps2(addr) {
-            return BusDevice::write64(&self.ps2, addr, val);
-        }
-        if self.in_rtc(addr) {
-            return self.rtc.write64(addr, val);
-        }
-        if crate::dev::mace_audio::MaceAudio::contains(addr) {
-            return BusDevice::write64(&self.audio, addr, val);
-        }
-        if self.in_sdma(addr) {
-            return self.sdma_write(addr, val);
-        }
-        if MaceIsa::contains(addr) {
-            self.mace.w();
-            self.mace.hit(addr, true);
-            let r = BusDevice::write64(&*self.isa, addr, val);
-            self.isa_wrote(addr);
-            return r;
-        }
-        if self.in_mace(addr) {
-            let r = self.mace.write64(addr, val);
-            self.mace_wrote(addr);
-            return r;
+        if Mace::contains(addr) {
+            return self.mace.write64(addr, val);
         }
         if self.write_bytes(addr, 8, val) { BUS_OK } else { self.miss(addr, true); BUS_ERR }
     }
@@ -1427,10 +848,9 @@ impl Ip32Bus {
 /// other machines.
 impl Ip32Bus {
     fn devices(&self) -> Vec<&dyn crate::traits::Device> {
-        vec![
-            &*self.crime, &self.crime_re, &self.gbe, &self.macepci, &*self.ust, &self.rtc, &self.ps2,
-            &self.onewire, &self.com0, &self.com1, &self.sdma, &self.audio, &*self.mec, &*self.isa,
-        ]
+        let mut d: Vec<&dyn crate::traits::Device> = vec![&*self.crime.regs, &self.crime.re, &self.gbe];
+        d.extend(self.mace.devices());
+        d
     }
 }
 

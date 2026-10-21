@@ -397,3 +397,81 @@ impl BusDevice for Crime {
         BUS_OK
     }
 }
+
+/// CRIME as the bus sees it: its registers at 0x14000000 and its rendering
+/// engine at 0x15000000, one device that decodes which an access is for.
+/// A write to a memory bank control moves the bank in `ram` at once, since
+/// CRIME is the memory controller too.
+pub struct CrimeSpace {
+    pub regs: std::sync::Arc<Crime>,
+    pub re: crate::dev::o2gfx::CrimeRe,
+    ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>,
+}
+
+impl CrimeSpace {
+    pub fn new(regs: std::sync::Arc<Crime>, ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
+        Self { re: crate::dev::o2gfx::CrimeRe::new(ram.clone()), regs, ram }
+    }
+
+    /// Whether CRIME answers `addr`.
+    pub fn contains(addr: u32) -> bool {
+        Self::in_regs(addr) || Self::in_re(addr)
+    }
+
+    pub fn in_regs(addr: u32) -> bool {
+        (CRIME_BASE..CRIME_BASE + CRIME_SIZE).contains(&addr)
+    }
+
+    pub fn in_re(addr: u32) -> bool {
+        (CRIME_RE_BASE..CRIME_RE_BASE + CRIME_RE_SIZE).contains(&addr)
+    }
+
+    fn regs_wrote(&self, addr: u32) {
+        let off = (addr - CRIME_BASE) & !7;
+        if (crime_reg::MEM_BANK_CTRL0..crime_reg::MEM_BANK_CTRL0 + 8 * 8).contains(&off) {
+            let v = self.regs.load(off);
+            self.ram.lock().unwrap().set_ctrl(((off - crime_reg::MEM_BANK_CTRL0) / 8) as usize, v);
+        }
+    }
+}
+
+// Narrow accesses reach both as the 32-bit word they fall in: neither has a
+// byte-wide register, and the engine's busy status passes through.
+impl BusDevice for CrimeSpace {
+    fn read8(&self, addr: u32) -> crate::traits::BusRead8 {
+        let r = if Self::in_re(addr) { self.re.read32(addr & !3) } else { self.regs.read32(addr & !3) };
+        crate::traits::BusRead8 { status: r.status, data: r.data as u8 }
+    }
+    fn read16(&self, addr: u32) -> crate::traits::BusRead16 {
+        let r = if Self::in_re(addr) { self.re.read32(addr & !3) } else { self.regs.read32(addr & !3) };
+        crate::traits::BusRead16 { status: r.status, data: r.data as u16 }
+    }
+    fn read32(&self, addr: u32) -> BusRead32 {
+        if Self::in_re(addr) { self.re.read32(addr) } else { self.regs.read32(addr) }
+    }
+    fn read64(&self, addr: u32) -> BusRead64 {
+        if Self::in_re(addr) { self.re.read64(addr) } else { self.regs.read64(addr) }
+    }
+    fn write8(&self, addr: u32, val: u8) -> u32 {
+        self.write32(addr & !3, val as u32)
+    }
+    fn write16(&self, addr: u32, val: u16) -> u32 {
+        self.write32(addr & !3, val as u32)
+    }
+    fn write32(&self, addr: u32, val: u32) -> u32 {
+        if Self::in_re(addr) {
+            return self.re.write32(addr, val);
+        }
+        let r = self.regs.write32(addr, val);
+        self.regs_wrote(addr);
+        r
+    }
+    fn write64(&self, addr: u32, val: u64) -> u32 {
+        if Self::in_re(addr) {
+            return self.re.write64(addr, val);
+        }
+        let r = self.regs.write64(addr, val);
+        self.regs_wrote(addr);
+        r
+    }
+}

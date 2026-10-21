@@ -90,7 +90,7 @@ impl O2Machine {
         let mut bus = Ip32Bus::with_options(mem, prom, opts);
         // MACE audio plays through the host unless audio is off.
         if !cfg.no_audio {
-            bus.audio.enable_output(cfg.audio.clone());
+            bus.mace.audio.enable_output(cfg.audio.clone());
         }
         if o2.graphics {
             bus.enable_graphics_with_mouse(o2.mouse);
@@ -125,13 +125,13 @@ impl O2Machine {
                     Err(e) => eprintln!("iris: O2 serial log {path}: {e}"),
                 }
             }
-            bus.com0.set_backend(backend);
+            bus.mace.com0.set_backend(backend);
         }
         if o2.net {
             let mut net = crate::net::GatewayConfig::default();
             net.port_forwards = o2.forwards.clone();
             eprintln!("iris: O2 Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
-            bus.mec.start_nat(net);
+            bus.mace.mec.start_nat(net);
         }
 
         let timer_manager = Arc::new(TimerManager::new());
@@ -194,13 +194,13 @@ impl O2Machine {
         }
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
-        bus.ust.use_host_clock();
+        bus.mace.ust.use_host_clock();
         bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
 
         bus.gbe.use_cpu_clock(cpu.cycles_ptr(), o2.cpu_mhz);
         // CRIME's rendering engine draws on its own thread, fed through
         // its interface buffer.
-        bus.crime_re.start(bus.clone(), |b: &Ip32Bus| &b.crime_re);
+        bus.crime.re.start(bus.clone(), |b: &Ip32Bus| &b.crime.re);
         let running = Arc::new(AtomicBool::new(false));
         let display = Arc::new(O2Display::new(bus.clone(), cpu.cycles_ptr(), cpu.fasttick_count(), running.clone()));
         if let Some(port) = o2.control_port {
@@ -345,7 +345,7 @@ impl O2Machine {
             // Frames from the network, and any line that changed without a
             // register access (a disk finishing, a key from the window).
             bus.service();
-            if bus.rtc.powered_off() {
+            if bus.mace.rtc.powered_off() {
                 eprintln!("iris: the O2 switched itself off");
                 dev.stop();
                 bus.save_flash();
@@ -367,7 +367,7 @@ impl O2Machine {
     }
 
     pub fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> {
-        match self.bus.ps2.devices() {
+        match self.bus.mace.ps2.devices() {
             Some(d) => d.clone(),
             // Serial console: a keyboard nothing reads.
             None => Arc::new(crate::dev::ps2::Ps2Controller::new(None)),
@@ -581,7 +581,7 @@ fn control_server(listener: std::net::TcpListener, bus: Arc<Ip32Bus>) {
 }
 
 fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> String {
-    let kb = bus.ps2.devices();
+    let kb = bus.mace.ps2.devices();
     match cmd {
         "shot" => match bus.render_screen(rgba) {
             Some((w, h)) => match crate::ip32_screen::save_png(arg, &rgba[..(w * h * 4) as usize], w, h) {
@@ -598,8 +598,8 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
         // `crimelog PATH`: the guest's recent CRIME interrupt-register
         // accesses, oldest first.
         "nictrace" => {
-            let mut t = bus.nic_trace.text();
-            for l in bus.onewire.protocol_log() {
+            let mut t = bus.mace.nic_trace.text();
+            for l in bus.mace.onewire.protocol_log() {
                 t.push_str(&format!("# {l}\n"));
             }
             match std::fs::write(arg.trim(), t) {
@@ -607,7 +607,7 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
                 Err(e) => format!("err {e}"),
             }
         }
-        "crimelog" => match std::fs::write(arg.trim(), bus.crime.irqlog_text()) {
+        "crimelog" => match std::fs::write(arg.trim(), bus.crime.regs.irqlog_text()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),
         },
@@ -663,7 +663,7 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
         }
         // `ps2log PATH`: the PS/2 ports' recent traffic, `1>f4` a byte to
         // port 1's device, `1<fa` one from it.
-        "ps2log" => match std::fs::write(arg, bus.ps2.traffic_timed()) {
+        "ps2log" => match std::fs::write(arg, bus.mace.ps2.traffic_timed()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),
         },
@@ -671,7 +671,7 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),
         },
-        "retrace" => match std::fs::write(arg, bus.crime_re.trace_text()) {
+        "retrace" => match std::fs::write(arg, bus.crime.re.trace_text()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),
         },

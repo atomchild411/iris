@@ -7,6 +7,7 @@ pub mod o2gfx;
 pub mod gl;
 pub mod gr2;
 pub mod mec;
+pub mod mace;
 pub mod mace_audio;
 pub mod mace_isa;
 pub mod crime;
