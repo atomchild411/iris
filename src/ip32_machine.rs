@@ -8,11 +8,12 @@
 //! - a service thread keeps the devices' interrupts current in CRIME and
 //!   CRIME's in the CPU's IP2, runs the MACE clock from the host clock, and
 //!   ends the run when the guest switches the machine off;
-//! - a batch hook on the CPU thread switches tcache with where the guest is
-//!   running: the cache holds data until POST has finished (the PROM keeps
-//!   its stack in it while it tests memory), and again whenever the guest is
-//!   back inside the PROM, which sets the caches up the same way to power
-//!   off.
+//! - a batch hook on the CPU thread switches the cache with where the guest
+//!   is running: the cache holds data until POST has finished (the PROM
+//!   keeps its stack in it while it tests memory), and again whenever the
+//!   guest is back inside the PROM, which sets the caches up the same way to
+//!   power off. The R10000 hands over from its full model to IP28's shadow
+//!   model and back ([`HandoverCache`]); the R5000 turns tcache off and on.
 //!
 //! The screen is GBE scanned out of RAM by [`O2Display`], presented through
 //! the same renderer the other machines use; keys from the window go to the

@@ -49,11 +49,11 @@ pub struct HandoverCache {
 
 impl From<Arc<dyn BusDevice>> for HandoverCache {
     fn from(bus: Arc<dyn BusDevice>) -> Self {
-        Self {
-            full: R10000O2Cache::from(bus.clone()),
-            shadow: R10000O2ShadowCache::from(bus),
-            on_shadow: AtomicBool::new(false),
-        }
+        let full = R10000O2Cache::from(bus.clone());
+        // The full model only ever runs the PROM, which keeps its stack in
+        // the cache with nothing behind it, so it is never transparent.
+        full.set_tcache_live(false);
+        Self { full, shadow: R10000O2ShadowCache::from(bus), on_shadow: AtomicBool::new(false) }
     }
 }
 
@@ -268,9 +268,12 @@ impl MipsCache for HandoverCache {
     fn jit_dc_lru_ptr(&self) -> *mut u8 {
         live!(self, c => c.jit_dc_lru_ptr())
     }
-    fn set_tcache_live(&self, on: bool) {
-        self.full.set_tcache_live(on)
-    }
+    /// The handover is the switch: the full model holds data for the PROM,
+    /// the shadow model is transparent for the kernel. Passing the machine's
+    /// firmware-entry switch on as well wrote every line back twice at kernel
+    /// entry and cleared and rewrote the idle full model on every firmware
+    /// callback.
+    fn set_tcache_live(&self, _on: bool) {}
     fn jit_dc_geometry(&self) -> JitDcGeometry {
         live!(self, c => c.jit_dc_geometry())
     }
