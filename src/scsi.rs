@@ -158,8 +158,8 @@ pub enum DeviceKind {
 /// What a target reports of itself in INQUIRY: vendor, product and
 /// revision. The command set is the same on every machine; who a machine
 /// says its drives are is its own (the Indy's Sony CD-ROM is in
-/// `wd33c93a`), so each controller passes its identity when it attaches a
-/// device.
+/// `wd33c93a`, the O2's identity in `aic7880`), so each controller passes
+/// its identity when it attaches a device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScsiIdentity {
     pub vendor: [u8; 8],
@@ -640,6 +640,24 @@ impl ScsiDevice {
     }
 
     /// (physical_block_size, logical_block_size)
+    /// Capacity of the loaded medium, in bytes (0 with none).
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Set the logical block size, as a controller does for its own
+    /// convention after a bus reset (the O2's: an SGI CD-ROM in 512-byte
+    /// blocks).
+    pub fn set_logical_block_size(&mut self, n: u64) {
+        self.logical_block_size = n;
+    }
+
+    /// The logical block size a device powers up with: 2048 for a CD-ROM,
+    /// 512 for a disk.
+    pub fn power_on_block_size(&mut self) {
+        self.logical_block_size = if self.is_cdrom() { 2048 } else { 512 };
+    }
+
     pub fn block_sizes(&self) -> (u64, u64) {
         (self.phys_block_size, self.logical_block_size)
     }
