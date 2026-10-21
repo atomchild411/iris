@@ -797,13 +797,12 @@ impl Texture {
         let (w, h) = ((self.w >> level).max(1), (self.h >> level).max(1));
         let wrap = |c: i64, n: u32, rep: bool| if rep { c.rem_euclid(n as i64) as u32 } else { c.clamp(0, n as i64 - 1) as u32 };
         let (u, v) = (wrap(u, w, self.repeat_s), wrap(v, h, self.repeat_t));
-        // A map smaller than 64 x 64 sits where its size's level of a full
-        // pyramid would, part way into its tile: the base is the map's tile,
-        // the offset its size's (a 32 x 32 map at 0x8000 of entry 93, as
-        // IRIX loads it). Read from offset 0, every map under 64 x 64 drew
-        // black.
-        let start = if level == 0 {
-            (self.base as u64) << 16 | (mip_level_addr(self.map_level) & 0xffff)
+        // A map of 64 x 64 or less sits where its size's level of a full
+        // pyramid would, entry and offset (a 32 x 32 map at 0x8000 of entry
+        // 93, as IRIX loads it), whichever of the two entries are valid.
+        // Larger maps start at their first valid entry.
+        let start = if level == 0 && self.map_level < 4 {
+            (self.base as u64) << 16
         } else {
             mip_level_addr(self.map_level + level)
         };
@@ -2912,6 +2911,46 @@ mod tests {
         assert_eq!(px(&ram), &[0, 255, 0]);
         tri(16);
         assert_eq!(px(&ram), &[0, 0, 255]);
+    }
+
+    /// With texture entries 92 and 93 both valid, a 32 x 32 map is still
+    /// read from 0x8000 into 93, its size's place, not from the first valid
+    /// entry: Quake 3's 32 x 32 HUD digits were missing.
+    #[test]
+    fn a_small_map_is_found_whichever_entries_are_valid() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = TestRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        re.write64(base + TLB_TEX + 8 * 23, (0x8060u64 << 48) | (0x8061u64 << 32));
+        {
+            let mut m = ram.lock().unwrap();
+            for y in 0..32 {
+                for x in 0..32 {
+                    m.write((0x61 << 16) + 0x8000 + subtile_offset(x * 4, y) as usize, &[30, 160, 90, 255]);
+                }
+            }
+        }
+        // Tiled, RGBA, 32-bit, level 5 of a full pyramid, NEAREST, REPLACE.
+        re.write32(base + TEX_MODE, 0x0129_5417);
+        re.write64(base + TEX_FORMAT, 0x0000_5555_01ff_01ff);
+        re.write32(base + BUFMODE_DST, 0x220);
+        re.write32(base + PRIMITIVE, 0x0200_0000);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        re.write32(base + DRAWMODE, 0x0040_8078);
+        re.write64(base + TRI_V0, (gl(0) as u64) << 32 | gl(0) as u64);
+        re.write64(base + TRI_V0 + 8, (gl(32) as u64) << 32 | gl(0) as u64);
+        re.write64(base + TRI_V0 + 16, (gl(0) as u64) << 32 | gl(32) as u64);
+        re.write64(base + TEX_SQ0, 16384);
+        re.write64(base + TEX_TQ0, 16384);
+        re.write32(base + TEX_Q0, 1);
+        re.write64(base + TEX_DSQDX, 512);
+        re.write64(base + TEX_DSQDY, 0);
+        re.write64(base + TEX_DTQDX, 0);
+        re.write64(base + TEX_DTQDY, 512);
+        re.write32(base + TEX_DQDX, 0);
+        re.write32(base + (TEX_DQDY | 0x800), 0);
+        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000 + 512 + 4, 3), &[30, 160, 90]);
     }
 
     /// A map smaller than 64 x 64 without mip levels is read from where its
