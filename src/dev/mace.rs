@@ -250,10 +250,13 @@ impl Mace {
         self.onewire.master_drive(self.ust.guest_us(), low);
     }
 
-    /// The NIC register, with the 1-Wire line as it stands now.
+    /// The NIC register, with the 1-Wire line as it stands now. A read does
+    /// not hold the guest clock (only the master driving the line does):
+    /// IRIX reads this register about a hundred times a second for its
+    /// other bits, and each read holding the clock for 5 ms ran UST at half
+    /// speed.
     fn nic_read(&self) -> u8 {
         let mut v = self.regs.cell(MACE_ISA_FLASH_NIC_REG) as u8;
-        self.ust.onewire_busy();
         if self.onewire.line_level(self.ust.guest_us()) {
             v |= nic_bit::DATA;
         } else {
