@@ -3499,6 +3499,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    // 44 implemented virtual address bits on the R10000, as the shadow
+    // model already says; XContext's layout follows them.
+    const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
     const NAME: &'static str = match MODEL {
         model::R5000 => "R5000",
         model::R10000 => "R10000",
@@ -5318,6 +5321,16 @@ mod tests {
         for (i, &(_, pa)) in cases.iter().enumerate() {
             assert_eq!(mem_read(&mem, pa), 0xa5a5_0000 + i as u32, "line at {pa:#x} not flushed");
         }
+    }
+
+    /// The R10000 implements 44 virtual address bits; XContext's fields are
+    /// laid out around them, so the full model must say so too.
+    #[test]
+    fn the_r10000_full_model_has_44_va_bits() {
+        assert_eq!(<R10000Cache as CpuModel>::VA_BITS, 44);
+        assert_eq!(<crate::cpu::mips_cache_shadow::R10000ShadowCache as CpuModel>::VA_BITS, 44);
+        assert_eq!(<R4400Cache as CpuModel>::VA_BITS, 40);
+        assert_eq!(<R5000Cache as CpuModel>::VA_BITS, 40);
     }
 
     fn flush_l2_to_mem(cache: &R4400Cache, phys: u32) {
