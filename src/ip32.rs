@@ -1427,7 +1427,7 @@ impl Ip32Bus {
     fn devices(&self) -> Vec<&dyn crate::traits::Device> {
         vec![
             &*self.crime, &self.crime_re, &self.gbe, &self.macepci, &*self.ust, &self.rtc, &self.ps2,
-            &self.onewire, &self.com0, &self.com1, &self.sdma, &self.audio, &*self.mec,
+            &self.onewire, &self.com0, &self.com1, &self.sdma, &self.audio, &*self.mec, &*self.isa,
         ]
     }
 }
