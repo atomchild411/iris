@@ -17,7 +17,7 @@
 //! - Interrupts are the low byte of the ISA interrupt status (status word,
 //!   volume, then threshold and error for each channel), on CRIME line 6.
 //! - Each channel counts sample pairs (MSC) and stamps UST, in the UST
-//!   block at 0x20 + 8 n.
+//!   block at 0x20 + 8 n: MSC in bits 63:32, UST in 31:0.
 //!
 //! The codec is modelled from the AD1843's register layout (the field map
 //! Linux's sgio2audio driver also uses): it reports itself initialised and
@@ -428,17 +428,21 @@ impl MaceAudio {
         }
     }
 
-    /// The channel MSC/UST pairs in MACE's UST block (offset 0x20 + 8 n:
-    /// UST in the high word, MSC in the low).
+    /// The channel MSC/UST pairs in MACE's UST block (offset 0x20 + 8 n):
+    /// MSC in the high word, UST in the low, as the spec's MSC/UST figure
+    /// draws it and IRIX's audio library reads it. (Its timer chapter's
+    /// table lists the two words the other way round; read that way,
+    /// alGetFrameTime ran 17 times fast and amesh drew the same samples
+    /// over and over.)
     pub fn msc_ust(&self, n: usize) -> u64 {
         let c = &self.st.lock().ch[n];
-        (c.ust as u64) << 32 | c.msc as u64
+        (c.msc as u64) << 32 | c.ust as u64
     }
 
     pub fn set_msc_ust(&self, n: usize, val: u64) {
         let c = &mut self.st.lock().ch[n];
-        c.ust = (val >> 32) as u32;
-        c.msc = val as u32;
+        c.msc = (val >> 32) as u32;
+        c.ust = val as u32;
     }
 
     /// The low byte of the ISA interrupt status.
@@ -815,6 +819,6 @@ mod tests {
         assert_eq!(a.read(MACE_AUDIO + 0x58) as u32, 0x800u32.wrapping_sub(rp) & PTR_MASK);
         assert_ne!(a.isa_bits() & 0x10, 0, "below half now");
         let mu = a.msc_ust(1);
-        assert!(mu as u32 > 0 && (mu >> 32) as u32 == 7, "MSC counts, UST stamped");
+        assert!((mu >> 32) as u32 > 0 && mu as u32 == 7, "MSC counts in the high word, UST stamped in the low");
     }
 }
