@@ -1398,17 +1398,6 @@ pub type R10000Cache = CpuCache<32768, 64, 1, 512,
                                 32768, 32, 1, 1024, 4096,
                                 1048576, 128, 8192, 131072, 262144, true,
                                 true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
-/// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
-///
-/// The O2 PROM (4.18 and earlier) handles only that line size. With Config's
-/// SB bit set (128-byte lines, as on an IP28) its sizing code keeps the
-/// secondary cache's *size* as the line size, then aligns every DMA buffer to
-/// 1 MB, runs out of heap, and panics on the first SCSI command. So O2 R10000
-/// modules have SB clear, and so does this model.
-pub type R10000O2Cache = CpuCache<32768, 64, 1, 512,
-                                  32768, 32, 1, 1024, 4096,
-                                  1048576, 64, 16384, 131072, 262144, true,
-                                  true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
@@ -5478,7 +5467,7 @@ mod tests {
                 assert_eq!(read(kseg0(pa), pa), 0x0bad_f00d, "{name}");
             }
         };
-        let r10k: R10000O2Cache = make_cache_of(mem.clone());
+        let r10k: R10000Cache = make_cache_of(mem.clone());
         check("R10000", &|on| r10k.set_tcache_live(on),
             &|va, v| { let _ = r10k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r10k.read::<4>(va, pa as u64).data as u32);

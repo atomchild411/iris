@@ -16,12 +16,30 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::cpu::mips_cache_shadow::R10000O2ShadowCache;
+use crate::cpu::mips_cache_shadow::ShadowCache;
 use crate::cpu::mips_cache_v2::{
-    CpuModel, FetchInstrResult, JitDcGeometry, MipsCache, R10000O2Cache,
+    model, CpuCache, CpuModel, FetchInstrResult, JitDcGeometry, MipsCache,
 };
 use crate::cpu::mips_isa::{CACH_PD, CACH_PI, CACH_SD, C_IINV, C_IWBINV};
 use crate::traits::{BusDevice, BusRead64};
+
+/// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
+///
+/// The O2 PROM (4.18 and earlier) handles only that line size. With Config's
+/// SB bit set (128-byte lines, as on an IP28) its sizing code keeps the
+/// secondary cache's *size* as the line size, then aligns every DMA buffer to
+/// 1 MB, runs out of heap, and panics on the first SCSI command. So O2 R10000
+/// modules have SB clear, and so does this model.
+pub type R10000O2Cache = CpuCache<32768, 64, 1, 512,
+                                  32768, 32, 1, 1024, 4096,
+                                  1048576, 64, 16384, 131072, 262144, true,
+                                  true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
+
+/// The IP28 shadow with the same 64-byte secondary lines. Not usable from
+/// reset on its own (see the module notes), so [`HandoverCache`] switches to
+/// it once a kernel starts.
+pub type R10000O2ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 1048576, 64, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
 pub struct HandoverCache {
     full: R10000O2Cache,
@@ -253,5 +271,28 @@ impl MipsCache for HandoverCache {
     }
     fn jit_dc_geometry(&self) -> JitDcGeometry {
         live!(self, c => c.jit_dc_geometry())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shadow stands in for the full model once the kernel runs, so
+    /// everything software can read must be the full model's: the geometry
+    /// CP0 Config reports (64-byte secondary lines, the one size the O2 PROM
+    /// handles), PRId/FIR, ISA level and TLB size.
+    #[test]
+    fn the_o2_shadow_matches_the_o2_full_model() {
+        type S = R10000O2ShadowCache;
+        type F = R10000O2Cache;
+        assert_eq!((S::IC_SIZE, S::IC_LINE, S::DC_SIZE, S::DC_LINE, S::L2_SIZE, S::L2_LINE),
+                   (F::IC_SIZE, F::IC_LINE, F::DC_SIZE, F::DC_LINE, F::L2_SIZE, F::L2_LINE), "geometry");
+        assert_eq!(<F as MipsCache>::L2_LINE, 64);
+        assert_eq!((<S as CpuModel>::PRID, <S as CpuModel>::FIR, <S as CpuModel>::MIPS4,
+                    <S as CpuModel>::TLB_ENTRIES, <S as CpuModel>::VA_BITS, <S as CpuModel>::R10K_CACHE_OPS),
+                   (<F as CpuModel>::PRID, <F as CpuModel>::FIR, <F as CpuModel>::MIPS4,
+                    <F as CpuModel>::TLB_ENTRIES, <F as CpuModel>::VA_BITS, <F as CpuModel>::R10K_CACHE_OPS),
+                   "identity");
     }
 }

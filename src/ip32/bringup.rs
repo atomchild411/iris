@@ -151,7 +151,7 @@ fn trace_the_prom_from_reset_inner() {
                 eprintln!("ip32: the kernel started at step {steps}; caches written back, now on the shadow cache");
             })
         }
-        "r10000" | "r10k" => run_the_prom_from_reset::<crate::cpu::mips_cache_v2::R10000O2Cache>("R10000", |_, _| {}),
+        "r10000" | "r10k" => run_the_prom_from_reset::<crate::ip32_handover::R10000O2Cache>("R10000", |_, _| {}),
         _ => run_the_prom_from_reset::<R5000Cache>("R5000", |_, _| {}),
     }
 }
