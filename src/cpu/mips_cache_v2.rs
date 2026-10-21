@@ -4185,9 +4185,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 let tag_lo = phys_addr as u32;  // R4000-family tags are 32-bit
 
                 if is_l2 {
-                    if MODEL == model::R10000 {
-                        eprintln!("ip28: C_IST(SD) idx={idx:#x} taglo={tag_lo:#010x} phys={phys_addr:#018x}");
-                    }
                     // L2 TagLo format:  [31:13] ptag   [12:10] state   [9:7] PIdx
                     let ptag = (tag_lo >> 13) & L2_PTAG_MASK;
                     let state = (tag_lo >> 10) & 0x7;
