@@ -2596,22 +2596,6 @@ pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd:
     }
     core.cp0_cause = cause;
 
-    // IRIS_TRAP_LOG: user-mode address and bus errors (exception codes 4-7),
-    // the first 200, as they happen. A program dying of SIGBUS shows no
-    // trace of where otherwise.
-    if !was_exl && (4..=7).contains(&((status & CAUSE_EXCCODE_MASK) >> 2)) && core.cp0_status & 0x18 == 0x10 {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if *ON.get_or_init(|| std::env::var_os("IRIS_TRAP_LOG").is_some())
-            && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200
-        {
-            eprintln!(
-                "trap: user exc {} epc {:#x} badvaddr {:#x} bd {bd} ra {:#x} sp {:#x}",
-                (status & CAUSE_EXCCODE_MASK) >> 2, core.cp0_epc, core.cp0_badvaddr, core.gpr[31], core.gpr[29]
-            );
-        }
-    }
-
     core.cp0_status |= STATUS_EXL;
 
     let bev = (core.cp0_status & STATUS_BEV) != 0;

@@ -1853,8 +1853,8 @@ was wrong, and what it turned out to be:
   so a real O2 should flash the same way (unconfirmed).
 - **Quake 3** dies of SIGBUS in its RoQ cinematic: `move4_32` copies with
   `ldc1` from a 4-byte-aligned buffer. That is an address error on real
-  hardware too, so it is a port bug, not the emulator. `IRIS_TRAP_LOG`
-  found it.
+  hardware too, so it is a port bug, not the emulator. A user-fault trap
+  log in the CPU core found it (a bring-up aid, since removed).
 - **Quake 2's sound** ran dry about 45 times a second for a moment each.
   `sfplay` of a steady file at 11025 Hz ran dry 6 times in 18 s, so the
   audio path holds. Quake 2 under emulation does not keep the port fed,
