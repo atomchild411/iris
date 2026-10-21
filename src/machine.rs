@@ -553,15 +553,8 @@ impl Machine {
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
-            let ioc_clone = ioc.clone();
-            r.set_vblank_callback(Arc::new(move |active| {
-                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
-                ioc_clone.set_interrupt(wiring.retrace, active);
-            }));
-            let ioc_ff = ioc.clone();
-            r.set_fifo_full_callback(Arc::new(move |active| {
-                ioc_ff.set_interrupt(wiring.fifo_full, active);
-            }));
+            r.set_vblank_irq(ioc.irq_line(wiring.retrace));
+            r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
             Some(r)
         };
 
@@ -570,15 +563,8 @@ impl Machine {
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
-            let ioc_clone = ioc.clone();
-            r.set_vblank_callback(Arc::new(move |active| {
-                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
-                ioc_clone.set_interrupt(wiring.retrace, active);
-            }));
-            let ioc_ff = ioc.clone();
-            r.set_fifo_full_callback(Arc::new(move |active| {
-                ioc_ff.set_interrupt(wiring.fifo_full, active);
-            }));
+            r.set_vblank_irq(ioc.irq_line(wiring.retrace));
+            r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
             Some(r)
         };
 

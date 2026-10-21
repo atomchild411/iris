@@ -1354,11 +1354,11 @@ pub struct Rex3 {
     fb_dirty: AtomicBool,
     pub screen: Arc<Mutex<Rex3Screen>>,
     /// Drives the real REX3 `VV_INT_N` pin (vertical retrace / Kaleidoscope).
-    pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    pub vblank_cb: Mutex<Option<crate::irq::IrqLine>>,
     /// Drives the real REX3 `FIFO_INT_N` pin (GFIFO/BFIFO above/below
     /// interrupt — one physical pin for both directions, selected by
     /// `CONFIG_GFIFOABOVEINT`; see `update_gfifo_irqs`).
-    pub fifo_full_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    pub fifo_full_cb: Mutex<Option<crate::irq::IrqLine>>,
     /// Perfetto edge trackers: guest sees GFXBUSY, CPU stalled on a full
     /// GFIFO, GFIFO level as STATUS reports it.
     pf_wait: crate::PfLevel,
@@ -1671,12 +1671,14 @@ impl Rex3 {
     pub const DIAG_LOOP_DRAW_BLOCK:   u64 = 1 << 24;
     pub const DIAG_LOOP_EXECUTE_GO:   u64 = 1 << 25;
 
-    pub fn set_vblank_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
-        *self.vblank_cb.lock() = Some(cb);
+    /// Wire `VV_INT_N` (vertical retrace) to `irq`.
+    pub fn set_vblank_irq(&self, irq: crate::irq::IrqLine) {
+        *self.vblank_cb.lock() = Some(irq);
     }
 
-    pub fn set_fifo_full_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
-        *self.fifo_full_cb.lock() = Some(cb);
+    /// Wire `FIFO_INT_N` to `irq`.
+    pub fn set_fifo_full_irq(&self, irq: crate::irq::IrqLine) {
+        *self.fifo_full_cb.lock() = Some(irq);
     }
 
     /// Program VC2 with a host-side Newport timing preset (see `[graphics] resolution`).
@@ -1732,8 +1734,8 @@ impl Rex3 {
             self.config.status.fetch_and(!STATUS_GFIFO_INT, Ordering::Relaxed);
         }
 
-        if let Some(cb) = self.fifo_full_cb.lock().clone() {
-            cb(crossed);
+        if let Some(irq) = self.fifo_full_cb.lock().clone() {
+            irq.set(crossed);
         }
     }
 
@@ -3109,9 +3111,12 @@ impl Rex3 {
                 }
                 {
                     self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                    let cb = self.vblank_cb.lock().clone();
+                    let irq = self.vblank_cb.lock().clone();
                     self.diag.fetch_and(!Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                    if let Some(cb) = cb { cb(true); }
+                    if let Some(irq) = irq {
+                        crate::pf_instant!(crate::perfetto::events::REX3_VBLANK);
+                        irq.set(true);
+                    }
                 }
 
                 // Present: compositor → overlay → status bar → swap
@@ -3169,9 +3174,12 @@ impl Rex3 {
                 }
                 {
                     self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                    let cb = self.vblank_cb.lock().clone();
+                    let irq = self.vblank_cb.lock().clone();
                     self.diag.fetch_and(!Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                    if let Some(cb) = cb { cb(true); }
+                    if let Some(irq) = irq {
+                        crate::pf_instant!(crate::perfetto::events::REX3_VBLANK);
+                        irq.set(true);
+                    }
                 }
             }
 
@@ -4138,13 +4146,13 @@ impl Rex3 {
                 if reg_offset == REX3_STATUS {
                     let had_vrint = self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed) & STATUS_VRINT != 0;
                     if had_vrint {
-                        let cb = self.vblank_cb.lock().clone();
-                        if let Some(cb) = cb { cb(false); }
+                        let irq = self.vblank_cb.lock().clone();
+                        if let Some(irq) = irq { irq.set(false); }
                     }
                     let had_gfifo = self.config.status.fetch_and(!STATUS_GFIFO_INT, Ordering::Relaxed) & STATUS_GFIFO_INT != 0;
                     if had_gfifo {
-                        let cb = self.fifo_full_cb.lock().clone();
-                        if let Some(cb) = cb { cb(false); }
+                        let irq = self.fifo_full_cb.lock().clone();
+                        if let Some(irq) = irq { irq.set(false); }
                     }
                     let dcb = self.dcb.lock();
                     if let Some(until) = dcb.backbusy_until {
