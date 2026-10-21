@@ -797,7 +797,16 @@ impl Texture {
         let (w, h) = ((self.w >> level).max(1), (self.h >> level).max(1));
         let wrap = |c: i64, n: u32, rep: bool| if rep { c.rem_euclid(n as i64) as u32 } else { c.clamp(0, n as i64 - 1) as u32 };
         let (u, v) = (wrap(u, w, self.repeat_s), wrap(v, h, self.repeat_t));
-        let start = if level == 0 { (self.base as u64) << 16 } else { mip_level_addr(self.map_level + level) };
+        // A map smaller than 64 x 64 sits where its size's level of a full
+        // pyramid would, part way into its tile: the base is the map's tile,
+        // the offset its size's (a 32 x 32 map at 0x8000 of entry 93, as
+        // IRIX loads it). Read from offset 0, every map under 64 x 64 drew
+        // black.
+        let start = if level == 0 {
+            (self.base as u64) << 16 | (mip_level_addr(self.map_level) & 0xffff)
+        } else {
+            mip_level_addr(self.map_level + level)
+        };
         // Grid rows are 4 entries for 256 and 512 (Quake 2's 256 maps);
         // 1024 would need 8 (64 entries for 8 rows of tiles): unconfirmed.
         let stride = if self.map_level + level == 0 { 8 } else { 4 };
@@ -2903,6 +2912,47 @@ mod tests {
         assert_eq!(px(&ram), &[0, 255, 0]);
         tri(16);
         assert_eq!(px(&ram), &[0, 0, 255]);
+    }
+
+    /// A map smaller than 64 x 64 without mip levels is read from where its
+    /// size's level sits in its tile, not from the tile's start: a 16 x 16
+    /// RGBA8 map in entry 92 at 0xc000, with the registers IRIX's GL wrote
+    /// for one (textest, 2026-10-21). Read from offset 0, it drew black.
+    #[test]
+    fn a_small_map_is_read_from_its_place_in_the_tile() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = TestRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        re.write64(base + TLB_TEX + 8 * 23, 0x8060u64 << 48);
+        {
+            let mut m = ram.lock().unwrap();
+            for y in 0..16 {
+                for x in 0..16 {
+                    m.write((0x60 << 16) + 0xc000 + subtile_offset(x * 4, y) as usize, &[200, 100, 50, 255]);
+                }
+            }
+        }
+        // Tiled, RGBA, 32-bit, level 6 of a full pyramid, NEAREST, REPLACE.
+        re.write32(base + TEX_MODE, 0x0129_9017);
+        re.write64(base + TEX_FORMAT, 0x0000_6644_00ff_00ff);
+        re.write32(base + BUFMODE_DST, 0x220);
+        re.write32(base + PRIMITIVE, 0x0200_0000);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        re.write32(base + DRAWMODE, 0x0040_8078);
+        re.write64(base + TRI_V0, (gl(0) as u64) << 32 | gl(0) as u64);
+        re.write64(base + TRI_V0 + 8, (gl(16) as u64) << 32 | gl(0) as u64);
+        re.write64(base + TRI_V0 + 16, (gl(0) as u64) << 32 | gl(16) as u64);
+        re.write64(base + TEX_SQ0, 16384);
+        re.write64(base + TEX_TQ0, 16384);
+        re.write32(base + TEX_Q0, 1);
+        re.write64(base + TEX_DSQDX, 1024);
+        re.write64(base + TEX_DSQDY, 0);
+        re.write64(base + TEX_DTQDX, 0);
+        re.write64(base + TEX_DTQDY, 1024);
+        re.write32(base + TEX_DQDX, 0);
+        re.write32(base + (TEX_DQDY | 0x800), 0);
+        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000 + 512 + 4, 3), &[200, 100, 50]);
     }
 
     /// Ordered dithering to 5 bits: exact steps stay exact, and a value
