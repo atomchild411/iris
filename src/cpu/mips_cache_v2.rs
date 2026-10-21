@@ -1375,6 +1375,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     // Model discriminator: folds to a literal, so it replaces #[cfg(feature = "r5k")].
     // Keyed on MODEL, not on associativity — see `mod model`.
     const IS_R5K: bool = MODEL == model::R5000;
+    /// Virtual coherency exceptions (VCEI/VCED) are an R4000/R4400 feature. The
+    /// R5000 dropped the secondary-index check altogether; the R10000 keeps the
+    /// index in its secondary tags but resolves a mismatch in hardware.
+    const HAS_VCE: bool = MODEL == model::R4400;
 
     /// IP28 bring-up watch: physical window to trace, from IRIS_IP28_WATCH.
     /// Folds to a constant `None` on every model but the R10000, so the
@@ -2018,6 +2022,46 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         self.l2.set_tag(idx, L2Tag::default());
     }
 
+    /// R10000: a secondary hit under a different virtual index than the line
+    /// was last used under. Where an R4400 raises a virtual coherency
+    /// exception, the R10000 writes back and drops the primary copies made
+    /// under the old index, records the new one, and carries on. Without
+    /// this, an R10000 kernel that never expects VCE (OpenBSD) dies on the
+    /// first page it maps at two colours.
+    fn realias_l2_line(&self, l2_idx: usize, new_pidx: u32) {
+        let l2_tag: L2Tag = self.l2.get_tag(l2_idx);
+        let phys_base = l2_tag_to_phys(l2_tag, (l2_idx << Self::L2_LINE_SHIFT) as u64);
+        let old = l2_tag.pidx();
+
+        let l1i_lines_per_l2 = 1 << (Self::L2_LINE_SHIFT - Self::IC_LINE_SHIFT);
+        let ic_base_idx = self.l2_idx_to_l1_base_idx(l2_idx, old, &self.ic);
+        for i in 0..l1i_lines_per_l2 {
+            let ic_idx = (ic_base_idx + i) & Self::IC_NUM_LINES_MASK;
+            let phys_addr = phys_base + ((i as u64) << Self::IC_LINE_SHIFT);
+            let ic_tag: L1ITag = self.ic.get_tag(ic_idx);
+            if ic_tag.matches_phys(phys_addr) {
+                self.invalidate_l1i_line(ic_idx, false);
+            }
+        }
+
+        let l1d_lines_per_l2 = 1 << (Self::L2_LINE_SHIFT - Self::DC_LINE_SHIFT);
+        let dc_base_idx = self.l2_idx_to_l1_base_idx(l2_idx, old, &self.dc);
+        for i in 0..l1d_lines_per_l2 {
+            let dc_idx = (dc_base_idx + i) & Self::DC_NUM_LINES_MASK;
+            let phys_addr = phys_base + ((i as u64) << Self::DC_LINE_SHIFT);
+            let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
+            if dc_tag.matches_line(phys_addr) {
+                self.writeback_l1d_line(dc_idx, false);
+                self.invalidate_l1d_line(dc_idx, false, false);
+            }
+        }
+
+        // Re-read: the writebacks above may have changed the line's state.
+        let mut t: L2Tag = self.l2.get_tag(l2_idx);
+        t.set_pidx(new_pidx);
+        self.l2.set_tag(l2_idx, t);
+    }
+
     /// Invalidate L2 line by physical address, if present and tag matches.
     fn invalidate_l2_line_phys(&self, phys_addr: u64) {
         let l2_idx = self.l2.get_index(phys_addr);
@@ -2554,11 +2598,13 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
             if l2_hit {
                 // R4K only: check for Virtual Coherency Exception (VCEI).
-                // R5K dropped VCE — no pidx tracking needed.
-                if !Self::IS_R5K {
-                if self.pidx(index_addr) != l2_tag.pidx() {
-                    return exec_exception_const(EXC_VCEI);
-                }
+                // R5K dropped VCE — no pidx tracking needed; the R10000
+                // resolves the mismatch itself.
+                if !Self::IS_R5K && self.pidx(index_addr) != l2_tag.pidx() {
+                    if Self::HAS_VCE {
+                        return exec_exception_const(EXC_VCEI);
+                    }
+                    self.realias_l2_line(l2_idx, self.pidx(index_addr));
                 }
             } else {
                 // L2 miss — fill from memory into L2 first.
@@ -2769,7 +2815,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         let l2_ptag = self.l2_ptag(phys_addr);
         if l2_tag.cs() != L2_CS_INVALID && l2_tag.ptag() == l2_ptag {
             if !Self::IS_R5K && self.pidx(virt_addr) != l2_tag.pidx() {
-                return Err(BUS_VCE);
+                if Self::HAS_VCE {
+                    return Err(BUS_VCE);
+                }
+                self.realias_l2_line(l2_idx, self.pidx(virt_addr));
             }
             Ok(true)
         } else {
@@ -3095,9 +3144,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let l2_tag: L2Tag = self.l2.get_tag(l2_idx);
             let l2_ptag = self.l2_ptag(phys_addr);
             if l2_tag.cs() != L2_CS_INVALID && l2_tag.ptag() == l2_ptag {
-                // Check for Virtual Coherency Exception (R4K only; R5K dropped VCE)
-                if !Self::IS_R5K {
-                if self.pidx(virt_addr) != l2_tag.pidx() { return BUS_VCE; }
+                // Check for Virtual Coherency Exception (R4K only; R5K dropped
+                // VCE; the R10000 resolves the mismatch itself)
+                if !Self::IS_R5K && self.pidx(virt_addr) != l2_tag.pidx() {
+                    if Self::HAS_VCE { return BUS_VCE; }
+                    self.realias_l2_line(l2_idx, self.pidx(virt_addr));
                 }
                 true
             } else {
@@ -5318,6 +5369,31 @@ mod tests {
         for (i, &(_, pa)) in cases.iter().enumerate() {
             assert_eq!(mem_read(&mem, pa), 0xa5a5_0000 + i as u32, "line at {pa:#x} not flushed");
         }
+    }
+
+    /// One physical line used under two virtual colours (index bits 12-13
+    /// differ): the R4400 raises a virtual coherency exception on the
+    /// secondary hit; the R10000 resolves it itself, and a store under one
+    /// colour is what a load under the other sees.
+    #[test]
+    fn the_r10000_resolves_a_colour_mismatch_where_the_r4400_raises_vce() {
+        let pa = 0x8040u64;
+        let (va1, va2) = (0x0010_0040u64, 0x0010_3040u64);
+
+        let mem = Arc::new(Memory::new(MEM_MB));
+        mem_write(&mem, pa as u32, 0x1111_2222);
+        let r4k: R4400Cache = make_cache_of(mem.clone());
+        assert_eq!(r4k.read::<4>(va1, pa).status, BUS_OK);
+        assert_eq!(r4k.read::<4>(va2, pa).status, BUS_VCE, "the R4400 raises VCE");
+
+        let mem = Arc::new(Memory::new(MEM_MB));
+        mem_write(&mem, pa as u32, 0x1111_2222);
+        let r10k: R10000Cache = make_cache_of(mem.clone());
+        assert_eq!(r10k.read::<4>(va1, pa).data, 0x1111_2222);
+        let r = r10k.read::<4>(va2, pa);
+        assert_eq!((r.status, r.data), (BUS_OK, 0x1111_2222), "the R10000 carries on");
+        assert_eq!(r10k.write::<4>(va2, pa, 0x3333_4444), BUS_OK);
+        assert_eq!(r10k.read::<4>(va1, pa).data, 0x3333_4444, "the old colour's copy was dropped");
     }
 
     /// The R10000 implements 44 virtual address bits; XContext's fields are
