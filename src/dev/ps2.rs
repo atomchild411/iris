@@ -48,6 +48,11 @@ struct Ps2State {
     mouse_id: u8,
     // Last two sample rates written, to detect knock sequences
     sample_rate_history: [u8; 2],
+    /// The mouse command whose data byte comes next (0xF3 rate, 0xE8
+    /// resolution), and what they last set: Status Request reports both.
+    mouse_param_cmd: u8,
+    mouse_rate: u8,
+    mouse_res: u8,
     /// Set-3 key modes: bit 0 permits typematic makes, bit 1 permits breaks.
     key_modes: [u8; 256],
     held_keys: [bool; 256],
@@ -80,6 +85,9 @@ impl Ps2Controller {
                 last_read: 0xAA, // pretend we finished BAT at startup
                 mouse_id: 0,
                 sample_rate_history: [0, 0],
+                mouse_param_cmd: 0,
+                mouse_rate: 100,
+                mouse_res: 2,
                 key_modes: [3; 256],
                 held_keys: [false; 256],
             }),
@@ -140,6 +148,16 @@ impl Ps2Controller {
                 dlog!(LogModule::Ps2, "PS2: Mouse Set Sample Rate value <- {:02x} (history: [{:02x}, {:02x}])",
                     val, state.sample_rate_history[0], state.sample_rate_history[1]);
                 state.rx_queue.push_back((0xFA, Ps2Source::MouseCmd));
+                if state.mouse_param_cmd == 0xE8 {
+                    // Resolution, not a rate: it must not count towards a knock.
+                    state.mouse_res = val & 3;
+                    state.command_state = CommandState::Idle;
+                    state.next_write_is_mouse = false;
+                    drop(state);
+                    self.update_interrupt();
+                    return;
+                }
+                state.mouse_rate = val;
                 // Track sample rate history to detect knock sequences.
                 let prev = state.sample_rate_history[1];
                 state.sample_rate_history[1] = state.sample_rate_history[0];
@@ -164,6 +182,8 @@ impl Ps2Controller {
                         state.mouse_enabled = false;
                         state.mouse_id = 0;
                         state.sample_rate_history = [0, 0];
+                        state.mouse_rate = 100;
+                        state.mouse_res = 2;
                         state.rx_queue.push_back((0xAA, Ps2Source::MouseCmd)); // BAT Success
                         state.rx_queue.push_back((0x00, Ps2Source::MouseCmd)); // ID
                         state.next_write_is_mouse = false;
@@ -176,6 +196,8 @@ impl Ps2Controller {
                         // the negotiated device mode — a real IntelliMouse stays in 4-byte
                         // mode through Set Defaults. Only 0xFF (Reset) clears it.
                         state.sample_rate_history = [0, 0];
+                        state.mouse_rate = 100;
+                        state.mouse_res = 2;
                         state.next_write_is_mouse = false;
                     }
                     0xF5 => {
@@ -197,11 +219,25 @@ impl Ps2Controller {
                     }
                     0xF3 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Set Sample Rate <- {:02x}", val); }
+                        state.mouse_param_cmd = 0xF3;
                         state.command_state = CommandState::MouseData;
                     }
                     0xE8 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Set Resolution <- {:02x}", val); }
+                        state.mouse_param_cmd = 0xE8;
                         state.command_state = CommandState::MouseData;
+                    }
+                    0xE9 => {
+                        // Status Request: ACK, then three bytes. Drivers that
+                        // probe for touchpads (OpenBSD's pms: E8 00 x4, then E9)
+                        // wait for all of them.
+                        if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Status Request <- {:02x}", val); }
+                        let status = if state.mouse_enabled { 0x20 } else { 0x00 };
+                        let (res, rate) = (state.mouse_res, state.mouse_rate);
+                        state.rx_queue.push_back((status, Ps2Source::MouseCmd));
+                        state.rx_queue.push_back((res, Ps2Source::MouseCmd));
+                        state.rx_queue.push_back((rate, Ps2Source::MouseCmd));
+                        state.next_write_is_mouse = false;
                     }
                     _ => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Mouse unsupported <- {:02x}", val); }
@@ -1134,6 +1170,9 @@ impl Resettable for Ps2Controller {
         state.last_read = 0xAA;
         state.mouse_id = 0;
         state.sample_rate_history = [0, 0];
+        state.mouse_param_cmd = 0;
+        state.mouse_rate = 100;
+        state.mouse_res = 2;
         state.key_modes = [3; 256];
         state.held_keys = [false; 256];
     }
@@ -1179,6 +1218,9 @@ impl Saveable for Ps2Controller {
         tbl.insert("mouse_enabled".into(), toml::Value::Boolean(state.mouse_enabled));
         tbl.insert("last_read".into(), hex_u8(state.last_read));
         tbl.insert("mouse_id".into(), hex_u8(state.mouse_id));
+        tbl.insert("mouse_param_cmd".into(), hex_u8(state.mouse_param_cmd));
+        tbl.insert("mouse_rate".into(), hex_u8(state.mouse_rate));
+        tbl.insert("mouse_res".into(), hex_u8(state.mouse_res));
         tbl.insert("sample_rate_history".into(), toml::Value::Array(vec![
             hex_u8(state.sample_rate_history[0]),
             hex_u8(state.sample_rate_history[1]),
@@ -1239,6 +1281,9 @@ impl Saveable for Ps2Controller {
         if let Some(x) = get_field(v, "mouse_enabled") { state.mouse_enabled = toml_bool(x).unwrap_or(false); }
         if let Some(x) = get_field(v, "last_read") { state.last_read = toml_u8(x).unwrap_or(0xAA); }
         if let Some(x) = get_field(v, "mouse_id") { state.mouse_id = toml_u8(x).unwrap_or(0); }
+        if let Some(x) = get_field(v, "mouse_param_cmd") { state.mouse_param_cmd = toml_u8(x).unwrap_or(0); }
+        if let Some(x) = get_field(v, "mouse_rate") { state.mouse_rate = toml_u8(x).unwrap_or(100); }
+        if let Some(x) = get_field(v, "mouse_res") { state.mouse_res = toml_u8(x).unwrap_or(2); }
         if let Some(toml::Value::Array(arr)) = get_field(v, "sample_rate_history") {
             if arr.len() == 2 {
                 state.sample_rate_history[0] = toml_u8(&arr[0]).unwrap_or(0);
@@ -1320,6 +1365,9 @@ mod tests {
             s.scanning_enabled = true;
             s.mouse_enabled = true;
             s.last_read = 0x12;
+            s.mouse_param_cmd = 0xE8;
+            s.mouse_rate = 40;
+            s.mouse_res = 3;
         }
         let v1 = src.save_state();
 
@@ -1405,6 +1453,33 @@ mod tests {
         ps2.write_command(0xA8); // re-enable AUX port
         ps2.push_mouse_input(0, 5, 5, 0);
         assert!(ps2.state.lock().rx_queue.len() > 0, "mouse packet should be queued once AUX port re-enabled");
+    }
+
+    /// Status Request (0xE9): an ACK, then three bytes (status, resolution,
+    /// sample rate). OpenBSD's pms probes for a touchpad with `E8 00` four
+    /// times and then `E9`, and waits for all three. Setting the resolution
+    /// must not count as a sample-rate write towards the IntelliMouse knock.
+    #[test]
+    fn mouse_status_request_reports_resolution_and_rate() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        let mouse = |b: u8| {
+            ps2.write_command(0xD4);
+            ps2.write_data(b);
+            ps2.read_data()
+        };
+        for b in [0xE8, 0x03, 0xF3, 40] {
+            assert_eq!(mouse(b), 0xFA);
+        }
+        assert_eq!(mouse(0xE9), 0xFA);
+        assert_eq!([ps2.read_data(), ps2.read_data(), ps2.read_data()], [0x00, 3, 40]);
+        // The knock (rates 200, 100, 80) still selects IntelliMouse with
+        // resolution writes in between.
+        for b in [0xF3, 200, 0xE8, 0x00, 0xF3, 100, 0xE8, 0x00, 0xF3, 80] {
+            assert_eq!(mouse(b), 0xFA);
+        }
+        assert_eq!(mouse(0xF2), 0xFA, "Get Device ID");
+        assert_eq!(ps2.read_data(), 3, "IntelliMouse");
     }
 
     /// Set-3 make codes for the JIS keys, against xkeyboard-config
