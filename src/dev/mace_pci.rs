@@ -35,11 +35,56 @@ pub const IP32_SCSI_SLOT_B: u8 = 2;
 pub const IP32_SCSI_CRIME_INT: u32 = 8;
 pub const IP32_SCSI_CRIME_INT_B: u32 = 9;
 
-fn crime_input(slot: u8) -> Option<u32> {
-    match slot {
-        IP32_SCSI_SLOT => Some(IP32_SCSI_CRIME_INT),
-        IP32_SCSI_SLOT_B => Some(IP32_SCSI_CRIME_INT_B),
+/// The O2's routing: which CRIME input a slot's pin (1 = INTA) drives.
+fn crime_input(slot: u8, pin: u8) -> Option<u32> {
+    match (slot, pin) {
+        (IP32_SCSI_SLOT, 1) => Some(IP32_SCSI_CRIME_INT),
+        (IP32_SCSI_SLOT_B, 1) => Some(IP32_SCSI_CRIME_INT_B),
         _ => None,
+    }
+}
+
+/// Bus 0 has 32 device numbers, each with four interrupt pins.
+const PCI_PINS: usize = 32 * 4;
+
+/// The bridge's interrupt router. Each slot's INTA..INTD is a line
+/// (`slot * 4 + pin - 1`); the router keeps every pin's level and drives
+/// each system input it routes to with the OR of the pins routed there, so
+/// on a shared input one function cannot clear another's interrupt.
+struct PciIrqRouter {
+    /// Where the system inputs are: CRIME.
+    intc: Arc<dyn InterruptController>,
+    /// Slot and pin (1 = INTA) to system input.
+    route: fn(u8, u8) -> Option<u32>,
+    levels: Mutex<[bool; PCI_PINS]>,
+}
+
+impl PciIrqRouter {
+    fn line(slot: u8, pin: u8) -> u32 {
+        slot as u32 * 4 + (pin as u32 - 1)
+    }
+
+    fn slot_pin(line: u32) -> (u8, u8) {
+        ((line / 4) as u8, (line % 4) as u8 + 1)
+    }
+}
+
+impl InterruptController for PciIrqRouter {
+    fn set_line(&self, line: u32, level: bool) {
+        if line as usize >= PCI_PINS {
+            return;
+        }
+        let (slot, pin) = Self::slot_pin(line);
+        let Some(input) = (self.route)(slot, pin) else { return };
+        // The lock is held while CRIME is driven, so two pins sharing an
+        // input cannot reach it out of order.
+        let mut levels = self.levels.lock().unwrap();
+        levels[line as usize] = level;
+        let any = (0..PCI_PINS as u32).any(|l| {
+            let (s, p) = Self::slot_pin(l);
+            levels[l as usize] && (self.route)(s, p) == Some(input)
+        });
+        self.intc.set_line(input, any);
     }
 }
 
@@ -76,27 +121,33 @@ pub struct MacePci {
     probed: Mutex<Vec<u32>>,
     /// Functions by device number on bus 0.
     slots: Mutex<std::collections::BTreeMap<u8, Arc<Slot>>>,
-    /// Where the slots' interrupt pins lead: CRIME.
-    intc: Arc<dyn InterruptController>,
+    /// The slots' interrupt pins, routed to CRIME.
+    irq: Arc<PciIrqRouter>,
 }
 
 impl MacePci {
     pub fn new(intc: Arc<dyn InterruptController>) -> Self {
+        Self::with_routing(intc, crime_input)
+    }
+
+    /// A bridge with its own routing of slot pins (1 = INTA) to `intc`'s
+    /// inputs.
+    fn with_routing(intc: Arc<dyn InterruptController>, route: fn(u8, u8) -> Option<u32>) -> Self {
         Self {
             config_addr: Mutex::new(0),
             regs: Mutex::new([0u32; (MACEPCI_SIZE / 4) as usize]),
             probed: Mutex::new(Vec::new()),
             slots: Mutex::new(std::collections::BTreeMap::new()),
-            intc,
+            irq: Arc::new(PciIrqRouter { intc, route, levels: Mutex::new([false; PCI_PINS]) }),
         }
     }
 
-    /// Put a function in a slot on bus 0, and wire its interrupt pin.
+    /// Put a function in a slot on bus 0, and wire its interrupt pin to the
+    /// bridge, which routes it on.
     pub fn attach(&self, slot: u8, name: &'static str, dev: Arc<dyn PciBusDevice>) {
-        if dev.config().interrupt_pin() != 0 {
-            if let Some(line) = crime_input(slot) {
-                dev.connect_interrupt(IrqLine::new(self.intc.clone(), line));
-            }
+        let pin = dev.config().interrupt_pin();
+        if (1..=4).contains(&pin) {
+            dev.connect_interrupt(IrqLine::new(self.irq.clone(), PciIrqRouter::line(slot, pin)));
         }
         self.slots.lock().unwrap().insert(slot, Arc::new(Slot { name, dev, touched: Mutex::new(Vec::new()) }));
     }
@@ -297,10 +348,12 @@ impl crate::traits::Device for MacePci {
                     let c = s.dev.config();
                     let id = c.read(0);
                     let bars: Vec<String> = (0..6).map(|i| c.bar_base(i)).filter(|&b| b != 0).map(|b| format!("{b:#x}")).collect();
-                    let irq = match (c.interrupt_pin(), crime_input(*slot)) {
-                        (0, _) => "no interrupt".to_string(),
-                        (p, Some(l)) => format!("INT{} to CRIME {l}", (b'A' + p - 1) as char),
-                        (p, None) => format!("INT{} unrouted", (b'A' + p - 1) as char),
+                    let irq = match c.interrupt_pin() {
+                        0 => "no interrupt".to_string(),
+                        p => match (self.irq.route)(*slot, p) {
+                            Some(l) => format!("INT{} to CRIME {l}", (b'A' + p - 1) as char),
+                            None => format!("INT{} unrouted", (b'A' + p - 1) as char),
+                        },
                     };
                     writeln!(w, "  slot {slot}: {} {:04x}:{:04x}, command {:#06x}, BARs [{}], {irq}",
                         s.name, id & 0xffff, id >> 16, c.command(), bars.join(", ")).ok();
@@ -389,5 +442,37 @@ mod tests {
         // Pin A of slot 1 is CRIME input 8.
         f.irq.get().expect("wired at attach").set(true);
         assert_eq!(*crime.0.lock().unwrap(), vec![(IP32_SCSI_CRIME_INT, true)]);
+    }
+    /// Two functions whose pins share one system input (slot 3's INTA and
+    /// slot 4's INTB, on a made-up routing): the input stays up until both
+    /// have dropped, so neither can clear the other's interrupt.
+    #[test]
+    fn a_shared_input_stays_up_until_every_pin_drops() {
+        fn route(slot: u8, pin: u8) -> Option<u32> {
+            match (slot, pin) {
+                (3, 1) | (4, 2) => Some(12),
+                _ => None,
+            }
+        }
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::with_routing(crime.clone(), route);
+        let fake = |pin| Arc::new(Fake {
+            cfg: PciConfig::new(0x1234, 0x5678, 0, 0, [Bar::Unused; 6], pin),
+            last: Mutex::new(None),
+            irq: std::sync::OnceLock::new(),
+        });
+        let (a, b) = (fake(PCI_INTA), fake(PCI_INTA + 1));
+        pci.attach(3, "a", a.clone());
+        pci.attach(4, "b", b.clone());
+        let (la, lb) = (a.irq.get().unwrap(), b.irq.get().unwrap());
+        let last = || *crime.0.lock().unwrap().last().unwrap();
+
+        la.set(true);
+        assert_eq!(last(), (12, true));
+        lb.set(true);
+        la.set(false);
+        assert_eq!(last(), (12, true), "slot 4's INTB still holds it");
+        lb.set(false);
+        assert_eq!(last(), (12, false));
     }
 }
