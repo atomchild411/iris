@@ -614,7 +614,10 @@ impl Machine {
             crate::config::GraphicsBoard::SolidImpact
             | crate::config::GraphicsBoard::HighImpact
             | crate::config::GraphicsBoard::MaxImpact => {
-                Some(crate::dev::mgras::Mgras::new(cfg.graphics.board, ioc.clone(), heartbeat.clone(), fasttick_count.clone()))
+                Some(crate::dev::mgras::Mgras::new(cfg.graphics.board, {
+                    use crate::dev::ioc::IocInterrupt::{GioSgFifo, GioSgGraphics, GioSgRetrace};
+                    [ioc.irq_line(GioSgFifo), ioc.irq_line(GioSgGraphics), ioc.irq_line(GioSgRetrace)]
+                }, heartbeat.clone(), fasttick_count.clone()))
             }
             _ => None,
         };

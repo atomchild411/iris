@@ -217,8 +217,7 @@ mod tests {
     #[test]
     fn mgras_answers_the_gio_id_probe() {
         let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let ioc = crate::dev::ioc::Ioc::new(false);
-        let m = Mgras::new(GraphicsBoard::SolidImpact, ioc, hb.clone(), hb);
+        let m = Mgras::new(GraphicsBoard::SolidImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), hb.clone(), hb);
         assert_eq!(m.read32(MGRAS_SLOT_GFX_BASE).data, GIO_ID);
     }
 

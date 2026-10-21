@@ -264,7 +264,9 @@ pub struct Mgras {
     /// a full FIFO.
     pf_wait: crate::PfLevel,
     pf_fifo_full: crate::PfLevel,
-    ioc: crate::dev::ioc::Ioc,
+    /// The board's three GIO interrupts, as the slot wires them: FIFO,
+    /// general, retrace (see [`Line`]).
+    irqs: [crate::irq::IrqLine; 3],
     /// Current level of the general interrupt line.
     general: AtomicBool,
     /// The FIFO interrupt's inputs, kept apart from `front` for the HQ3
@@ -456,14 +458,16 @@ impl Mgras {
     /// Build the board in place on the heap: its multi-megabyte state is
     /// zero-initialised without touching the stack, and only the fields that
     /// are not valid zeroed are written.
-    pub fn new(board: GraphicsBoard, ioc: crate::dev::ioc::Ioc, heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Arc<Self> {
+    /// `irqs` are the FIFO, general and retrace interrupts, as the slot
+    /// wires them.
+    pub fn new(board: GraphicsBoard, irqs: [crate::irq::IrqLine; 3], heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Arc<Self> {
         let mut a: Arc<MaybeUninit<Self>> = Arc::new_zeroed();
         let p = Arc::get_mut(&mut a).unwrap().as_mut_ptr();
         // SAFETY: `p` points at zeroed, exclusively owned memory. Every field
         // that is not valid zeroed is written below, before assume_init.
         let m = unsafe {
             addr_of_mut!((*p).kind).write(board);
-            addr_of_mut!((*p).ioc).write(ioc);
+            addr_of_mut!((*p).irqs).write(irqs);
             addr_of_mut!((*p).general).write(AtomicBool::new(false));
             addr_of_mut!((*p).fifo_cfg).write(AtomicU32::new(0));
             addr_of_mut!((*p).fifo_line).write(SpinLock::new(false));
@@ -852,15 +856,14 @@ impl Mgras {
         *self.mem.lock() = Some(mem);
     }
 
-    /// Drive one of the board's interrupt lines (graphics slot wiring).
+    /// Drive one of the board's interrupt lines.
     fn set_line(&self, line: Line, active: bool) {
-        use crate::dev::ioc::IocInterrupt;
-        let src = match line {
-            Line::Fifo => IocInterrupt::GioSgFifo,
-            Line::General => IocInterrupt::GioSgGraphics,
-            Line::Retrace => IocInterrupt::GioSgRetrace,
+        let n = match line {
+            Line::Fifo => 0,
+            Line::General => 1,
+            Line::Retrace => 2,
         };
-        self.ioc.set_interrupt(src, active);
+        self.irqs[n].set(active);
     }
 
     /// Wire up the CPU cycle counter for the status bar's MIPS figure.
