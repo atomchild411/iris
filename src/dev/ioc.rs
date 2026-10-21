@@ -10,6 +10,7 @@ use crate::dev::pit8254::{Pit8254, TimerCallback};
 use crate::cpu::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
 use crate::dev::ps2::{Ps2Controller, Ps2Callback};
 use crate::hptimer::TimerManager;
+use crate::irq::{InterruptController, IrqLine};
 use std::io::Write;
 
 pub const IOC_BASE: u32 = 0x1FBD9800;
@@ -237,6 +238,29 @@ pub enum IocInterrupt {
     GioS1Retrace,   // EXTIO_S1_RETRACE = 0x0001, sets L1_STAT VERTICAL_RETRACE
 }
 
+impl IocInterrupt {
+    /// Every source, in declaration order: the line numbers of the IOC's
+    /// [`InterruptController`] inputs.
+    pub const ALL: [IocInterrupt; 31] = [
+        Self::Graphics, Self::Parallel, Self::McDma, Self::Ethernet, Self::Scsi1, Self::Scsi0, Self::FifoFull,
+        Self::VerticalRetrace, Self::VideoVsync, Self::AcFail, Self::HpcDma, Self::Gp2, Self::Panel, Self::Gp0,
+        Self::Serial, Self::KbMouse, Self::GioExp0, Self::GioExp1,
+        Self::Mappable0, Self::Mappable1, Self::Mappable2, Self::Mappable3,
+        Self::GioSgFifo, Self::GioSgGraphics, Self::GioSgRetrace,
+        Self::GioS0Fifo, Self::GioS0Graphics, Self::GioS0Retrace,
+        Self::GioS1Fifo, Self::GioS1Graphics, Self::GioS1Retrace,
+    ];
+
+    /// This source's line number on the IOC's controller.
+    pub const fn line(self) -> u32 {
+        self as u32
+    }
+
+    pub fn from_line(line: u32) -> Option<Self> {
+        Self::ALL.get(line as usize).copied()
+    }
+}
+
 /// The 3 GIO64 bus slots, indexed as MAME's `gio64_slot_device::slot_type_t`
 /// (`GIO64_SLOT_GFX`/`EXP0`/`EXP1` = 0/1/2 — see `$HOME/gits/mame/src/devices/bus/gio64/gio64.h`).
 /// Physically present on both Indy and Indigo2 (`indy_indigo2.cpp` instantiates
@@ -431,6 +455,18 @@ struct IocIrqLine {
     source: IocInterrupt,
 }
 
+/// The IOC's interrupt inputs, as a controller devices hold lines into: line
+/// `n` is the [`IocInterrupt`] numbered `n` (see [`IocInterrupt::line`]).
+struct IocInputs(Arc<Mutex<IocState>>);
+
+impl InterruptController for IocInputs {
+    fn set_line(&self, line: u32, level: bool) {
+        if let Some(source) = IocInterrupt::from_line(line) {
+            self.0.lock().set_source(source, level);
+        }
+    }
+}
+
 struct IocTimerCallback {
     state: Arc<Mutex<IocState>>,
     source: IocInterrupt,
@@ -472,6 +508,15 @@ impl IrqCallback for IocIrqLine {
 impl Ps2Callback for IocIrqLine {
     fn set_interrupt(&self, active: bool) {
         self.set_level(active);
+    }
+}
+
+/// Line `n` is the [`IocInterrupt`] numbered `n`, as through [`Ioc::irq_line`].
+impl InterruptController for Ioc {
+    fn set_line(&self, line: u32, level: bool) {
+        if let Some(source) = IocInterrupt::from_line(line) {
+            self.set_interrupt(source, level);
+        }
     }
 }
 
@@ -651,79 +696,12 @@ impl Ioc {
     /// *addresses* differ by profile (PIO4 int2_map vs PIO6 base_map's
     /// upper half), handled in hpc3.rs's PIO dispatch — not here.
     pub fn set_interrupt(&self, source: IocInterrupt, active: bool) {
-        // Note: map_pol (polarity) register is currently ignored.
-        // We assume active-high logic internally for now.
-        match source {
-            IocInterrupt::VerticalRetrace | IocInterrupt::VideoVsync => {},
-            _ => dlog_dev!(LogModule::Ioc, "IOC: Set Interrupt {:?} = {}", source, active),
-        }
-        let mut state = self.state.lock();
-        match source {
-            // Local 0
-            IocInterrupt::Graphics => if active { state.l0_stat |= l0_regs::GRAPHICS } else { state.l0_stat &= !l0_regs::GRAPHICS },
-            IocInterrupt::Parallel => if active { state.l0_stat |= l0_regs::PARALLEL } else { state.l0_stat &= !l0_regs::PARALLEL },
-            IocInterrupt::McDma => if active { state.l0_stat |= l0_regs::MC_DMA } else { state.l0_stat &= !l0_regs::MC_DMA },
-            IocInterrupt::Ethernet => if active { state.l0_stat |= l0_regs::ETHERNET } else { state.l0_stat &= !l0_regs::ETHERNET },
-            IocInterrupt::Scsi1 => if active { state.l0_stat |= l0_regs::SCSI1 } else { state.l0_stat &= !l0_regs::SCSI1 },
-            IocInterrupt::Scsi0 => if active { state.l0_stat |= l0_regs::SCSI0 } else { state.l0_stat &= !l0_regs::SCSI0 },
-            IocInterrupt::FifoFull => if active { state.l0_stat |= l0_regs::FIFO_FULL } else { state.l0_stat &= !l0_regs::FIFO_FULL },
+        self.state.lock().set_source(source, active);
+    }
 
-            // Local 1
-            IocInterrupt::VerticalRetrace => if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE } else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE },
-            IocInterrupt::VideoVsync => if active { state.l1_stat |= l1_regs::VIDEO_VSYNC } else { state.l1_stat &= !l1_regs::VIDEO_VSYNC },
-            IocInterrupt::AcFail => if active { state.l1_stat |= l1_regs::AC_FAIL } else { state.l1_stat &= !l1_regs::AC_FAIL },
-            IocInterrupt::HpcDma => if active { state.l1_stat |= l1_regs::HPC_DMA } else { state.l1_stat &= !l1_regs::HPC_DMA },
-            IocInterrupt::Gp2   => if active { state.l1_stat |= l1_regs::GP2   } else { state.l1_stat &= !l1_regs::GP2   },
-            IocInterrupt::Panel => if active { state.l1_stat |= l1_regs::PANEL } else { state.l1_stat &= !l1_regs::PANEL },
-            IocInterrupt::Gp0   => if active { state.l1_stat |= l1_regs::GP0   } else { state.l1_stat &= !l1_regs::GP0   },
-
-            // Mappable (LIO_2 on IP24)
-            IocInterrupt::Serial  => if active { state.map_stat |= map_regs::SERIAL    } else { state.map_stat &= !map_regs::SERIAL    },
-            IocInterrupt::KbMouse => if active { state.map_stat |= map_regs::KBD_MOUSE } else { state.map_stat &= !map_regs::KBD_MOUSE },
-            IocInterrupt::GioExp0 => if active { state.map_stat |= map_regs::GIO_EXP0 } else { state.map_stat &= !map_regs::GIO_EXP0 },
-            IocInterrupt::GioExp1 => if active { state.map_stat |= map_regs::GIO_EXP1 } else { state.map_stat &= !map_regs::GIO_EXP1 },
-            IocInterrupt::Mappable0 => if active { state.map_stat |= 1 << 0 } else { state.map_stat &= !(1 << 0) },
-            IocInterrupt::Mappable1 => if active { state.map_stat |= 1 << 1 } else { state.map_stat &= !(1 << 1) },
-            IocInterrupt::Mappable2 => if active { state.map_stat |= 1 << 2 } else { state.map_stat &= !(1 << 2) },
-            IocInterrupt::Mappable3 => if active { state.map_stat |= 1 << 3 } else { state.map_stat &= !(1 << 3) },
-
-            // Fullhouse GIO slot fan-out (see GIO_SLOT_MAP's doc comment):
-            // each sets the one shared L0/L1 bit every slot's signal uses,
-            // and clears (active) / sets (idle) its own active-low EXT_IO
-            // bit so ip22_gio0/1/2_intr can tell which slot fired.
-            IocInterrupt::GioSgFifo => {
-                if active { state.l0_stat |= l0_regs::FIFO_FULL; state.ext_io &= !ext_io_regs::SG_IRQ_2; }
-                else { state.l0_stat &= !l0_regs::FIFO_FULL; state.ext_io |= ext_io_regs::SG_IRQ_2; }
-            }
-            IocInterrupt::GioSgGraphics => {
-                if active { state.l0_stat |= l0_regs::GRAPHICS; state.ext_io &= !ext_io_regs::SG_IRQ_1; }
-                else { state.l0_stat &= !l0_regs::GRAPHICS; state.ext_io |= ext_io_regs::SG_IRQ_1; }
-            }
-            IocInterrupt::GioSgRetrace => {
-                if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE; state.ext_io &= !ext_io_regs::SG_RETRACE; }
-                else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE; state.ext_io |= ext_io_regs::SG_RETRACE; }
-            }
-            IocInterrupt::GioS0Fifo => {
-                if active { state.l0_stat |= l0_regs::FIFO_FULL; state.ext_io &= !ext_io_regs::S0_IRQ_2; }
-                else { state.l0_stat &= !l0_regs::FIFO_FULL; state.ext_io |= ext_io_regs::S0_IRQ_2; }
-            }
-            IocInterrupt::GioS0Graphics => {
-                if active { state.l0_stat |= l0_regs::GRAPHICS; state.ext_io &= !ext_io_regs::S0_IRQ_1; }
-                else { state.l0_stat &= !l0_regs::GRAPHICS; state.ext_io |= ext_io_regs::S0_IRQ_1; }
-            }
-            IocInterrupt::GioS0Retrace => {
-                if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE; state.ext_io &= !ext_io_regs::S0_RETRACE; }
-                else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE; state.ext_io |= ext_io_regs::S0_RETRACE; }
-            }
-            // GioS1* bits have no second EXT_IO register modeled (see
-            // IocState.ext_io's doc comment) — still set the shared L0/L1
-            // bit so callers routing through this slot don't silently drop
-            // the interrupt, but the EXT_IO side is a no-op.
-            IocInterrupt::GioS1Fifo => if active { state.l0_stat |= l0_regs::FIFO_FULL } else { state.l0_stat &= !l0_regs::FIFO_FULL },
-            IocInterrupt::GioS1Graphics => if active { state.l0_stat |= l0_regs::GRAPHICS } else { state.l0_stat &= !l0_regs::GRAPHICS },
-            IocInterrupt::GioS1Retrace => if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE } else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE },
-        }
-        state.update_interrupts();
+    /// An [`IrqLine`] into one of the IOC's sources, for a device to drive.
+    pub fn irq_line(&self, source: IocInterrupt) -> IrqLine {
+        IrqLine::new(Arc::new(IocInputs(self.state.clone())), source.line())
     }
 
     pub fn ps2(&self) -> Arc<Ps2Controller> {
@@ -1202,6 +1180,83 @@ impl IocState {
         self.map_stat &= !(val & 0x3);
     }
 
+    /// Drive one source's status bit (and, for the fullhouse GIO slots,
+    /// its EXT_IO bit), then recompute the CPU lines.
+    fn set_source(&mut self, source: IocInterrupt, active: bool) {
+        // Note: map_pol (polarity) register is currently ignored.
+        // We assume active-high logic internally for now.
+        match source {
+            IocInterrupt::VerticalRetrace | IocInterrupt::VideoVsync => {},
+            _ => dlog_dev!(LogModule::Ioc, "IOC: Set Interrupt {:?} = {}", source, active),
+        }
+        match source {
+            // Local 0
+            IocInterrupt::Graphics => if active { self.l0_stat |= l0_regs::GRAPHICS } else { self.l0_stat &= !l0_regs::GRAPHICS },
+            IocInterrupt::Parallel => if active { self.l0_stat |= l0_regs::PARALLEL } else { self.l0_stat &= !l0_regs::PARALLEL },
+            IocInterrupt::McDma => if active { self.l0_stat |= l0_regs::MC_DMA } else { self.l0_stat &= !l0_regs::MC_DMA },
+            IocInterrupt::Ethernet => if active { self.l0_stat |= l0_regs::ETHERNET } else { self.l0_stat &= !l0_regs::ETHERNET },
+            IocInterrupt::Scsi1 => if active { self.l0_stat |= l0_regs::SCSI1 } else { self.l0_stat &= !l0_regs::SCSI1 },
+            IocInterrupt::Scsi0 => if active { self.l0_stat |= l0_regs::SCSI0 } else { self.l0_stat &= !l0_regs::SCSI0 },
+            IocInterrupt::FifoFull => if active { self.l0_stat |= l0_regs::FIFO_FULL } else { self.l0_stat &= !l0_regs::FIFO_FULL },
+
+            // Local 1
+            IocInterrupt::VerticalRetrace => if active { self.l1_stat |= l1_regs::VERTICAL_RETRACE } else { self.l1_stat &= !l1_regs::VERTICAL_RETRACE },
+            IocInterrupt::VideoVsync => if active { self.l1_stat |= l1_regs::VIDEO_VSYNC } else { self.l1_stat &= !l1_regs::VIDEO_VSYNC },
+            IocInterrupt::AcFail => if active { self.l1_stat |= l1_regs::AC_FAIL } else { self.l1_stat &= !l1_regs::AC_FAIL },
+            IocInterrupt::HpcDma => if active { self.l1_stat |= l1_regs::HPC_DMA } else { self.l1_stat &= !l1_regs::HPC_DMA },
+            IocInterrupt::Gp2   => if active { self.l1_stat |= l1_regs::GP2   } else { self.l1_stat &= !l1_regs::GP2   },
+            IocInterrupt::Panel => if active { self.l1_stat |= l1_regs::PANEL } else { self.l1_stat &= !l1_regs::PANEL },
+            IocInterrupt::Gp0   => if active { self.l1_stat |= l1_regs::GP0   } else { self.l1_stat &= !l1_regs::GP0   },
+
+            // Mappable (LIO_2 on IP24)
+            IocInterrupt::Serial  => if active { self.map_stat |= map_regs::SERIAL    } else { self.map_stat &= !map_regs::SERIAL    },
+            IocInterrupt::KbMouse => if active { self.map_stat |= map_regs::KBD_MOUSE } else { self.map_stat &= !map_regs::KBD_MOUSE },
+            IocInterrupt::GioExp0 => if active { self.map_stat |= map_regs::GIO_EXP0 } else { self.map_stat &= !map_regs::GIO_EXP0 },
+            IocInterrupt::GioExp1 => if active { self.map_stat |= map_regs::GIO_EXP1 } else { self.map_stat &= !map_regs::GIO_EXP1 },
+            IocInterrupt::Mappable0 => if active { self.map_stat |= 1 << 0 } else { self.map_stat &= !(1 << 0) },
+            IocInterrupt::Mappable1 => if active { self.map_stat |= 1 << 1 } else { self.map_stat &= !(1 << 1) },
+            IocInterrupt::Mappable2 => if active { self.map_stat |= 1 << 2 } else { self.map_stat &= !(1 << 2) },
+            IocInterrupt::Mappable3 => if active { self.map_stat |= 1 << 3 } else { self.map_stat &= !(1 << 3) },
+
+            // Fullhouse GIO slot fan-out (see GIO_SLOT_MAP's doc comment):
+            // each sets the one shared L0/L1 bit every slot's signal uses,
+            // and clears (active) / sets (idle) its own active-low EXT_IO
+            // bit so ip22_gio0/1/2_intr can tell which slot fired.
+            IocInterrupt::GioSgFifo => {
+                if active { self.l0_stat |= l0_regs::FIFO_FULL; self.ext_io &= !ext_io_regs::SG_IRQ_2; }
+                else { self.l0_stat &= !l0_regs::FIFO_FULL; self.ext_io |= ext_io_regs::SG_IRQ_2; }
+            }
+            IocInterrupt::GioSgGraphics => {
+                if active { self.l0_stat |= l0_regs::GRAPHICS; self.ext_io &= !ext_io_regs::SG_IRQ_1; }
+                else { self.l0_stat &= !l0_regs::GRAPHICS; self.ext_io |= ext_io_regs::SG_IRQ_1; }
+            }
+            IocInterrupt::GioSgRetrace => {
+                if active { self.l1_stat |= l1_regs::VERTICAL_RETRACE; self.ext_io &= !ext_io_regs::SG_RETRACE; }
+                else { self.l1_stat &= !l1_regs::VERTICAL_RETRACE; self.ext_io |= ext_io_regs::SG_RETRACE; }
+            }
+            IocInterrupt::GioS0Fifo => {
+                if active { self.l0_stat |= l0_regs::FIFO_FULL; self.ext_io &= !ext_io_regs::S0_IRQ_2; }
+                else { self.l0_stat &= !l0_regs::FIFO_FULL; self.ext_io |= ext_io_regs::S0_IRQ_2; }
+            }
+            IocInterrupt::GioS0Graphics => {
+                if active { self.l0_stat |= l0_regs::GRAPHICS; self.ext_io &= !ext_io_regs::S0_IRQ_1; }
+                else { self.l0_stat &= !l0_regs::GRAPHICS; self.ext_io |= ext_io_regs::S0_IRQ_1; }
+            }
+            IocInterrupt::GioS0Retrace => {
+                if active { self.l1_stat |= l1_regs::VERTICAL_RETRACE; self.ext_io &= !ext_io_regs::S0_RETRACE; }
+                else { self.l1_stat &= !l1_regs::VERTICAL_RETRACE; self.ext_io |= ext_io_regs::S0_RETRACE; }
+            }
+            // GioS1* bits have no second EXT_IO register modeled (see
+            // IocState.ext_io's doc comment) — still set the shared L0/L1
+            // bit so callers routing through this slot don't silently drop
+            // the interrupt, but the EXT_IO side is a no-op.
+            IocInterrupt::GioS1Fifo => if active { self.l0_stat |= l0_regs::FIFO_FULL } else { self.l0_stat &= !l0_regs::FIFO_FULL },
+            IocInterrupt::GioS1Graphics => if active { self.l0_stat |= l0_regs::GRAPHICS } else { self.l0_stat &= !l0_regs::GRAPHICS },
+            IocInterrupt::GioS1Retrace => if active { self.l1_stat |= l1_regs::VERTICAL_RETRACE } else { self.l1_stat &= !l1_regs::VERTICAL_RETRACE },
+        }
+        self.update_interrupts();
+    }
+
     fn update_interrupts(&mut self) {
         // 1. Update Mappable Interrupts (MAP_INT0, MAP_INT1)
         let map_int0 = (self.map_stat & self.map_mask0) != 0;
@@ -1342,6 +1397,28 @@ impl Saveable for Ioc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every source has its own line, and a line drives exactly what
+    /// `set_interrupt` with that source does.
+    #[test]
+    fn each_source_is_a_line_on_the_ioc() {
+        for (n, src) in IocInterrupt::ALL.iter().enumerate() {
+            assert_eq!(src.line(), n as u32, "{src:?} out of declaration order");
+            assert_eq!(IocInterrupt::from_line(n as u32), Some(*src));
+        }
+        assert_eq!(IocInterrupt::from_line(IocInterrupt::ALL.len() as u32), None);
+
+        let ioc = Ioc::new_ci(false);
+        let serial = ioc.irq_line(IocInterrupt::Serial);
+        serial.set(true);
+        assert_ne!(ioc.state.lock().map_stat & map_regs::SERIAL, 0);
+        serial.set(false);
+        assert_eq!(ioc.state.lock().map_stat & map_regs::SERIAL, 0);
+        ioc.irq_line(IocInterrupt::Scsi0).set(true);
+        assert_ne!(ioc.state.lock().l0_stat & l0_regs::SCSI0, 0);
+        InterruptController::set_line(&ioc, IocInterrupt::Scsi0.line(), false);
+        assert_eq!(ioc.state.lock().l0_stat & l0_regs::SCSI0, 0);
+    }
 
     /// Timer 1 feeds the status bar's Hz, timer 0 does not; a tick landing on
     /// a pending one is merged; TMR_CLR on a set bit is an acknowledgement and
