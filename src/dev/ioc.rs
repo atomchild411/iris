@@ -5,7 +5,7 @@ use crate::devlog::LogModule;
 use std::sync::mpsc;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::snapshot::{get_field, toml_u8, hex_u8};
-use crate::dev::z85c30::{Z85c30, IrqCallback};
+use crate::dev::z85c30::Z85c30;
 use crate::dev::pit8254::{Pit8254, TimerCallback};
 use crate::cpu::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
 use crate::dev::ps2::{Ps2Controller, Ps2Callback};
@@ -493,21 +493,11 @@ impl TimerCallback for IocTimerCallback {
     }
 }
 
-impl IrqCallback for IocIrqLine {
-    fn set_level(&self, level: bool) {
-        let mut state = self.state.lock();
-        match self.source {
-            IocInterrupt::Serial => if level { state.map_stat |= map_regs::SERIAL } else { state.map_stat &= !map_regs::SERIAL },
-            IocInterrupt::KbMouse => if level { state.map_stat |= map_regs::KBD_MOUSE } else { state.map_stat &= !map_regs::KBD_MOUSE },
-            _ => {} // Only Serial supported via this callback for now
-        }
-        state.update_interrupts();
-    }
-}
-
 impl Ps2Callback for IocIrqLine {
     fn set_interrupt(&self, active: bool) {
-        self.set_level(active);
+        let mut state = self.state.lock();
+        if active { state.map_stat |= map_regs::KBD_MOUSE } else { state.map_stat &= !map_regs::KBD_MOUSE }
+        state.update_interrupts();
     }
 }
 
@@ -600,10 +590,7 @@ impl Ioc {
             interrupts: None,
         }));
 
-        let serial_irq = Arc::new(IocIrqLine {
-            state: state.clone(),
-            source: IocInterrupt::Serial,
-        });
+        let serial_irq = IrqLine::new(Arc::new(IocInputs(state.clone())), IocInterrupt::Serial.line());
 
         let clock_ticks = Arc::new(std::sync::OnceLock::new());
         let timer0_cb = Arc::new(IocTimerCallback {

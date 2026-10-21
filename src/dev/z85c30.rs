@@ -9,6 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
+use crate::irq::IrqLine;
 use std::thread;
 use std::io::Write as IoWrite;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
@@ -115,10 +116,6 @@ pub mod wr14 {
     pub const AUTO_ECHO: u8 = 1 << 4;
 }
 
-pub trait IrqCallback: Send + Sync {
-    fn set_level(&self, level: bool);
-}
-
 pub struct Channel {
     pub regs: [u8; 16],
     pub reg_ptr: u8,
@@ -129,14 +126,14 @@ pub struct Channel {
     pub tx_delay: u64,
     pub ip_num: Arc<AtomicU8>,
     pub ip_other: Arc<AtomicU8>,
-    pub callback: Option<Arc<dyn IrqCallback>>,
+    pub irq: Option<IrqLine>,
     // Z85C30 Tx interrupt fires once when buffer empties, then arms again only
     // after RES_Tx_P.  Without this latch the IRQ line stays asserted forever.
     pub tx_int_pending: bool,
 }
 
 impl Channel {
-    pub fn new(name: &str, ip_num: Arc<AtomicU8>, ip_other: Arc<AtomicU8>, callback: Option<Arc<dyn IrqCallback>>) -> Self {
+    pub fn new(name: &str, ip_num: Arc<AtomicU8>, ip_other: Arc<AtomicU8>, irq: Option<IrqLine>) -> Self {
         let mut c = Self {
             regs: [0; 16],
             reg_ptr: 0,
@@ -147,7 +144,7 @@ impl Channel {
             tx_delay: 0,
             ip_num,
             ip_other,
-            callback,
+            irq,
             tx_int_pending: false,
         };
         c.update_tx_delay();
@@ -300,9 +297,9 @@ impl Channel {
         let ip = self.get_ip();
         self.ip_num.store(ip, Ordering::SeqCst);
         
-        if let Some(cb) = &self.callback {
+        if let Some(line) = &self.irq {
             let other = self.ip_other.load(Ordering::SeqCst);
-            cb.set_level((ip | other) != 0);
+            line.set((ip | other) != 0);
         }
     }
 
@@ -609,24 +606,24 @@ pub const DEFAULT_PORTS: [u16; 2] = [8880, 8881];
 impl Z85c30 {
     /// Default constructor: binds TCP serial backends on 127.0.0.1:8880
     /// (channel A / tty2) and 127.0.0.1:8881 (channel B / tty1).
-    pub fn new(callback: Option<Arc<dyn IrqCallback>>) -> Self {
-        Self::new_with_ports(callback, DEFAULT_PORTS)
+    pub fn new(irq: Option<IrqLine>) -> Self {
+        Self::new_with_ports(irq, DEFAULT_PORTS)
     }
 
     /// As `new`, with the TCP ports of channels A and B on 127.0.0.1.
-    pub fn new_with_ports(callback: Option<Arc<dyn IrqCallback>>, ports: [u16; 2]) -> Self {
-        Self::new_inner(callback, Some(ports))
+    pub fn new_with_ports(irq: Option<IrqLine>, ports: [u16; 2]) -> Self {
+        Self::new_inner(irq, Some(ports))
     }
 
     /// CI-mode constructor: uses null backends instead of binding TCP. The
     /// caller is expected to install real backends via `set_backend_a` /
     /// `set_backend_b` before the first `start()`. Avoids port conflicts
     /// when multiple `--ci` instances run in parallel.
-    pub fn new_null(callback: Option<Arc<dyn IrqCallback>>) -> Self {
-        Self::new_inner(callback, None)
+    pub fn new_null(irq: Option<IrqLine>) -> Self {
+        Self::new_inner(irq, None)
     }
 
-    fn new_inner(callback: Option<Arc<dyn IrqCallback>>, ports: Option<[u16; 2]>) -> Self {
+    fn new_inner(irq: Option<IrqLine>, ports: Option<[u16; 2]>) -> Self {
         let ip_a = Arc::new(AtomicU8::new(0));
         let ip_b = Arc::new(AtomicU8::new(0));
 
@@ -649,9 +646,9 @@ impl Z85c30 {
         };
 
         Self {
-            channel_a: Arc::new((Mutex::new(Channel::new("A", ip_a.clone(), ip_b.clone(), callback.clone())), Condvar::new())),
+            channel_a: Arc::new((Mutex::new(Channel::new("A", ip_a.clone(), ip_b.clone(), irq.clone())), Condvar::new())),
             // Note: Channel B gets ip_b as its 'num' and ip_a as 'other'
-            channel_b: Arc::new((Mutex::new(Channel::new("B", ip_b, ip_a, callback)), Condvar::new())),
+            channel_b: Arc::new((Mutex::new(Channel::new("B", ip_b, ip_a, irq)), Condvar::new())),
             backend_a: Arc::new(Mutex::new(backend_a)),
             backend_b: Arc::new(Mutex::new(backend_b)),
             inject_b: Arc::new(Mutex::new(VecDeque::new())),
@@ -1437,11 +1434,6 @@ mod tests {
 
     #[test]
     fn restore_redrives_irq_line() {
-        struct Line(AtomicBool);
-        impl IrqCallback for Line {
-            fn set_level(&self, level: bool) { self.0.store(level, Ordering::SeqCst); }
-        }
-
         let src = Z85c30::new_null(None);
         {
             let mut ch = src.channel_a.0.lock();
@@ -1450,11 +1442,11 @@ mod tests {
         }
         let saved = src.save_state();
 
-        let line = Arc::new(Line(AtomicBool::new(false)));
-        let dst = Z85c30::new_null(Some(line.clone()));
+        let (probe, line) = crate::irq::LevelProbe::line();
+        let dst = Z85c30::new_null(Some(line));
         dst.load_state(&saved).expect("load_state");
 
-        assert!(line.0.load(Ordering::SeqCst),
+        assert!(probe.level(),
             "`power_on_devices` cleared map_stat SERIAL and `Ioc::load_state` \
              restored it wholesale, so only the SCC can put the line back up");
     }
