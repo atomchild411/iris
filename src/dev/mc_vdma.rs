@@ -69,7 +69,6 @@ use std::io::Write as IoWrite;
 
 use crate::devlog::LogModule;
 use crate::traits::BUS_BUSY;
-use crate::dev::ioc::IocInterrupt;
 use crate::dev::mc::MemoryController;
 
 // ── DMA register offsets (MC base 0x1FA00000) ───────────────────────────────
@@ -411,8 +410,8 @@ pub struct VdmaResult {
 
 impl MemoryController {
     pub(crate) fn signal_dma_interrupt(&self) {
-        if let Some(ioc) = self.ioc() {
-            ioc.set_interrupt(IocInterrupt::McDma, true);
+        if let Some(irq) = self.dma_irq() {
+            irq.set(true);
         }
     }
 

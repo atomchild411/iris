@@ -687,7 +687,7 @@ impl Machine {
 
         // Connect Physical to MC (for VDMA)
         mc.set_phys(phys.clone());
-        mc.set_ioc(ioc.clone());
+        mc.set_dma_irq(ioc.irq_line(crate::dev::ioc::IocInterrupt::McDma));
 
         // Wire MEMCFG callback: when MC writes MEMCFG0/1, remap banks in Physical.
         // SAFETY: Physical is pinned in Arc; remap_banks(&mut self) is only invoked

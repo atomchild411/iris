@@ -7,7 +7,7 @@ use std::thread;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Signal, Resettable, Saveable, MachineEvent};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
 use crate::dev::eeprom_93c56::Eeprom93c56;
-use crate::dev::ioc::{Ioc, IocInterrupt};
+use crate::irq::IrqLine;
 use std::io::Write as IoWrite;
 
 // The GIO virtual DMA engine — registers, µTLB translation and the transfer
@@ -65,7 +65,8 @@ struct MemoryControllerState {
     cpu_cycle_acc: u64,
     rpss_cycle_acc: u64,
     cpu: Option<Weak<dyn Device>>,
-    ioc: Option<Ioc>,
+    /// The GIO DMA engine's interrupt (the IOC's MC DMA line).
+    dma_irq: Option<IrqLine>,
 }
 
 #[derive(Clone)]
@@ -134,7 +135,7 @@ impl MemoryController {
                 cpu_cycle_acc: 0,
                 rpss_cycle_acc: 0,
                 cpu: None,
-                ioc: None,
+                dma_irq: None,
             })),
             giodma: Arc::new(GioDma::new()),
             phys: Arc::new(OnceLock::new()),
@@ -243,8 +244,9 @@ impl MemoryController {
         self.state.lock().cpu = Some(cpu);
     }
 
-    pub fn set_ioc(&self, ioc: Ioc) {
-        self.state.lock().ioc = Some(ioc);
+    /// Wire the GIO DMA engine's interrupt.
+    pub fn set_dma_irq(&self, irq: IrqLine) {
+        self.state.lock().dma_irq = Some(irq);
     }
 
     pub fn set_phys(&self, phys: Arc<dyn BusDevice>) {
@@ -527,7 +529,7 @@ impl MemoryController {
 
     /// The IOC handle, cloned out so the caller does not hold the MC state lock
     /// while raising an interrupt.
-    pub(crate) fn ioc(&self) -> Option<Ioc> { self.state.lock().ioc.clone() }
+    pub(crate) fn dma_irq(&self) -> Option<IrqLine> { self.state.lock().dma_irq.clone() }
 
     /// Current GIO64_ARB value (bus widths / arbitration per GIO slot).
     pub(crate) fn gio64_arb(&self) -> u32 { self.state.lock().regs[(REG_GIO64_ARB / 4) as usize] }
@@ -877,8 +879,8 @@ impl BusDevice for MemoryController {
                 dma.run = (dma.run & !0xF) | (val & 0xF);
                 drop(dma);
                 if val == 0 {
-                    if let Some(ioc) = &state.ioc {
-                        ioc.set_interrupt(IocInterrupt::McDma, false);
+                    if let Some(irq) = &state.dma_irq {
+                        irq.set(false);
                     }
                 }
                 BUS_OK
