@@ -954,6 +954,15 @@ pub mod re_reg {
     pub const TEX_DQDY: u32 = 0x215c;
     pub const TLB_TEX: u32 = 0x1600;
     pub const DEPTH_FUNC: u32 = 0x21c0;
+    /// Stencil test: reference 31:24, value mask 23:16, function 15:12
+    /// (the depth functions' order), then the ops for a stencil failure,
+    /// a depth failure and a pass in 11:8, 7:4 and 3:0. Read off IRIX's
+    /// writes (the spec's table is empty): mirrors marks its floor with
+    /// 0x01ff7333 (ALWAYS, ref 1, REPLACE) and draws the reflection with
+    /// 0x01ff2000 (EQUAL 1, KEEP).
+    pub const STENCIL_MODE: u32 = 0x21e0;
+    /// The stencil write mask, low 8 bits.
+    pub const STENCIL_MASK: u32 = 0x21e8;
     pub const DEPTH_Z0: u32 = 0x21c8;
     pub const DEPTH_DZDX: u32 = 0x21d0;
     pub const DEPTH_DZDY: u32 = 0x21d8;
@@ -1000,6 +1009,7 @@ mod draw {
     pub const ALPHA_TEST: u32 = 1 << 11;
     pub const BLEND: u32 = 1 << 10;
     pub const DEPTH_TEST: u32 = 1 << 2;
+    pub const STENCIL_TEST: u32 = 1 << 0;
     pub const DEPTH_MASK: u32 = 1 << 1;
     pub const LOGIC_OP: u32 = 1 << 9;
     /// Dithering, set by GL (on by default in OpenGL). The spec's table
@@ -1959,6 +1969,27 @@ impl CrimeRe {
                 let (z0, dzdx, dzdy) = (r64(DEPTH_Z0), r64(DEPTH_DZDX), r64(DEPTH_DZDY));
                 let zfunc = (g(DEPTH_FUNC) >> 25) & 7;
                 let zbuf = Buf { tlb: TLB_A + 0x400, bd: 4 };
+                // The stencil buffer is the depth buffer's top byte.
+                let stencil = dm & draw::STENCIL_TEST != 0;
+                let smode = g(STENCIL_MODE);
+                let (sref, svmask, sfunc) = (smode >> 24, (smode >> 16) & 0xff, (smode >> 12) & 7);
+                let swmask = g(STENCIL_MASK) & 0xff;
+                if stencil {
+                    for op in [(smode >> 8) & 15, (smode >> 4) & 15, smode & 15] {
+                        if op != 0 && op != 3 {
+                            self.note(format!("stencil op {op} (taken as KEEP)"));
+                        }
+                    }
+                    if matches!(sfunc, 1 | 3 | 4 | 6) {
+                        self.note(format!("stencil function {sfunc} (order unconfirmed)"));
+                    }
+                }
+                // Op 0 keeps, 3 replaces with the reference; no other has been
+                // seen, so they keep too (and say so above).
+                let sop = |op: u32, s: u32| -> u32 {
+                    let v = if op == 3 { sref & 0xff } else { s };
+                    (s & !swmask) | (v & swmask)
+                };
                 // Signed area, so the edge functions agree in sign inside.
                 let area = (v[1].0 - v[0].0) * (v[2].1 - v[0].1) - (v[1].1 - v[0].1) * (v[2].0 - v[0].0);
                 if area == 0.0 {
@@ -2027,26 +2058,38 @@ impl CrimeRe {
                             if atest && !Self::alpha_pass(afunc, aref, src.unwrap()[3]) {
                                 continue;
                             }
-                            if depth {
+                            // GL order: the stencil test, then depth; the
+                            // stencil op is chosen by which of them failed.
+                            if depth || stencil {
                                 let zs = (z0 + dzdx * (px - rx) + dzdy * (py - ry)).clamp(0.0, 16_777_215.0) as u32;
                                 if let Some(zo) = zrow.at(&r, mem, x as u32, y as u32) {
                                     let old = Self::get_px(mem, zo, 4);
-                                    let zd = old & 0xff_ffff;
-                                    let pass = match zfunc {
+                                    let (sd, zd) = (old >> 24, old & 0xff_ffff);
+                                    let cmp = |f: u32, a: u32, b: u32| match f {
                                         0 => false,
-                                        1 => zs < zd,
-                                        2 => zs == zd,
-                                        3 => zs <= zd,
-                                        4 => zs > zd,
-                                        5 => zs != zd,
-                                        6 => zs >= zd,
+                                        1 => a < b,
+                                        2 => a == b,
+                                        3 => a <= b,
+                                        4 => a > b,
+                                        5 => a != b,
+                                        6 => a >= b,
                                         _ => true,
                                     };
-                                    if !pass {
+                                    if stencil && !cmp(sfunc, sd & svmask, sref & svmask) {
+                                        let s = sop((smode >> 8) & 15, sd);
+                                        if s != sd {
+                                            mem.put_be(zo, 4, s << 24 | zd);
+                                        }
                                         continue;
                                     }
-                                    if zmask {
-                                        mem.put_be(zo, 4, (old & 0xff00_0000) | zs);
+                                    let zpass = !depth || cmp(zfunc, zs, zd);
+                                    let s = if stencil { sop(if zpass { smode & 15 } else { (smode >> 4) & 15 }, sd) } else { sd };
+                                    let z = if zpass && depth && zmask { zs } else { zd };
+                                    if s != sd || z != zd {
+                                        mem.put_be(zo, 4, s << 24 | z);
+                                    }
+                                    if !zpass {
+                                        continue;
                                     }
                                 }
                             }
@@ -3154,6 +3197,41 @@ mod tests {
         // Pixel (2, 1): row 1 of the first tile, 512 bytes a row.
         let o = 0x0100_0000 + 512 + 2 * 4;
         assert_eq!(&m.bytes(o, 4), &[0, 0, 0, 2]);
+    }
+
+    /// The stencil test as mirrors uses it: a triangle marks the stencil
+    /// (ALWAYS, ref 1, REPLACE), then a larger one drawn where it EQUALs 1
+    /// lands only where the first was. Without the test the reflection was
+    /// drawn over the whole scene.
+    #[test]
+    fn a_stencilled_triangle_draws_only_where_the_stencil_was_marked() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = TestRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        // TLB C (the stencil-depth buffer) entry 0 -> 0x0110_0000, zeroed.
+        re.write64(base + TLB_A + 0x400, (0x8000u64 | 0x110) << 48);
+        re.write32(base + BUFMODE_DST, 0x200);
+        re.write32(base + PRIMITIVE, 0x0200_0000);
+        re.write32(base + STENCIL_MASK, 0xff);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        let tri = |n: u32, fg: u32| {
+            re.write64(base + TRI_V0, (gl(0) as u64) << 32 | gl(0) as u64);
+            re.write64(base + TRI_V0 + 8, (gl(n) as u64) << 32 | gl(0) as u64);
+            re.write64(base + TRI_V0 + 16, (gl(0) as u64) << 32 | gl(n) as u64);
+            re.write32(base + (FG | 0x800), fg);
+        };
+        // Flat, colour index, stencil test on, depth test off.
+        re.write32(base + DRAWMODE, 0x0040_0179);
+        re.write32(base + STENCIL_MODE, 0x01ff_7333);
+        tri(8, 1);
+        re.write32(base + STENCIL_MODE, 0x01ff_2000);
+        tri(32, 2);
+        let m = ram.lock().unwrap();
+        let px = |x: usize, y: usize| m.bytes(0x0100_0000 + y * 512 + x * 4 + 3, 1)[0];
+        let st = |x: usize, y: usize| m.bytes(0x0110_0000 + y * 512 + x * 4, 1)[0];
+        assert_eq!((px(2, 1), st(2, 1)), (2, 1), "inside the mark: drawn, stencil 1");
+        assert_eq!((px(20, 1), st(20, 1)), (0, 0), "outside it: neither");
     }
 
     /// A 32-bit linear end at a byte address (a step of 1, or a start off
