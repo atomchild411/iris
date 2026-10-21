@@ -8,12 +8,7 @@ use crate::traits::{Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, toml_bool, hex_u8};
 use crate::devlog::LogModule;
 use crate::config::KeyboardLayout;
-
-/// Callback trait for PS/2 interrupts
-pub trait Ps2Callback: Send + Sync {
-    /// Set the interrupt line state
-    fn set_interrupt(&self, active: bool);
-}
+use crate::irq::IrqLine;
 
 enum Ps2Source {
     Keyboard,
@@ -56,7 +51,8 @@ struct Ps2State {
 /// Combined PS/2 Keyboard and Mouse Controller
 pub struct Ps2Controller {
     state: Mutex<Ps2State>,
-    callback: Option<Arc<dyn Ps2Callback>>,
+    /// The controller's interrupt: up while a byte waits to be read.
+    irq: Option<IrqLine>,
     running: AtomicBool,
     /// Host keyboard shape (`KeyboardLayout as u8`). Host config, not guest
     /// state, so it is not in snapshots.
@@ -65,7 +61,7 @@ pub struct Ps2Controller {
 
 impl Ps2Controller {
     /// Create a new PS/2 Controller
-    pub fn new(callback: Option<Arc<dyn Ps2Callback>>) -> Self {
+    pub fn new(irq: Option<IrqLine>) -> Self {
         Self {
             state: Mutex::new(Ps2State {
                 rx_queue: VecDeque::new(),
@@ -83,7 +79,7 @@ impl Ps2Controller {
                 key_modes: [3; 256],
                 held_keys: [false; 256],
             }),
-            callback,
+            irq,
             running: AtomicBool::new(false),
             layout: AtomicU8::new(KeyboardLayout::Ansi as u8),
         }
@@ -96,11 +92,11 @@ impl Ps2Controller {
 
     /// Update interrupt state based on queue status
     fn update_interrupt(&self) {
-        if let Some(cb) = &self.callback {
+        if let Some(line) = &self.irq {
             let state = self.state.lock();
             let len = state.rx_queue.len();
             drop(state);
-            cb.set_interrupt(len > 0);
+            line.set(len > 0);
         }
     }
 
@@ -1253,6 +1249,18 @@ impl Saveable for Ps2Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The interrupt is up exactly while a byte waits to be read.
+    #[test]
+    fn the_irq_line_follows_the_receive_queue() {
+        let (probe, line) = crate::irq::LevelProbe::line();
+        let ps2 = Ps2Controller::new(Some(line));
+        ps2.start();
+        ps2.write_data(0xF4); // enable scanning: answered with an ACK
+        assert!(probe.level(), "the ACK is waiting");
+        assert_eq!(ps2.read_data(), 0xFA);
+        assert!(!probe.level(), "and once read, the line drops");
+    }
 
     #[test]
     fn set3_make_break_suppresses_host_repeat_and_preserves_release() {

@@ -8,7 +8,7 @@ use crate::snapshot::{get_field, toml_u8, hex_u8};
 use crate::dev::z85c30::Z85c30;
 use crate::dev::pit8254::{Pit8254, TimerCallback};
 use crate::cpu::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
-use crate::dev::ps2::{Ps2Controller, Ps2Callback};
+use crate::dev::ps2::Ps2Controller;
 use crate::hptimer::TimerManager;
 use crate::irq::{InterruptController, IrqLine};
 use std::io::Write;
@@ -450,11 +450,6 @@ struct IocState {
 // accessed through Arc<Mutex<IocState>>, which is what actually needs Send.
 unsafe impl Send for IocState {}
 
-struct IocIrqLine {
-    state: Arc<Mutex<IocState>>,
-    source: IocInterrupt,
-}
-
 /// The IOC's interrupt inputs, as a controller devices hold lines into: line
 /// `n` is the [`IocInterrupt`] numbered `n` (see [`IocInterrupt::line`]).
 struct IocInputs(Arc<Mutex<IocState>>);
@@ -489,14 +484,6 @@ impl TimerCallback for IocTimerCallback {
             IocInterrupt::Mappable1 => { state.ticks[1].fire(); state.map_stat |= 1 << 1 }
             _ => {}
         }
-        state.update_interrupts();
-    }
-}
-
-impl Ps2Callback for IocIrqLine {
-    fn set_interrupt(&self, active: bool) {
-        let mut state = self.state.lock();
-        if active { state.map_stat |= map_regs::KBD_MOUSE } else { state.map_stat &= !map_regs::KBD_MOUSE }
         state.update_interrupts();
     }
 }
@@ -605,10 +592,7 @@ impl Ioc {
             ticks: clock_ticks.clone(),
         });
 
-        let ps2_cb = Arc::new(IocIrqLine {
-            state: state.clone(),
-            source: IocInterrupt::KbMouse,
-        });
+        let ps2_irq = IrqLine::new(Arc::new(IocInputs(state.clone())), IocInterrupt::KbMouse.line());
 
         let scc = if ci_mode {
             Z85c30::new_null(Some(serial_irq))
@@ -620,7 +604,7 @@ impl Ioc {
             state,
             scc,
             pit: Pit8254::new(1_000_000, Some(timer0_cb), Some(timer1_cb), None),
-            ps2: Arc::new(Ps2Controller::new(Some(ps2_cb))),
+            ps2: Arc::new(Ps2Controller::new(Some(ps2_irq))),
             guinness,
             event_tx: Arc::new(std::sync::OnceLock::new()),
             heartbeat: Arc::new(std::sync::OnceLock::new()),
