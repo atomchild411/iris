@@ -167,8 +167,15 @@ impl O2Machine {
             g.compile_queue.set_thread_count(cfg.jitv2.threads.max(1));
             g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
             g.compile_queue.set_owner(Arc::downgrade(&jit));
-            let stats = g.stats.clone();
-            g.compile_queue.start(bus.clone() as Arc<dyn BusDevice>, stats);
+            // Not under lockstep, as on the other machines: lockstep compiles
+            // inline on the CPU thread, and a running pool both owns the
+            // Codegen inline needs and deadlocks the CPU thread's flush (its
+            // join waits on workers parked on the Jitv2 lock it holds).
+            #[cfg(not(feature = "jitv2_lockstep"))]
+            {
+                let stats = g.stats.clone();
+                g.compile_queue.start(bus.clone() as Arc<dyn BusDevice>, stats);
+            }
             // The compile pool keeps only a weak handle on the CPU.
             std::mem::forget(cpu_device);
         }
