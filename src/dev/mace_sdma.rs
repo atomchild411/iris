@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use crate::dev::crime_mem::O2Memory;
+use crate::snapshot::{get_field, hex_u32, hex_u64, toml_u32, toml_u64};
 use crate::ip32::*;
 
 /// The serial DMA control registers, rings and status bits, as MACE's
@@ -450,6 +451,66 @@ impl crate::traits::Device for MaceSerialDma {
     }
 }
 
+impl SdmaChan {
+    fn save(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("ctrl".into(), hex_u64(self.ctrl));
+        t.insert("rptr".into(), hex_u32(self.rptr));
+        t.insert("wptr".into(), hex_u32(self.wptr));
+        t.insert("blocks".into(), hex_u64(self.blocks));
+        t.insert("bytes".into(), hex_u64(self.bytes));
+        toml::Value::Table(t)
+    }
+
+    fn load(v: &toml::Value) -> Self {
+        let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
+        let p = |k: &str| get_field(v, k).and_then(toml_u32).unwrap_or(0);
+        Self { ctrl: u("ctrl"), rptr: p("rptr"), wptr: p("wptr"), blocks: u("blocks"), bytes: u("bytes") }
+    }
+}
+
+/// Both ports' channels and latches; loading hands the ports' status to
+/// MACE ISA again.
+impl crate::traits::Saveable for MaceSerialDma {
+    fn save_state(&self) -> toml::Value {
+        let ports = self.ports.lock().unwrap().iter().map(|p| {
+            let mut t = toml::map::Map::new();
+            t.insert("tx".into(), p.tx.save());
+            t.insert("rx".into(), p.rx.save());
+            t.insert("owned".into(), toml::Value::Boolean(p.owned));
+            t.insert("preq".into(), toml::Value::Boolean(p.preq));
+            t.insert("tx_memerr".into(), toml::Value::Boolean(p.tx_memerr));
+            t.insert("rx_overrun".into(), toml::Value::Boolean(p.rx_overrun));
+            toml::Value::Table(t)
+        }).collect();
+        let mut t = toml::map::Map::new();
+        t.insert("ports".into(), toml::Value::Array(ports));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let mut any = false;
+        if let Some(toml::Value::Array(a)) = get_field(v, "ports") {
+            let mut ports = self.ports.lock().unwrap();
+            for (p, e) in ports.iter_mut().zip(a) {
+                let b = |k: &str| get_field(e, k).and_then(|x| x.as_bool()).unwrap_or(false);
+                *p = SdmaPort {
+                    tx: get_field(e, "tx").map_or(SdmaChan::RESET, SdmaChan::load),
+                    rx: get_field(e, "rx").map_or(SdmaChan::RESET, SdmaChan::load),
+                    owned: b("owned"),
+                    preq: b("preq"),
+                    tx_memerr: b("tx_memerr"),
+                    rx_overrun: b("rx_overrun"),
+                };
+                any |= p.owned;
+            }
+        }
+        self.any_owned.store(any, Ordering::Release);
+        self.update_irq();
+        Ok(())
+    }
+}
+
 impl crate::traits::Resettable for MaceSerialDma {
     fn power_on(&self) {
         self.reset();
@@ -489,5 +550,26 @@ mod tests {
                 assert!(!held.threshold(false) && !held.threshold(true), "never in reset");
             }
         }
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        use crate::traits::Saveable;
+        let src = MaceSerialDma::new();
+        {
+            let mut p = src.ports.lock().unwrap();
+            p[0].tx = SdmaChan { ctrl: sdma::CTRL_ENABLE | 4 << 5, rptr: 0x40, wptr: 0x80, blocks: 3, bytes: 77 };
+            p[0].rx = SdmaChan { ctrl: sdma::CTRL_ENABLE | 5 << 5, rptr: 0x20, wptr: 0x60, blocks: 1, bytes: 9 };
+            p[0].owned = true;
+            p[0].preq = true;
+            p[1].rx_overrun = true;
+        }
+        src.any_owned.store(true, Ordering::Release);
+        let v1 = src.save_state();
+
+        let dst = MaceSerialDma::new();
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "MaceSerialDma save_state mismatch after load_state round-trip");
+        assert!(dst.any_owned(), "ownership is derived again on load");
     }
 }

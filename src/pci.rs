@@ -10,6 +10,7 @@
 use std::sync::Mutex;
 
 use crate::irq::IrqLine;
+use crate::snapshot::{get_field, load_u32_slice, u32_slice_to_toml};
 
 /// Command register bits.
 pub const PCI_COMMAND_IO: u32 = 0x1;
@@ -145,6 +146,28 @@ impl PciConfig {
     }
 }
 
+/// The header's registers. Identity, class and the BARs' sizes come from
+/// the function, so a header only loads into the same kind of function.
+impl crate::traits::Saveable for PciConfig {
+    fn save_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("regs".into(), u32_slice_to_toml(&*self.regs.lock().unwrap()));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let Some(r) = get_field(v, "regs") else { return Ok(()) };
+        let mut saved = [0u32; 64];
+        load_u32_slice(r, &mut saved);
+        let mut regs = self.regs.lock().unwrap();
+        if saved[0] != regs[0] {
+            return Err(format!("pci: saved header is for {:#010x}, this function is {:#010x}", saved[0], regs[0]));
+        }
+        *regs = saved;
+        Ok(())
+    }
+}
+
 /// A PCI function, as a host bridge sees it.
 ///
 /// BAR accesses arrive with the offset and value the device sees: whatever
@@ -173,6 +196,23 @@ mod tests {
 
     /// Firmware learns how much space a device wants by writing all ones to
     /// a BAR and reading back which address bits stuck.
+    #[test]
+    fn save_load_round_trip() {
+        use crate::traits::Saveable;
+        let src = scsi_like();
+        src.write(1, PCI_COMMAND_MEMORY | PCI_COMMAND_IO);
+        src.write(4, 0x0000_1000);
+        src.write(5, 0x8000_1000);
+        src.write(15, 0x0000_0108);
+        let v1 = src.save_state();
+        let dst = scsi_like();
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "PciConfig save_state mismatch after load_state round-trip");
+        assert_eq!(dst.bar_base(1), 0x8000_1000);
+        let other = PciConfig::new(0x1234, 0x5678, 0, 0, [Bar::Unused; 6], 0);
+        assert!(other.load_state(&v1).is_err(), "a header loads only into the same kind of function");
+    }
+
     #[test]
     fn a_bar_reports_its_size_to_a_probe() {
         let c = scsi_like();

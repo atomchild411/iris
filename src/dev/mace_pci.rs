@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::irq::{InterruptController, IrqLine};
 use crate::pci::{PciBusDevice, Space};
-use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
+use crate::snapshot::{get_field, hex_u32, load_u32_slice, toml_u32, u32_slice_to_toml};
+use crate::traits::{BusDevice, BusRead32, BusRead64, Saveable, BUS_OK};
 use crate::ip32::*;
 
 pub mod macepci_reg {
@@ -321,6 +322,48 @@ impl BusDevice for MacePci {
     }
 }
 
+/// The bridge's registers, the selected configuration address, the pins'
+/// levels (driven into CRIME again on load) and each slot's configuration
+/// header, by device number. The functions behind the slots save their own
+/// state.
+impl Saveable for MacePci {
+    fn save_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("config_addr".into(), hex_u32(*self.config_addr.lock().unwrap()));
+        t.insert("regs".into(), u32_slice_to_toml(&*self.regs.lock().unwrap()));
+        let levels = self.irq.levels.lock().unwrap();
+        t.insert("pins".into(), toml::Value::Array(levels.iter().map(|&b| toml::Value::Boolean(b)).collect()));
+        drop(levels);
+        let mut slots = toml::map::Map::new();
+        for (n, s) in self.slots.lock().unwrap().iter() {
+            slots.insert(n.to_string(), s.dev.config().save_state());
+        }
+        t.insert("slots".into(), toml::Value::Table(slots));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        *self.config_addr.lock().unwrap() = get_field(v, "config_addr").and_then(toml_u32).unwrap_or(0);
+        if let Some(r) = get_field(v, "regs") {
+            load_u32_slice(r, &mut *self.regs.lock().unwrap());
+        }
+        if let Some(toml::Value::Table(slots)) = get_field(v, "slots") {
+            let ours = self.slots.lock().unwrap();
+            for (n, cfg) in slots {
+                let s = n.parse::<u8>().ok().and_then(|n| ours.get(&n))
+                    .ok_or_else(|| format!("pci: saved state has slot {n}, which is empty here"))?;
+                s.dev.config().load_state(cfg)?;
+            }
+        }
+        if let Some(toml::Value::Array(pins)) = get_field(v, "pins") {
+            for (line, level) in pins.iter().enumerate().take(PCI_PINS) {
+                self.irq.set_line(line as u32, level.as_bool().unwrap_or(false));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl crate::traits::Device for MacePci {
     fn step(&self, _cycles: u64) {}
     fn stop(&self) {}
@@ -443,6 +486,36 @@ mod tests {
         f.irq.get().expect("wired at attach").set(true);
         assert_eq!(*crime.0.lock().unwrap(), vec![(IP32_SCSI_CRIME_INT, true)]);
     }
+    #[test]
+    fn save_load_round_trip() {
+        let make = |crime: Arc<Crime>| {
+            let pci = MacePci::new(crime);
+            let f = Arc::new(Fake {
+                cfg: PciConfig::new(0x9004, 0x8078, 0x0100_00, 1,
+                    [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA),
+                last: Mutex::new(None),
+                irq: std::sync::OnceLock::new(),
+            });
+            pci.attach(IP32_SCSI_SLOT, "fake", f.clone());
+            (pci, f)
+        };
+        let (src, f) = make(Arc::new(Crime(Mutex::new(Vec::new()))));
+        let slot1 = (IP32_SCSI_SLOT as u32) << 11;
+        src.write32(MACEPCI_BASE + macepci_reg::CONFIG_ADDR, cfg(slot1, 5));
+        src.write32(MACEPCI_BASE + macepci_reg::CONFIG_DATA, 0x8000_1000);
+        src.write32(MACEPCI_BASE + macepci_reg::CONFIG_ADDR, cfg(slot1, 1));
+        src.write32(MACEPCI_BASE + macepci_reg::CONFIG_DATA, PCI_COMMAND_MEMORY);
+        f.irq.get().unwrap().set(true);
+        let v1 = src.save_state();
+
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let (dst, _) = make(crime.clone());
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "MacePci save_state mismatch after load_state round-trip");
+        assert_eq!(dst.window_read(PCI_MEM_BASE + 0x1084, 4), 0x1234_5678, "BAR and memory enable restored");
+        assert!(crime.0.lock().unwrap().contains(&(IP32_SCSI_CRIME_INT, true)), "the pin is driven again");
+    }
+
     /// Two functions whose pins share one system input (slot 3's INTA and
     /// slot 4's INTB, on a made-up routing): the input stays up until both
     /// have dropped, so neither can clear the other's interrupt.
