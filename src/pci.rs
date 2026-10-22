@@ -183,6 +183,22 @@ pub trait PciBusDevice: Send + Sync {
 
     /// The bridge wires the function's interrupt pin to `line`.
     fn connect_interrupt(&self, _line: IrqLine) {}
+
+    /// The bridge gives a function that masters the bus its way to memory.
+    fn connect_dma(&self, _dma: std::sync::Arc<dyn PciDma>) {}
+}
+
+/// Memory as a bus master reaches it. The bridge decides what a PCI address
+/// is and in which order its bytes arrive; the function sees bytes at bus
+/// addresses, as it would on the bus.
+pub trait PciDma: Send + Sync {
+    /// `buf.len()` bytes from bus address `addr`. False if any of them is
+    /// not memory; those read as zero.
+    fn dma_read(&self, addr: u32, buf: &mut [u8]) -> bool;
+
+    /// `data` to bus address `addr`. False if any of it is not memory;
+    /// those bytes go nowhere.
+    fn dma_write(&self, addr: u32, data: &[u8]) -> bool;
 }
 
 #[cfg(test)]

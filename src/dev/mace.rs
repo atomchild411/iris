@@ -61,7 +61,7 @@ impl Mace {
         let mace = Self {
             isa,
             regs: Stub::new("mace"),
-            pci: MacePci::new(crime.clone()),
+            pci: MacePci::new(crime.clone(), ram.clone()),
             ust,
             nic_trace: NicTrace::new(),
             rtc: MaceRtc::new(),

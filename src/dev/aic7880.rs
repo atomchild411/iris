@@ -331,10 +331,11 @@ pub struct Aic7880 {
     /// CHDs, overlays, CD-ROMs). An install needs at least two -- the media
     /// to read and the disk to write.
     targets: Mutex<[Option<ScsiDevice>; 16]>,
-    /// Host memory. The controller fetches its work from there rather than
-    /// being handed it a register at a time, so without this it can see the
-    /// tag of a command and nothing else about it.
-    ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>,
+    /// Host memory, through the PCI bridge the chip masters. The controller
+    /// fetches its work from there rather than being handed it a register at
+    /// a time, so without this it can see the tag of a command and nothing
+    /// else about it.
+    dma: std::sync::OnceLock<std::sync::Arc<dyn crate::pci::PciDma>>,
     /// The SCSI id a disk attached without one answers at.
     target: u8,
     /// The controller's own sense, as (key, ASC, ASCQ): a command for a
@@ -356,11 +357,11 @@ pub const PCI_DEVICE_AIC7880: u16 = 0x8078;
 pub const PCI_CLASS_SCSI: u32 = 0x0100_00;
 
 impl Aic7880 {
-    pub fn new(ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
+    pub fn new() -> Self {
         Self {
             st: Mutex::new(State::default()),
             targets: Mutex::new(std::array::from_fn(|_| None)),
-            ram,
+            dma: std::sync::OnceLock::new(),
             sense: Mutex::new(None),
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
             irq: std::sync::OnceLock::new(),
@@ -375,20 +376,25 @@ impl Aic7880 {
         }
     }
 
-    /// Memory answers at its own base and again in a low alias, and the
-    /// driver uses both in the same breath: the SCB's own address is given as
-    /// `0x410752fc` while the CDB pointer inside it is `0x0107532c`, which is
-    /// the same bytes. The memory's own decode covers both.
-    /// Read a byte of host memory, given the address the device sees.
+    /// `n` bytes of host memory from bus address `addr`, through the bridge.
+    /// Its two views reach the same bytes, and the driver uses both in the
+    /// same breath: the SCB's own address is given as `0x410752fc` while the
+    /// CDB pointer inside it is `0x0107532c`.
+    fn dma_read_bytes(&self, addr: u32, n: usize) -> Vec<u8> {
+        let mut b = vec![0u8; n];
+        if !self.dma.get().is_some_and(|d| d.dma_read(addr, &mut b)) {
+            self.dma_miss(addr, false);
+        }
+        b
+    }
+
     fn dma_read8(&self, addr: u32) -> u8 {
-        let r = self.ram.lock().unwrap();
-        match r.dma_offset(addr) {
-            Some(i) => r[i],
-            None => {
-                drop(r);
-                self.dma_miss(addr, false);
-                0
-            }
+        self.dma_read_bytes(addr, 1)[0]
+    }
+
+    fn dma_write_bytes(&self, addr: u32, data: &[u8]) {
+        if !self.dma.get().is_some_and(|d| d.dma_write(addr, data)) {
+            self.dma_miss(addr, true);
         }
     }
 
@@ -403,13 +409,7 @@ impl Aic7880 {
     }
 
     fn dma_write8(&self, addr: u32, val: u8) {
-        let mut r = self.ram.lock().unwrap();
-        if let Some(i) = r.dma_offset(addr) {
-            r.write(i, &[val]);
-        } else {
-            drop(r);
-            self.dma_miss(addr, true);
-        }
+        self.dma_write_bytes(addr, &[val]);
     }
 
 
@@ -421,11 +421,8 @@ impl Aic7880 {
     /// written a register at a time, least significant first — so the two
     /// orders sit side by side and both are settled by observation.
     fn dma_read32(&self, addr: u32) -> u32 {
-        let mut v = 0u32;
-        for i in 0..4 {
-            v = (v << 8) | self.dma_read8(addr + i) as u32;
-        }
-        v
+        let b = self.dma_read_bytes(addr, 4);
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
     }
 
     /// A 32-bit word the little-endian way.
@@ -436,15 +433,8 @@ impl Aic7880 {
     /// the wrong way round turns 0x0005fe58 into 0x58fe0500 -- an address
     /// far outside memory, which lands nowhere and reports success.
     fn dma_read32_le(&self, addr: u32) -> u32 {
-        let mut v = 0u32;
-        for i in (0..4).rev() {
-            v = (v << 8) | self.dma_read8(addr + i) as u32;
-        }
-        v
-    }
-
-    fn dma_read_bytes(&self, addr: u32, n: usize) -> Vec<u8> {
-        (0..n as u32).map(|i| self.dma_read8(addr + i)).collect()
+        let b = self.dma_read_bytes(addr, 4);
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
     }
 
     fn note(st: &mut State, what: String) {
@@ -548,7 +538,7 @@ impl Aic7880 {
     /// bytes the HIM also uses, so a doorbell whose rings are not memory is
     /// somebody else's bytes and not a doorbell.
     fn is_memory(&self, addr: u32) -> bool {
-        self.ram.lock().unwrap().dma_offset(addr).is_some()
+        self.dma.get().is_some_and(|d| d.dma_read(addr, &mut [0u8]))
     }
 
     /// A CDB's length follows from its opcode group. Taking it from the
@@ -718,9 +708,7 @@ impl Aic7880 {
                 break;
             }
             let n = (*l as usize).min(data.len() - done);
-            for k in 0..n {
-                self.dma_write8(a + k as u32, data[done + k]);
-            }
+            self.dma_write_bytes(*a, &data[done..done + n]);
             done += n;
         }
         done
@@ -767,9 +755,7 @@ impl Aic7880 {
             }
             entries.push((a, l));
             let n = (l as usize).min(data.len() - done);
-            for k in 0..n {
-                self.dma_write8(a + k as u32, data[done + k]);
-            }
+            self.dma_write_bytes(a, &data[done..done + n]);
             done += n;
             if raw & SG_LAST != 0 {
                 break;
@@ -1403,6 +1389,10 @@ impl crate::pci::PciBusDevice for Aic7880 {
     fn connect_interrupt(&self, line: crate::irq::IrqLine) {
         self.connect_irq(line);
     }
+
+    fn connect_dma(&self, dma: std::sync::Arc<dyn crate::pci::PciDma>) {
+        let _ = self.dma.set(dma);
+    }
 }
 
 #[cfg(test)]
@@ -1410,7 +1400,14 @@ mod tests {
     use super::*;
 
     fn chip() -> Aic7880 {
-        Aic7880::new(std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20))))
+        on(std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20))))
+    }
+
+    /// A chip that masters host memory `ram` through the bridge.
+    fn on(ram: Ram) -> Aic7880 {
+        let c = Aic7880::new();
+        crate::pci::PciBusDevice::connect_dma(&c, std::sync::Arc::new(crate::dev::mace_pci::HostMemory::new(ram)));
+        c
     }
 
     #[test]
@@ -1509,7 +1506,7 @@ mod tests {
     #[test]
     fn a_queued_tag_fetches_the_command_and_answers_it() {
         let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
-        let c = Aic7880::new(ram.clone());
+        let c = on(ram.clone());
 
         // A controller with nothing attached answers nothing, so the test
         // needs a disk as much as the machine does.
@@ -1569,7 +1566,7 @@ mod tests {
     #[test]
     fn a_write_reaches_the_disk_and_reads_back() {
         let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
-        let c = Aic7880::new(ram.clone());
+        let c = on(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-write.img");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
         c.attach_disk(&img).expect("attach");
@@ -1622,7 +1619,7 @@ mod tests {
     #[test]
     fn a_long_scatter_gather_list_is_followed_to_the_end() {
         let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(4 << 20)));
-        let c = Aic7880::new(ram.clone());
+        let c = on(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-sg.img");
         let pattern: Vec<u8> = (0..264 * BLOCK_SIZE).map(|i| (i % 253) as u8).collect();
         std::fs::write(&img, &pattern).expect("test image");
@@ -1685,7 +1682,7 @@ mod tests {
     fn dma_resolves_the_low_memory_alias() {
         let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 16)));
         ram.lock().unwrap().write(0x40, &[0xa5]);
-        let c = Aic7880::new(ram);
+        let c = on(ram);
         assert_eq!(c.dma_read8(0x40), 0xa5, "the low alias");
         assert_eq!(c.dma_read8(crate::ip32::RAM_BASE + 0x40), 0xa5, "and memory's own base");
     }
@@ -1732,7 +1729,7 @@ mod tests {
     /// on an O2. One disk, at id 1.
     fn him_rig(name: &str) -> (Aic7880, Ram) {
         let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
-        let c = Aic7880::new(ram.clone());
+        let c = on(ram.clone());
         let img = std::env::temp_dir().join(format!("iris-aic7880-{name}.img"));
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
         c.attach_disk_at(1, &img).expect("attach");
@@ -1825,7 +1822,7 @@ mod tests {
     #[test]
     fn the_netbsd_doorbell_still_runs_commands() {
         let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
-        let c = Aic7880::new(ram.clone());
+        let c = on(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-nb.img");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
         c.attach_disk_at(1, &img).expect("attach");

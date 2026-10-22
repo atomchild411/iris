@@ -6,7 +6,8 @@
 use std::sync::{Arc, Mutex};
 
 use crate::irq::{InterruptController, IrqLine};
-use crate::pci::{PciBusDevice, Space};
+use crate::dev::crime_mem::O2Memory;
+use crate::pci::{PciBusDevice, PciDma, Space};
 use crate::snapshot::{get_field, hex_u32, load_u32_slice, toml_u32, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Saveable, BUS_OK};
 use crate::ip32::*;
@@ -107,6 +108,70 @@ pub const PCI_MEM_PCI_BASE: u32 = 0x8000_0000;
 /// arrives as 0x8000_0000 and up, where an O2 has nothing else below 4 GB.
 pub const PCI_HI_MEM_BASE: u32 = 0x8000_0000;
 
+/// Host memory on the PCI bus, as bus masters see it (MACE spec 9.3.1): the
+/// low gigabyte is the "byte-swapped view", the next the "native view",
+/// both onto the same gigabyte of memory, and above that is not host memory.
+pub const PCI_SWAPPED_VIEW: u32 = 0x0000_0000;
+pub const PCI_NATIVE_VIEW: u32 = 0x4000_0000;
+pub const PCI_HOST_END: u32 = 0x8000_0000;
+
+/// What a bus master reaches through the bridge: host memory in its two
+/// views, which reach the same bytes as the CPU's own decode.
+///
+/// Both views hand bytes over in address order. The spec has the low view
+/// byte-swapped, but every driver run here needs address order in both:
+/// IRIX's HIM keeps its descriptors in the native view and its CDBs in the
+/// low one, the BSDs give the chip physical addresses in either range for
+/// the same little-endian descriptors and data, and swapping the native
+/// view's 32-bit words broke OpenBSD's writes (programs crashed after a
+/// reboot). Word order is the device's business, settled per driver.
+pub struct HostMemory {
+    ram: Arc<Mutex<O2Memory>>,
+}
+
+impl HostMemory {
+    pub fn new(ram: Arc<Mutex<O2Memory>>) -> Self {
+        Self { ram }
+    }
+
+    /// The memory byte bus address `a` reaches, if any.
+    fn locate(m: &O2Memory, a: u32) -> Option<usize> {
+        if a >= PCI_HOST_END {
+            return None;
+        }
+        m.dma_offset(a)
+    }
+}
+
+impl PciDma for HostMemory {
+    fn dma_read(&self, addr: u32, buf: &mut [u8]) -> bool {
+        let m = self.ram.lock().unwrap();
+        let mut ok = true;
+        for (k, b) in buf.iter_mut().enumerate() {
+            match Self::locate(&m, addr.wrapping_add(k as u32)) {
+                Some(i) => *b = m[i],
+                None => {
+                    *b = 0;
+                    ok = false;
+                }
+            }
+        }
+        ok
+    }
+
+    fn dma_write(&self, addr: u32, data: &[u8]) -> bool {
+        let mut m = self.ram.lock().unwrap();
+        let mut ok = true;
+        for (k, &b) in data.iter().enumerate() {
+            match Self::locate(&m, addr.wrapping_add(k as u32)) {
+                Some(i) => m.write(i, &[b]),
+                None => ok = false,
+            }
+        }
+        ok
+    }
+}
+
 /// A function in a slot, and the configuration registers the guest has
 /// touched (first touch, with direction), for the bring-up report.
 struct Slot {
@@ -124,28 +189,32 @@ pub struct MacePci {
     slots: Mutex<std::collections::BTreeMap<u8, Arc<Slot>>>,
     /// The slots' interrupt pins, routed to CRIME.
     irq: Arc<PciIrqRouter>,
+    /// Host memory, for the functions that master the bus.
+    dma: Arc<HostMemory>,
 }
 
 impl MacePci {
-    pub fn new(intc: Arc<dyn InterruptController>) -> Self {
-        Self::with_routing(intc, crime_input)
+    pub fn new(intc: Arc<dyn InterruptController>, ram: Arc<Mutex<O2Memory>>) -> Self {
+        Self::with_routing(intc, crime_input, ram)
     }
 
     /// A bridge with its own routing of slot pins (1 = INTA) to `intc`'s
     /// inputs.
-    fn with_routing(intc: Arc<dyn InterruptController>, route: fn(u8, u8) -> Option<u32>) -> Self {
+    fn with_routing(intc: Arc<dyn InterruptController>, route: fn(u8, u8) -> Option<u32>, ram: Arc<Mutex<O2Memory>>) -> Self {
         Self {
             config_addr: Mutex::new(0),
             regs: Mutex::new([0u32; (MACEPCI_SIZE / 4) as usize]),
             probed: Mutex::new(Vec::new()),
             slots: Mutex::new(std::collections::BTreeMap::new()),
             irq: Arc::new(PciIrqRouter { intc, route, levels: Mutex::new([false; PCI_PINS]) }),
+            dma: Arc::new(HostMemory::new(ram)),
         }
     }
 
-    /// Put a function in a slot on bus 0, and wire its interrupt pin to the
-    /// bridge, which routes it on.
+    /// Put a function in a slot on bus 0, wire its interrupt pin to the
+    /// bridge, which routes it on, and give it host memory to master.
     pub fn attach(&self, slot: u8, name: &'static str, dev: Arc<dyn PciBusDevice>) {
+        dev.connect_dma(self.dma.clone());
         let pin = dev.config().interrupt_pin();
         if (1..=4).contains(&pin) {
             dev.connect_interrupt(IrqLine::new(self.irq.clone(), PciIrqRouter::line(slot, pin)));
@@ -447,10 +516,32 @@ mod tests {
 
     fn cfg(addr: u32, reg: u32) -> u32 { addr | (1 << 31) | (reg << 2) }
 
+    fn test_ram() -> Arc<Mutex<O2Memory>> {
+        Arc::new(Mutex::new(O2Memory::single(1 << 20)))
+    }
+
+    /// A bus master reaches the same memory through both views, bytes in
+    /// address order, and nothing above 2 GB.
+    #[test]
+    fn bus_masters_reach_memory_through_both_views() {
+        let ram = test_ram();
+        ram.lock().unwrap().write(0x100, &[0x11, 0x22, 0x33, 0x44]);
+        let host = HostMemory::new(ram.clone());
+        let mut b = [0u8; 4];
+        assert!(host.dma_read(PCI_SWAPPED_VIEW + 0x100, &mut b));
+        assert_eq!(b, [0x11, 0x22, 0x33, 0x44]);
+        assert!(host.dma_read(PCI_NATIVE_VIEW + 0x100, &mut b));
+        assert_eq!(b, [0x11, 0x22, 0x33, 0x44]);
+        assert!(host.dma_write(PCI_NATIVE_VIEW + 0x102, &[0xaa, 0xbb]));
+        assert_eq!(ram.lock().unwrap().bytes(0x100, 4), [0x11, 0x22, 0xaa, 0xbb]);
+        assert!(!host.dma_read(PCI_HOST_END + 0x100, &mut b), "not host memory");
+        assert_eq!(b, [0; 4]);
+    }
+
     #[test]
     fn the_bridge_configures_decodes_and_routes_a_function() {
         let crime = Arc::new(Crime(Mutex::new(Vec::new())));
-        let pci = MacePci::new(crime.clone());
+        let pci = MacePci::new(crime.clone(), test_ram());
         let f = Arc::new(Fake {
             cfg: PciConfig::new(0x9004, 0x8078, 0x0100_00, 1,
                 [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA),
@@ -489,7 +580,7 @@ mod tests {
     #[test]
     fn save_load_round_trip() {
         let make = |crime: Arc<Crime>| {
-            let pci = MacePci::new(crime);
+            let pci = MacePci::new(crime, test_ram());
             let f = Arc::new(Fake {
                 cfg: PciConfig::new(0x9004, 0x8078, 0x0100_00, 1,
                     [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA),
@@ -528,7 +619,7 @@ mod tests {
             }
         }
         let crime = Arc::new(Crime(Mutex::new(Vec::new())));
-        let pci = MacePci::with_routing(crime.clone(), route);
+        let pci = MacePci::with_routing(crime.clone(), route, test_ram());
         let fake = |pin| Arc::new(Fake {
             cfg: PciConfig::new(0x1234, 0x5678, 0, 0, [Bar::Unused; 6], pin),
             last: Mutex::new(None),
