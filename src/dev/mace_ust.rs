@@ -4,7 +4,8 @@ use std::sync::Mutex;
 
 use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
 use std::io::Write;
-use crate::traits::{Device, Resettable};
+use crate::traits::{Device, Resettable, Saveable};
+use crate::snapshot::{get_field, hex_u64, toml_u64};
 
 /// MACE's UST/MSC counter: unadjusted system time, free-running.
 ///
@@ -21,6 +22,9 @@ pub struct MaceUst {
     /// read live. The 1-Wire ID chip's slots are tens of microseconds, so a
     /// clock stepped from another thread cannot time them.
     host: std::sync::OnceLock<std::time::Instant>,
+    /// Added to the host clock, so a restored machine's time runs on from
+    /// where it was saved rather than from when this process started.
+    base: std::sync::atomic::AtomicI64,
     /// The guest's own view of time: see [`MaceUst::guest_us`].
     guest: Mutex<GuestClock>,
 }
@@ -63,7 +67,14 @@ impl Default for MaceUst {
 }
 
 impl MaceUst {
-    pub fn new() -> Self { Self { ticks: Mutex::new(0), host: std::sync::OnceLock::new(), guest: Mutex::new(GuestClock::default()) } }
+    pub fn new() -> Self {
+        Self {
+            ticks: Mutex::new(0),
+            host: std::sync::OnceLock::new(),
+            base: std::sync::atomic::AtomicI64::new(0),
+            guest: Mutex::new(GuestClock::default()),
+        }
+    }
 
     /// Run from the host clock from now on (a machine, not the harness).
     pub fn use_host_clock(&self) {
@@ -122,7 +133,8 @@ impl MaceUst {
 
     pub fn now(&self) -> u64 {
         match self.host.get() {
-            Some(t0) => t0.elapsed().as_micros() as u64,
+            Some(t0) => (t0.elapsed().as_micros() as i64
+                + self.base.load(std::sync::atomic::Ordering::Relaxed)) as u64,
             None => *self.ticks.lock().unwrap(),
         }
     }
@@ -158,6 +170,32 @@ impl Device for MaceUst {
     }
 }
 
+/// The clock as it stood: the raw time, what 1-Wire work has held out of the
+/// guest's view, and the bus's busy window, so the guest's time neither jumps
+/// nor runs backwards across a restore.
+impl Saveable for MaceUst {
+    fn save_state(&self) -> toml::Value {
+        let now = self.now();
+        let g = self.guest.lock().unwrap();
+        let mut t = toml::map::Map::new();
+        t.insert("now".into(), hex_u64(now));
+        t.insert("last".into(), hex_u64(g.last));
+        t.insert("lost".into(), hex_u64(g.lost));
+        t.insert("onewire_until".into(), hex_u64(g.onewire_until));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
+        let now = u("now");
+        *self.ticks.lock().unwrap() = now;
+        let elapsed = self.host.get().map_or(0, |t0| t0.elapsed().as_micros() as i64);
+        self.base.store(now as i64 - elapsed, std::sync::atomic::Ordering::Relaxed);
+        *self.guest.lock().unwrap() = GuestClock { last: u("last"), lost: u("lost"), onewire_until: u("onewire_until") };
+        Ok(())
+    }
+}
+
 impl Resettable for MaceUst {
     /// The counter is free-running from power-up; nothing a reset clears.
     fn power_on(&self) {}
@@ -172,4 +210,35 @@ impl BusDevice for MaceUst {
     fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::ok(self.counter()) }
     fn write32(&self, _a: u32, _v: u32) -> u32 { BUS_OK }
     fn write64(&self, _a: u32, _v: u64) -> u32 { BUS_OK }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_load_round_trip() {
+        let src = MaceUst::new();
+        src.set_us(5_000_000);
+        *src.guest.lock().unwrap() = GuestClock { last: 4_999_000, lost: 1234, onewire_until: 5_003_000 };
+        let v1 = src.save_state();
+
+        let dst = MaceUst::new();
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "MaceUst save_state mismatch after load_state round-trip");
+    }
+
+    /// On the host clock, a restored machine's time carries on from the
+    /// saved value even though this process's clock started later.
+    #[test]
+    fn a_restored_host_clock_runs_on_from_the_saved_time() {
+        let src = MaceUst::new();
+        src.set_us(7_000_000_000);
+        let v = src.save_state();
+        let dst = MaceUst::new();
+        dst.use_host_clock();
+        dst.load_state(&v).expect("load_state");
+        let t = dst.now();
+        assert!((7_000_000_000..7_001_000_000).contains(&t), "restored clock at {t}");
+    }
 }

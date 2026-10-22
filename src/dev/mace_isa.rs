@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use crate::dev::mace_sdma::sdma;
 use crate::irq::{InterruptController, IrqLine};
 use crate::ip32::*;
-use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device, Resettable, BUS_OK};
+use crate::snapshot::{get_field, hex_u64, toml_u64};
+use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device, Resettable, Saveable, BUS_OK};
 
 /// MACE's own interrupt status, which CRIME input 4 cascades from. NetBSD's
 /// handler reads this register and matches each device's mask against it, so
@@ -212,6 +213,45 @@ impl Device for MaceIsa {
     }
 }
 
+/// The registers, the levels devices drive, and the serial engine's view;
+/// loading drives CRIME's cascade lines from them again.
+impl Saveable for MaceIsa {
+    fn save_state(&self) -> toml::Value {
+        let st = self.st.lock().unwrap();
+        let mut t = toml::map::Map::new();
+        t.insert("status".into(), hex_u64(st.guest));
+        t.insert("mask".into(), hex_u64(st.mask));
+        t.insert("driven".into(), hex_u64(st.driven));
+        t.insert("levels".into(), hex_u64(st.levels));
+        t.insert("serial0_pio".into(), toml::Value::Boolean(st.serial0_pio));
+        t.insert("serial_dma_owned".into(),
+            toml::Value::Array(st.serial_dma.0.iter().map(|&b| toml::Value::Boolean(b)).collect()));
+        t.insert("serial_dma_bits".into(), hex_u64(st.serial_dma.1));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        {
+            let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
+            let mut st = self.st.lock().unwrap();
+            st.guest = u("status");
+            st.mask = u("mask");
+            st.driven = u("driven");
+            st.levels = u("levels");
+            st.serial0_pio = get_field(v, "serial0_pio").and_then(|b| b.as_bool()).unwrap_or(false);
+            let mut owned = [false; 2];
+            if let Some(toml::Value::Array(a)) = get_field(v, "serial_dma_owned") {
+                for (o, b) in owned.iter_mut().zip(a) {
+                    *o = b.as_bool().unwrap_or(false);
+                }
+            }
+            st.serial_dma = (owned, u("serial_dma_bits"));
+        }
+        self.update();
+        Ok(())
+    }
+}
+
 impl Resettable for MaceIsa {
     fn power_on(&self) {
         *self.st.lock().unwrap() = State::default();
@@ -256,5 +296,24 @@ mod tests {
         // Software's writes do not stick on bits a device drives.
         isa.write64(MACE_ISA_INT_STATUS, 0);
         assert_eq!(isa.status() & 1 << 2, 1 << 2);
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let src = MaceIsa::new(Arc::new(Lines(Mutex::new([false; 8]))));
+        src.set_line(2, true);
+        src.set_line(9, true);
+        src.set_line(ISA_SERIAL0_PIO, true);
+        src.write64(MACE_ISA_INT_MASK, 0xff | MACE_ISA_PS2_MASK);
+        src.write64(MACE_ISA_INT_STATUS, 0x4000_0000);
+        src.set_serial_dma([false, true], sdma::group(1));
+        let v1 = src.save_state();
+
+        let crime = Arc::new(Lines(Mutex::new([false; 8])));
+        let dst = MaceIsa::new(crime.clone());
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "MaceIsa save_state mismatch after load_state round-trip");
+        let lv = |n: usize| crime.0.lock().unwrap()[n];
+        assert!(lv(4) && lv(5) && lv(6), "the cascade is driven again after a load");
     }
 }

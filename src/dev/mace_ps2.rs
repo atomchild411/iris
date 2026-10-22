@@ -6,7 +6,8 @@ use std::sync::Mutex;
 use std::io::Write;
 
 use crate::ip32::*;
-use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device, Resettable, BUS_OK};
+use crate::snapshot::{get_field, hex_u64, hex_u8, toml_u64, toml_u8};
+use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device, Resettable, Saveable, BUS_OK};
 
 /// The pair of PS/2 ports, with nothing plugged into either.
 ///
@@ -318,8 +319,73 @@ impl Resettable for MacePs2 {
     }
 }
 
+/// Each port's latches, and the keyboard and mouse behind them (the shared
+/// PS/2 model's own state). The traffic log and the sent bytes are for
+/// debugging, not the ports' state.
+impl Saveable for MacePs2 {
+    fn save_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        let ports = self.ports.iter().map(|p| {
+            let p = p.lock().unwrap();
+            let mut e = toml::map::Map::new();
+            e.insert("control".into(), hex_u64(p.control));
+            e.insert("rx".into(), hex_u8(p.rx));
+            e.insert("rx_full".into(), toml::Value::Boolean(p.rx_full));
+            if let Some(b) = p.tx {
+                e.insert("tx".into(), hex_u8(b));
+            }
+            toml::Value::Table(e)
+        }).collect();
+        t.insert("ports".into(), toml::Value::Array(ports));
+        if let Some(d) = &self.dev {
+            t.insert("devices".into(), d.save_state());
+        }
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        if let Some(toml::Value::Array(a)) = get_field(v, "ports") {
+            for (port, e) in self.ports.iter().zip(a) {
+                let mut p = port.lock().unwrap();
+                p.control = get_field(e, "control").and_then(toml_u64).unwrap_or(ps2_ctl::CLKEN);
+                p.rx = get_field(e, "rx").and_then(toml_u8).unwrap_or(0);
+                p.rx_full = get_field(e, "rx_full").and_then(|b| b.as_bool()).unwrap_or(false);
+                p.tx = get_field(e, "tx").and_then(toml_u8);
+            }
+        }
+        if let (Some(d), Some(dv)) = (&self.dev, get_field(v, "devices")) {
+            d.load_state(dv)?;
+        }
+        self.update_irq();
+        Ok(())
+    }
+}
+
 impl Default for MacePs2 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_load_round_trip() {
+        let src = MacePs2::with_devices(true);
+        {
+            let mut p = src.ports[0].lock().unwrap();
+            p.control = ps2_ctl::CLKEN | ps2_ctl::RX_INT | ps2_ctl::TX_ENABLE;
+            p.rx = 0xfa;
+            p.rx_full = true;
+        }
+        src.ports[1].lock().unwrap().tx = Some(0xf4);
+        src.devices().unwrap().push_mouse_input(1, 3, -2, 0);
+        let v1 = src.save_state();
+
+        let dst = MacePs2::with_devices(true);
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "MacePs2 save_state mismatch after load_state round-trip");
     }
 }

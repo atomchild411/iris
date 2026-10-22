@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use std::io::Write;
 
 use crate::dev::z85c30::SerialBackend;
-use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device, Resettable, BUS_OK};
+use crate::snapshot::{get_field, load_u8_slice, toml_u8, u8_slice_to_toml};
+use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device, Resettable, Saveable, BUS_OK};
 use crate::ip32::*;
 
 /// A 16550 with just enough behaviour to be written to.
@@ -336,6 +337,29 @@ impl Device for Com16550 {
     }
 }
 
+/// The registers and what has been typed but not yet read. The transcript
+/// is the host's record of the line, not the UART's state.
+impl Saveable for Com16550 {
+    fn save_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("regs".into(), u8_slice_to_toml(&*self.regs.lock().unwrap()));
+        let input: Vec<u8> = self.input.lock().unwrap().iter().copied().collect();
+        t.insert("input".into(), u8_slice_to_toml(&input));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        if let Some(r) = get_field(v, "regs") {
+            load_u8_slice(r, &mut *self.regs.lock().unwrap());
+        }
+        if let Some(toml::Value::Array(a)) = get_field(v, "input") {
+            *self.input.lock().unwrap() = a.iter().map(|b| toml_u8(b).unwrap_or(0)).collect();
+        }
+        self.update_irq();
+        Ok(())
+    }
+}
+
 impl Resettable for Com16550 {
     /// Registers to zero; the transcript and anything a console has typed
     /// stay, as they would on the far end of a real serial line.
@@ -398,5 +422,20 @@ mod tests {
         client.read_exact(&mut got).expect("output");
         assert_eq!(&got, b"ok");
         assert_eq!(c.output(), "ok", "the console buffer still has it too");
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let src = Com16550::new();
+        src.write8(MACE_COM0 + (com_reg::IER << 8) + 7, com_reg::IER_RX);
+        src.write8(MACE_COM0 + (com_reg::LCR << 8) + 7, 0x03);
+        src.write8(MACE_COM0 + (com_reg::SCR << 8) + 7, 0x5a);
+        src.feed(b"typed");
+        let v1 = src.save_state();
+
+        let dst = Com16550::new();
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "Com16550 save_state mismatch after load_state round-trip");
+        assert_eq!(dst.read8(MACE_COM0 + 7).data, b't', "unread input survives");
     }
 }

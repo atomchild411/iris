@@ -4,7 +4,8 @@ use std::sync::Mutex;
 
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK};
 use std::io::Write;
-use crate::traits::{Device, Resettable};
+use crate::traits::{Device, Resettable, Saveable};
+use crate::snapshot::{get_field, load_u8_slice, u8_slice_to_toml};
 
 /// A Dallas-style RTC with battery-backed NVRAM.
 ///
@@ -236,6 +237,30 @@ impl Resettable for MaceRtc {
     }
 }
 
+/// The cells, and the clock as guest seconds: a restored machine's clock
+/// runs on from the moment it was saved.
+impl Saveable for MaceRtc {
+    fn save_state(&self) -> toml::Value {
+        let mut tbl = toml::map::Map::new();
+        tbl.insert("cells".into(), u8_slice_to_toml(&self.cells.lock().unwrap()));
+        tbl.insert("time".into(), toml::Value::Integer(self.now()));
+        tbl.insert("powered_off".into(), toml::Value::Boolean(self.powered_off()));
+        toml::Value::Table(tbl)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        if let Some(c) = get_field(v, "cells") {
+            load_u8_slice(c, &mut self.cells.lock().unwrap());
+        }
+        if let Some(t) = get_field(v, "time").and_then(|t| t.as_integer()) {
+            *self.clock.lock().unwrap() = (t, std::time::Instant::now());
+        }
+        let off = get_field(v, "powered_off").and_then(|b| b.as_bool()).unwrap_or(false);
+        self.powered_off.store(off, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 impl Default for MaceRtc {
     fn default() -> Self { Self::new() }
 }
@@ -355,5 +380,21 @@ mod tests {
         r.write8(reg(0x4a), 0x08);
         assert!(r.powered_off(), "PAB switches the machine off");
         assert_eq!(civil_from_days(10957), (2000, 1, 1));
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let src = MaceRtc::new();
+        src.poke(0x40, 0xa5);
+        src.poke(0xff, 0x5a);
+        *src.clock.lock().unwrap() = (946_684_798, std::time::Instant::now());
+        src.powered_off.store(true, std::sync::atomic::Ordering::Relaxed);
+        let v1 = src.save_state();
+
+        let dst = MaceRtc::new();
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(dst.now(), 946_684_798, "the clock resumes from the saved time");
+        assert!(dst.powered_off());
+        assert_eq!(v1, dst.save_state(), "MaceRtc save_state mismatch after load_state round-trip");
     }
 }

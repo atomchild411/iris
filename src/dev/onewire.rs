@@ -2,6 +2,8 @@
 
 use std::sync::Mutex;
 
+use crate::snapshot::{get_field, hex_u64, hex_u8, load_u8_slice, toml_u64, toml_u8, u8_slice_to_toml};
+
 
 /// The Dallas 1-Wire identity chip: 64 bits of ROM holding a family code, a
 /// 48-bit serial number and a CRC. SGI machines keep the Ethernet address here.
@@ -401,6 +403,62 @@ impl crate::traits::Device for OneWireId {
     }
 }
 
+/// A transaction in progress, so a machine saved mid-read finishes it. The
+/// ROM and EPROM come from the configured MAC; the trace log is not state.
+impl crate::traits::Saveable for OneWireId {
+    fn save_state(&self) -> toml::Value {
+        let st = self.st.lock().unwrap();
+        let mut t = toml::map::Map::new();
+        if let Some(l) = st.low_since {
+            t.insert("low_since".into(), hex_u64(l));
+        }
+        t.insert("in_bits".into(), hex_u8(st.in_bits));
+        t.insert("in_count".into(), hex_u8(st.in_count));
+        if let Some(c) = st.command {
+            t.insert("command".into(), hex_u8(c));
+        }
+        t.insert("out_pos".into(), toml::Value::Integer(st.out_pos as i64));
+        let phase = match st.phase { OwPhase::Idle => 0, OwPhase::WantAddr => 1, OwPhase::Sending => 2 };
+        t.insert("phase".into(), toml::Value::Integer(phase));
+        t.insert("pending".into(), hex_u8(st.pending));
+        t.insert("addr".into(), u8_slice_to_toml(&st.addr));
+        t.insert("addr_count".into(), toml::Value::Integer(st.addr_count as i64));
+        t.insert("out".into(), u8_slice_to_toml(&st.out));
+        t.insert("out_then_idle".into(), toml::Value::Boolean(st.out_then_idle));
+        t.insert("presenting".into(), toml::Value::Boolean(st.presenting));
+        t.insert("presence_from".into(), hex_u64(st.presence_from));
+        t.insert("presence_to".into(), hex_u64(st.presence_to));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let mut st = self.st.lock().unwrap();
+        *st = Default::default();
+        let u8_of = |k: &str| get_field(v, k).and_then(toml_u8).unwrap_or(0);
+        let int_of = |k: &str| get_field(v, k).and_then(|x| x.as_integer()).unwrap_or(0);
+        let bool_of = |k: &str| get_field(v, k).and_then(|x| x.as_bool()).unwrap_or(false);
+        st.low_since = get_field(v, "low_since").and_then(toml_u64);
+        st.in_bits = u8_of("in_bits");
+        st.in_count = u8_of("in_count");
+        st.command = get_field(v, "command").and_then(toml_u8);
+        st.out_pos = int_of("out_pos") as usize;
+        st.phase = match int_of("phase") { 1 => OwPhase::WantAddr, 2 => OwPhase::Sending, _ => OwPhase::Idle };
+        st.pending = u8_of("pending");
+        if let Some(a) = get_field(v, "addr") {
+            load_u8_slice(a, &mut st.addr);
+        }
+        st.addr_count = int_of("addr_count") as usize;
+        if let Some(toml::Value::Array(a)) = get_field(v, "out") {
+            st.out = a.iter().map(|b| toml_u8(b).unwrap_or(0)).collect();
+        }
+        st.out_then_idle = bool_of("out_then_idle");
+        st.presenting = bool_of("presenting");
+        st.presence_from = get_field(v, "presence_from").and_then(toml_u64).unwrap_or(0);
+        st.presence_to = get_field(v, "presence_to").and_then(toml_u64).unwrap_or(0);
+        Ok(())
+    }
+}
+
 impl crate::traits::Resettable for OneWireId {
     /// The ROM and EPROM are the chip's; a reset only drops a transaction
     /// in progress.
@@ -409,3 +467,35 @@ impl crate::traits::Resettable for OneWireId {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::Saveable;
+
+    #[test]
+    fn save_load_round_trip() {
+        let src = OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
+        {
+            let mut st = src.st.lock().unwrap();
+            st.low_since = Some(123_456);
+            st.in_bits = 0x5a;
+            st.in_count = 3;
+            st.command = Some(onewire_cmd::READ_MEMORY);
+            st.out_pos = 17;
+            st.phase = OwPhase::Sending;
+            st.pending = onewire_cmd::READ_DATA_CRC;
+            st.addr = [0x12, 0x34];
+            st.addr_count = 2;
+            st.out = vec![0xde, 0xad, 0xbe, 0xef];
+            st.out_then_idle = true;
+            st.presenting = true;
+            st.presence_from = 1000;
+            st.presence_to = 1150;
+        }
+        let v1 = src.save_state();
+
+        let dst = OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "OneWireId save_state mismatch after load_state round-trip");
+    }
+}
