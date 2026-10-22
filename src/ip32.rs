@@ -881,6 +881,69 @@ impl Ip32Bus {
     }
 }
 
+/// CRIME (which maps RAM again from its bank controls), GBE, VICE, MACE
+/// and the SCSI controllers. RAM and the flash are too big for this and go
+/// beside it as files ([`Ip32Bus::save_raw`]), as do the disks' overlays
+/// ([`crate::dev::aic7880::Aic7880::export_overlays`]).
+impl crate::traits::Saveable for Ip32Bus {
+    fn save_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("crime".into(), self.crime.save_state());
+        t.insert("gbe".into(), self.gbe.save_state());
+        t.insert("vice".into(), self.vice.save_state());
+        t.insert("mace".into(), self.mace.save_state());
+        let scsi = self.scsi.lock().unwrap().iter().map(|c| c.save_state()).collect();
+        t.insert("scsi".into(), toml::Value::Array(scsi));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        use crate::snapshot::get_field;
+        if let Some(m) = get_field(v, "mace") {
+            self.mace.load_state(m)?;
+        }
+        if let Some(c) = get_field(v, "crime") {
+            self.crime.load_state(c)?;
+        }
+        if let Some(g) = get_field(v, "gbe") {
+            self.gbe.load_state(g)?;
+        }
+        if let Some(x) = get_field(v, "vice") {
+            self.vice.load_state(x)?;
+        }
+        if let Some(toml::Value::Array(a)) = get_field(v, "scsi") {
+            let scsi = self.scsi.lock().unwrap();
+            if a.len() != scsi.len() {
+                return Err(format!("saved state has {} SCSI controllers, this machine {}", a.len(), scsi.len()));
+            }
+            for (c, s) in scsi.iter().zip(a) {
+                c.load_state(s)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Ip32Bus {
+    /// RAM and the flash, as `ram.bin` and `flash.bin` in `dir`.
+    pub fn save_raw(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.ram.lock().unwrap().save_raw(&dir.join("ram.bin"))?;
+        std::fs::write(dir.join("flash.bin"), &*self.prom.lock().unwrap())
+    }
+
+    /// What [`Self::save_raw`] wrote, back.
+    pub fn load_raw(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.ram.lock().unwrap().load_raw(&dir.join("ram.bin"))?;
+        let flash = std::fs::read(dir.join("flash.bin"))?;
+        let mut prom = self.prom.lock().unwrap();
+        if flash.len() != prom.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "saved flash is the wrong size"));
+        }
+        *prom = flash;
+        Ok(())
+    }
+}
+
 impl crate::traits::Device for Ip32Bus {
     fn step(&self, _cycles: u64) {}
     fn stop(&self) {}

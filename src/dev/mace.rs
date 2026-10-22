@@ -25,7 +25,8 @@ use crate::ip32::{
     MACE_MEC, MACE_MEC_SIZE, MACE_PS2, MACE_PS2_SIZE, MACE_RTC, MACE_RTC_SIZE, MACE_SIZE, MACE_UST_MSC,
     MACE_UST_MSC_SIZE, MACEPCI_BASE, MACEPCI_SIZE,
 };
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_OK};
+use crate::snapshot::get_field;
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_OK};
 
 pub struct Mace {
     ram: Arc<Mutex<O2Memory>>,
@@ -264,6 +265,49 @@ impl Mace {
         }
         self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
         v
+    }
+}
+
+/// Every block behind MACE, each under its own name. The UST loads first,
+/// since others keep time by it, and the ISA controller last: the devices
+/// drive their lines again as they load, and the controller's own record
+/// of which bits devices drive is then put back as it was saved.
+impl Saveable for Mace {
+    fn save_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        for (k, d) in self.blocks() {
+            t.insert(k.into(), d.save_state());
+        }
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        for (k, d) in self.blocks() {
+            if let Some(s) = get_field(v, k) {
+                d.load_state(s).map_err(|e| format!("mace {k}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Mace {
+    /// The blocks with state, in load order.
+    fn blocks(&self) -> [(&'static str, &dyn Saveable); 12] {
+        [
+            ("ust", &*self.ust),
+            ("regs", &self.regs),
+            ("pci", &self.pci),
+            ("rtc", &self.rtc),
+            ("ps2", &self.ps2),
+            ("onewire", &self.onewire),
+            ("com0", &self.com0),
+            ("com1", &self.com1),
+            ("sdma", &self.sdma),
+            ("audio", &self.audio),
+            ("mec", &*self.mec),
+            ("isa", &*self.isa),
+        ]
     }
 }
 

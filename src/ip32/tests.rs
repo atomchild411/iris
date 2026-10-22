@@ -135,6 +135,59 @@ fn stub_save_load_round_trip() {
     assert_eq!(v1, dst.save_state(), "Stub save_state mismatch after load_state round-trip");
 }
 
+/// Where two saved states first differ, as a path and both values: a
+/// mismatch in a whole bus's state is unreadable as one assert.
+fn first_difference(a: &toml::Value, b: &toml::Value, at: &str) -> Option<String> {
+    match (a, b) {
+        (toml::Value::Table(x), toml::Value::Table(y)) => {
+            for k in x.keys().chain(y.keys()) {
+                match (x.get(k), y.get(k)) {
+                    (Some(p), Some(q)) => {
+                        if let Some(d) = first_difference(p, q, &format!("{at}.{k}")) {
+                            return Some(d);
+                        }
+                    }
+                    (p, q) => return Some(format!("{at}.{k}: {p:?} vs {q:?}")),
+                }
+            }
+            None
+        }
+        (toml::Value::Array(x), toml::Value::Array(y)) if x.len() == y.len() => {
+            x.iter().zip(y).enumerate().find_map(|(i, (p, q))| first_difference(p, q, &format!("{at}[{i}]")))
+        }
+        _ if a == b => None,
+        _ => Some(format!("{at}: {a} vs {b}")),
+    }
+}
+
+/// A whole bus saved and loaded into a fresh one: every device's state, RAM
+/// and the flash come back.
+#[test]
+fn a_bus_saves_and_loads_whole() {
+    use crate::traits::Saveable;
+    let dir = std::env::temp_dir().join(format!("iris-o2-snap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut flash = vec![0u8; PROM_SIZE as usize];
+    flash[0x100] = 0x42;
+    let src = Ip32Bus::new(16 << 20, flash);
+    src.write64(CRIME_BASE + crime_reg::INTMASK, 0x00ff);
+    src.write32(GBE_BASE + 0x50000 + 4 * 3, 0x0011_2233);
+    src.mace.com0.feed(b"x");
+    src.mace.rtc.poke(0x40, 0x99);
+    src.ram.lock().unwrap().write(0x1234, b"saved bytes");
+    let v1 = src.save_state();
+    src.save_raw(&dir).unwrap();
+
+    let dst = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
+    dst.load_raw(&dir).unwrap();
+    dst.load_state(&v1).expect("load_state");
+    let v2 = dst.save_state();
+    assert_eq!(first_difference(&v1, &v2, "bus"), None, "Ip32Bus save_state mismatch after load_state round-trip");
+    assert_eq!(dst.ram.lock().unwrap().bytes(0x1234, 11), b"saved bytes");
+    assert_eq!(dst.prom.lock().unwrap()[0x100], 0x42);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The PROM identifies the machine from this register before it will do
 /// anything else, so zero is the one answer guaranteed to be wrong.
 #[test]

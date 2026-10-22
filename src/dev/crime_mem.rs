@@ -226,6 +226,27 @@ impl O2Memory {
         }
     }
 
+    /// Every fitted byte to `path`, as the host keeps them: a snapshot is
+    /// restored only on a host of the same architecture.
+    pub fn save_raw(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.raw(0, self.total))
+    }
+
+    /// The bytes [`Self::save_raw`] wrote, back, with every page's
+    /// generation bumped so no compiled code outlives them.
+    pub fn load_raw(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let data = std::fs::read(path)?;
+        if data.len() != self.total {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("saved memory is {} bytes, this machine has {}", data.len(), self.total)));
+        }
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.host, self.total) };
+        for page in 0..self.total.div_ceil(PAGE) {
+            self.touch(page);
+        }
+        Ok(())
+    }
+
     /// Page `page` was written: bump its generation.
     #[inline]
     fn touch(&mut self, page: usize) {
