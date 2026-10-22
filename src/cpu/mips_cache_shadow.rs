@@ -369,6 +369,10 @@ impl<
 
     fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
 
+    /// Tags only: a fetch reads memory through the decode cache and changes
+    /// nothing a guest can see.
+    fn fetch_is_pure(&self) -> bool { true }
+
     #[cfg(feature = "jitv2")]
     fn tcache_gen_ptr(&self) -> *mut u8 { unsafe { *self.tc_gen.get() as *mut u8 } }
 

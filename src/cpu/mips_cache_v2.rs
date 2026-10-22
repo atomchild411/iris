@@ -556,6 +556,12 @@ pub trait MipsCache: Send + Sync {
     /// outlives this cache.
     unsafe fn set_tcache_window(&self, _base: *mut u8) {}
 
+    /// Whether `fetch` of cacheable RAM only reads: no line fill, no LRU or
+    /// tag change, no exception. Then a caller that does not need the
+    /// instruction (jitv2 entering compiled code) may leave the fetch out.
+    /// Default `false`: a model that keeps instruction-cache state does.
+    fn fetch_is_pure(&self) -> bool { false }
+
     /// tcache: pointer to this cache's inline mapped-region bitmap, for
     /// `MappedMemory::set_bitmap_sink2`. Null when the cache has no such field.
     fn tcache_bitmap_ptr(&self) -> *mut u64 { std::ptr::null_mut() }
@@ -837,6 +843,9 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
     const DC_WAYS: usize = 1;
     const L2_SIZE: usize = 0;
     const L2_LINE: usize = 0;
+
+    /// A fetch is a bus read: no cache state to keep.
+    fn fetch_is_pure(&self) -> bool { true }
 
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         let r = self.downstream.read32(phys_addr as u32);

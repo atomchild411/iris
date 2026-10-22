@@ -4012,7 +4012,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     pub fn step_jit(&mut self) -> ExecStatus {
         let pc = self.core.pc;
 
-        let fetch = self.fetch_instr(pc);
+        let fetch = self.jit_entry_fetch(pc);
         // Retired AFTER fetch_instr, not before: fetch_instr's own
         // nanotlb_translate is what runs jitv2_track_pcp, the thing that
         // sets `core.jit_trigger = true` on a fresh page's first arrival.
@@ -4108,6 +4108,33 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.skip_breakpoints = false;
         }
         result
+    }
+
+    /// `step_jit`'s fetch at `pc`. Entering compiled code needs the page
+    /// (`self.pcp`) and the offset, not the instruction, and every other way
+    /// out of the gate (`step_int`, an exception from it) fetches for itself.
+    /// So when the cache's fetch changes nothing (`MipsCache::fetch_is_pure`)
+    /// and no breakpoint can match (a `lightning` build), only the
+    /// translation runs: it is what raises a fetch's TLB exceptions and moves
+    /// `self.pcp` onto a new page. A cacheable page then needs no cache
+    /// access; an uncached one goes to the bus as before, its translation
+    /// already in the slot. Profiled, the cache fetch was most of the cost of
+    /// entering compiled code, which calls, syscalls and a GL driver's inner
+    /// loop all do constantly.
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    fn jit_entry_fetch(&mut self, pc: u64) -> FetchInstrResult {
+        if !(cfg!(feature = "lightning") && self.cache.fetch_is_pure()) {
+            return self.fetch_instr(pc);
+        }
+        let t = self.nanotlb_translate::<{ AccessType::Fetch as u8 }>(pc);
+        if t.is_exception() {
+            FetchInstrResult::exception(t.status)
+        } else if t.is_cached() {
+            FetchInstrResult::hit(std::ptr::null())
+        } else {
+            self.fetch_instr(pc)
+        }
     }
 
     /// Begin recording a per-instruction execution trace to `path`
