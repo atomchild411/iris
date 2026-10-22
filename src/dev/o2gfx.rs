@@ -1599,11 +1599,12 @@ impl CrimeRe {
             }
         };
         // Read the whole source first, as the tiled copy does.
+        let blend = Self::xfer_blends(r, dbd);
         let mut tmp = Vec::with_capacity(((xb - xa + 1) * (yb - ya + 1)) as usize);
         for y in ya..=yb {
             for x in xa..=xb {
                 let v = src_at(mem, x, y).map(|o| Self::get_px(mem, o, sbd)).unwrap_or(0);
-                tmp.push(Self::convert(v, sm, dmode, sbd.min(dbd)));
+                tmp.push(if blend { v } else { Self::convert(v, sm, dmode, sbd.min(dbd)) });
             }
         }
         let mut it = tmp.into_iter();
@@ -1614,10 +1615,37 @@ impl CrimeRe {
                     continue;
                 }
                 if let Some(o) = dst_at(mem, x, y) {
+                    let v = if blend { Self::blend_xfer(r, v, Self::get_px(mem, o, 4)) } else { v };
                     Self::put(r, mem, o, dbd, v);
                 }
             }
         }
+    }
+
+    /// Whether a transfer into a buffer of `dbd`-byte words blends: with
+    /// DrawMode.enBlend set and an RGB(A) destination of 32-bit words, not
+    /// split for double buffering. NetBSD's X server draws antialiased text
+    /// and other Render composites this way, a linear buffer of pixels with
+    /// alpha blended onto the screen.
+    fn xfer_blends(r: &[u32], dbd: u32) -> bool {
+        let (dm, dmode) = (r[(DRAWMODE / 4) as usize], r[(BUFMODE_DST / 4) as usize]);
+        dm & draw::BLEND != 0 && dbd == 4 && (dmode >> 4) & 0xf != 0 && dmode & 2 == 0
+    }
+
+    /// Source pixel `s`, as read from its buffer, blended over destination
+    /// pixel `d` by the Blend register, in the destination's pixel type. A
+    /// pixel narrower than its 32-bit type arrives zero-extended, so an
+    /// 8-bit buffer of RGBA pixels gives alpha only: NetBSD blends black
+    /// text from its 8-bit glyph masks so, with a ZERO source factor.
+    fn blend_xfer(r: &[u32], s: u32, d: u32) -> u32 {
+        let g = |off: u32| r[(off / 4) as usize];
+        let (smode, dmode) = (g(BUFMODE_SRC), g(BUFMODE_DST));
+        let split = |v: u32, mode: u32| {
+            let v = Self::convert(v, mode, 0x20, 4);
+            [v >> 24, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff]
+        };
+        let [r8, g8, b8, a8] = Self::blend(g(BLEND_FUNC), g(BLEND_CONST), split(s, smode), split(d, dmode));
+        Self::convert(r8 << 24 | g8 << 16 | b8 << 8 | a8, 0x20, dmode, 4)
     }
 
     fn pixel_pipe(&self) {
@@ -1767,6 +1795,7 @@ impl CrimeRe {
                     let Some(src) = self.buf(&r, g(BUFMODE_SRC), "src") else { return };
                     let (sx0, sy0) = Self::xy(g(XFER_SRC));
                     let (dxs, dys) = (sx0 - x0, sy0 - y0);
+                    let blend = Self::xfer_blends(&r, dst.bd);
                     let mut tmp = Vec::with_capacity(((xb - xa + 1) * (yb - ya + 1)) as usize);
                     for y in ya..=yb {
                         for x in xa..=xb {
@@ -1776,7 +1805,7 @@ impl CrimeRe {
                             } else {
                                 0
                             };
-                            tmp.push(Self::convert(v, g(BUFMODE_SRC), g(BUFMODE_DST), src.bd.min(dst.bd)));
+                            tmp.push(if blend { v } else { Self::convert(v, g(BUFMODE_SRC), g(BUFMODE_DST), src.bd.min(dst.bd)) });
                         }
                     }
                     let mut it = tmp.into_iter();
@@ -1787,6 +1816,7 @@ impl CrimeRe {
                                 continue;
                             }
                             if let Some(o) = Self::locate(&r, mem, dst, x, y) {
+                                let v = if blend { Self::blend_xfer(&r, v, Self::get_px(mem, o, 4)) } else { v };
                                 Self::put(&r, mem, o, dst.bd, v);
                             }
                         }
@@ -3019,6 +3049,44 @@ mod tests {
         let m = ram.lock().unwrap();
         // Pixel (10, 0): word 10 of the first tile row.
         assert_eq!(&m.bytes(0x0100_0000 + 40, (0x0100_0000 + 44) - (0x0100_0000 + 40)), &[0, 0, 0, 0x21]);
+    }
+
+    /// NetBSD's Render text: an 8-bit glyph mask in linear B blended onto a
+    /// 32-bit RGBA window with ZERO, ONE_MINUS_SRC_ALPHA (black text), and
+    /// a 32-bit coloured one with SRC_ALPHA, ONE_MINUS_SRC_ALPHA, with the
+    /// registers its crime driver used.
+    #[test]
+    fn transfers_blend_onto_the_screen() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = TestRe::new(ram.clone());
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        let src = 0x1038_f000u32;
+        let page = 0x0050_0000u32;
+        let idx = (src >> 12) & 31;
+        re.write64(base + TLB_LINEAR_A + 0x80 + 8 * (idx / 2), if idx & 1 == 1 { 0x8000_0000 | (page >> 12) as u64 } else { (0x8000_0000 | (page >> 12) as u64) << 32 });
+        let screen = 0x0100_0000 + 10 * 4;
+        let xfer = |smode: u32, func: u32, step: u32, data: &[u8]| {
+            ram.lock().unwrap().write(screen, &[0xff; 12]);
+            ram.lock().unwrap().write(page as usize, data);
+            re.write32(base + BUFMODE_SRC, smode);
+            re.write32(base + BUFMODE_DST, 0x228);
+            re.write32(base + BLEND_CONST, 0);
+            re.write32(base + BLEND_FUNC, func);
+            re.write32(base + DRAWMODE, 0x0020_0478);
+            re.write32(base + PRIMITIVE, 0x0302_0000);
+            re.write32(base + VERTEX_0, 10 << 16);
+            re.write32(base + VERTEX_1, 12 << 16);
+            re.write32(base + XFER_STEP_X, step);
+            re.write32(base + XFER_STEP_ROW, 0);
+            re.write32(base + (XFER_SRC | 0x800), src);
+            ram.lock().unwrap().bytes(screen, 12)
+        };
+        // Alpha 0, half and whole: white, grey and black.
+        assert_eq!(xfer(0x1428, 0x05, 1, &[0, 0x80, 0xff]), [255, 255, 255, 255, 127, 127, 127, 127, 0, 0, 0, 0]);
+        // Red at alpha 0, half and whole.
+        let red = [0xff, 0, 0, 0, 0xff, 0, 0, 0x80, 0xff, 0, 0, 0xff];
+        assert_eq!(xfer(0x1628, 0x45, 4, &red), [255, 255, 255, 255, 255, 127, 127, 191, 255, 0, 0, 255]);
     }
 
     /// The subtile layout is the 16-bit one perfly's maps were solved with,
