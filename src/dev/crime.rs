@@ -15,6 +15,11 @@ use crate::ip32::*;
 pub mod crime_reg {
     pub const REVISION: u32 = 0x0000;
     pub const CONTROL: u32 = 0x0008;
+    /// CONTROL bit 11, cold reset: software sets it to reset the system as
+    /// at power-on, and the hardware clears it (CRIME 1.5 spec, table 5-9).
+    /// NetBSD reboots this way, where IRIX and OpenBSD go back through the
+    /// PROM.
+    pub const CONTROL_COLD_RESET: u64 = 1 << 11;
     pub const INT_STAT: u32 = 0x0010;
     pub const INT_MASK: u32 = 0x0018;
     pub const INT_SOFT: u32 = 0x0020;
@@ -90,6 +95,9 @@ pub struct Crime {
     out: std::sync::OnceLock<crate::irq::IrqLine>,
     out_level: std::sync::atomic::AtomicBool,
     out_lock: Mutex<()>,
+    /// Software asked for a cold reset (CONTROL bit 11); the machine takes
+    /// it ([`Crime::take_reset_request`]).
+    reset_request: std::sync::atomic::AtomicBool,
 }
 
 /// CRIME's counter runs at 66.67 MHz. The PROM's own delay routine computes
@@ -111,6 +119,7 @@ impl Crime {
             out: std::sync::OnceLock::new(),
             out_level: std::sync::atomic::AtomicBool::new(false),
             out_lock: Mutex::new(()),
+            reset_request: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -247,8 +256,18 @@ impl Crime {
         }
     }
 
+    /// Whether software has asked for a cold reset since the last call.
+    pub fn take_reset_request(&self) -> bool {
+        self.reset_request.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
     fn store_inner(&self, off: u32, val: u64) {
         match off {
+            crime_reg::CONTROL if val & crime_reg::CONTROL_COLD_RESET != 0 => {
+                self.regs.lock().unwrap()[(off / 8) as usize] = val & !crime_reg::CONTROL_COLD_RESET;
+                self.reset_request.store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
             // Read-only: the sources set it, not the CPU.
             crime_reg::INTSTAT => return,
             crime_reg::HARDINT => {

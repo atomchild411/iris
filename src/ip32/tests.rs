@@ -188,6 +188,18 @@ fn a_bus_saves_and_loads_whole() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Setting CONTROL's cold-reset bit asks the machine for a reset once, and
+/// the bit reads back clear, as the hardware clears it.
+#[test]
+fn crime_cold_reset_is_requested_once() {
+    let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    assert!(!c.take_reset_request());
+    c.write64(CRIME_BASE + crime_reg::CONTROL, 0x0200 | crime_reg::CONTROL_COLD_RESET);
+    assert!(c.take_reset_request(), "the write asks for a reset");
+    assert!(!c.take_reset_request(), "once");
+    assert_eq!(c.read64(CRIME_BASE + crime_reg::CONTROL).data, 0x0200, "the bit clears; the rest stays");
+}
+
 /// The PROM identifies the machine from this register before it will do
 /// anything else, so zero is the one answer guaranteed to be wrong.
 #[test]

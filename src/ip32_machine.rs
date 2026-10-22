@@ -346,6 +346,15 @@ impl O2Machine {
             // Frames from the network, and any line that changed without a
             // register access (a disk finishing, a key from the window).
             bus.service();
+            // A cold reset through CRIME (NetBSD's reboot): the CPU starts
+            // again at the reset vector with every device as at power-on.
+            if bus.crime.regs.take_reset_request() {
+                eprintln!("iris: the O2 reset itself (CRIME cold reset)");
+                dev.stop();
+                crate::traits::Resettable::power_on(&*cpu);
+                bus.power_on();
+                dev.start();
+            }
             if bus.mace.rtc.powered_off() {
                 eprintln!("iris: the O2 switched itself off");
                 dev.stop();

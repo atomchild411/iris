@@ -924,6 +924,20 @@ impl crate::traits::Saveable for Ip32Bus {
 }
 
 impl Ip32Bus {
+    /// A cold reset (CRIME's CONTROL register): the devices with a power-on
+    /// state go back to it, and memory and the flash keep their contents, as
+    /// on the hardware. The PROM sets up the rest again as it starts.
+    pub fn power_on(&self) {
+        use crate::traits::Resettable;
+        self.crime.regs.power_on();
+        let m = &self.mace;
+        let devices: [&dyn Resettable; 8] =
+            [&*m.ust, &m.rtc, &m.ps2, &m.onewire, &m.com0, &m.com1, &m.sdma, &*m.isa];
+        for d in devices {
+            d.power_on();
+        }
+    }
+
     /// RAM and the flash, as `ram.bin` and `flash.bin` in `dir`.
     pub fn save_raw(&self, dir: &std::path::Path) -> std::io::Result<()> {
         self.ram.lock().unwrap().save_raw(&dir.join("ram.bin"))?;
