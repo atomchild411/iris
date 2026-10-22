@@ -84,6 +84,57 @@ fn crime_is_a_64_bit_register_file() {
     );
 }
 
+#[test]
+fn crime_save_load_round_trip() {
+    use crate::traits::Saveable;
+    let src = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    src.write64(CRIME_BASE + crime_reg::INTMASK, 0x0000_ff00);
+    src.write64(CRIME_BASE + crime_reg::SOFTINT, 0x0000_0100);
+    src.set_int(9, true);
+    src.latch_int(16);
+    src.write64(CRIME_BASE + crime_reg::TIME, 12345);
+    src.set_revision(0xa1);
+    let v1 = src.save_state();
+
+    let dst = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    dst.load_state(&v1).expect("load_state");
+    assert_eq!(v1, dst.save_state(), "Crime save_state mismatch after load_state round-trip");
+    assert!(dst.interrupting(), "a pending, unmasked interrupt is still pending");
+}
+
+/// A load puts RAM back where the saved bank controls had it.
+#[test]
+fn crime_space_load_restores_the_memory_banks() {
+    use crate::traits::Saveable;
+    let make = || {
+        let ram = std::sync::Arc::new(Mutex::new(crate::dev::crime_mem::O2Memory::with_total(256).unwrap()));
+        let crime = std::sync::Arc::new(Crime::new(std::sync::Arc::new(MaceUst::new())));
+        (crate::dev::crime::CrimeSpace::new(crime, ram.clone()), ram)
+    };
+    let (src, src_ram) = make();
+    for (i, v) in [0x0100u64, 0x0101, 0x0102, 0x0103].into_iter().enumerate() {
+        src.write64(CRIME_BASE + crime_reg::MEM_BANK_CTRL0 + 8 * i as u32, v);
+    }
+    let v1 = src.save_state();
+
+    let (dst, dst_ram) = make();
+    dst.load_state(&v1).expect("load_state");
+    assert_eq!(v1, dst.save_state(), "CrimeSpace save_state mismatch after load_state round-trip");
+    assert_eq!(dst_ram.lock().unwrap().ctrls(), src_ram.lock().unwrap().ctrls(), "banks mapped as saved");
+}
+
+#[test]
+fn stub_save_load_round_trip() {
+    use crate::traits::Saveable;
+    let src = Stub::new("vice");
+    src.write64(0x1700_0010, 0xdead_beef);
+    src.write32(0x1700_0040, 7);
+    let v1 = src.save_state();
+    let dst = Stub::new("vice");
+    dst.load_state(&v1).expect("load_state");
+    assert_eq!(v1, dst.save_state(), "Stub save_state mismatch after load_state round-trip");
+}
+
 /// The PROM identifies the machine from this register before it will do
 /// anything else, so zero is the one answer guaranteed to be wrong.
 #[test]

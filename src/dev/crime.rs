@@ -4,7 +4,8 @@
 use std::io::Write;
 use std::sync::Mutex;
 
-use crate::traits::{BusDevice, BusRead32, BusRead64, Device, Resettable, BUS_OK};
+use crate::snapshot::{get_field, hex_u64, load_u64_slice, toml_u64, u64_slice_to_toml};
+use crate::traits::{BusDevice, BusRead32, BusRead64, Device, Resettable, Saveable, BUS_OK};
 use crate::ip32::*;
 
 // ── CRIME registers ─────────────────────────────────────────────────────────
@@ -360,6 +361,33 @@ impl Resettable for Crime {
     }
 }
 
+/// The registers, the latched edges, the revision and the counter's offset
+/// (against the UST, which restores its own time); loading hands the output
+/// to IP2 again.
+impl Saveable for Crime {
+    fn save_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("regs".into(), u64_slice_to_toml(&self.regs.lock().unwrap()));
+        t.insert("latched".into(), hex_u64(*self.latched.lock().unwrap()));
+        t.insert("revision".into(), hex_u64(self.revision()));
+        t.insert("time_base".into(), hex_u64(*self.time_base.lock().unwrap()));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        if let Some(r) = get_field(v, "regs") {
+            load_u64_slice(r, &mut self.regs.lock().unwrap());
+        }
+        *self.latched.lock().unwrap() = get_field(v, "latched").and_then(toml_u64).unwrap_or(0);
+        if let Some(rev) = get_field(v, "revision").and_then(toml_u64) {
+            self.set_revision(rev);
+        }
+        *self.time_base.lock().unwrap() = get_field(v, "time_base").and_then(toml_u64).unwrap_or(0);
+        self.update_output();
+        Ok(())
+    }
+}
+
 impl BusDevice for Crime {
     fn read64(&self, addr: u32) -> BusRead64 {
         let off = addr & (CRIME_SIZE - 1) & !7;
@@ -432,6 +460,31 @@ impl CrimeSpace {
             let v = self.regs.load(off);
             self.ram.lock().unwrap().set_ctrl(((off - crime_reg::MEM_BANK_CTRL0) / 8) as usize, v);
         }
+    }
+}
+
+/// CRIME's registers and the rendering engine. A load sets the memory
+/// banks again from the restored bank controls, so RAM appears where the
+/// saved machine had it.
+impl Saveable for CrimeSpace {
+    fn save_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("crime".into(), self.regs.save_state());
+        t.insert("re".into(), self.re.save_state());
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        if let Some(c) = get_field(v, "crime") {
+            self.regs.load_state(c)?;
+        }
+        for bank in 0..8 {
+            self.regs_wrote(CRIME_BASE + crime_reg::MEM_BANK_CTRL0 + 8 * bank);
+        }
+        if let Some(re) = get_field(v, "re") {
+            self.re.load_state(re)?;
+        }
+        Ok(())
     }
 }
 

@@ -312,6 +312,11 @@ impl O2Memory {
         self.size
     }
 
+    /// The bank controls as last written.
+    pub fn ctrls(&self) -> [u64; 8] {
+        self.ctrl
+    }
+
     /// Bank `i`'s control register was written.
     pub fn set_ctrl(&mut self, i: usize, val: u64) {
         if self.ctrl[i] != val {

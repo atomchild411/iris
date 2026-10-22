@@ -16,7 +16,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::dev::crime_mem::{Draw, O2Memory, RamWindow};
-use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_BUSY, BUS_OK};
+use crate::snapshot::{get_field, hex_u64, load_u32_slice, toml_u32, toml_u64, u32_slice_to_toml};
+use crate::traits::{BusDevice, BusRead32, BusRead64, Saveable, BUS_BUSY, BUS_OK};
 
 /// GBE register offsets from its base, `0x1600_0000`.
 pub mod gbe_reg {
@@ -1256,6 +1257,21 @@ impl CrimeRe {
     /// `busy` is raised), so an empty buffer with `busy` clear is idle.
     fn idle(&self) -> bool {
         self.ib.is_empty() && !self.busy.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait up to `limit` for the engine to finish what is queued: a
+    /// snapshot of its registers means nothing with writes still in the
+    /// interface buffer.
+    pub fn drain(&self, limit: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + limit;
+        let backoff = crossbeam_utils::Backoff::new();
+        while !self.idle() {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            backoff.snooze();
+        }
+        true
     }
 
     /// Wait until the engine is idle (tests and replays; the CPU retries).
@@ -2587,6 +2603,76 @@ impl CrimeRe {
     }
 }
 
+/// The registers (TLBs, colour maps and cursor among them), the beam's
+/// timing reference, and the shadow writes still waiting for blanking. The
+/// timing is in guest time, which the UST restores.
+impl Saveable for Gbe {
+    fn save_state(&self) -> toml::Value {
+        let s = self.s.lock().unwrap();
+        let mut t = toml::map::Map::new();
+        t.insert("regs".into(), u32_slice_to_toml(&s.r));
+        t.insert("t0".into(), hex_u64(s.t0));
+        t.insert("reads".into(), hex_u64(s.reads));
+        t.insert("seen_dots".into(), hex_u64(s.seen_dots));
+        let pending = s.pending.iter().map(|&(off, val, frame)| {
+            toml::Value::Array(vec![
+                toml::Value::Integer(off as i64),
+                toml::Value::Integer(val as i64),
+                hex_u64(frame),
+            ])
+        }).collect();
+        t.insert("pending".into(), toml::Value::Array(pending));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let mut s = self.s.lock().unwrap();
+        if let Some(r) = get_field(v, "regs") {
+            load_u32_slice(r, &mut s.r);
+        }
+        let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
+        s.t0 = u("t0");
+        s.reads = u("reads");
+        s.seen_dots = u("seen_dots");
+        s.pending.clear();
+        if let Some(toml::Value::Array(a)) = get_field(v, "pending") {
+            for e in a {
+                if let Some([off, val, frame]) = e.as_array().map(|x| x.as_slice()) {
+                    s.pending.push((
+                        toml_u32(off).unwrap_or(0),
+                        toml_u32(val).unwrap_or(0),
+                        toml_u64(frame).unwrap_or(0),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The engine's registers, once what is queued has been drawn: the interface
+/// buffer is empty in every snapshot, so a load only sets registers.
+impl Saveable for CrimeRe {
+    fn save_state(&self) -> toml::Value {
+        if !self.drain(std::time::Duration::from_secs(2)) {
+            eprintln!("crime-re: saving with {} writes still queued; they are lost", self.ib.len());
+        }
+        let mut t = toml::map::Map::new();
+        t.insert("regs".into(), u32_slice_to_toml(&self.regs.lock().unwrap()));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        if !self.drain(std::time::Duration::from_secs(2)) {
+            return Err("crime-re: the engine is still busy".into());
+        }
+        if let Some(r) = get_field(v, "regs") {
+            load_u32_slice(r, &mut self.regs.lock().unwrap());
+        }
+        Ok(())
+    }
+}
+
 impl crate::traits::Device for Gbe {
     fn step(&self, _cycles: u64) {}
     fn stop(&self) {}
@@ -2694,6 +2780,39 @@ mod tests {
     fn gbe() -> Gbe {
         let t = Arc::new(std::sync::atomic::AtomicU64::new(0));
         Gbe::new(Arc::new(move || t.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
+    #[test]
+    fn gbe_save_load_round_trip() {
+        let src = gbe();
+        src.write32(DOTCLOCK, DOTCLOCK_RUN | 0x0123);
+        src.write32(CMAP + 4 * 7, 0x00ff_8000);
+        {
+            let mut s = src.s.lock().unwrap();
+            s.t0 = 1_000_000;
+            s.reads = 42;
+            s.seen_dots = 9999;
+            s.pending.push((FRM_CONTROL, 0x8000_0001, 17));
+        }
+        let v1 = src.save_state();
+
+        let dst = gbe();
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "Gbe save_state mismatch after load_state round-trip");
+    }
+
+    #[test]
+    fn re_save_load_round_trip() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let src = TestRe::new(ram.clone());
+        src.write32(0x1500_0000 + FG, 0x1234_5678);
+        src.write32(0x1500_0000 + BG, 0x9abc_def0);
+        src.write64(0x1500_0000 + TLB_A, 0x0123_4567_89ab_cdef);
+        let v1 = src.save_state();
+
+        let dst = CrimeRe::new(ram);
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "CrimeRe save_state mismatch after load_state round-trip");
     }
 
     #[test]

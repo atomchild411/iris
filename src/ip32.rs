@@ -252,6 +252,33 @@ impl Stub {
     }
 }
 
+/// The values written, by offset; the access counts are for finding a
+/// driver waiting on a missing bit, not state.
+impl crate::traits::Saveable for Stub {
+    fn save_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        for (off, v) in self.cells.lock().unwrap().iter() {
+            t.insert(format!("{off:#x}"), crate::snapshot::hex_u64(*v));
+        }
+        let mut s = toml::map::Map::new();
+        s.insert("cells".into(), toml::Value::Table(t));
+        toml::Value::Table(s)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let mut cells = self.cells.lock().unwrap();
+        cells.clear();
+        if let Some(toml::Value::Table(t)) = crate::snapshot::get_field(v, "cells") {
+            for (k, v) in t {
+                let off = u32::from_str_radix(k.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("{}: bad offset {k:?}", self.name))?;
+                cells.insert(off, crate::snapshot::toml_u64(v).unwrap_or(0));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl BusDevice for Stub {
     fn read8(&self, a: u32) -> BusRead8 { self.r(); self.hit(a, false); BusRead8::ok(self.cell(a) as u8) }
     fn read16(&self, a: u32) -> BusRead16 { self.r(); self.hit(a, false); BusRead16::ok(self.cell(a) as u16) }
