@@ -29,6 +29,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use crate::snapshot::{get_field, hex_u32, hex_u64, load_u16_slice, toml_u32, toml_u64, u16_slice_to_toml};
+
 pub mod reg {
     pub const MAC_CONTROL: u32 = 0x00;
     pub const INT_STATUS: u32 = 0x08;
@@ -670,6 +672,77 @@ impl crate::traits::BusDevice for Mec {
     }
 }
 
+/// The registers, the rings' pointers, the receive buffers handed over, the
+/// PHY and the counters; loading drives the interrupt again. The link to
+/// the host's network is the machine's, not the chip's.
+impl crate::traits::Saveable for Mec {
+    fn save_state(&self) -> toml::Value {
+        let st = self.st.lock().unwrap();
+        let mut t = toml::map::Map::new();
+        for (k, v) in [
+            ("mac_control", st.mac_control), ("int_status", st.int_status),
+            ("dma_control", st.dma_control), ("tx_ring_base", st.tx_ring_base),
+            ("station", st.station), ("multicast", st.multicast), ("rx_seq", st.rx_seq),
+            ("phy_address", st.phy_address), ("phy_data", st.phy_data),
+            ("tx_frames", st.tx_frames), ("rx_frames", st.rx_frames), ("rx_dropped", st.rx_dropped),
+        ] {
+            t.insert(k.into(), hex_u64(v));
+        }
+        t.insert("tx_read".into(), hex_u32(st.tx_read));
+        t.insert("tx_write".into(), hex_u32(st.tx_write));
+        t.insert("rx_mcl_read".into(), hex_u32(st.rx_mcl_read));
+        t.insert("mcl_fifo".into(), toml::Value::Array(st.mcl_fifo.iter().map(|&a| hex_u32(a)).collect()));
+        t.insert("phy".into(), u16_slice_to_toml(&st.phy.regs));
+        let mut other = toml::map::Map::new();
+        let mut keys: Vec<_> = st.other.keys().copied().collect();
+        keys.sort_unstable();
+        for k in keys {
+            other.insert(format!("{k:#x}"), hex_u64(st.other[&k]));
+        }
+        t.insert("other".into(), toml::Value::Table(other));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        {
+            let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
+            let w = |k: &str| get_field(v, k).and_then(toml_u32).unwrap_or(0);
+            let mut st = self.st.lock().unwrap();
+            *st = State::new();
+            st.mac_control = u("mac_control");
+            st.int_status = u("int_status");
+            st.dma_control = u("dma_control");
+            st.tx_ring_base = u("tx_ring_base");
+            st.station = u("station");
+            st.multicast = u("multicast");
+            st.rx_seq = u("rx_seq");
+            st.phy_address = u("phy_address");
+            st.phy_data = u("phy_data");
+            st.tx_frames = u("tx_frames");
+            st.rx_frames = u("rx_frames");
+            st.rx_dropped = u("rx_dropped");
+            st.tx_read = w("tx_read");
+            st.tx_write = w("tx_write");
+            st.rx_mcl_read = w("rx_mcl_read");
+            if let Some(toml::Value::Array(a)) = get_field(v, "mcl_fifo") {
+                st.mcl_fifo = a.iter().map(|x| toml_u32(x).unwrap_or(0)).collect();
+            }
+            if let Some(p) = get_field(v, "phy") {
+                load_u16_slice(p, &mut st.phy.regs);
+            }
+            if let Some(toml::Value::Table(o)) = get_field(v, "other") {
+                for (k, x) in o {
+                    let off = u32::from_str_radix(k.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("mec: bad offset {k:?}"))?;
+                    st.other.insert(off, toml_u64(x).unwrap_or(0));
+                }
+            }
+        }
+        self.update_irq();
+        Ok(())
+    }
+}
+
 impl crate::traits::Device for Mec {
     fn step(&self, _cycles: u64) {}
     fn stop(&self) {}
@@ -724,6 +797,37 @@ mod tests {
         m.write64(reg::PHY_ADDRESS, u64::from((phy << 5) | r));
         m.write64(reg::PHY_READ_INITIATE, 1);
         m.read64(reg::PHY_DATA)
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        use crate::traits::Saveable;
+        let (src, _) = mec();
+        {
+            let mut st = src.st.lock().unwrap();
+            st.mac_control = 0x0000_0002;
+            st.int_status = 0x41;
+            st.dma_control = 0x0000_8001;
+            st.tx_ring_base = 0x0123_4000;
+            st.tx_read = 3;
+            st.tx_write = 9;
+            st.station = 0x0800_6912_3456;
+            st.multicast = 0xffff;
+            st.mcl_fifo = [0x0010_0000u32, 0x0010_1000].into_iter().collect();
+            st.rx_seq = 5;
+            st.rx_mcl_read = 7;
+            st.phy.regs[4] = 0x0061;
+            st.phy_address = 0x101;
+            st.phy_data = 0x45e1;
+            st.other.insert(0x80, 0xabcd);
+            st.tx_frames = 10;
+            st.rx_frames = 20;
+            st.rx_dropped = 1;
+        }
+        let v1 = src.save_state();
+        let (dst, _) = mec();
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "Mec save_state mismatch after load_state round-trip");
     }
 
     #[test]

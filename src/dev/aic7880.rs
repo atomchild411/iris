@@ -29,6 +29,8 @@ use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiDevice, ScsiIdentity, ScsiReques
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use crate::snapshot::{get_field, hex_u16, hex_u32, hex_u64, hex_u8, load_u8_slice, toml_u16, toml_u32, toml_u64, toml_u8, u8_slice_to_toml};
+
 /// Registers, at the offsets the chip presents them. The bridge's byte-lane
 /// swap is applied before we get here, so these are device offsets.
 pub mod reg {
@@ -1277,6 +1279,113 @@ impl Aic7880 {
     }
 }
 
+impl Aic7880 {
+    /// Copy each target's copy-on-write overlay into `dir` as
+    /// `scsi<id>.overlay`, and return the dirty sectors of each, as the
+    /// Indigo2's and Indy's controller does for their snapshots.
+    pub fn export_overlays(&self, dir: &std::path::Path) -> std::io::Result<Vec<(usize, Vec<u64>)>> {
+        let mut targets = self.targets.lock().unwrap();
+        let mut out = Vec::new();
+        for (id, t) in targets.iter_mut().enumerate() {
+            if let Some(dev) = t.as_mut().filter(|d| d.is_cow()) {
+                out.push((id, dev.cow_export(&dir.join(format!("scsi{id}.overlay")))?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Put back the overlays [`Self::export_overlays`] wrote.
+    pub fn import_overlays(&self, dir: &std::path::Path, dirty_sets: &[(usize, Vec<u64>)]) -> std::io::Result<()> {
+        let mut targets = self.targets.lock().unwrap();
+        for (id, dirty) in dirty_sets {
+            if let Some(dev) = targets.get_mut(*id).and_then(|t| t.as_mut()).filter(|d| d.is_cow()) {
+                dev.cow_import(&dir.join(format!("scsi{id}.overlay")), dirty.clone())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What the guest can see of the chip: registers, SCBs, the sequencer's
+/// program and address, both queues, the latched status, the host-ring
+/// positions and the controller's own sense; loading drives the interrupt
+/// again. The disks' contents go with the snapshot's overlays
+/// ([`Aic7880::export_overlays`]); the logs of queued and executed commands
+/// are evidence, not state.
+impl crate::traits::Saveable for Aic7880 {
+    fn save_state(&self) -> toml::Value {
+        let st = self.st.lock().unwrap();
+        let mut t = toml::map::Map::new();
+        t.insert("regs".into(), u8_slice_to_toml(&st.regs));
+        t.insert("scb".into(), toml::Value::Array(st.scb.iter().map(|b| u8_slice_to_toml(b)).collect()));
+        t.insert("seqram".into(), u8_slice_to_toml(&st.seqram));
+        t.insert("seqaddr".into(), hex_u16(st.seqaddr));
+        let q = |q: &VecDeque<u8>| toml::Value::Array(q.iter().map(|&b| hex_u8(b)).collect());
+        t.insert("qin".into(), q(&st.qin));
+        t.insert("qout".into(), q(&st.qout));
+        t.insert("intstat".into(), hex_u8(st.intstat));
+        t.insert("sstat0".into(), hex_u8(st.sstat0));
+        t.insert("sstat1".into(), hex_u8(st.sstat1));
+        t.insert("qoutpos".into(), hex_u32(st.qoutpos));
+        t.insert("qinpos".into(), hex_u8(st.qinpos));
+        t.insert("scb_onchip".into(),
+            toml::Value::Array(st.scb_onchip.iter().map(|&b| toml::Value::Boolean(b)).collect()));
+        t.insert("total_cmds".into(), hex_u64(st.total_cmds));
+        t.insert("total_in".into(), hex_u64(st.total_in));
+        t.insert("total_out".into(), hex_u64(st.total_out));
+        if let Some((key, asc, ascq)) = *self.sense.lock().unwrap() {
+            t.insert("sense".into(), toml::Value::Array(vec![hex_u8(key), hex_u8(asc), hex_u8(ascq)]));
+        }
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        {
+            let mut st = self.st.lock().unwrap();
+            *st = State::default();
+            let b = |k: &str| get_field(v, k).and_then(toml_u8).unwrap_or(0);
+            if let Some(r) = get_field(v, "regs") {
+                load_u8_slice(r, &mut st.regs);
+            }
+            if let Some(toml::Value::Array(a)) = get_field(v, "scb") {
+                for (dst, src) in st.scb.iter_mut().zip(a) {
+                    load_u8_slice(src, dst);
+                }
+            }
+            if let Some(toml::Value::Array(a)) = get_field(v, "seqram") {
+                st.seqram = a.iter().map(|x| toml_u8(x).unwrap_or(0)).collect();
+            }
+            st.seqaddr = get_field(v, "seqaddr").and_then(toml_u16).unwrap_or(0);
+            let q = |k: &str| match get_field(v, k) {
+                Some(toml::Value::Array(a)) => a.iter().map(|x| toml_u8(x).unwrap_or(0)).collect(),
+                _ => VecDeque::new(),
+            };
+            st.qin = q("qin");
+            st.qout = q("qout");
+            st.intstat = b("intstat");
+            st.sstat0 = b("sstat0");
+            st.sstat1 = b("sstat1");
+            st.qoutpos = get_field(v, "qoutpos").and_then(toml_u32).unwrap_or(0);
+            st.qinpos = b("qinpos");
+            if let Some(toml::Value::Array(a)) = get_field(v, "scb_onchip") {
+                for (o, x) in st.scb_onchip.iter_mut().zip(a) {
+                    *o = x.as_bool().unwrap_or(false);
+                }
+            }
+            let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
+            st.total_cmds = u("total_cmds");
+            st.total_in = u("total_in");
+            st.total_out = u("total_out");
+        }
+        *self.sense.lock().unwrap() = match get_field(v, "sense").and_then(|s| s.as_array()) {
+            Some(a) if a.len() == 3 => Some((toml_u8(&a[0]).unwrap_or(0), toml_u8(&a[1]).unwrap_or(0), toml_u8(&a[2]).unwrap_or(0))),
+            _ => None,
+        };
+        self.update_irq();
+        Ok(())
+    }
+}
+
 /// Both BARs reach the same registers.
 impl crate::pci::PciBusDevice for Aic7880 {
     fn config(&self) -> &crate::pci::PciConfig {
@@ -1302,6 +1411,36 @@ mod tests {
 
     fn chip() -> Aic7880 {
         Aic7880::new(std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20))))
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        use crate::traits::Saveable;
+        let src = chip();
+        {
+            let mut st = src.st.lock().unwrap();
+            st.regs[0x20] = 0x5a;
+            st.scb[3][0] = 0x12;
+            st.scb[15][SCB_SIZE - 1] = 0xff;
+            st.seqram = vec![1, 2, 3, 4];
+            st.seqaddr = 0x1f;
+            st.qin = [3u8, 7].into_iter().collect();
+            st.qout = [1u8].into_iter().collect();
+            st.intstat = 0x02;
+            st.sstat0 = 0x40;
+            st.sstat1 = 0x08;
+            st.qoutpos = 9;
+            st.qinpos = 4;
+            st.scb_onchip[3] = true;
+            st.total_cmds = 100;
+            st.total_in = 1 << 20;
+            st.total_out = 4096;
+        }
+        *src.sense.lock().unwrap() = Some((5, 0x25, 0));
+        let v1 = src.save_state();
+        let dst = chip();
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "Aic7880 save_state mismatch after load_state round-trip");
     }
 
     #[test]

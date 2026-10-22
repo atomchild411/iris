@@ -28,6 +28,8 @@
 //! plays through, opened when a channel first plays.
 
 use std::sync::Arc;
+
+use crate::snapshot::{get_field, hex_u32, hex_u64, load_u16_slice, toml_u32, toml_u64, u16_slice_to_toml};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use parking_lot::Mutex;
@@ -637,6 +639,75 @@ impl MaceAudio {
 /// The bus side: MACE's 64-bit audio registers; a 32-bit read is the half
 /// it names, narrower reads the low bits, and every store the value as
 /// given.
+impl Chan {
+    fn save(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("ctl".into(), hex_u64(self.ctl));
+        for (k, v) in [("rptr", self.rptr), ("wptr", self.wptr), ("sub", self.sub), ("msc", self.msc),
+                       ("ust", self.ust), ("rate", self.rate), ("dry", self.dry)] {
+            t.insert(k.into(), hex_u32(v));
+        }
+        t.insert("done".into(), hex_u64(self.done));
+        toml::Value::Table(t)
+    }
+
+    /// The pacing clock restarts from the load: frames due are counted
+    /// from then, as after a host stall.
+    fn load(v: &toml::Value) -> Self {
+        let w = |k: &str| get_field(v, k).and_then(toml_u32).unwrap_or(0);
+        Self {
+            ctl: get_field(v, "ctl").and_then(toml_u64).unwrap_or(CTRL_RESET),
+            rptr: w("rptr"),
+            wptr: w("wptr"),
+            sub: w("sub"),
+            msc: w("msc"),
+            ust: w("ust"),
+            start: None,
+            done: get_field(v, "done").and_then(toml_u64).unwrap_or(0),
+            rate: w("rate"),
+            dry: w("dry"),
+        }
+    }
+}
+
+/// The control registers, the three channels and the codec's registers;
+/// loading drives the interrupts again. The host output is the machine's.
+impl crate::traits::Saveable for MaceAudio {
+    fn save_state(&self) -> toml::Value {
+        let st = self.st.lock();
+        let mut t = toml::map::Map::new();
+        t.insert("ctl".into(), hex_u64(st.ctl));
+        t.insert("codec_ctl".into(), hex_u64(st.codec_ctl));
+        t.insert("mask".into(), hex_u64(st.mask));
+        t.insert("status_in".into(), hex_u64(st.status_in));
+        t.insert("channels".into(), toml::Value::Array(st.ch.iter().map(Chan::save).collect()));
+        t.insert("codec".into(), u16_slice_to_toml(&st.codec));
+        toml::Value::Table(t)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        {
+            let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
+            let mut st = self.st.lock();
+            *st = State::new();
+            st.ctl = u("ctl");
+            st.codec_ctl = u("codec_ctl");
+            st.mask = u("mask");
+            st.status_in = u("status_in");
+            if let Some(toml::Value::Array(a)) = get_field(v, "channels") {
+                for (c, e) in st.ch.iter_mut().zip(a) {
+                    *c = Chan::load(e);
+                }
+            }
+            if let Some(c) = get_field(v, "codec") {
+                load_u16_slice(c, &mut st.codec);
+            }
+        }
+        self.update_irq();
+        Ok(())
+    }
+}
+
 impl crate::traits::BusDevice for MaceAudio {
     fn read8(&self, addr: u32) -> crate::traits::BusRead8 { crate::traits::BusRead8::ok(self.read(addr) as u8) }
     fn read16(&self, addr: u32) -> crate::traits::BusRead16 { crate::traits::BusRead16::ok(self.read(addr) as u16) }
@@ -702,6 +773,27 @@ mod tests {
     fn read_codec(a: &MaceAudio, reg: u32) -> u16 {
         a.write(MACE_AUDIO + 0x08, (reg as u64) << 17 | 1 << 16);
         a.read(MACE_AUDIO + 0x18) as u16
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        use crate::traits::Saveable;
+        let src = MaceAudio::new();
+        src.write(MACE_AUDIO, 0);
+        write_codec(&src, 28, 0x3800);
+        write_codec(&src, 17, 44100);
+        {
+            let mut st = src.st.lock();
+            st.mask = 0x0f;
+            st.status_in = 0x3;
+            st.ch[1] = Chan { ctl: CTRL_ENABLE, rptr: 0x40, wptr: 0x200, sub: 2, msc: 1234, ust: 5678,
+                              start: None, done: 99, rate: 44100, dry: 3 };
+        }
+        let v1 = src.save_state();
+        let dst = MaceAudio::new();
+        dst.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.save_state(), "MaceAudio save_state mismatch after load_state round-trip");
+        assert_eq!(read_codec(&dst, 17), 44100, "the codec's clock rate is restored");
     }
 
     /// Out of reset the codec answers, reports itself initialised, and
