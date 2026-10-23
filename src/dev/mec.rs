@@ -2,7 +2,7 @@
 //! CRIME interrupt 3.
 //!
 //! What it implements is the contract NetBSD's `mec` driver relies on, as its
-//! source shows it (see `docs/ip32-o2-bringup.md`):
+//! source shows it (see `clanker/devices/ip32-o2-bringup-log.md`):
 //!
 //! - Registers are 64 bits, big-endian. INT_STATUS's low byte is
 //!   write-one-to-clear; bits 16-24 read back the transmit read pointer.

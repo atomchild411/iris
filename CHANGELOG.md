@@ -13,6 +13,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### SGI O2 (IP32)
+
+- **A new machine: the SGI O2.** `[machine] profile = "o2_ip32"` with an `[o2]`
+  section ([guide](docs/o2-ip32.md)): R10000 or R5000, CRIME memory and
+  rendering engine, MACE (PCI with two Adaptec 7880 SCSI controllers,
+  Ethernet on the NAT gateway, serial ports, PS/2, audio, clocks), GBE
+  display. Runs IRIX 6.5.22 to the desktop with OpenGL through the rendering
+  engine, and NetBSD 11 to multi-user and X. Needs the O2 PROM image; not in
+  iris-gui yet.
+- **Scripting and inspection.** The O2's devices have monitor commands, and
+  `o2 <command>` (also on `[o2] control_port`) takes screen shots, types,
+  moves the mouse and reads memory ([debug.md](debug.md#sgi-o2-ip32)).
+- **PROM network boot.** `[network] tftp_dir` serves the O2's PROM too:
+  `boot -f bootp():FILE`.
+
 ### NAT gateway
 
 - **Gateway replies no longer wait for a poll tick.** A reply to a guest

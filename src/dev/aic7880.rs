@@ -15,7 +15,7 @@
 //! rather than with the hardware, so it has to be checked against each one.
 //! The SCB layout in particular is defined by whichever sequencer program was
 //! downloaded, not by the silicon, so it is discovered by watching what the
-//! driver writes before it queues — see `docs/ip32-o2-bringup.md`.
+//! driver writes before it queues — see `clanker/devices/ip32-o2-bringup-log.md`.
 //!
 //! Three contracts are known. SGI's PROM and the IRIX kernel both carry
 //! Adaptec's "HIM" and its sequencer program, which hand the chip a tag
@@ -117,7 +117,7 @@ pub mod seqctl {
 
 /// Scratch RAM the downloaded program uses to find its work. These offsets
 /// belong to that program, not to the chip, and were read out of the driver:
-/// see `docs/ip32-o2-bringup.md`.
+/// see `clanker/devices/ip32-o2-bringup-log.md`.
 pub mod sram {
     /// Bus address of an array of SCB bus addresses, indexed by tag.
     pub const SCB_ARRAY: u32 = 0x3d;

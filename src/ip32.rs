@@ -14,7 +14,7 @@
 //! NetBSD's published register names. No code or comments were taken from the
 //! GPL-3.0 `ip32prom-decompiler` annotations; IRIS is BSD-3-Clause.
 //!
-//! See `docs/ip32-o2-bringup.md`.
+//! See `docs/o2-ip32.md`; the bring-up log is `clanker/devices/ip32-o2-bringup-log.md`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;

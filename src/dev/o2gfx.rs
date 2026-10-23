@@ -1024,7 +1024,7 @@ mod draw {
     pub const DEPTH_MASK: u32 = 1 << 1;
     pub const LOGIC_OP: u32 = 1 << 9;
     /// Dithering, set by GL (on by default in OpenGL). The spec's table
-    /// swaps this with LOGIC_OP: see docs/ip32-o2-bringup.md.
+    /// swaps this with LOGIC_OP: see clanker/devices/ip32-o2-bringup-log.md.
     pub const DITHER: u32 = 1 << 8;
     pub const PLANE_MASK: u32 = 1 << 7;
 }

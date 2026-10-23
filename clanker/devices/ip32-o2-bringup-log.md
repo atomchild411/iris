@@ -1,4 +1,8 @@
-# Bringing up IP32 (O2) in IRIS — what it would take
+# The O2 (IP32) bring-up log
+
+Status: history, 2026-09 to 2026-10. How the O2 was brought up, gate by gate,
+with the dead ends. For the machine as it is, read [docs/o2-ip32.md](../../docs/o2-ip32.md);
+its "Today" section below is the most current part of this log.
 
 ## Today (read this first)
 

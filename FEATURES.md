@@ -166,7 +166,7 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28. |
+| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)). |
 | `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. |
 
 ### [graphics]
@@ -289,6 +289,29 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `ultra64.enabled` | `false` | Enable the GIO N64 development board; requires an external gopher64 peer. |
+
+### [o2]
+
+Used with `machine.profile = "o2_ip32"`; the Indy/Indigo2 top-level `prom`,
+`nvram`, `banks` and `[scsi.N]` keys do not apply. Paths are relative to where
+iris runs. See [the O2 guide](docs/o2-ip32.md).
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `o2.prom` | `ip32prom.rev4.18.bin` | The O2 PROM image (not embedded). |
+| `o2.flash` | unset | File the PROM's flash (its environment) is loaded from and saved to. |
+| `o2.ram_mb` | `256` | Memory in MB, fitted largest DIMM kits first (up to 1024). |
+| `o2.dimms` | unset | Instead of `ram_mb`: the kit in each DIMM pair, in MB (32, 64, 128 or 256). |
+| `o2.disks` | `[]` | SCSI devices: `{ id, path, cdrom = false, bus = 0 }`; bus 0 internal, 1 external. |
+| `o2.serial_port` | unset | TCP port on 127.0.0.1 for the first serial port. |
+| `o2.serial_log` | unset | File that copies the first serial port's output. |
+| `o2.graphics` | `true` | PS/2 keyboard and the graphics console; `false` for a serial console. |
+| `o2.mouse` | `true` | PS/2 mouse on the second port (with `graphics`). |
+| `o2.cpu_mhz` | `180` | CPU clock the PROM measures; CP0 Count runs at half of it. |
+| `o2.control_port` | unset | TCP port on 127.0.0.1 serving the `o2` monitor commands for scripts. |
+| `o2.net` | `true` | Ethernet on the NAT gateway. |
+| `o2.forwards` | `[]` | Host-to-guest port forwards: `{ proto, host_port, guest_port }`. |
+| `o2.arcs_fpu` | `false` | Test aid: lend a kernel the FPU while it runs inside the PROM. |
 
 ### Hardware constraints and precedence
 
@@ -431,6 +454,12 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_IP28_TLBW` | wired enables extra IP28 Wired/TLB-write tracing. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_IP28_WATCH` | IP28 physical-address/window access trace filter. | [src/cpu/mips_cache_v2.rs](src/cpu/mips_cache_v2.rs) |
 | `IRIS_IP28_WATCHGPR` | Guest GPR index whose writes are traced in IP28 bring-up. | [src/cpu/mips_core.rs](src/cpu/mips_core.rs) |
+| `IRIS_IP32_HOT` | Any presence counts O2 register accesses (MACE, GBE, rendering engine) for finding a driver polling a bit nothing sets; costs speed. | [src/ip32.rs](src/ip32.rs) |
+| `IRIS_IP32_MEC_TRACE` | Any presence traces O2 Ethernet frames (sent, received, dropped) on stderr. | [src/dev/mec.rs](src/dev/mec.rs) |
+| `IRIS_IP32_RE_TRACE` | Number of O2 rendering-engine primitives to record for `o2 retrace PATH`. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
+| `IRIS_IP32_WATCHMEM` | `lo[:hi]` physical range of O2 memory accesses to record for `o2 watchdump PATH` (also `o2 watch LO HI`). | [src/ip32.rs](src/ip32.rs) |
+| `IRIS_IP32_WATCHMEM_CAP` | Accesses `IRIS_IP32_WATCHMEM` keeps (default 256). | [src/ip32.rs](src/ip32.rs) |
+| `IRIS_IP32_WATCHMEM_WRITES` | Any presence records writes only. | [src/ip32.rs](src/ip32.rs) |
 | `IRIS_JIT_CACHE` | 1 or on enables persistent JIT page reuse. | [src/cpu/jitv2/pcache.rs](src/cpu/jitv2/pcache.rs) |
 | `IRIS_JIT_CACHE_DIR` | Persistent JIT cache base directory. | [src/cpu/jitv2/pcache.rs](src/cpu/jitv2/pcache.rs) |
 | `IRIS_JIT_CLIF` | Any presence prints Cranelift input IR. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
@@ -442,6 +471,9 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_MEM_HELPERS` | Any presence enables the experimental JIT memory-helper path. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_MGRAS_REC` | Record IMPACT bus operations from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
 | `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path (`gputrace` builds). | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
+| `IRIS_O2_AUDIO_CAPTURE` | O2 host audio capture output path (what the host plays). | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
+| `IRIS_O2_AUDIO_DUMP` | File to record the O2's audio output at the guest's rate, before resampling. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
+| `IRIS_O2_AUDIO_TRACE` | Any presence traces every O2 audio register access and codec operation on stderr. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
 | `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `IRIS_REX3_TRACE` | Trace REX3 GFIFO and CPU accesses from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_trace.rs](src/dev/ng1/rex3_trace.rs) |
 | `IRIS_NO_EXIT_ON_POWEROFF` | Any presence prevents process exit on guest power-off/CI quit; set by GUI. | [src/ci.rs](src/ci.rs) |
