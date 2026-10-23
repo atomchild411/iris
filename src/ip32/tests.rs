@@ -283,9 +283,10 @@ fn the_uart_decodes_maces_register_spacing() {
     // Transmit register is offset 0, so byte lane +7 of the first slot.
     c.write8(MACE_COM0 + 7, b'A');
     assert_eq!(c.output(), "A");
-    // Anything not in the +7 lane is not a register.
-    c.write8(MACE_COM0 + 3, b'X');
-    assert_eq!(c.output(), "A", "only the +7 lane carries the byte");
+    // The UART is on an 8-bit bus, so the byte answers on any lane: Linux's
+    // 8250 driver uses +0 (mapbase 0x1f390000, regshift 8).
+    c.write8(MACE_COM0, b'L');
+    assert_eq!(c.output(), "AL", "Linux's +0 lane reaches the same register");
     // Line status lives at register 5, i.e. +0x507.
     let lsr = c.read8(MACE_COM0 + 0x507).data;
     assert_eq!(lsr, com_reg::LSR_THRE | com_reg::LSR_TEMT,

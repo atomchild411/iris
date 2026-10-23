@@ -372,10 +372,13 @@ impl BusDevice for Com16550 {
     // Every width must be answered. An unimplemented one falls through to the
     // trait default, which reports a bus error — and a DBE inside POST looks
     // like a missing device rather than a missing method.
-    fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.read_reg(addr)) }
+    // The UART sits on MACE's 8-bit ISA bus, so its byte answers on any lane
+    // of the doubleword: IRIX and the BSDs use +7, Linux's 8250 driver +0
+    // (mapbase 0x1f390000, regshift 8).
+    fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.read_reg(addr | 7)) }
     fn read16(&self, addr: u32) -> BusRead16 { BusRead16::ok(self.read_reg(addr | 7) as u16) }
     fn write16(&self, addr: u32, val: u16) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
-    fn write8(&self, addr: u32, val: u8) -> u32 { self.write_reg(addr, val); BUS_OK }
+    fn write8(&self, addr: u32, val: u8) -> u32 { self.write_reg(addr | 7, val); BUS_OK }
     fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.read_reg(addr | 7) as u32) }
     fn write32(&self, addr: u32, val: u32) -> u32 { self.write_reg(addr | 7, val as u8); BUS_OK }
     fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.read_reg(addr | 7) as u64) }
