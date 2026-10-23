@@ -1,13 +1,14 @@
-//! The O2's R10000 cache: the full model until the kernel starts, the shadow
-//! one after.
+//! The O2's CPU cache: the full model until the kernel starts, the shadow one
+//! after. Both O2 CPUs, R10000 and R5000, run this way.
 //!
 //! The O2 PROM sizes memory with its stack in the data cache, before there is
 //! any RAM behind it, and only a cache that holds data keeps that stack: the
 //! shadow cache (tags only, loads and stores straight to memory) loses it and
 //! POST returns to a garbage address. Everything after the PROM is the
 //! opposite case. An OS manages the caches itself, and the shadow cache is the
-//! model IP28 runs IRIX on: faster, and out of the data path, so a cache
-//! modelling mistake cannot corrupt memory.
+//! model IP28 (and every jitv2 build of the other machines) runs on: faster,
+//! and out of the data path, so a cache modelling mistake cannot corrupt
+//! memory.
 //!
 //! So this holds both and forwards to one. [`HandoverCache::hand_over`]
 //! writes every dirty line of the full model back to memory, carries the
@@ -16,11 +17,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::cpu::mips_cache_shadow::ShadowCache;
+use crate::cpu::mips_cache_shadow::{R5000ShadowCache, ShadowCache};
 use crate::cpu::mips_cache_v2::{
     model, CpuCache, CpuModel, FetchInstrResult, JitDcGeometry, MipsCache,
 };
-use crate::cpu::mips_isa::{CACH_PD, CACH_PI, CACH_SD, C_IINV, C_IWBINV};
+use crate::cpu::mips_isa::{CACH_PD, C_IST};
 use crate::traits::{BusDevice, BusRead64};
 
 /// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
@@ -33,7 +34,14 @@ use crate::traits::{BusDevice, BusRead64};
 pub type R10000O2Cache = CpuCache<32768, 64, 1, 512,
                                   32768, 32, 1, 1024, 4096,
                                   1048576, 64, 16384, 131072, 262144, true,
-                                  true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
+                                  true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }, false>;
+
+/// SGI O2 R5000 (IP32): the Indy/Indigo2 R5000 model, holding its data like
+/// the R10000's (`TC = false`) because it too runs the PROM.
+pub type R5000O2Cache = CpuCache<32768, 32, 2, 1024,
+                                 32768, 32, 2, 1024, 4096,
+                                 128, 128, 1, 16, 0, false,
+                                 true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }, false>;
 
 /// The IP28 shadow with the same 64-byte secondary lines. Not usable from
 /// reset on its own (see the module notes), so [`HandoverCache`] switches to
@@ -41,19 +49,26 @@ pub type R10000O2Cache = CpuCache<32768, 64, 1, 512,
 pub type R10000O2ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 1048576, 64, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
-pub struct HandoverCache {
-    full: R10000O2Cache,
-    shadow: R10000O2ShadowCache,
+/// A full model `F` for the PROM and a shadow model `S` for the kernel. `F`
+/// is built with `TC = false`: it only ever runs the PROM, which keeps its
+/// stack in the cache with nothing behind it.
+pub struct HandoverCache<F, S> {
+    full: F,
+    shadow: S,
     on_shadow: AtomicBool,
+    /// The guest began initialising the primary data cache's tags while the
+    /// shadow model was live: POST starting over, which needs the full model
+    /// before it puts its stack in the cache. See [`Self::take_reset_seen`].
+    reset_seen: AtomicBool,
 }
 
-impl From<Arc<dyn BusDevice>> for HandoverCache {
+/// The two O2 CPUs.
+pub type R10000Handover = HandoverCache<R10000O2Cache, R10000O2ShadowCache>;
+pub type R5000Handover = HandoverCache<R5000O2Cache, R5000ShadowCache>;
+
+impl<F: From<Arc<dyn BusDevice>>, S: From<Arc<dyn BusDevice>>> From<Arc<dyn BusDevice>> for HandoverCache<F, S> {
     fn from(bus: Arc<dyn BusDevice>) -> Self {
-        let full = R10000O2Cache::from(bus.clone());
-        // The full model only ever runs the PROM, which keeps its stack in
-        // the cache with nothing behind it, so it is never transparent.
-        full.set_tcache_live(false);
-        Self { full, shadow: R10000O2ShadowCache::from(bus), on_shadow: AtomicBool::new(false) }
+        Self { full: F::from(bus.clone()), shadow: S::from(bus), on_shadow: AtomicBool::new(false), reset_seen: AtomicBool::new(false) }
     }
 }
 
@@ -70,39 +85,19 @@ macro_rules! live {
     };
 }
 
-impl HandoverCache {
+impl<F: MipsCache, S: MipsCache> HandoverCache<F, S> {
     /// Whether the shadow model is live.
     pub fn on_shadow(&self) -> bool {
         self.on_shadow.load(Ordering::Relaxed)
     }
 
     /// Write the full model's dirty lines back, then switch to the shadow
-    /// model. Index operations over every set of both ways, as an R10000
-    /// kernel flushes: primary data, primary instruction, then secondary.
+    /// model for good (until a reboot hands back).
     pub fn hand_over(&self) {
         if self.on_shadow() {
             return;
         }
-        let kseg0 = 0x8000_0000u64;
-        let way_size = |size: usize| (size / 2) as u64;
-        for va in (0..way_size(<R10000O2Cache as MipsCache>::DC_SIZE)).step_by(<R10000O2Cache as MipsCache>::DC_LINE) {
-            for way in 0..2 {
-                let a = kseg0 | va | way;
-                self.full.cache_op(C_IWBINV | CACH_PD, a, a);
-            }
-        }
-        for va in (0..way_size(<R10000O2Cache as MipsCache>::IC_SIZE)).step_by(<R10000O2Cache as MipsCache>::IC_LINE) {
-            for way in 0..2 {
-                let a = kseg0 | va | way;
-                self.full.cache_op(C_IINV | CACH_PI, a, a);
-            }
-        }
-        for va in (0..way_size(<R10000O2Cache as MipsCache>::L2_SIZE)).step_by(<R10000O2Cache as MipsCache>::L2_LINE) {
-            for way in 0..2 {
-                let a = kseg0 | va | way;
-                self.full.cache_op(C_IWBINV | CACH_SD, a, a);
-            }
-        }
+        self.full.writeback_all();
         self.shadow.set_llbit(self.full.get_llbit());
         self.shadow.set_lladdr(self.full.get_lladdr());
         // Which physical ranges are RAM (the direct-path bitmap): the memory
@@ -119,9 +114,19 @@ impl HandoverCache {
         self.on_shadow.store(true, Ordering::Relaxed);
     }
 
+    /// Whether POST has started over since the last call: an Index Store Tag
+    /// to the primary data cache under the shadow model. POST sets every tag
+    /// that way before it keeps its stack in the cache; an OS calling a PROM
+    /// routine, or running, does not. A reboot may simply jump into the PROM,
+    /// so this, not the reset vector, is what tells the machine to hand back.
+    pub fn take_reset_seen(&self) -> bool {
+        self.reset_seen.swap(false, Ordering::Relaxed)
+    }
+
     /// Back to the full model, empty, for a PROM starting over (a reboot):
     /// POST needs a cache that holds its stack again.
     pub fn hand_back(&self) {
+        self.reset_seen.store(false, Ordering::Relaxed);
         if !self.on_shadow() {
             return;
         }
@@ -132,25 +137,25 @@ impl HandoverCache {
     }
 }
 
-impl CpuModel for HandoverCache {
-    const MIPS4: bool = <R10000O2Cache as CpuModel>::MIPS4;
-    const PRID: u32 = <R10000O2Cache as CpuModel>::PRID;
-    const FIR: u32 = <R10000O2Cache as CpuModel>::FIR;
-    const TLB_ENTRIES: usize = <R10000O2Cache as CpuModel>::TLB_ENTRIES;
-    const VA_BITS: u32 = <R10000O2Cache as CpuModel>::VA_BITS;
-    const NAME: &'static str = <R10000O2Cache as CpuModel>::NAME;
-    const R10K_CACHE_OPS: bool = <R10000O2Cache as CpuModel>::R10K_CACHE_OPS;
+impl<F: MipsCache + CpuModel, S: MipsCache> CpuModel for HandoverCache<F, S> {
+    const MIPS4: bool = F::MIPS4;
+    const PRID: u32 = F::PRID;
+    const FIR: u32 = F::FIR;
+    const TLB_ENTRIES: usize = F::TLB_ENTRIES;
+    const VA_BITS: u32 = F::VA_BITS;
+    const NAME: &'static str = F::NAME;
+    const R10K_CACHE_OPS: bool = F::R10K_CACHE_OPS;
 }
 
-impl MipsCache for HandoverCache {
-    const IC_SIZE: usize = <R10000O2Cache as MipsCache>::IC_SIZE;
-    const IC_LINE: usize = <R10000O2Cache as MipsCache>::IC_LINE;
-    const IC_WAYS: usize = <R10000O2Cache as MipsCache>::IC_WAYS;
-    const DC_SIZE: usize = <R10000O2Cache as MipsCache>::DC_SIZE;
-    const DC_LINE: usize = <R10000O2Cache as MipsCache>::DC_LINE;
-    const DC_WAYS: usize = <R10000O2Cache as MipsCache>::DC_WAYS;
-    const L2_SIZE: usize = <R10000O2Cache as MipsCache>::L2_SIZE;
-    const L2_LINE: usize = <R10000O2Cache as MipsCache>::L2_LINE;
+impl<F: MipsCache + CpuModel, S: MipsCache> MipsCache for HandoverCache<F, S> {
+    const IC_SIZE: usize = F::IC_SIZE;
+    const IC_LINE: usize = F::IC_LINE;
+    const IC_WAYS: usize = F::IC_WAYS;
+    const DC_SIZE: usize = F::DC_SIZE;
+    const DC_LINE: usize = F::DC_LINE;
+    const DC_WAYS: usize = F::DC_WAYS;
+    const L2_SIZE: usize = F::L2_SIZE;
+    const L2_LINE: usize = F::L2_LINE;
 
     fn set_l1i_counters(&mut self, hit: Arc<AtomicU64>, fetch: Arc<AtomicU64>) {
         self.full.set_l1i_counters(hit.clone(), fetch.clone());
@@ -172,6 +177,9 @@ impl MipsCache for HandoverCache {
         live!(self, c => c.write64_masked(virt_addr, phys_addr, val, mask))
     }
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
+        if cache_op & 0x1C == C_IST && cache_op & 3 == CACH_PD && self.on_shadow() {
+            self.reset_seen.store(true, Ordering::Relaxed);
+        }
         live!(self, c => c.cache_op(cache_op, virt_addr, phys_addr))
     }
     fn set_cache_ecc(&self, v: u32) {
@@ -271,12 +279,9 @@ impl MipsCache for HandoverCache {
     fn jit_dc_lru_ptr(&self) -> *mut u8 {
         live!(self, c => c.jit_dc_lru_ptr())
     }
-    /// The handover is the switch: the full model holds data for the PROM,
-    /// the shadow model is transparent for the kernel. Passing the machine's
-    /// firmware-entry switch on as well wrote every line back twice at kernel
-    /// entry and cleared and rewrote the idle full model on every firmware
-    /// callback.
-    fn set_tcache_live(&self, _on: bool) {}
+    fn writeback_all(&self) {
+        live!(self, c => c.writeback_all())
+    }
     fn jit_dc_geometry(&self) -> JitDcGeometry {
         live!(self, c => c.jit_dc_geometry())
     }
@@ -294,9 +299,14 @@ mod tests {
     fn the_o2_shadow_matches_the_o2_full_model() {
         type S = R10000O2ShadowCache;
         type F = R10000O2Cache;
+        same::<F, S>();
+        assert_eq!(<F as MipsCache>::L2_LINE, 64);
+        same::<R5000O2Cache, R5000ShadowCache>();
+    }
+
+    fn same<F: MipsCache + CpuModel, S: MipsCache + CpuModel>() {
         assert_eq!((S::IC_SIZE, S::IC_LINE, S::DC_SIZE, S::DC_LINE, S::L2_SIZE, S::L2_LINE),
                    (F::IC_SIZE, F::IC_LINE, F::DC_SIZE, F::DC_LINE, F::L2_SIZE, F::L2_LINE), "geometry");
-        assert_eq!(<F as MipsCache>::L2_LINE, 64);
         assert_eq!((<S as CpuModel>::PRID, <S as CpuModel>::FIR, <S as CpuModel>::MIPS4,
                     <S as CpuModel>::TLB_ENTRIES, <S as CpuModel>::VA_BITS, <S as CpuModel>::R10K_CACHE_OPS),
                    (<F as CpuModel>::PRID, <F as CpuModel>::FIR, <F as CpuModel>::MIPS4,

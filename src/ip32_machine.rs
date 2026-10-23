@@ -12,8 +12,8 @@
 //!   is running: the cache holds data until POST has finished (the PROM
 //!   keeps its stack in it while it tests memory), and again whenever the
 //!   guest is back inside the PROM, which sets the caches up the same way to
-//!   power off. The R10000 hands over from its full model to IP28's shadow
-//!   model and back ([`HandoverCache`]); the R5000 turns tcache off and on.
+//!   power off. Both CPUs hand over from a full model to the shadow model
+//!   and back ([`HandoverCache`]).
 //!
 //! The screen is GBE scanned out of RAM by [`O2Display`], presented through
 //! the same renderer the other machines use; keys from the window go to the
@@ -28,8 +28,8 @@ use parking_lot::Mutex;
 use crate::config::{CpuModel, MachineConfig};
 use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
-use crate::cpu::mips_cache_v2::{MipsCache, R5000Cache};
-use crate::ip32_handover::HandoverCache;
+use crate::cpu::mips_cache_v2::MipsCache;
+use crate::ip32_handover::{HandoverCache, R10000Handover, R5000Handover};
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::crime_mem::O2Memory;
 use crate::dev::ng1::rex3::Renderer;
@@ -40,11 +40,34 @@ use crate::traits::{BusDevice, Device, Signal};
 
 const PROM_VA: std::ops::Range<u32> = 0xbfc0_0000..0xbfc8_0000;
 
-/// Whether `pc` is inside the PROM or its firmware copied into RAM. The
-/// firmware runs from its KSEG1 alias too (0xa100_0000), uncached.
-fn in_firmware(pc: u32) -> bool {
+/// Whether `pc` is in the firmware the PROM copies into RAM, at its KSEG0
+/// address or its KSEG1 alias (0xa100_0000, uncached): it runs from both.
+fn in_loaded_firmware(pc: u32) -> bool {
     let fw = FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN;
-    PROM_VA.contains(&pc) || fw.contains(&pc) || fw.contains(&(pc.wrapping_sub(0x2000_0000)))
+    fw.contains(&pc) || fw.contains(&(pc.wrapping_sub(0x2000_0000)))
+}
+
+/// Whether `pc` is inside the PROM or its firmware copied into RAM.
+fn in_firmware(pc: u32) -> bool {
+    PROM_VA.contains(&pc) || in_loaded_firmware(pc)
+}
+
+/// The kernel takes over (`true`): hand over to the shadow model. The PROM
+/// starts again (`false`): back to the full model. True if the model changed.
+fn switch_model<F, S>(c: &HandoverCache<F, S>, kernel: bool) -> bool
+where
+    F: MipsCache,
+    S: MipsCache,
+{
+    if kernel && !c.on_shadow() {
+        c.hand_over();
+        true
+    } else if !kernel && c.on_shadow() {
+        c.hand_back();
+        true
+    } else {
+        false
+    }
 }
 
 /// The CPU's interrupt pins as a controller: line n is IPn.
@@ -143,23 +166,13 @@ impl O2Machine {
         let sysad: Arc<dyn BusDevice> = bus.clone();
         let arcs_fpu = o2.arcs_fpu;
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
-            // The R10000 runs the full cache model through the PROM and
-            // IP28's tagless shadow model once the kernel is in charge: the
-            // JIT then reaches RAM through the ppmem window with no tag probe,
-            // LRU or dirty bit on every load and store (memory-bound code ran
-            // 2.5-4x slower than on IP28 with the full model).
-            CpuModel::R10000 => Self::build_cpu::<HandoverCache>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, |c, kernel| {
-                if kernel && !c.on_shadow() {
-                    c.hand_over();
-                    true
-                } else if !kernel && c.on_shadow() {
-                    c.hand_back();
-                    true
-                } else {
-                    false
-                }
-            }),
-            CpuModel::R5000 => Self::build_cpu::<R5000Cache>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, |_, _| false),
+            // The full cache model through the PROM and the tagless shadow
+            // model once the kernel is in charge: the JIT then reaches RAM
+            // through the ppmem window with no tag probe, LRU or dirty bit on
+            // every load and store (memory-bound code ran 2.5-4x slower than on
+            // IP28 with the full model).
+            CpuModel::R10000 => Self::build_cpu::<R10000Handover>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, switch_model, HandoverCache::take_reset_seen),
+            CpuModel::R5000 => Self::build_cpu::<R5000Handover>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, switch_model, HandoverCache::take_reset_seen),
             CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
         };
 
@@ -240,8 +253,9 @@ impl O2Machine {
     /// `kernel_mode(cache, in_kernel)` switches the cache model on leaving the
     /// firmware for the kernel (true) and on a PROM starting over (false),
     /// returning whether it changed, so the JIT's memory pointers are
-    /// re-published.
-    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, kernel_mode: fn(&C, bool) -> bool) -> Arc<dyn CpuDevice>
+    /// re-published. `reset_seen(cache)` says the PROM has started over.
+    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32,
+                    kernel_mode: fn(&C, bool) -> bool, reset_seen: fn(&C) -> bool) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
@@ -252,8 +266,6 @@ impl O2Machine {
         exec.core.set_timer_manager(tm.clone());
         // Count runs at half the pipeline clock on both CPUs.
         exec.core.set_count_hz(mhz.max(1) as u64 * 500_000);
-        // The PROM runs with the cache holding its data (see the module doc).
-        exec.cache.set_tcache_live(false);
         let mut post_done = false;
         let mut inside = true;
         let mut cu1_saved = 0u32;
@@ -279,19 +291,24 @@ impl O2Machine {
             LAST_REGS[41].store(exec.core.cp0_config as u64, Ordering::Relaxed);
             if !post_done {
                 // POST is over once the firmware it loaded into RAM runs.
-                if (FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN).contains(&pc) {
+                if in_loaded_firmware(pc) {
                     post_done = true;
                 } else {
                     return;
                 }
             }
-            // The boot PROM running again (a reboot): the full model, so POST
-            // has a cache that holds its stack.
-            if PROM_VA.contains(&pc) && kernel_mode(&exec.cache, false) {
+            // The boot PROM starting again (a reboot): the full model, so POST
+            // has a cache that holds its stack. POST initialising the cache
+            // tags says so (`take_reset_seen`), not the PC: `sash` and the
+            // IRIX kernel call into the PROM's own code, which is no reboot,
+            // and IRIX reboots by jumping into the PROM, which a batch
+            // boundary need not catch at the reset vector.
+            if reset_seen(&exec.cache) && kernel_mode(&exec.cache, false) {
                 eprintln!("iris: O2 cache: full model again (PC {pc:#010x}, ra {:#010x})", exec.core.gpr[31] as u32);
-                post_done = false;
+                // Not back to waiting for POST: the PROM's cache routine
+                // (`sash` calls it before starting a kernel) sets the tags too,
+                // and the next code outside the firmware hands over again.
                 inside = true;
-                exec.cache.set_tcache_live(false);
                 #[cfg(feature = "jitv2")]
                 exec.install_jit_mem_ptrs();
                 return;
@@ -299,7 +316,6 @@ impl O2Machine {
             let fw = in_firmware(pc);
             if fw != inside {
                 inside = fw;
-                exec.cache.set_tcache_live(!fw);
                 if !fw && kernel_mode(&exec.cache, true) {
                     eprintln!("iris: O2 cache: shadow model from PC {pc:#010x}");
                     #[cfg(feature = "jitv2")]

@@ -574,10 +574,9 @@ pub trait MipsCache: Send + Sync {
     /// Default `false`: a model that keeps instruction-cache state does.
     fn fetch_is_pure(&self) -> bool { false }
 
-    /// tcache: make the cache transparent (`true`) or hold line data
-    /// (`false`) from now on. Default no-op: a cache without tcache, or a
-    /// build without the feature, always holds its data.
-    fn set_tcache_live(&self, _on: bool) {}
+    /// Write every dirty line back to memory, so RAM holds everything.
+    /// Default no-op: a cache that holds no data has nothing to write.
+    fn writeback_all(&self) {}
 
     /// tcache: pointer to this cache's inline mapped-region bitmap, for
     /// `MappedMemory::set_bitmap_sink2`. Null when the cache has no such field.
@@ -1240,6 +1239,10 @@ pub struct CpuCache<
     const L2_NINSTRS: usize, const HAS_L2: bool,
     const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize,
     const MODEL: u8,
+    // tcache: whether this cache is transparent (RAM is the store) in a
+    // `tcache` build. Off for a cache that must hold data with nothing behind
+    // it: the O2 PROM keeps its stack in the data cache while it tests RAM.
+    const TC: bool = true,
 > {
     downstream: Arc<dyn BusDevice>,
 
@@ -1294,12 +1297,6 @@ pub struct CpuCache<
     /// is directly mapped" and sends every access to the bus.
     #[cfg(feature = "tcache")]
     tc_bitmap: UnsafeCell<u64>,
-    /// tcache: whether the cache is transparent right now. On from
-    /// construction; a machine whose firmware keeps data in the cache with
-    /// nothing behind it (the O2 PROM's cache-as-RAM stack) turns it off for
-    /// the firmware and back on once the OS runs ([`Self::set_tcache_live`]).
-    #[cfg(feature = "tcache")]
-    tc_on: UnsafeCell<bool>,
     /// tcache + jitv2: base of ppmem's generation window, one `AtomicU64` per
     /// 4KB page (`gen_base + (phys >> 12)`).
     ///
@@ -1331,12 +1328,12 @@ unsafe impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, co
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Send for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {}
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> Send for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {}
 unsafe impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Sync for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {}
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> Sync for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {}
 
 // Per-level cache types, parameterised so each CPU model monomorphises its own.
 type ICacheT<const S: usize, const L: usize, const W: usize, const T: usize> =
@@ -1403,7 +1400,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     // Model discriminator: folds to a literal, so it replaces #[cfg(feature = "r5k")].
     // Keyed on MODEL, not on associativity — see `mod model`.
     const IS_R5K: bool = MODEL == model::R5000;
@@ -1523,8 +1520,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "tcache")]
             tc_bitmap: UnsafeCell::new(0),
-            #[cfg(feature = "tcache")]
-            tc_on: UnsafeCell::new(true),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "r5ksc_triton")]
@@ -1564,7 +1559,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> From<Arc<dyn BusDevice>> for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> From<Arc<dyn BusDevice>> for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn from(downstream: Arc<dyn BusDevice>) -> Self {
         Self::new(downstream)
     }
@@ -1574,7 +1569,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     /// Check if we're tracking this physical address (for debug purposes)
     #[cfg(feature = "debug_cache")]
     #[inline]
@@ -1697,50 +1692,27 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         unsafe { *self.tc_gen.get() = gen_base };
     }
 
-    /// tcache: is the cache transparent right now? Always false without the
-    /// feature, so every `tc_live()` branch folds away in such a build.
+    /// tcache: is this cache transparent? A constant (the feature and `TC`),
+    /// so every `tc_live()` branch folds away.
     #[inline(always)]
     fn tc_live(&self) -> bool {
-        #[cfg(feature = "tcache")]
-        { unsafe { *self.tc_on.get() } }
-        #[cfg(not(feature = "tcache"))]
-        { false }
+        cfg!(feature = "tcache") && TC
     }
 
-    /// tcache: switch transparency at run time. Off, the cache holds line data
-    /// as a build without tcache does; on, RAM is the store.
-    ///
-    /// Turning it on writes every dirty line back first (primary data into
-    /// the secondary, then the secondary to memory), after which RAM holds
-    /// everything and the data arrays are never read again. The tags stay, so
-    /// the guest sees no change. Turning it off invalidates every line, since
-    /// the data arrays went stale while RAM was the store; it is meant for
-    /// power-on, when the cache is empty anyway.
-    ///
-    /// Call between instructions, from the CPU thread, before any jitv2
-    /// region is compiled for the new state (`install_jit_mem_ptrs` reads it).
-    #[cfg(feature = "tcache")]
-    pub fn set_tcache_live_impl(&self, on: bool) {
-        if on == self.tc_live() {
-            return;
-        }
-        if on {
-            for eidx in 0..DC_WAYS * Self::DC_NUM_LINES {
-                if self.dc.get_tag(eidx).is_valid() {
-                    self.writeback_l1d_line(eidx, false);
-                }
+    /// Write every dirty line back to memory: primary data into the
+    /// secondary, then the secondary to memory. Tags stay. For handing a
+    /// guest over from a cache that holds data to one that does not.
+    pub fn writeback_all_impl(&self) {
+        for eidx in 0..DC_WAYS * Self::DC_NUM_LINES {
+            if self.dc.get_tag(eidx).is_valid() {
+                self.writeback_l1d_line(eidx, false);
             }
-            if HAS_L2 {
-                for idx in 0..Self::L2_NUM_LINES {
-                    self.writeback_l2_line(idx);
-                }
-            }
-        } else {
-            self.ic.tags_mut().fill(L1ITag::default());
-            self.dc.tags_mut().fill(L1DTag::default());
-            self.l2.tags_mut().fill(L2Tag::default());
         }
-        unsafe { *self.tc_on.get() = on };
+        if HAS_L2 {
+            for idx in 0..Self::L2_NUM_LINES {
+                self.writeback_l2_line(idx);
+            }
+        }
     }
 
     /// tcache + jitv2: bump the generation counter for `phys_addr`'s 4KB page.
@@ -3595,7 +3567,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuModel for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> CpuModel for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     const MIPS4: bool = MIPS4;
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
@@ -3615,15 +3587,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> MipsCache for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> MipsCache for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn set_l1i_counters(&mut self, hit: Arc<AtomicU64>, fetch: Arc<AtomicU64>) {
         self.l1i_hit_count = hit;
         self.l1i_fetch_count = fetch;
     }
 
-    #[cfg(feature = "tcache")]
-    fn set_tcache_live(&self, on: bool) {
-        self.set_tcache_live_impl(on)
+    fn writeback_all(&self) {
+        self.writeback_all_impl()
     }
 
     #[cfg(feature = "tcache")]
@@ -3667,8 +3638,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // every emitted access) is what lets the emitted code assume them.
         #[cfg(feature = "jitv2")]
         {
-            // The inline path is the transparent one; while the cache holds
-            // data (`set_tcache_live(false)`) compiled code must go through it.
+            // The inline path is the transparent one; a cache that holds data
+            // (`TC = false`) must be reached through its own accesses.
             if !self.tc_live() {
                 return JitDcGeometry::unsupported();
             }
@@ -4874,7 +4845,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Drop for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> Drop for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn drop(&mut self) {
         self.ic.stop.store(true, Ordering::Relaxed);
     }
@@ -4886,7 +4857,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Resettable for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> Resettable for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn power_on(&self) {
         self.ic.tags_mut().fill(L1ITag::default());
         self.dc.tags_mut().fill(L1DTag::default());
@@ -4917,7 +4888,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn save_tags_as_u32<TAG: Copy + Into<u32>>(tags: &[TAG]) -> Vec<u32> {
         tags.iter().map(|&t| t.into()).collect()
     }
@@ -5446,37 +5417,40 @@ mod tests {
         assert_eq!(<R5000Cache as CpuModel>::VA_BITS, 40);
     }
 
-    /// With tcache switched off the cache holds its data, as a build without
-    /// tcache does: a line written through it survives an uncached write
-    /// behind it (the O2 PROM keeps its stack that way while it tests RAM).
-    /// Switching tcache on writes the line back, and RAM is the store after.
+    /// A cache with `TC = false` holds its data in a `tcache` build too: a
+    /// line written through it survives an uncached write behind it (the O2
+    /// PROM keeps its stack that way while it tests RAM). `writeback_all`
+    /// then puts it in RAM.
     #[test]
-    fn tcache_switched_off_holds_data_until_switched_on() {
+    fn a_cache_with_tc_off_holds_data_until_written_back() {
+        type HoldingR4400 = CpuCache<16384, 16, 1, 1024, 16384, 16, 1, 1024, 2048,
+            1048576, 128, 8192, 131072, 262144, true,
+            false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }, false>;
+        type HoldingR5000 = CpuCache<32768, 32, 2, 1024, 32768, 32, 2, 1024, 4096,
+            128, 128, 1, 16, 0, false,
+            true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }, false>;
+        type HoldingR10000 = CpuCache<32768, 64, 1, 512, 32768, 32, 1, 1024, 4096,
+            1048576, 128, 8192, 131072, 262144, true,
+            true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }, false>;
         let mem = Arc::new(Memory::new(MEM_MB));
-        let check = |name: &str, live: &dyn Fn(bool), write: &dyn Fn(u64, u32), read: &dyn Fn(u64, u32) -> u32| {
+        let check = |name: &str, writeback: &dyn Fn(), write: &dyn Fn(u64, u32), read: &dyn Fn(u64, u32) -> u32| {
             let pa = 0x4040u32;
-            live(false);
             write(kseg0(pa), 0x1234_5678);
             mem_write(&mem, pa, 0xdead_beef);
             assert_eq!(read(kseg0(pa), pa), 0x1234_5678, "{name}: the cache lost its line");
-            live(true);
-            if cfg!(feature = "tcache") {
-                assert_eq!(mem_read(&mem, pa), 0x1234_5678, "{name}: not written back on switching on");
-                write(kseg0(pa), 0x0bad_f00d);
-                assert_eq!(mem_read(&mem, pa), 0x0bad_f00d, "{name}: RAM is not the store once on");
-                assert_eq!(read(kseg0(pa), pa), 0x0bad_f00d, "{name}");
-            }
+            writeback();
+            assert_eq!(mem_read(&mem, pa), 0x1234_5678, "{name}: writeback_all left it in the cache");
         };
-        let r10k: R10000Cache = make_cache_of(mem.clone());
-        check("R10000", &|on| r10k.set_tcache_live(on),
+        let r10k: HoldingR10000 = make_cache_of(mem.clone());
+        check("R10000", &|| r10k.writeback_all(),
             &|va, v| { let _ = r10k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r10k.read::<4>(va, pa as u64).data as u32);
-        let r5k: R5000Cache = make_cache_of(mem.clone());
-        check("R5000", &|on| r5k.set_tcache_live(on),
+        let r5k: HoldingR5000 = make_cache_of(mem.clone());
+        check("R5000", &|| r5k.writeback_all(),
             &|va, v| { let _ = r5k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r5k.read::<4>(va, pa as u64).data as u32);
-        let r4k: R4400Cache = make_cache_of(mem.clone());
-        check("R4400", &|on| r4k.set_tcache_live(on),
+        let r4k: HoldingR4400 = make_cache_of(mem.clone());
+        check("R4400", &|| r4k.writeback_all(),
             &|va, v| { let _ = r4k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r4k.read::<4>(va, pa as u64).data as u32);
     }
