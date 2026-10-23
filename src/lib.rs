@@ -184,6 +184,7 @@ pub mod chd_disk;
 pub mod scsi;
 pub mod irq;
 pub mod ip32_handover;
+pub mod ip32_screen;
 pub mod host_audio;
 pub mod pci;
 pub mod ui;
