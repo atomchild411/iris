@@ -40,9 +40,11 @@ use crate::traits::{BusDevice, Device, Signal};
 
 const PROM_VA: std::ops::Range<u32> = 0xbfc0_0000..0xbfc8_0000;
 
-/// Whether `pc` is inside the PROM or its firmware copied into RAM.
+/// Whether `pc` is inside the PROM or its firmware copied into RAM. The
+/// firmware runs from its KSEG1 alias too (0xa100_0000), uncached.
 fn in_firmware(pc: u32) -> bool {
-    PROM_VA.contains(&pc) || (FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN).contains(&pc)
+    let fw = FIRMWARE_LOAD_VA..FIRMWARE_LOAD_VA + FIRMWARE_SPAN;
+    PROM_VA.contains(&pc) || fw.contains(&pc) || fw.contains(&(pc.wrapping_sub(0x2000_0000)))
 }
 
 /// The CPU's interrupt pins as a controller: line n is IPn.
