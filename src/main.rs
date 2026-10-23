@@ -58,10 +58,14 @@ fn main() {
             // flight before the machine is boxed. This is virtual address space,
             // lazily committed, so the large reservation has no real cost.
             .stack_size(64 * 1024 * 1024)
-        .spawn(move || Box::new(Machine::new(cfg)))
+        .spawn(move || iris::workstation::build(cfg))
         .unwrap()
         .join()
-        .unwrap();
+        .unwrap()
+        .unwrap_or_else(|e| {
+            eprintln!("iris: {e}");
+            std::process::exit(1);
+        });
     machine.register_system_controller();
 
     // --load-elf: load before the CPU starts, so the binary runs instead of the
@@ -81,8 +85,7 @@ fn main() {
     // CI control socket: started after Machine::new so it can hand out the
     // machine pointer + CiSerialBackend to command handlers.
     let _ci_server = if ci_enabled {
-        let mptr: *mut iris::machine::Machine = &mut *machine;
-        match iris::ci::start_server(mptr, &ci_socket_path) {
+        match iris::ci::start_server(&mut *machine, &ci_socket_path) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("iris: failed to start CI server: {}", e);
@@ -155,8 +158,7 @@ fn main() {
         use winit::event_loop::EventLoop;
         let event_loop = EventLoop::new().unwrap();
         let display = machine.get_display().expect("a graphics board must be present in non-headless mode");
-        let scsi = machine.hpc3().scsi().clone();
-        let ui = Ui::new(machine.get_ps2(), display, scsi, machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio);
+        let ui = Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio);
         ui.run(event_loop);
     }
 

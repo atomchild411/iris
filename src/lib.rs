@@ -170,6 +170,7 @@ pub mod prombini2;
 pub mod prombinip28;
 pub mod ppmem;
 pub mod machine;
+pub mod workstation;
 pub mod platform;
 pub mod physical;
 pub mod monitor;

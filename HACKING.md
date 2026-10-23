@@ -48,6 +48,22 @@ the devices together, starts and stops them, and takes snapshots.
 Indigo2 "Fullhouse": IOC variant, one or two SCSI controllers, NVRAM chip,
 EISA/INT2 cascade, PROM fallback, memory layout).
 
+The front ends do not use `Machine` directly. `main.rs`, the window
+(`ui.rs`), the CI socket (`ci.rs`), the monitor's system commands and
+iris-gui hold a `Box<dyn Workstation>` from `workstation::build`
+(`src/workstation.rs`). The trait's required methods are what every machine
+has (start and stop, the screen, the keyboard and mouse, the serial console,
+the monitor); its provided methods are optional facilities (snapshots, CHD
+folding, the scratch volume, disc changes, the NAT controls) that default to
+"not supported on this machine". `Machine` implements all of it. A machine
+built around a different chipset implements the same trait and gets the
+window, iris-ci, iris-gui and the monitor's `reset`/`save`/`load` with it.
+
+The monitor's system controller, the machine-events thread and the CI server
+reach the machine through one shared `MachineSlot` per machine, which the
+machine's `Drop` nulls, so a holder that outlives the machine (the monitor,
+after iris-gui's Stop) gets "machine is not running" instead of freed memory.
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit

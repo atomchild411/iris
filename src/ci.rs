@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::machine::Machine;
+use crate::workstation::{MachineSlot, Workstation};
 use crate::gfx_display::GfxDisplay;
 use crate::dev::z85c30::CiSerialBackend;
 
@@ -57,10 +57,10 @@ impl Response {
 
 pub struct CiServer {
     socket_path: String,
-    /// The Machine's shared pointer slot (see `Machine::machine_slot`): the
-    /// same one the monitor's SystemController uses, nulled when the Machine
-    /// is dropped, so a CI command can never reach a freed Machine.
-    machine: crate::machine::MachineSlot,
+    /// The machine's shared pointer slot (see `Workstation::machine_slot`):
+    /// the same one the monitor's SystemController uses, nulled when the
+    /// machine is dropped, so a CI command can never reach a freed machine.
+    machine: MachineSlot,
     ci_serial: Arc<CiSerialBackend>,
     /// Optional in case --headless is also passed (no REX3). Screenshot
     /// commands return an error in that case.
@@ -87,15 +87,15 @@ impl CiServer {
     /// mutex serializes all Machine accesses from CI command handlers.
     /// CPU/peripheral threads observe state changes only when the methods we
     /// call stop them first (ci_restore/ci_rollback do).
-    fn with_machine<R>(&self, f: impl FnOnce(&mut Machine) -> R) -> Result<R, String> {
-        crate::machine::with_machine_slot(&self.machine, f)
+    fn with_machine<R>(&self, f: impl FnOnce(&mut dyn Workstation) -> R) -> Result<R, String> {
+        crate::workstation::with_machine_slot(&self.machine, f)
     }
 
     /// `with_machine` for a fallible closure, flattening both failures into
     /// the message the command reports.
     fn with_machine_result<T, E: std::fmt::Display>(
         &self,
-        f: impl FnOnce(&mut Machine) -> Result<T, E>,
+        f: impl FnOnce(&mut dyn Workstation) -> Result<T, E>,
     ) -> Result<T, String> {
         self.with_machine(f)?.map_err(|e| e.to_string())
     }
@@ -103,24 +103,22 @@ impl CiServer {
 
 /// Bind the control socket, spawn the accept thread, return a handle.
 ///
-/// # Safety
-/// `machine_ptr` must point to a live `Machine` in its final location (boxed,
-/// or on `main`'s stack). The server reaches it only through the Machine's
-/// shared slot afterwards, so it may be dropped while the server runs.
+/// `machine` must be in its final location (boxed). The server reaches it
+/// only through the machine's shared slot afterwards, so it may be dropped
+/// while the server runs.
 pub fn start_server(
-    machine_ptr: *mut Machine,
+    machine: &mut dyn Workstation,
     socket_path: &str,
 ) -> Result<Arc<CiServer>, String> {
-    // SAFETY: caller guarantees the pointer is valid.
-    let ci_serial = unsafe { (*machine_ptr).get_ci_serial() }
-        .ok_or_else(|| "CI mode: CiSerialBackend not installed on Machine".to_string())?;
-    let display = unsafe { (*machine_ptr).get_display() };
-    let display_head1 = unsafe { (*machine_ptr).get_display_head1() };
+    let ci_serial = machine.get_ci_serial()
+        .ok_or_else(|| "CI mode: CiSerialBackend not installed on the machine".to_string())?;
+    let display = machine.get_display();
+    let display_head1 = machine.get_display_head1();
 
     let path = socket_path.to_string();
     let server = Arc::new(CiServer {
         socket_path: path.clone(),
-        machine: unsafe { (*machine_ptr).machine_slot() },
+        machine: machine.machine_slot(),
         ci_serial,
         display,
         display_head1,
@@ -288,9 +286,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
 fn cmd_rtc_save(server: &CiServer, args: &Value) -> Response {
     let explicit_path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
     let result = server.with_machine_result(|m| {
-        let rtc = m.hpc3().rtc();
-        let path = explicit_path.clone().unwrap_or_else(|| rtc.nvram_path().to_string());
-        rtc.save_nvram(&path).map(|_| path)
+        m.save_nvram(explicit_path.as_deref())
     });
     match result {
         Ok(path) => Response::data(serde_json::json!({ "path": path })),
@@ -304,7 +300,7 @@ fn cmd_cdrom_eject(server: &CiServer, args: &Value) -> Response {
         None => return Response::err("cdrom-eject: missing 'id' arg"),
     };
     let result = server.with_machine_result(|m| {
-        m.hpc3().scsi().eject_disc(id)
+        m.disc_changer().ok_or("no CD-ROM controller")?.eject_disc(id)
     });
     match result {
         Ok(path) => Response::data(serde_json::json!({ "id": id, "new_disc": path })),
@@ -322,7 +318,7 @@ fn cmd_cdrom_load(server: &CiServer, args: &Value) -> Response {
         None => return Response::err("cdrom-load: missing 'path' arg"),
     };
     let result = server.with_machine_result(|m| {
-        m.hpc3().scsi().load_disc(id, path.clone())
+        m.disc_changer().ok_or("no CD-ROM controller")?.load_disc(id, path.clone())
     });
     match result {
         Ok(loaded) => Response::data(serde_json::json!({ "id": id, "disc": loaded })),
@@ -661,7 +657,7 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
 //     (sector-aligned; conv=sync zero-pads the trailing partial sector).
 //
 // Each scratch op briefly stops the machine to quiesce in-flight SCSI I/O
-// (Machine::with_paused). The CPU is restarted only if it was running before
+// (`with_paused` on `dyn Workstation`). The CPU is restarted only if it was running before
 // — a scratch-write issued before the harness `start`s the CPU does not
 // auto-start it.
 // ----------------------------------------------------------------------------
@@ -842,6 +838,8 @@ fn cmd_validate(server: &CiServer, args: &Value) -> Response {
         .unwrap_or(1_000_000);
 
     let report_result = server.with_machine_result(|m| {
+        let m = m.as_any_mut().downcast_mut::<crate::machine::Machine>()
+            .ok_or("not supported on this machine")?;
         crate::validate::validate_snapshot_determinism(m, &name, n)
     });
 

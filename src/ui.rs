@@ -17,7 +17,7 @@ use crate::compositor::{Compositor, SwCompositor};
 use crate::gl_compositor::GlCompositor;
 use crate::debug_overlay::DebugOverlay;
 use crate::hptimer::{TimerManager, TimerReturn};
-use crate::dev::wd33c93a::Wd33c93a;
+use crate::workstation::DiscChanger;
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile, NotCurrentContext, PossiblyCurrentContext, Version};
 use glutin::display::GetGlDisplay;
@@ -752,7 +752,7 @@ struct MouseDelta {
 pub struct Ui {
     ps2: Arc<Ps2Controller>,
     display: Arc<dyn GfxDisplay>,
-    scsi: Arc<Wd33c93a>,
+    discs: Option<Arc<dyn DiscChanger>>,
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     resize_request: Arc<Mutex<Option<ResizeRequest>>>,
@@ -764,7 +764,7 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(ps2: Arc<Ps2Controller>, display: Arc<dyn GfxDisplay>, scsi: Arc<Wd33c93a>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool) -> Self {
+    pub fn new(ps2: Arc<Ps2Controller>, display: Arc<dyn GfxDisplay>, discs: Option<Arc<dyn DiscChanger>>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool) -> Self {
         // The Indy's default video mode is 1280×1024; open the window at that
         // size (plus the status bar). The renderer snaps to the real resolution
         // via resize() once the PROM/IRIX programs its actual mode, keeping `scale`.
@@ -901,12 +901,12 @@ impl Ui {
 
         *display.renderer_slot().lock() = Some(Box::new(renderer));
 
-        Self { ps2, display, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
+        Self { ps2, display, discs, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, display, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
+        let Ui { ps2, display, discs, window, window_size, resize_request, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
         let scale = initial_scale;
 
         let last_win_size = {
@@ -931,7 +931,7 @@ impl Ui {
 
         event_loop.set_control_flow(ControlFlow::Wait);
         let mut app = UiApp {
-            ps2, display, scsi, window, window_size, resize_request, display_res, mouse_delta,
+            ps2, display, discs, window, window_size, resize_request, display_res, mouse_delta,
             scale, scroll_pixels_per_line, lock_aspect_ratio,
             mouse_grabbed: false, rctrl_held: false, held_keys: Vec::new(), last_win_size,
         };
@@ -979,7 +979,7 @@ impl Ui {
         }
     }
 
-    fn handle_keyboard(ps2: &Ps2Controller, display: &dyn GfxDisplay, scsi: &Arc<Wd33c93a>,
+    fn handle_keyboard(ps2: &Ps2Controller, display: &dyn GfxDisplay, discs: &Option<Arc<dyn DiscChanger>>,
         resize_request: &Mutex<Option<ResizeRequest>>,
         input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, held_keys: &mut Vec<KeyCode>,
         window: &Window)
@@ -1027,9 +1027,10 @@ impl Ui {
             // RCtrl+F12: hot-swap CD-ROM disc (open file picker and load into first CD-ROM device)
             if keycode == KeyCode::F12 && pressed && !input.repeat && *rctrl_held {
                 // Find the first CD-ROM device (disc_status only lists CD-ROMs)
-                let cdrom_id = scsi.disc_status().first().map(|(id, ..)| *id);
+                let cdrom = discs.as_ref()
+                    .and_then(|d| d.disc_status().first().map(|(id, ..)| (*id, d.clone())));
 
-                if let Some(id) = cdrom_id {
+                if let Some((id, discs)) = cdrom {
                     // Run the picker on its own thread rather than inline.
                     //
                     // A native file dialog pumps its **own modal message loop**,
@@ -1044,9 +1045,8 @@ impl Ui {
                     //
                     // Off-thread it can neither re-enter the event loop nor
                     // stall emulation while the dialog sits open.
-                    // `Wd33c93a::load_disc` takes `&self` and locks internally,
-                    // so calling it from here is safe.
-                    let scsi = scsi.clone();
+                    // `DiscChanger::load_disc` takes `&self` and locks
+                    // internally, so calling it from here is safe.
                     std::thread::Builder::new()
                         .name("cdrom-picker".to_string())
                         .spawn(move || {
@@ -1058,7 +1058,7 @@ impl Ui {
                             else { return };
 
                             let path_str = path.to_string_lossy().into_owned();
-                            match scsi.load_disc(id, path_str.clone()) {
+                            match discs.load_disc(id, path_str.clone()) {
                                 Ok(_) => {
                                     let filename = path.file_name()
                                         .map(|n| n.to_string_lossy().into_owned())
@@ -1127,7 +1127,7 @@ impl Ui {
 struct UiApp {
     ps2:         Arc<Ps2Controller>,
     display:     Arc<dyn GfxDisplay>,
-    scsi:        Arc<Wd33c93a>,
+    discs:       Option<Arc<dyn DiscChanger>>,
     window:      Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     resize_request: Arc<Mutex<Option<ResizeRequest>>>,
@@ -1181,7 +1181,7 @@ impl ApplicationHandler for UiApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                Ui::handle_keyboard(&self.ps2, &*self.display, &self.scsi, &self.resize_request, event,
+                Ui::handle_keyboard(&self.ps2, &*self.display, &self.discs, &self.resize_request, event,
                     &mut self.mouse_grabbed, &mut self.rctrl_held, &mut self.held_keys, &self.window);
             }
             WindowEvent::MouseInput { state, button, .. } => {

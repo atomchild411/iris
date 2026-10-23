@@ -1,7 +1,7 @@
 use crate::framebuffer::{new_capture_renderer, FrameSink};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use iris::config::{MachineConfig, PortForwardConfig};
-use iris::machine::Machine;
+use iris::workstation::Workstation;
 use iris::dev::ps2::Ps2Controller;
 use parking_lot::Mutex;
 use std::net::Ipv4Addr;
@@ -333,7 +333,7 @@ fn worker_loop(
     pending_commands: Arc<AtomicUsize>,
     abandoned_machine: Arc<AtomicBool>,
 ) {
-    let mut machine: Option<Box<Machine>> = None;
+    let mut machine: Option<Box<dyn Workstation>> = None;
     // Live MIPS estimate: read REX3's free-running cycle counter and divide
     // the delta by wall-clock between ticks. Mirrors the status-bar math in
     // src/disp.rs, but driven here since the GUI never runs REX3's own
@@ -380,7 +380,7 @@ fn worker_loop(
                         let net_frames = machine.as_ref().map_or(0, |m| m.net_guest_frames());
                         let net_guest_ip = machine.as_ref().and_then(|m| m.net_observed_guest_ip());
                         let net_guest_gateway = machine.as_ref().and_then(|m| m.net_observed_gateway());
-                        let net_nat_gateway = machine.as_ref().map(|m| m.nat_expected().1);
+                        let net_nat_gateway = machine.as_ref().and_then(|m| m.nat_expected()).map(|(_, gw, _)| gw);
                         let pcap_status = machine.as_ref()
                             .map_or(iris::net::PcapStatus::Inactive, |m| m.net_pcap_status());
                         let _ = evt_tx.send(Evt::Status(Status {
@@ -418,7 +418,9 @@ fn worker_loop(
                 let sink_for_head1 = frame_sink_head1.clone();
                 let heads = cfg_owned.graphics.heads;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut m = Box::new(Machine::new(cfg_owned));
+                    // A machine that cannot be built panics here, so the
+                    // catch_unwind below reports why.
+                    let mut m = iris::workstation::build(cfg_owned).unwrap_or_else(|e| panic!("{e}"));
                     m.register_system_controller();
                     // Install the capture renderer before the CPU starts
                     // so the very first REX3 frame already lands in the
@@ -634,7 +636,7 @@ fn worker_loop(
             Ok(Cmd::LoadDisc { id, path, remount }) => {
                 match machine.as_ref() {
                     Some(m) => {
-                        match m.hpc3().scsi().load_disc(id as usize, path.clone()) {
+                        match m.disc_changer().ok_or_else(no_cdrom).and_then(|d| d.load_disc(id as usize, path.clone())) {
                             Ok(loaded_path) => {
                                 let filename = std::path::Path::new(&loaded_path)
                                     .file_name()
@@ -659,7 +661,7 @@ fn worker_loop(
             Ok(Cmd::EjectCdrom { id }) => {
                 match machine.as_ref() {
                     Some(m) => {
-                        match m.hpc3().scsi().eject_to_empty(id as usize) {
+                        match m.disc_changer().ok_or_else(no_cdrom).and_then(|d| d.eject_to_empty(id as usize)) {
                             Ok(()) => {
                                 let _ = evt_tx.send(Evt::Error(t!("emu-disc-ejected", id = id)));
                             }
@@ -699,12 +701,17 @@ impl Drop for CommandInFlight<'_> {
     fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Release); }
 }
 
+/// The error for a disc command on a machine with no CD-ROM controller.
+fn no_cdrom() -> String {
+    "no CD-ROM controller".to_string()
+}
+
 /// Stop a machine, but never block longer than `STOP_TIMEOUT`. `Machine::stop()`
 /// starts with `cpu.stop()`, which waits for the CPU thread to acknowledge the
 /// halt; a wedged guest can make that never return. We run it on a detached
 /// helper thread and give up after the timeout — the helper thread and that
 /// `Machine` then leak, but the caller (and the whole GUI) stays responsive.
-fn stop_machine_timed(m: Box<Machine>) -> Result<(), String> {
+fn stop_machine_timed(m: Box<dyn Workstation>) -> Result<(), String> {
     const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     if std::thread::Builder::new()

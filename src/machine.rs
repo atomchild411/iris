@@ -39,6 +39,7 @@ use crate::dev::ng1::rex3::Rex3;
 use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, enabled_features};
 use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
 use crate::hptimer::TimerManager;
+use crate::workstation::{MachineRef, MachineSlot, SystemController, Workstation};
 
 pub fn emulator_name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -1024,23 +1025,6 @@ impl Machine {
         self.scratch_path.as_deref()
     }
 
-    /// Briefly stop the machine, run `work`, then restart peripherals and the
-    /// CPU only if it was running before. Used by the scratch-write/read/clear
-    /// CI commands to mutate the scratch file without racing the SCSI device's
-    /// in-flight reads. CPU stays stopped if the harness hasn't called `start`
-    /// yet — a file injected before boot stays injected, the CPU doesn't get
-    /// auto-started.
-    pub fn with_paused<R>(&mut self, work: impl FnOnce() -> R) -> R {
-        let was_running = self.cpu.is_running();
-        self.stop();
-        let r = work();
-        self.restart_peripherals();
-        if was_running {
-            self.cpu.start();
-        }
-        r
-    }
-
     pub fn start(&mut self) {
         // Start peripherals
         self.mc.start();
@@ -1071,10 +1055,10 @@ impl Machine {
     /// use. Must be called while `self` is in its final location (boxed, or on
     /// `main`'s stack) — the slot records this address.
     pub(crate) fn machine_slot(&mut self) -> MachineSlot {
-        let ptr = self as *mut Machine;
+        let ptr = self as *mut Machine as *mut dyn Workstation;
         let slot = self.controller_slot
             .get_or_insert_with(|| Arc::new(Mutex::new(MachineRef(ptr))));
-        debug_assert_eq!(slot.lock().0, ptr, "Machine moved after its slot was handed out");
+        debug_assert!(std::ptr::addr_eq(slot.lock().0, ptr), "Machine moved after its slot was handed out");
         slot.clone()
     }
 
@@ -1086,52 +1070,10 @@ impl Machine {
         // The controller and the event thread reach this Machine through the
         // shared slot, which `Drop` nulls: iris-gui drops a Machine on Stop
         // while the monitor thread (and a connected client) lives on.
-        // SystemController stops all threads before mutating machine state.
         assert!(!self.controller_registered, "register_system_controller called twice");
         self.controller_registered = true;
-        let ctrl = Arc::new(SystemController {
-            machine: self.machine_slot(),
-        });
-        // We need interior mutability to register after construction.
-        // Monitor::register_device takes &mut self, so we use unsafe to call it.
-        // SAFETY: This is called once, before the monitor server thread starts,
-        // while we have exclusive access to Machine.
-        let monitor_ptr = Arc::as_ptr(&self.monitor) as *mut Monitor;
-        unsafe {
-            (*monitor_ptr).register_device(ctrl.clone());
-        }
-
-        // Spawn the event dispatch thread: receives MachineEvent from devices and
-        // performs the requested system-level action.
-        // Uses the same SystemController (which is Send+Sync via unsafe impls) so it
-        // can stop all threads and mutate machine state safely.
-        if let Some(rx) = self.event_rx.take() {
-            thread::Builder::new().name("machine-events".to_string()).spawn(move || {
-                while let Ok(event) = rx.recv() {
-                    let _ = ctrl.with_machine(|machine| {
-                        match event {
-                            MachineEvent::HardReset => {
-                                println!("Machine: SIN hard reset");
-                                machine.reset();
-                                machine.cpu.start();
-                            }
-                            MachineEvent::PowerOff => {
-                                println!("Machine: soft power-off");
-                                machine.stop();
-                                // Hosts that embed iris as a library (e.g. iris-gui)
-                                // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
-                                // does not kill the host process.
-                                #[cfg(not(feature = "developer"))]
-                                if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
-                                    std::process::exit(0);
-                                }
-                            }
-                        }
-                        Ok(())
-                    });
-                }
-            }).unwrap();
-        }
+        let slot = self.machine_slot();
+        crate::workstation::register_system_controller(&self.monitor, slot, self.event_rx.take());
     }
 
     pub fn stop(&mut self) {
@@ -1353,67 +1295,6 @@ impl Machine {
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
         self.hpc3.scsi().sync_chd_disks(only, progress, cancel)
-    }
-
-    /// Cumulative count of guest-originated Ethernet frames the NAT engine has
-    /// processed. Monotonic for the life of the machine; an embedder samples the
-    /// delta to tell whether the guest's internal networking is alive.
-    pub fn net_guest_frames(&self) -> u64 {
-        self.hpc3.seeq().nat_control().guest_frames()
-    }
-
-    /// NAT addresses the emulator hands the guest: (ec0 client IP, gateway IP,
-    /// netmask) — the source of truth for what the guest's ec0 should be.
-    pub fn nat_expected(&self) -> (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr) {
-        self.hpc3.seeq().gateway_addrs()
-    }
-
-    /// The guest's own source IP as last seen on the wire (None if no frame has
-    /// revealed one yet). Captured passively, so it works even when the guest's
-    /// networking is misconfigured and nothing routes.
-    pub fn net_observed_guest_ip(&self) -> Option<std::net::Ipv4Addr> {
-        self.hpc3.seeq().nat_control().observed_guest_ip()
-    }
-
-    /// The guest's likely default gateway, inferred passively from the in-subnet
-    /// address it keeps ARP-ing for but can't resolve. None if none seen.
-    pub fn net_observed_gateway(&self) -> Option<std::net::Ipv4Addr> {
-        self.hpc3.seeq().nat_control().observed_gateway()
-    }
-
-    /// Live status of the PCAP bridged-capture backend. `Inactive` unless this is
-    /// a `--features pcap` build whose active machine uses `mode = "pcap"`; goes
-    /// `PermissionDenied` when the raw capture can't be opened for lack of
-    /// privilege, which the GUI turns into an "Enable packet capture" prompt.
-    pub fn net_pcap_status(&self) -> crate::net::PcapStatus {
-        self.hpc3.seeq().nat_control().pcap_status()
-    }
-
-    /// Move the running NAT onto a new subnet without a reboot: the NAT thread
-    /// swaps its `(gateway, client, netmask)` and flushes connection state on
-    /// its next loop. Typically gateway = network+1, client = network+2.
-    pub fn set_nat_subnet(&self, gateway: std::net::Ipv4Addr, client: std::net::Ipv4Addr, netmask: std::net::Ipv4Addr) {
-        self.hpc3.seeq().nat_control().request_subnet(gateway, client, netmask);
-    }
-
-    /// Tell the NAT engine the host's own IPv4 networks `(network, prefix)` so it
-    /// won't adopt a guest subnet that overlaps them (which would shadow the
-    /// host's real LAN). The embedder gathers these from the host interfaces.
-    pub fn set_host_nets(&self, nets: Vec<(std::net::Ipv4Addr, u8)>) {
-        self.hpc3.seeq().nat_control().set_host_nets(nets);
-    }
-
-    /// Replace the running NAT's inbound port-forward rules without a reboot;
-    /// the NAT thread rebinds its host listeners on its next loop.
-    pub fn set_port_forwards(&self, rules: Vec<crate::config::PortForwardConfig>) {
-        self.hpc3.seeq().nat_control().set_port_forwards(rules);
-    }
-
-    /// Change the PCAP bridged host interface (`None` = auto-pick) on a running
-    /// machine without rebooting the guest: the PcapEngine reopens its capture on
-    /// the new NIC. No-op in NAT mode.
-    pub fn set_pcap_interface(&self, iface: Option<String>) {
-        self.hpc3.seeq().nat_control().request_pcap_interface(iface);
     }
 
     /// Step the CPU `n` instructions in-line on the calling thread, with all
@@ -2156,33 +2037,6 @@ impl Machine {
     }
 }
 
-// ---- SystemController — registers reset/save/load with the monitor ----
-
-/// A raw pointer to a live `Machine`, or null once that Machine is dropped.
-pub(crate) struct MachineRef(*mut Machine);
-
-// SAFETY: only dereferenced under the slot's Mutex, while non-null; `Drop for
-// Machine` nulls it under that same Mutex before any field is torn down.
-unsafe impl Send for MachineRef {}
-unsafe impl Sync for MachineRef {}
-
-pub(crate) type MachineSlot = Arc<Mutex<MachineRef>>;
-
-/// Run `f` against the Machine behind `slot`, or fail if it has been dropped.
-pub(crate) fn with_machine_slot<R>(slot: &MachineSlot, f: impl FnOnce(&mut Machine) -> R) -> Result<R, String> {
-    let guard = slot.lock();
-    let ptr = guard.0;
-    if ptr.is_null() {
-        return Err("machine is not running".to_string());
-    }
-    // SAFETY: non-null only while the Machine is alive. Drop nulls it while
-    // holding this lock, and `guard` is held until `f` returns, so the Machine
-    // cannot be freed while `f` runs.
-    let result = f(unsafe { &mut *ptr });
-    drop(guard);
-    Ok(result)
-}
-
 impl Drop for Machine {
     fn drop(&mut self) {
         // Runs before any field is dropped. Taking the lock waits for an
@@ -2190,7 +2044,7 @@ impl Drop for Machine {
         // a half-destroyed Machine. No controller command drops the Machine, so
         // this never waits on a lock its own thread holds.
         if let Some(slot) = self.controller_slot.take() {
-            slot.lock().0 = std::ptr::null_mut();
+            slot.lock().0 = MachineRef::null();
         }
         // The guest clock points into this Machine's CPU core.
         #[cfg(feature = "perfetto")]
@@ -2201,105 +2055,59 @@ impl Drop for Machine {
     }
 }
 
-/// A thin monitor device that wraps the machine behind a Mutex so the monitor
-/// thread can issue system-level commands (reset, save, load).
-pub struct SystemController {
-    machine: MachineSlot,
-}
+/// The Indy and Indigo2 family as the front ends see it: each method is the
+/// inherent one of the same name.
+impl Workstation for Machine {
+    fn start(&mut self) { Machine::start(self) }
+    fn stop(&mut self) { Machine::stop(self) }
+    fn reset(&mut self) { Machine::reset(self) }
+    fn restart_peripherals(&mut self) { Machine::restart_peripherals(self) }
+    fn cpu_start(&self) { Machine::cpu_start(self) }
+    fn cpu_is_running(&self) -> bool { Machine::cpu_is_running(self) }
+    fn machine_slot(&mut self) -> MachineSlot { Machine::machine_slot(self) }
+    fn register_system_controller(&mut self) { Machine::register_system_controller(self) }
+    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { Machine::monitor_addr(self) }
 
+    fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display(self) }
+    fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display_head1(self) }
+    fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { Machine::get_ps2(self) }
+    fn get_timer_manager(&self) -> Arc<TimerManager> { Machine::get_timer_manager(self) }
+    fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> { Machine::get_cpu_debug(self) }
+    fn fasttick_count(&self) -> Arc<AtomicU64> { Machine::fasttick_count(self) }
+    fn get_ci_serial(&self) -> Option<Arc<crate::dev::z85c30::CiSerialBackend>> { Machine::get_ci_serial(self) }
+    fn inject_serial_console(&self, bytes: &[u8]) { Machine::inject_serial_console(self, bytes) }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 
-impl SystemController {
-    fn with_machine<F: FnOnce(&mut Machine) -> Result<(), String>>(&self, f: F) -> Result<(), String> {
-        with_machine_slot(&self.machine, f)?
+    fn load_elf(&self, path: &str) -> Result<String, String> { Machine::load_elf(self, path) }
+    fn save_snapshot(&mut self, name: &str) -> Result<(), String> { Machine::save_snapshot(self, name) }
+    fn load_snapshot(&mut self, name: &str) -> Result<(), String> { Machine::load_snapshot(self, name) }
+    fn ci_restore(&mut self, name: &str) -> Result<(), String> { Machine::ci_restore(self, name) }
+    fn ci_rollback(&mut self) -> Result<(), String> { Machine::ci_rollback(self) }
+
+    fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
+        let rtc = self.hpc3.rtc();
+        let path = path.unwrap_or_else(|| rtc.nvram_path()).to_string();
+        rtc.save_nvram(&path).map(|_| path).map_err(|e| e.to_string())
     }
-}
-
-impl Device for SystemController {
-    fn step(&self, _cycles: u64) {}
-    fn stop(&self) {}
-    fn start(&self) {}
-    fn is_running(&self) -> bool { false }
-    fn get_clock(&self) -> u64 { 0 }
-
-    fn register_commands(&self) -> Vec<(String, String)> {
-        vec![
-            ("machine-stop".to_string(),  "Stop CPU and all peripherals".to_string()),
-            ("machine-start".to_string(), "Start CPU and all peripherals".to_string()),
-            ("reset".to_string(),         "Reset all hardware to power-on state".to_string()),
-            ("save".to_string(),          "save <name> — Save snapshot to saves/<name>/".to_string()),
-            ("load".to_string(),          "load <name> — Load snapshot from saves/<name>/".to_string()),
-            #[cfg(all(feature = "jitv2", feature = "developer"))]
-            ("jitcheck".to_string(), "jitcheck <n> [skip] — capture live state, run n instructions interpreter-only vs real JIT dispatch, reconverge past the first `skip` divergences and stop at the next one [DEV]".to_string()),
-        ]
+    fn scratch_path(&self) -> Option<&std::path::Path> { Machine::scratch_path(self) }
+    fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
+        Some(self.hpc3.scsi().clone())
     }
-
-    fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
-        match cmd {
-            "machine-stop" => {
-                let _ = writeln!(writer, "Stopping machine...");
-                self.with_machine(|m| { m.stop(); Ok(()) })
-            }
-            "machine-start" => {
-                let _ = writeln!(writer, "Starting machine...");
-                self.with_machine(|m| {
-                    m.restart_peripherals();
-                    m.cpu.start();
-                    Ok(())
-                })
-            }
-            "reset" => {
-                let _ = writeln!(writer, "Resetting machine...");
-                self.with_machine(|m| { m.reset(); Ok(()) })
-            }
-            "save" => {
-                let name = args.first().ok_or_else(|| "Usage: save <name>".to_string())?;
-                let _ = writeln!(writer, "Saving snapshot '{}'...", name);
-                self.with_machine(|m| m.save_snapshot(name))
-            }
-            "load" => {
-                let name = args.first().ok_or_else(|| "Usage: load <name>".to_string())?;
-                let _ = writeln!(writer, "Loading snapshot '{}'...", name);
-                self.with_machine(|m| m.load_snapshot(name))
-            }
-            #[cfg(all(feature = "jitv2", feature = "developer"))]
-            "jitcheck" => {
-                let n: u64 = args.first()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("Usage: jitcheck <n> [skip]".to_string())?;
-                let skip: u64 = args.get(1)
-                    .map(|s| s.parse().map_err(|_| "Usage: jitcheck <n> [skip]".to_string()))
-                    .transpose()?
-                    .unwrap_or(0);
-                let _ = writeln!(writer, "jitcheck: capturing live state, running {} instructions interpreter-only then with real JIT dispatch (skipping first {} divergence(s))...", n, skip);
-                self.with_machine(|m| {
-                    let report = crate::validate::validate_jit_determinism(m, n, skip)
-                        .map_err(|e| format!("jitcheck failed: {}", e))?;
-                    for (i, d) in report.skipped.iter().enumerate() {
-                        let _ = writeln!(writer, "jitcheck: SKIPPED divergence #{} at instruction {} of {} (pc={:#018x}), reconverged and continued", i + 1, d.instruction, n, d.replay_pc);
-                        for (field, a, b) in &d.diffs {
-                            let _ = writeln!(writer, "  {}: interp={} jit={}", field, a, b);
-                        }
-                    }
-                    let next_divergence_number = report.skipped.len() + 1;
-                    match &report.stopped_at {
-                        None => {
-                            let _ = writeln!(writer, "jitcheck: no further divergence across {} instructions", n);
-                            let _ = writeln!(writer, "jitcheck: CPU left stopped (peripherals still running) with the replay (JIT-dispatch) pass's final state loaded — 'start' to resume the CPU");
-                        }
-                        Some(d) => {
-                            let _ = writeln!(writer, "jitcheck: DIVERGED (divergence #{}) at instruction {} of {} (pc={:#018x})", next_divergence_number, d.instruction, n, d.replay_pc);
-                            for (field, a, b) in &d.diffs {
-                                let _ = writeln!(writer, "  {}: interp={} jit={}", field, a, b);
-                            }
-                            let _ = writeln!(writer, "jitcheck: rerun with skip={} to reconverge past this one too", next_divergence_number);
-                            let _ = writeln!(writer, "jitcheck: stopped immediately at the divergence — CPU left stopped exactly as the JIT-dispatch pass left it (peripherals still running, console stays live) — 'start' to resume the CPU");
-                        }
-                    }
-                    Ok(())
-                })
-            }
-            _ => Err(format!("Unknown command: {}", cmd)),
-        }
+    fn remount_cdrom_guest(&self, scsi_id: u8) { Machine::remount_cdrom_guest(self, scsi_id) }
+    fn pending_chd_sync_count(&self) -> usize { Machine::pending_chd_sync_count(self) }
+    fn sync_chd_disks(
+        &self,
+        only: Option<usize>,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        Machine::sync_chd_disks(self, only, progress, cancel)
+    }
+    fn nat_control(&self) -> Option<Arc<crate::net::NatControl>> {
+        Some(self.hpc3.seeq().nat_control())
+    }
+    fn nat_expected(&self) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+        Some(self.hpc3.seeq().gateway_addrs())
     }
 }
 
