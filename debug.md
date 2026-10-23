@@ -448,6 +448,42 @@ With `[ultra64] enabled = true`: `ultra status | send <hex> | reset | r
 <offset> | w <offset> <val> | dump <offset> <size> | disasm <offset> <count>
 | load <path> [offset]`. See [HELP.md](HELP.md#n64-development-board-ultra64).
 
+### SGI O2 (IP32)
+
+The O2's devices register their own commands (see [the O2 guide](docs/o2-ip32.md)):
+
+| Command | Description |
+|---|---|
+| `crime status` / `crime regs` / `crime irqlog [n]` / `crime touched` | CRIME interrupts, mask and memory banks / registers / recent interrupt changes / registers the guest used |
+| `re status` / `re notes` | CRIME rendering engine state / notes on unusual commands |
+| `gbe status` | GBE display engine: timing, frame buffer, tiles |
+| `isa status` | MACE ISA interrupts |
+| `pci status` / `pci config <slot>` | MACE PCI bridge / a function's configuration space |
+| `mec status` | MACE Ethernet: rings, receive buffers, frame counts |
+| `sdma status` | MACE serial DMA |
+| `maceps2 status` / `maceps2 traffic` | PS/2 ports / recent bytes each way |
+| `audio status` / `audio codec` | MACE audio rings and rates / AD1843 codec registers |
+| `ust status` | MACE UST counter |
+| `rtc status` / `rtc dump` / `rtc r <reg>` / `rtc w <reg> <val>` | DS1687 RTC |
+| `onewire status` / `onewire log` | 1-Wire ID chip (the MAC address) |
+
+`o2 <command>` runs the same commands `[o2] control_port` serves, one per line:
+
+| Command | Description |
+|---|---|
+| `o2 shot PATH` | Screen shot (PNG) |
+| `o2 status` | GBE display state |
+| `o2 pixel X Y` | One screen pixel |
+| `o2 type TEXT` | Type on the PS/2 keyboard (`\r` is Enter) |
+| `o2 key\|keydown\|keyup NAME` | Press, hold or release a key |
+| `o2 mouse DX DY [BUTTONS]` / `o2 click [BUTTON]` | Move the mouse / click |
+| `o2 pc` / `o2 regs` | CPU PC / registers as last published |
+| `o2 peek ADDR LEN PATH` | Physical memory to a file (up to 1 MB) |
+| `o2 retrace PATH` | Recorded rendering-engine primitives (`IRIS_IP32_RE_TRACE`) |
+| `o2 scsi PATH` | The SCSI controllers' recent commands |
+| `o2 unmapped` | Bus accesses that reached no device (the first 64 distinct), with the PC that made each |
+| `o2 ps2log PATH` / `o2 crimelog PATH` / `o2 nictrace PATH` | PS/2 traffic / recent CRIME interrupt-register accesses / the MAC-address chip's register trace and 1-Wire protocol log |
+
 ## Recipes
 
 **Stop at a function and look around** (release or developer build):
