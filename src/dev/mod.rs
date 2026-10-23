@@ -1,6 +1,7 @@
 //! Emulated hardware. Graphics boards get a directory each (GR2, Newport,
 //! IMPACT); the rest of the system's devices sit here as single files.
 
+pub mod ds1687;
 pub mod onewire;
 pub mod gl;
 pub mod gr2;
