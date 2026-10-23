@@ -667,7 +667,7 @@ impl Aic7880 {
                 d[7] = 10;
                 d[12] = asc;
                 d[13] = ascq;
-                d.truncate((cdb[4] as usize).max(1).min(18));
+                d.truncate(crate::scsi::request_sense_alloc_len(cdb).min(18));
                 return (d, 0x00);
             }
         }
@@ -2103,5 +2103,19 @@ mod tests {
         assert_eq!(sense(4), (0x07, 0x27, 0x00), "a CD is write protected");
         assert_eq!(c.execute_write_on(&write10(8), &block, 1), 0x02);
         assert_eq!(sense(1), (0x05, 0x21, 0x00), "past the end is out of range");
+    }
+
+    /// The controller's own sense follows SCSI-2 like a device's: an
+    /// allocation length of 0 asks for 4 bytes.
+    #[test]
+    fn controller_sense_honours_the_allocation_length() {
+        let c = chip();
+        *c.sense.lock().unwrap() = Some((0x05, 0x25, 0x00));
+        let (d, status) = c.execute_on(&[0x03, 0, 0, 0, 0, 0], 1);
+        assert_eq!(status, 0x00);
+        assert_eq!(d.len(), 4, "SCSI-2: 0 means 4 bytes");
+        assert_eq!(d[2], 0x05);
+        *c.sense.lock().unwrap() = Some((0x05, 0x25, 0x00));
+        assert_eq!(c.execute_on(&[0x03, 0, 0, 0, 14, 0], 1).0.len(), 14);
     }
 }
