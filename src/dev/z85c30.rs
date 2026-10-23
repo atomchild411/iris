@@ -583,6 +583,21 @@ impl SerialBackend for TcpSocketBackend {
     }
 }
 
+/// A TCP serial console on 127.0.0.1:`port` (0 takes any free port), in
+/// telnet character mode, for any device with a serial line: every client
+/// connected sees the output and may type. Returns the backend and the port
+/// it bound, or `None` when the port is taken.
+pub fn tcp_serial_backend(port: u16) -> Option<(Arc<dyn SerialBackend>, u16)> {
+    let b = TcpSocketBackend::new(("127.0.0.1", port))?;
+    let bound = b.listener.local_addr().ok()?.port();
+    Some((Arc::new(b), bound))
+}
+
+/// A serial line wired to nothing: output is dropped, nothing arrives.
+pub fn null_serial_backend() -> Arc<dyn SerialBackend> {
+    Arc::new(NullBackend)
+}
+
 #[derive(Clone)]
 pub struct Z85c30 {
     pub channel_a: Arc<(Mutex<Channel>, Condvar)>,
