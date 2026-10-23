@@ -476,6 +476,49 @@ impl Ps2Controller {
         self.update_interrupt();
     }
 
+    /// Type one character as a press and release, with Shift where needed.
+    /// `\r` and `\n` are Enter, `\x1b` is Escape and `\x08` Backspace.
+    /// False, and nothing sent, if there is no key for it.
+    pub fn type_char(&self, ch: char) -> bool {
+        let (k, shifted) = match ch {
+            '\r' | '\n' => (KeyCode::Enter, false),
+            '\x1b' => (KeyCode::Escape, false),
+            '\x08' => (KeyCode::Backspace, false),
+            c => match ascii_to_keycode(c) {
+                Some(k) => k,
+                None => return false,
+            },
+        };
+        if shifted { self.push_kb(KeyCode::ShiftLeft, true); }
+        self.push_kb(k, true);
+        self.push_kb(k, false);
+        if shifted { self.push_kb(KeyCode::ShiftLeft, false); }
+        true
+    }
+
+    /// Send a byte straight to the keyboard (`mouse == false`) or the mouse,
+    /// for a host with a separate port per device and no 8042 in front (the
+    /// SGI O2's MACE). Same device behaviour as the data port, without
+    /// controller commands in between.
+    pub fn write_to(&self, val: u8, mouse: bool) {
+        self.state.lock().next_write_is_mouse = mouse;
+        self.write_data(val);
+    }
+
+    /// The oldest byte the keyboard (or the mouse) has sent, taken from the
+    /// shared queue. For one-port-per-device hosts; see [`Self::write_to`].
+    pub fn pop_from(&self, mouse: bool) -> Option<u8> {
+        let mut state = self.state.lock();
+        let i = state.rx_queue.iter().position(|(_, src)| matches!(src, Ps2Source::Keyboard) != mouse)?;
+        let (byte, src) = state.rx_queue.remove(i)?;
+        if matches!(src, Ps2Source::Mouse) {
+            state.mouse_queue_bytes -= 1;
+        }
+        drop(state);
+        self.update_interrupt();
+        Some(byte)
+    }
+
     /// Push a scancode byte to the keyboard queue (called from UI)
     pub fn push_kb(&self, key: KeyCode, pressed: bool) {
         if !self.running.load(Ordering::Relaxed) { return; }
@@ -1033,11 +1076,7 @@ impl Device for Ps2Controller {
                 let text = args[1..].join(" ");
                 let mut n = 0usize;
                 for ch in text.chars() {
-                    if let Some((k, shifted)) = ascii_to_keycode(ch) {
-                        if shifted { self.push_kb(KeyCode::ShiftLeft, true); }
-                        self.push_kb(k, true);
-                        self.push_kb(k, false);
-                        if shifted { self.push_kb(KeyCode::ShiftLeft, false); }
+                    if self.type_char(ch) {
                         n += 1;
                     }
                 }
@@ -1294,6 +1333,51 @@ impl Saveable for Ps2Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `type_char` sends what the keys themselves would: Shift around a
+    /// shifted character, Enter for a newline, and nothing for a character
+    /// with no key.
+    #[test]
+    fn type_char_matches_pressing_the_keys() {
+        let scanning = || {
+            let p = Ps2Controller::new(None);
+            p.start();
+            p.write_to(0xF4, false); // enable scanning
+            assert_eq!(p.pop_from(false), Some(0xFA));
+            p
+        };
+        let (typed, pressed) = (scanning(), scanning());
+        assert!(typed.type_char('A'));
+        assert!(typed.type_char('\r'));
+        let (k, shifted) = ascii_to_keycode('A').unwrap();
+        assert!(shifted);
+        pressed.push_kb(KeyCode::ShiftLeft, true);
+        pressed.push_kb(k, true);
+        pressed.push_kb(k, false);
+        pressed.push_kb(KeyCode::ShiftLeft, false);
+        pressed.push_kb(KeyCode::Enter, true);
+        pressed.push_kb(KeyCode::Enter, false);
+        let drain = |p: &Ps2Controller| std::iter::from_fn(|| p.pop_from(false)).collect::<Vec<u8>>();
+        let (a, b) = (drain(&typed), drain(&pressed));
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
+        assert!(!typed.type_char('\u{e9}'), "no key for it");
+        assert_eq!(drain(&typed), Vec::<u8>::new(), "and nothing sent");
+    }
+
+    /// A host with a port per device talks to each without 8042 commands,
+    /// and takes only that device's bytes from the shared queue.
+    #[test]
+    fn each_device_has_its_own_port_without_an_8042() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        ps2.write_to(0xF4, false); // keyboard: enable scanning
+        ps2.write_to(0xF4, true);  // mouse: enable data reporting
+        assert_eq!(ps2.pop_from(true), Some(0xFA), "the mouse's ACK");
+        assert_eq!(ps2.pop_from(true), None);
+        assert_eq!(ps2.pop_from(false), Some(0xFA), "the keyboard's ACK");
+        assert_eq!(ps2.pop_from(false), None);
+    }
 
     /// The interrupt is up exactly while a byte waits to be read.
     #[test]
