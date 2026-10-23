@@ -159,6 +159,9 @@ impl MipsCache for HandoverCache {
     fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         live!(self, c => c.fetch(virt_addr, phys_addr))
     }
+    fn fetch_is_pure(&self) -> bool {
+        live!(self, c => c.fetch_is_pure())
+    }
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
         live!(self, c => c.read::<SIZE>(virt_addr, phys_addr))
     }
