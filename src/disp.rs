@@ -831,6 +831,21 @@ impl StatusBar {
     }
 }
 
+/// Save `px` (R, G, B, A bytes, `w` x `h`, tightly packed) as a PNG, written
+/// to a temporary name and renamed, so a reader never sees half a file.
+pub fn save_png_rgba8(path: &str, px: &[u8], w: u32, h: u32) -> Result<(), String> {
+    let tmp = format!("{path}.tmp");
+    {
+        let f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().map_err(|e| e.to_string())?;
+        wr.write_image_data(px).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
 /// Save the composited rgba buffer as a PNG file.
 /// `rgba` uses 0xFFBBGGRR (GL-native); swap R↔B when writing PNG.
 pub fn save_screenshot(path: &str, rgba: &[u32], width: usize, height: usize) -> Result<(), String> {
