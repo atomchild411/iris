@@ -1526,6 +1526,12 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// recompiling to compare against).
     #[cfg(feature = "jitv2")]
     pub jitv2_dispatch_enabled: bool,
+    /// Called by the CPU thread between batches of instructions (about every
+    /// thousand), with the executor locked: for a machine that has to act on
+    /// where the guest is running (the O2 hands its cache over to the
+    /// shadow model once a kernel starts, and back when POST starts over).
+    /// None costs one check per batch.
+    pub batch_hook: Option<Box<dyn FnMut(&mut MipsExecutor<T, C>) + Send>>,
     /// `jitcheck`'s hardware-read fixup: `validate_jit_determinism`'s two
     /// passes run at genuinely different real wall-clock speed, so any
     /// device register whose value is driven by host time (e.g. the MC's
@@ -2929,6 +2935,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             // `j2 dispatch on|off` still flips it at runtime.
             #[cfg(feature = "jitv2")]
             jitv2_dispatch_enabled: !matches!(std::env::var("IRIS_JIT_DISPATCH").as_deref(), Ok("off") | Ok("0")),
+            batch_hook: None,
             #[cfg(feature = "developer")]
             hw_read_fixup_replay: None,
             #[cfg(feature = "developer")]
@@ -3061,8 +3068,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // Publish for the async compile worker, which owns its Codegen by
         // value and so cannot be stamped directly (see worker_loop).
         let core_addr = &mut self.core as *mut MipsCore as usize;
+        let geometry_changed;
         {
             let j = self.jitv2.lock();
+            geometry_changed = *j.dc_geometry.lock() != geom && j.pages_used() > 0;
             *j.dc_geometry.lock() = geom;
             // Everything codegen may bake as an immediate reaches its final
             // value here — this method is the last thing that moves any of
@@ -3099,6 +3108,22 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.jit_tc_base = self.cache.tcache_base_ptr();
         self.core.jit_tc_gen = self.cache.tcache_gen_ptr();
         self.core.jit_l2_tags = self.cache.jit_l2_tags_ptr();
+        // A cache that changes shape at run time (the O2's hand-over from the
+        // full model to the tagless one once a kernel starts): code compiled
+        // so far probes the old shape, and the compile workers took their
+        // geometry when they started. Flushing discards that code and
+        // restarts the workers, which then read the geometry published
+        // above. Without it, every inline load on the O2 probed the full
+        // model's emptied tags and called out (73M helper calls a second
+        // at idle); going back to the full model on a reboot would also
+        // leave tagless code reading memory under the full model's dirty
+        // lines.
+        if geometry_changed {
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            // Not clear_pcp alone: the fetch nanotlb would still hit, and
+            // nothing would re-derive the page step_jit needs.
+            self.nanotlb_invalidate();
+        }
     }
 
     /// Install JIT v2's memory-access and exception-delivery hooks
@@ -11559,6 +11584,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     }
                     #[cfg(not(feature = "jitv2"))]
                     run_batch!(step_int);
+                }
+                if let Some(mut hook) = guard.batch_hook.take() {
+                    hook(&mut guard);
+                    guard.batch_hook = Some(hook);
                 }
                 #[cfg(feature = "idle-pause")]
                 if crate::cpu::idle_park::idle_park_enabled() && idle_state.update(&guard.core) {
