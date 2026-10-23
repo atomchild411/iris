@@ -91,7 +91,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 
 ## devices/
 
-Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS/2, audio host backends.
+Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS/2, audio host backends, the O2 (IP32).
 
 | Note | Kind | Title |
 |---|---|---|
@@ -100,6 +100,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [hpc3-rx-channel-refused-while-active.md](devices/hpc3-rx-channel-refused-while-active.md) | rule | A receive channel that refuses while reporting itself active |
 | [indigo2-eeprom-byte-lane-gap.md](devices/indigo2-eeprom-byte-lane-gap.md) | rule | Indigo2 motherboard EEPROM: PROM writes via byte access, HPC3 only handled 32-bit |
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
+| [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |
