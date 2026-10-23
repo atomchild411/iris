@@ -1,7 +1,7 @@
 //! Host audio output shared by the machines' sound devices: a persistent
 //! cpal stream fed through a lock-free ring, and the resampler from a
-//! device's own rate to the stream's. HAL2 (Indy, Indigo2) plays through
-//! it; it is kept apart from HAL2 so another machine's audio can share it.
+//! device's own rate to the stream's. HAL2 (Indy, Indigo2) and MACE audio
+//! (O2) both play through it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

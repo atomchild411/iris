@@ -1,11 +1,23 @@
 //! Emulated hardware. Graphics boards get a directory each (GR2, Newport,
 //! IMPACT); the rest of the system's devices sit here as single files.
 
-pub mod mace_ust;
-pub mod ds1687;
-pub mod onewire;
+pub mod aic7880;
+pub mod crime_mem;
+pub mod o2gfx;
 pub mod gl;
 pub mod gr2;
+pub mod mec;
+pub mod mace;
+pub mod mace_audio;
+pub mod mace_isa;
+pub mod crime;
+pub mod ds1687;
+pub mod mace_pci;
+pub mod mace_ps2;
+pub mod mace_sdma;
+pub mod mace_ust;
+pub mod ns16550;
+pub mod onewire;
 pub mod mgras;
 pub mod ng1;
 
