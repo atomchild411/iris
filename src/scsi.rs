@@ -66,6 +66,13 @@ pub struct ScsiResponse {
     pub data: Vec<u8>,   // Response data
 }
 
+/// The allocation length of a 10-byte CDB (bytes 7-8): the most the
+/// initiator has room for. A command answering more overruns its buffer,
+/// so every data-in reply is cut to it.
+fn alloc_len_10(cdb: &[u8]) -> usize {
+    ((cdb[7] as usize) << 8) | cdb[8] as usize
+}
+
 /// Disk I/O backend: either direct file access or copy-on-write overlay.
 pub enum DiskBackend {
     /// Direct read-write access to a single file (current default behavior).
@@ -747,7 +754,10 @@ impl ScsiDevice {
         let sense = self.pending_sense;
         self.pending_sense = [0u8; 18];
         self.pending_sense[0] = 0x70; // Leave valid response code for next time
-        let data = sense[..sense.len().min(alloc_len.max(18))].to_vec();
+        // An allocation length of 0 keeps the old behaviour (the whole
+        // block); any other is honoured, short or not.
+        let n = if alloc_len == 0 { sense.len() } else { alloc_len.min(sense.len()) };
+        let data = sense[..n].to_vec();
         Ok(ScsiResponse { status: 0x00, data })
     }
 
@@ -1300,6 +1310,7 @@ impl ScsiDevice {
         }
         let msf    = (cdb[1] & 0x02) != 0;
         let format = cdb[2] & 0x0F;
+        let alloc_len = alloc_len_10(cdb);
 
         // TOC LBAs are always in physical CD sectors (2048 bytes each).
         let total_lba = (self.size / self.phys_block_size) as u32;
@@ -1340,6 +1351,10 @@ impl ScsiDevice {
                     data.extend_from_slice(&total_lba.to_be_bytes());
                 }
 
+                // NetBSD asks for 12 bytes (header + track 1): the lead-out
+                // past that is not wanted, and a controller that does not
+                // drop it puts it in someone else's memory.
+                data.truncate(alloc_len);
                 Ok(ScsiResponse { status: 0x00, data })
             }
             1 => {
@@ -1354,6 +1369,7 @@ impl ScsiDevice {
                 data[6] = 0x01; // Track 1
                 data[7] = 0x00;
                 data[8..12].copy_from_slice(&0u32.to_be_bytes()); // LBA 0
+                data.truncate(alloc_len);
                 Ok(ScsiResponse { status: 0x00, data })
             }
             _ => Ok(self.check_condition(0x05, 0x24, 0x00)), // Invalid Field in CDB
@@ -1381,7 +1397,7 @@ impl ScsiDevice {
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 
-    fn exec_get_configuration(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+    fn exec_get_configuration(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
         if !self.is_cdrom() {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid Command
         }
@@ -1400,6 +1416,60 @@ impl ScsiDevice {
         // Fill in Data Length (total - 4 header bytes)
         let dlen = (data.len() as u32) - 4;
         data[0..4].copy_from_slice(&dlen.to_be_bytes());
+        data.truncate(alloc_len_10(cdb));
         Ok(ScsiResponse { status: 0x00, data })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A CD-ROM target on a 100-sector image, past its power-on unit
+    /// attention.
+    fn cdrom() -> ScsiDevice {
+        let path = std::env::temp_dir().join(format!("iris-scsi-alloc-{}.iso", std::process::id()));
+        std::fs::write(&path, vec![0u8; 100 * 2048]).expect("test image");
+        let file = OpenOptions::new().read(true).write(true).open(&path).expect("open");
+        let identity = ScsiIdentity::new(b"TEST    ", b"CD-ROM          ", b"1.0 ");
+        let mut dev = ScsiDevice::new(DiskBackend::Direct(file), 100 * 2048, true, path.display().to_string(), Vec::new(), identity);
+        let _ = run(&mut dev, &[0x00, 0, 0, 0, 0, 0]);
+        let _ = run(&mut dev, &[0x03, 0, 0, 0, 18, 0]);
+        dev
+    }
+
+    fn run(dev: &mut ScsiDevice, cdb: &[u8]) -> ScsiResponse {
+        dev.request(&ScsiRequest { cdb: cdb.to_vec(), data_len: ScsiDataLength::Unlimited, data_in: None }).expect("request")
+    }
+
+    /// NetBSD's cd driver reads the TOC asking for 12 bytes: header and
+    /// track 1. The lead-out descriptor after them must not be sent, or a
+    /// controller passing it on overruns the driver's buffer.
+    #[test]
+    fn read_toc_answers_no_more_than_the_allocation_length() {
+        let mut dev = cdrom();
+        let r = run(&mut dev, &[0x43, 0, 0, 0, 0, 0, 0, 0, 12, 0x40]);
+        assert_eq!(r.status, 0);
+        assert_eq!(r.data.len(), 12);
+        assert_eq!(&r.data[4..8], &[0x00, 0x14, 0x01, 0x00], "track 1's descriptor");
+        let r = run(&mut dev, &[0x43, 0, 0, 0, 0, 0, 0, 0, 20, 0]);
+        assert_eq!(r.data.len(), 20, "the whole TOC when there is room");
+        assert_eq!(&r.data[12..16], &[0x00, 0x14, 0xaa, 0x00], "lead-out");
+        let r = run(&mut dev, &[0x43, 0, 1, 0, 0, 0, 0, 0, 4, 0]);
+        assert_eq!(r.data.len(), 4, "session info is cut too");
+    }
+
+    #[test]
+    fn get_configuration_answers_no_more_than_the_allocation_length() {
+        let mut dev = cdrom();
+        let r = run(&mut dev, &[0x46, 0, 0, 0, 0, 0, 0, 0, 8, 0]);
+        assert_eq!(r.data.len(), 8);
+    }
+
+    #[test]
+    fn request_sense_honours_a_short_allocation_length() {
+        let mut dev = cdrom();
+        assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 8, 0]).data.len(), 8);
+        assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 0, 0]).data.len(), 18, "0 still means the whole block");
     }
 }
