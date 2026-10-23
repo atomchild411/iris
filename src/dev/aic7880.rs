@@ -810,11 +810,22 @@ impl Aic7880 {
 
     /// The buffers one command transfers through: the SCB carries the first
     /// segment directly and points at the rest.
+    ///
+    /// The driver copies the first list entry into the SCB with its flags,
+    /// and SGPTR points at the *second* entry. When the first is also the
+    /// last, that second entry is whatever an earlier, longer command left
+    /// there, so the list ends here. Following it put a device's surplus
+    /// bytes (READ TOC answered 20 where 12 were asked for) at the start of
+    /// a page the kernel had reused for file-system metadata.
     fn netbsd_segments(&self, hscb: u32) -> Vec<(u32, u32)> {
         let mut segs = Vec::new();
-        let first_len = self.dma_read32_le(hscb + nb::DATACNT) & SG_LEN_MASK;
+        let first = self.dma_read32_le(hscb + nb::DATACNT);
+        let first_len = first & SG_LEN_MASK;
         if first_len != 0 {
             segs.push((self.dma_read32_le(hscb + nb::DATAPTR), first_len));
+        }
+        if first & nb::LAST_SEG != 0 {
+            return segs;
         }
         let mut sg = self.dma_read32_le(hscb + nb::SGPTR) & nb::SG_PTR_MASK;
         for _ in 0..SG_MAX {
@@ -863,7 +874,14 @@ impl Aic7880 {
             }
             None => {
                 let (data, status) = self.execute_for(&cdb, Some((scsiid >> 4, lun)));
-                (status, self.scatter_segs(&segs, &data))
+                let moved = self.scatter_segs(&segs, &data);
+                // More data than the command's buffers hold: what does not
+                // fit is dropped, as the chip would. Say so.
+                if moved < data.len() {
+                    Self::note(st, format!("nb overrun: CDB {:02x} returned {} bytes into {}",
+                        cdb[0], data.len(), moved));
+                }
+                (status, moved)
             }
         };
 
@@ -1847,6 +1865,81 @@ mod tests {
         assert_eq!(m[(hscbs + tag as u32 * nb::HSCB_STRIDE + nb::STATUS) as usize], 0, "with GOOD status");
         drop(m);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
+    }
+
+    /// One NetBSD command, tag 3, through the doorbell: `cdb` with its first
+    /// segment (`dataptr`, `datacnt` with flags) in the SCB and SGPTR at
+    /// `sgptr`. Returns the chip; the caller inspects `ram`.
+    fn netbsd_command(ram: &Ram, img_blocks: &[u8], cdb: &[u8], dataptr: u32, datacnt: u32, sgptr: u32) -> Aic7880 {
+        let c = on(ram.clone());
+        let img = std::env::temp_dir().join(format!("iris-aic7880-nb-{}.img", std::process::id()));
+        std::fs::write(&img, img_blocks).expect("test image");
+        c.attach_disk_at(1, &img).expect("attach");
+        let (hscbs, shared, tag) = (0x2000u32, 0x4000u32, 3u8);
+        {
+            let mut m = ram.lock().unwrap();
+            m[(shared + nb::FIFO_LEN) as usize] = tag;
+            let h = (hscbs + tag as u32 * nb::HSCB_STRIDE) as usize;
+            m.write(h + nb::CDB as usize, cdb);
+            m[h + nb::CDB_LEN as usize] = cdb.len() as u8;
+            m.write(h + nb::DATAPTR as usize, &dataptr.to_le_bytes());
+            m.write(h + nb::DATACNT as usize, &datacnt.to_le_bytes());
+            m.write(h + nb::SGPTR as usize, &sgptr.to_le_bytes());
+            m[h + nb::SCSIID as usize] = 0x17;
+        }
+        for (off, v) in [(nb::HSCB_ADDR, hscbs), (nb::SHARED_DATA_ADDR, shared)] {
+            for (i, b) in v.to_le_bytes().iter().enumerate() {
+                c.write(off + i as u32, *b as u32, 1);
+            }
+        }
+        c.write(nb::KERNEL_QINPOS, 1, 1);
+        c
+    }
+
+    /// The driver's first segment can be its whole list (last flag set in
+    /// DATACNT); SGPTR then points at a list entry left over from an
+    /// earlier command. A device answering more than fits must not spill
+    /// into that entry's buffer: that put READ TOC's lead-out bytes into
+    /// NetBSD's file-system metadata.
+    #[test]
+    fn a_one_segment_netbsd_command_ends_at_its_segment() {
+        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        {
+            let mut m = ram.lock().unwrap();
+            // The stale entry 1: a 256-byte buffer at 0x8000, holding 0x5a.
+            m.write(0x7000, &0x8000u32.to_le_bytes());
+            m.write(0x7004, &(0x100u32 | nb::LAST_SEG).to_le_bytes());
+            m.write(0x8000, &[0x5a; 0x100]);
+            m.write(0x6000, &[0x77; 16]);
+        }
+        // INQUIRY for 36 bytes into an 8-byte segment marked last.
+        let c = netbsd_command(&ram, &vec![0u8; 64 * BLOCK_SIZE], &[0x12, 0, 0, 0, 36, 0],
+            0x6000, 8 | nb::LAST_SEG, 0x7000);
+        let m = ram.lock().unwrap();
+        assert!(m.bytes(0x8000, 0x100).iter().all(|&b| b == 0x5a), "nothing lands in the stale entry's buffer");
+        assert_eq!(m.bytes(0x6008, 8), [0x77; 8], "nothing past the segment either");
+        assert_ne!(m.bytes(0x6000, 8), [0x77; 8], "the segment itself is filled");
+        drop(m);
+        assert!(c.notes().iter().any(|n| n.starts_with("nb overrun")), "the overrun is reported");
+    }
+
+    /// A real two-entry list still fills both buffers in order.
+    #[test]
+    fn a_two_segment_netbsd_read_fills_both_buffers() {
+        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        {
+            let mut m = ram.lock().unwrap();
+            m.write(0x7000, &0x9000u32.to_le_bytes());
+            m.write(0x7004, &(BLOCK_SIZE as u32 | nb::LAST_SEG).to_le_bytes());
+        }
+        let mut img = vec![0u8; 64 * BLOCK_SIZE];
+        img[..BLOCK_SIZE].fill(0x11);
+        img[BLOCK_SIZE..2 * BLOCK_SIZE].fill(0x22);
+        // READ(10) of blocks 0 and 1.
+        netbsd_command(&ram, &img, &[0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0], 0x6000, BLOCK_SIZE as u32, 0x7000);
+        let m = ram.lock().unwrap();
+        assert!(m.bytes(0x6000, BLOCK_SIZE).iter().all(|&b| b == 0x11));
+        assert!(m.bytes(0x9000, BLOCK_SIZE).iter().all(|&b| b == 0x22));
     }
 
     /// While paused, the queue-in FIFO holds what it is given, and the host
