@@ -102,6 +102,14 @@ pub const PCI_MEM_BASE: u32 = 0x1a00_0000;
 pub const PCI_MEM_SIZE: u32 = 0x0200_0000;
 pub const PCI_MEM_PCI_BASE: u32 = 0x8000_0000;
 
+/// The CPU-side window onto PCI I/O space: port `n` is at `PCI_IO_BASE + n`.
+/// Linux probes legacy ISA ports through it (the i8042 at 0x60/0x64, the
+/// 8250s at 0x3f8...), which nothing on an O2 answers: the bridge ends such a
+/// cycle with a master abort and the read floats high, rather than taking a
+/// bus error.
+pub const PCI_IO_BASE: u32 = 0x1800_0000;
+pub const PCI_IO_SIZE: u32 = 0x0200_0000;
+
 /// PCI memory's second, one-to-one window, from physical 0x2_8000_0000. A
 /// 64-bit kernel (OpenBSD's) reaches devices there; the PROM and NetBSD use
 /// the low window above. Physical addresses reach this bus as 32 bits, so it
@@ -231,7 +239,13 @@ impl MacePci {
 
     /// Whether `addr` is in one of the CPU's windows onto PCI memory.
     pub fn in_window(addr: u32) -> bool {
-        (PCI_MEM_BASE..PCI_MEM_BASE + PCI_MEM_SIZE).contains(&addr) || addr >= PCI_HI_MEM_BASE
+        (PCI_MEM_BASE..PCI_MEM_BASE + PCI_MEM_SIZE).contains(&addr)
+            || Self::in_io_window(addr)
+            || addr >= PCI_HI_MEM_BASE
+    }
+
+    fn in_io_window(addr: u32) -> bool {
+        (PCI_IO_BASE..PCI_IO_BASE + PCI_IO_SIZE).contains(&addr)
     }
 
     /// The PCI address a CPU address in a window reaches.
@@ -260,15 +274,24 @@ impl MacePci {
 
     /// The function decoding a PCI memory address: it, the BAR and the
     /// offset within it.
-    fn mem_target(&self, pci_addr: u32) -> Option<(Arc<dyn PciBusDevice>, usize, u32)> {
+    fn mem_target(&self, space: Space, pci_addr: u32) -> Option<(Arc<dyn PciBusDevice>, usize, u32)> {
         self.slots.lock().unwrap().values().find_map(|s| {
-            let (bar, off) = s.dev.config().decode(Space::Mem, pci_addr)?;
+            let (bar, off) = s.dev.config().decode(space, pci_addr)?;
             Some((s.dev.clone(), bar, off))
         })
     }
 
+    /// The function and BAR a CPU address in a window reaches, in whichever
+    /// space that window opens onto.
+    fn window_target(&self, addr: u32) -> Option<(Arc<dyn PciBusDevice>, usize, u32)> {
+        if Self::in_io_window(addr) {
+            return self.mem_target(Space::Io, addr - PCI_IO_BASE);
+        }
+        self.mem_target(Space::Mem, Self::pci_addr_of(addr))
+    }
+
     fn mem_read(&self, addr: u32, width: usize) -> u32 {
-        match self.mem_target(Self::pci_addr_of(addr)) {
+        match self.window_target(addr) {
             Some((f, bar, off)) => f.bar_read(bar, Self::lane_swizzle(off, width), width),
             // Nobody claims it: the bus floats high.
             None => 0xffff_ffff,
@@ -276,7 +299,7 @@ impl MacePci {
     }
 
     fn mem_write(&self, addr: u32, val: u32, width: usize) {
-        if let Some((f, bar, off)) = self.mem_target(Self::pci_addr_of(addr)) {
+        if let Some((f, bar, off)) = self.window_target(addr) {
             f.bar_write(bar, Self::lane_swizzle(off, width), val, width);
         }
     }
