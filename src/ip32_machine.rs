@@ -133,6 +133,8 @@ impl O2Machine {
         if o2.net {
             let mut net = crate::net::GatewayConfig::default();
             net.port_forwards = o2.forwards.clone();
+            // `[network] tftp_dir`, so the PROM can `boot -f bootp()FILE`.
+            net.tftp_dir = cfg.network.tftp_dir.as_ref().map(std::path::PathBuf::from);
             eprintln!("iris: O2 Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
             bus.mace.mec.start_nat(net);
         }
