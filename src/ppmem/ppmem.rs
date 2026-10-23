@@ -257,6 +257,23 @@ impl PpMemory {
         self.size_bytes
     }
 
+    /// The bank's own mapping: byte `o` of the bank (guest byte order) is at
+    /// `host_ptr() + (o ^ 3)`, as `read8` reads it. For devices that address
+    /// a bank by byte offset rather than through `BusDevice`.
+    #[inline(always)]
+    pub fn host_ptr(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// Bump the generation of the page holding bank byte offset `off`, for a
+    /// write made through [`Self::host_ptr`] rather than `BusDevice`.
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    pub fn bump_gen_off(&self, off: usize) {
+        let page = (off & self.mask()) / JITV2_PAGE_SIZE;
+        unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Relaxed) };
+    }
+
     /// The shared object behind this bank, for mapping it into a window.
     pub fn shared(&self) -> &Arc<SharedMem> {
         &self.mem
@@ -711,6 +728,34 @@ impl PpMemSpace {
 
     pub fn bank_count(&self) -> usize {
         self.banks.len()
+    }
+
+    /// Map `size` bytes of `bank`, from object offset `src`, at window
+    /// `offset`, without repeating, with the generation counters in lockstep.
+    /// The O2 maps its memory this way: one 32 MB slot of the window at a
+    /// time from wherever the slot's bank lies in one packed object.
+    pub fn map_range(&self, bank: usize, src: u64, offset: u64, size: u64) -> io::Result<()> {
+        let b = &self.banks[bank];
+        assert!(src + size <= b.len() as u64, "ppmem: range [{src:#x}, +{size:#x}) escapes bank {bank}");
+        assert!(offset + size <= WINDOW_SIZE, "ppmem: [{offset:#x}, +{size:#x}) escapes the 4GB window");
+        unsafe {
+            self.space.map(offset as usize, size as usize, b, src, Prot::ReadWrite)?;
+        }
+        #[cfg(feature = "jitv2")]
+        {
+            let (gen_off, gen_len, gen_src) = (offset / GEN_RATIO, size / GEN_RATIO, src / GEN_RATIO);
+            let gran = super::map::granularity() as u64;
+            if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 && gen_src % gran == 0 {
+                unsafe {
+                    self.gen_space.map(gen_off as usize, gen_len as usize, &self.gen_banks[bank], gen_src, Prot::ReadWrite)?;
+                }
+            } else {
+                debug_assert!(false, "ppmem: range gen [{gen_off:#x}, +{gen_len:#x}) not mappable at granularity {gran:#x}");
+            }
+        }
+        let st = unsafe { &mut *self.state.get() };
+        Self::record(st, offset, size);
+        Ok(())
     }
 
     /// Recompute the 64MB-granularity bitmap from the live mapping list.
