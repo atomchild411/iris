@@ -126,9 +126,6 @@ pub struct Gbe {
     /// The beam's clock when it should follow the CPU instead: microseconds
     /// from the instruction count (see `use_cpu_clock`).
     cpu_clock: std::sync::OnceLock<(crate::cpu::mips_core::CyclesPtr, u64)>,
-    /// The 64 KB tiles the last rendered frame came from (physical >> 16),
-    /// for a memory watch that wants only what is on screen.
-    pub displayed: Mutex<std::collections::HashSet<u32>>,
     /// The control port's `pixel X Y`: the point to describe on the next
     /// frame, and what the scan-out found there.
     pub probe: Mutex<(Option<(usize, usize)>, String)>,
@@ -140,7 +137,7 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), displayed: Mutex::new(Default::default()), probe: Mutex::new((None, String::new())) }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), probe: Mutex::new((None, String::new())) }
     }
 
     /// Run the beam on the CPU's instruction count at `mhz` rather than on
@@ -451,11 +448,6 @@ impl Gbe {
                     .unwrap_or(0);
                 tiles.push(if e == 0 { None } else { mem.dma_offset((e as u32) << 16).filter(|&o| o + 0x10000 <= mem.len()) });
             }
-            *self.displayed.lock().unwrap() = (0..n.min(65536))
-                .filter_map(|i| mem.dma_offset(list + 2 * i as u32).filter(|&o| o + 1 < mem.len()))
-                .map(|o| u16::from_be_bytes([mem[o], mem[o + 1]]) as u32)
-                .filter(|&e| e != 0)
-                .collect();
         }
         let fetch = |s: usize| -> u32 {
             if !dma {
@@ -3008,7 +3000,7 @@ mod tests {
                 }
             }
         }
-        crate::ip32_screen::save_png(&out, &rgba, w, h).unwrap();
+        crate::disp::save_png_rgba8(&out, &rgba, w, h).unwrap();
         // RE_REPLAY_PX="x,y x,y": the raw 32-bit words there.
         for xy in std::env::var("RE_REPLAY_PX").unwrap_or_default().split_whitespace() {
             let (x, y) = xy.split_once(',').unwrap();

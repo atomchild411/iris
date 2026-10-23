@@ -1,20 +1,5 @@
-//! Screen shots and key names for the O2's control port: a PNG of GBE's
-//! picture, and winit's names for physical keys (`key KeyA`).
-
-/// Save `px` (R, G, B, A bytes, `w` x `h`) as a PNG, written to a temporary
-/// name and renamed, so a reader never sees half a file.
-pub fn save_png(path: &str, px: &[u8], w: u32, h: u32) -> Result<(), String> {
-    let tmp = format!("{path}.tmp");
-    {
-        let f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut wr = enc.write_header().map_err(|e| e.to_string())?;
-        wr.write_image_data(px).map_err(|e| e.to_string())?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
-}
+//! Key names for the O2's control port: winit's names for physical keys
+//! (`key KeyA`). Its screen shots go through `disp::save_png_rgba8`.
 
 /// The winit key a name stands for (its `Debug` name, as `KeyA`).
 pub fn keycode(name: &str) -> Option<winit::keyboard::KeyCode> {

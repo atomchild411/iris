@@ -564,7 +564,7 @@ impl Device for O2Control {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("o2".to_string(), "O2 control: o2 shot PATH | status | pixel X Y | type TEXT | key|keydown|keyup NAME | \
-            mouse DX DY [BUTTONS] | click [BUTTON] | pc | regs | peek ADDR LEN PATH | watch LO HI|fb|off | watchdump PATH | \
+            mouse DX DY [BUTTONS] | click [BUTTON] | pc | regs | peek ADDR LEN PATH | \
             retrace PATH | scsi PATH | unmapped | ps2log PATH | crimelog PATH | nictrace PATH".to_string())]
     }
 
@@ -605,7 +605,7 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
     let kb = bus.mace.ps2.devices();
     match cmd {
         "shot" => match bus.render_screen(rgba) {
-            Some((w, h)) => match crate::ip32_screen::save_png(arg, &rgba[..(w * h * 4) as usize], w, h) {
+            Some((w, h)) => match crate::disp::save_png_rgba8(arg, &rgba[..(w * h * 4) as usize], w, h) {
                 Ok(()) => format!("ok {w}x{h}"),
                 Err(e) => format!("err {e}"),
             },
@@ -663,32 +663,9 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
                 _ => "err usage: peek ADDR LEN PATH".into(),
             }
         }
-        // `watch LO HI` (hex, bus addresses: RAM from 0x40000000) arms the
-        // memory watch with an empty log; `watch off` stops it.
-        "watch" => {
-            let v: Vec<u32> = arg.split_whitespace().filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).collect();
-            if arg.trim() == "fb" {
-                bus.set_watch(Some((0, 0)));
-                return "ok watching the displayed frame buffer".into();
-            }
-            match v[..] {
-                [lo, hi] if lo < hi => {
-                    bus.set_watch(Some((lo, hi)));
-                    format!("ok watching 0x{lo:08x}..0x{hi:08x}")
-                }
-                _ => {
-                    bus.set_watch(None);
-                    "ok watch off".into()
-                }
-            }
-        }
         // `ps2log PATH`: the PS/2 ports' recent traffic, `1>f4` a byte to
         // port 1's device, `1<fa` one from it.
         "ps2log" => match std::fs::write(arg, bus.mace.ps2.traffic_timed()) {
-            Ok(()) => "ok".into(),
-            Err(e) => format!("err {e}"),
-        },
-        "watchdump" => match std::fs::write(arg, bus.watch_text()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),
         },

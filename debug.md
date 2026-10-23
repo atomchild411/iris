@@ -479,7 +479,6 @@ The O2's devices register their own commands (see [the O2 guide](docs/o2-ip32.md
 | `o2 mouse DX DY [BUTTONS]` / `o2 click [BUTTON]` | Move the mouse / click |
 | `o2 pc` / `o2 regs` | CPU PC / registers as last published |
 | `o2 peek ADDR LEN PATH` | Physical memory to a file (up to 1 MB) |
-| `o2 watch LO HI\|fb\|off` / `o2 watchdump PATH` | Record accesses to a physical range (or the displayed frame buffer) / write them out |
 | `o2 retrace PATH` | Recorded rendering-engine primitives (`IRIS_IP32_RE_TRACE`) |
 | `o2 scsi PATH` | The SCSI controllers' recent commands |
 | `o2 unmapped` | Bus accesses that reached no device (the first 64 distinct), with the PC that made each |

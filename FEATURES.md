@@ -457,9 +457,6 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_IP32_HOT` | Any presence counts O2 register accesses (MACE, GBE, rendering engine) for finding a driver polling a bit nothing sets; costs speed. | [src/ip32.rs](src/ip32.rs) |
 | `IRIS_IP32_MEC_TRACE` | Any presence traces O2 Ethernet frames (sent, received, dropped) on stderr. | [src/dev/mec.rs](src/dev/mec.rs) |
 | `IRIS_IP32_RE_TRACE` | Number of O2 rendering-engine primitives to record for `o2 retrace PATH`. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
-| `IRIS_IP32_WATCHMEM` | `lo[:hi]` physical range of O2 memory accesses to record for `o2 watchdump PATH` (also `o2 watch LO HI`). | [src/ip32.rs](src/ip32.rs) |
-| `IRIS_IP32_WATCHMEM_CAP` | Accesses `IRIS_IP32_WATCHMEM` keeps (default 256). | [src/ip32.rs](src/ip32.rs) |
-| `IRIS_IP32_WATCHMEM_WRITES` | Any presence records writes only. | [src/ip32.rs](src/ip32.rs) |
 | `IRIS_JIT_CACHE` | 1 or on enables persistent JIT page reuse. | [src/cpu/jitv2/pcache.rs](src/cpu/jitv2/pcache.rs) |
 | `IRIS_JIT_CACHE_DIR` | Persistent JIT cache base directory. | [src/cpu/jitv2/pcache.rs](src/cpu/jitv2/pcache.rs) |
 | `IRIS_JIT_CLIF` | Any presence prints Cranelift input IR. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
