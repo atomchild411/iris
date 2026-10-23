@@ -1146,7 +1146,10 @@ impl CrimeRe {
         regs[(MTE_BYTEMASK / 4) as usize] = 0xffff_ffff;
         Self {
             regs: Mutex::new(regs),
-            ib: Box::new(IntfBuf::new()),
+            // Built in place: by way of the stack, a debug build's 1 MB
+            // ring overflows a 2 MB test thread.
+            // SAFETY: a zeroed GFifo is what `GFifo::new` returns.
+            ib: unsafe { Box::<IntfBuf>::new_zeroed().assume_init() },
             busy: std::sync::atomic::AtomicBool::new(false),
             asleep: std::sync::atomic::AtomicBool::new(false),
             started: std::sync::atomic::AtomicBool::new(false),
