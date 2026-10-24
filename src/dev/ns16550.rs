@@ -401,11 +401,21 @@ mod tests {
         c.set_backend(backend);
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-        // The backend takes the client on its next poll.
+        // The backend takes the client on one of its polls, and greets it
+        // then: keep polling until the greeting is all here.
         let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut hs = [0u8; 12];
-        c.pump();
-        client.read_exact(&mut hs).expect("handshake");
+        let mut got = 0;
+        client.set_read_timeout(Some(std::time::Duration::from_millis(20))).unwrap();
+        while got < hs.len() && std::time::Instant::now() < until {
+            c.pump();
+            match client.read(&mut hs[got..]) {
+                Ok(n) => got += n,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => panic!("handshake: {e}"),
+            }
+        }
+        client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
         assert_eq!(hs, crate::net::telnet::TelnetFilter::initial_handshake());
         // Typed, with a telnet command (IAC DO SGA, which it already offered) in between.
         client.write_all(&[b'l', 0xff, 0xfd, 0x03, b's', b'\r']).unwrap();
