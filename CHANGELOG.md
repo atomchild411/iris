@@ -25,6 +25,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Scripting and inspection.** The O2's devices have monitor commands, and
   `o2 <command>` (also on `[o2] control_port`) takes screen shots, types,
   moves the mouse and reads memory ([debug.md](debug.md#sgi-o2-ip32)).
+- **`glReadPixels` reads the frame buffer.** IRIX's OpenGL reads pixels back
+  through a rendering-engine transfer from the frame buffer into a linear
+  buffer; the engine placed that transfer by the wrong registers and copied
+  nothing, so every read returned zeros.
 - **PROM network boot.** `[network] tftp_dir` serves the O2's PROM too:
   `boot -f bootp():FILE`.
 

@@ -926,6 +926,7 @@ pub mod re_reg {
     pub const XFER_STEP_ROW: u32 = 0x20ac;
     /// Linear destination byte address.
     pub const XFER_DST: u32 = 0x20b0;
+    pub const XFER_DST_STRIDE: u32 = 0x20b4;
     pub const STIPPLE_MODE: u32 = 0x20c0;
     pub const STIPPLE_PATTERN: u32 = 0x20c4;
     pub const FG: u32 = 0x20d0;
@@ -1540,6 +1541,9 @@ impl CrimeRe {
         let (sb, db) = ((sm >> 10) & 7, (dmode >> 10) & 7);
         let (sbd, dbd) = (1u32 << ((sm >> 8) & 3).min(2), 1u32 << ((dmode >> 8) & 3).min(2));
         let lin = |b: u32| b == 4 || b == 5;
+        if !lin(sb) && sb <= 2 && lin(db) {
+            return self.xfer_to_linear(r);
+        }
         if (!lin(sb) && sb > 2) || (!lin(db) && db > 2) {
             self.note(format!("xfer buffers src {sb} dst {db}"));
             return;
@@ -1612,6 +1616,64 @@ impl CrimeRe {
                 if let Some(o) = dst_at(mem, x, y) {
                     let v = if blend { Self::blend_xfer(r, v, Self::get_px(mem, o, 4)) } else { v };
                     Self::put(r, mem, o, dbd, v);
+                }
+            }
+        }
+    }
+
+    /// A rectangle read out of a tiled buffer into a linear one: how IRIX's
+    /// OpenGL reads pixels back (the kernel transfers them into a buffer the
+    /// library then copies out).
+    ///
+    /// The rectangle (Primitive op-code 3) has its corners in the GL vertex
+    /// registers (13.6 fixed point) under DrawMode's GL bit, else in the X
+    /// ones, both ends included; only its size matters here. The source end
+    /// starts at XFER_SRC, a pixel in window coordinates that the source
+    /// window offset places on the screen modulo 4096 (GL windows carry the
+    /// 4096-pixel guard band in the offset), and moves XFER_STEP_X /
+    /// XFER_STEP_ROW pixels per column and row, in the directions the
+    /// Primitive register's edge type gives (bottom to top is up the
+    /// screen). The destination end starts at XFER_DST, a byte address in
+    /// the linear buffer, moves a pixel's width per column and
+    /// XFER_DST_STRIDE bytes from a row's last pixel to the next row's
+    /// first, as a linear source's XFER_STEP_ROW does: rows are packed when
+    /// it equals the pixel width (IRIX's GL: 4 at 32 bits; its X server: 1
+    /// at 8).
+    fn xfer_to_linear(&self, r: &[u32]) {
+        let g = |off: u32| r[(off / 4) as usize];
+        let (sm, dmode) = (g(BUFMODE_SRC), g(BUFMODE_DST));
+        let (sb, db) = ((sm >> 10) & 7, (dmode >> 10) & 7);
+        let (sbd, dbd) = (1u32 << ((sm >> 8) & 3).min(2), 1u32 << ((dmode >> 8) & 3).min(2));
+        let ((x0, y0), (x1, y1)) = if g(DRAWMODE) & draw::GL != 0 {
+            let fx = |off: u32| (g(off) as i32) >> 6;
+            ((fx(TRI_V0), fx(TRI_V0 + 4)), (fx(TRI_V0 + 8), fx(TRI_V0 + 12)))
+        } else {
+            (Self::xy(g(VERTEX_0)), Self::xy(g(VERTEX_1)))
+        };
+        let (w, h) = ((x1 - x0).abs() + 1, (y1 - y0).abs() + 1);
+        if w > 4096 || h > 4096 {
+            self.note(format!("xfer to linear {w}x{h}"));
+            return;
+        }
+        let edge = (g(PRIMITIVE) >> 16) & 3;
+        let (dx, dy) = (if edge & 1 != 0 { -1 } else { 1 }, if edge & 2 != 0 { 1 } else { -1 });
+        let (sx0, sy0) = Self::xy(g(XFER_SRC));
+        let (step_x, step_y) = (g(XFER_STEP_X) as i32 * dx, g(XFER_STEP_ROW) as i32 * dy);
+        let (ox, oy) = Self::offset_xy(g(WINOFFSET_SRC));
+        let src = Buf { tlb: TLB_A + 0x200 * sb, bd: sbd };
+        let dst0 = g(XFER_DST);
+        let pitch = ((w - 1) as u32).wrapping_mul(dbd).wrapping_add(g(XFER_DST_STRIDE));
+        let mut ram = Draw::new(self.win.lock().unwrap());
+        let mem: &mut RamWindow = &mut ram;
+        for j in 0..h {
+            let row = dst0.wrapping_add((j as u32).wrapping_mul(pitch));
+            for i in 0..w {
+                let sx = ((sx0 + i * step_x + ox) & 0xfff) as u32;
+                let sy = ((sy0 + j * step_y + oy) & 0xfff) as u32;
+                let v = Self::locate(r, mem, src, sx, sy).map(|o| Self::get_px(mem, o, sbd)).unwrap_or(0);
+                let a = row.wrapping_add(i as u32 * dbd);
+                if let Some(o) = Self::linear(r, mem, db - 4, a & !(dbd - 1)) {
+                    Self::put(r, mem, o, dbd, Self::convert(v, sm, dmode, sbd.min(dbd)));
                 }
             }
         }
@@ -3445,15 +3507,21 @@ mod tests {
         assert_eq!((px(20, 1), st(20, 1)), (0, 0), "outside it: neither");
     }
 
-    /// A 32-bit linear end at a byte address (a step of 1, or a start off
-    /// the word) is taken down to its word, not stored unaligned: opening
-    /// demograph aborted the emulator on a write to 0x...001.
+    /// A 32-bit linear end at a byte address (a start off the word) is taken
+    /// down to its word, not stored unaligned: opening demograph aborted the
+    /// emulator on a write to 0x...001. Its pixels then follow a word apart.
     #[test]
     fn a_32bit_linear_end_off_its_word_does_not_abort() {
         let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
+        {
+            let mut m = ram.lock().unwrap();
+            for x in 0..8u32 {
+                m.write((0x0100_0000 + x * 4) as usize, &(0x1100_0000 | x).to_be_bytes());
+            }
+        }
         let dst = 0x1038_f001u32;
         let page = 0x0050_0000u32;
         let idx = (dst >> 12) & 31;
@@ -3468,7 +3536,12 @@ mod tests {
         re.write32(base + XFER_STEP_ROW, 0);
         re.write32(base + XFER_DST, dst);
         re.write32(base + (XFER_SRC | 0x800), 0);
-        assert!(re.unhandled.lock().unwrap().keys().any(|k| k.starts_with("xfer unaligned linear end")));
+        let m = ram.lock().unwrap();
+        let at = (page + (dst & 0xfff & !3)) as usize;
+        for x in 0..8u32 {
+            let v = u32::from_be_bytes(m.bytes(at + 4 * x as usize, 4).try_into().unwrap());
+            assert_eq!(v, 0x1100_0000 | x, "pixel {x}, from the word the address falls in");
+        }
     }
 
     #[test]
@@ -3579,6 +3652,58 @@ mod tests {
             re.write32(base + (VERTEX_1 | 0x800), (5 << 16) | 0);
             let m = ram.lock().unwrap();
             assert_eq!(&m.bytes(0x0100_0000 + 16, 4), &want, "mode {mode:#x}");
+        }
+    }
+
+    /// glReadPixels as IRIX's OpenGL asks for it: a GL rectangle (13.6
+    /// vertices, both ends included) from the window's frame buffer into
+    /// linear A, bottom row first, packed (XFER_DST_STRIDE 4). The
+    /// source pixel is window-relative and the source window offset, which
+    /// carries the 4096 guard band, places it modulo 4096.
+    #[test]
+    fn a_read_back_fills_the_linear_buffer_bottom_row_first() {
+        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let re = TestRe::new(ram.clone());
+        let base = 0x1500_0000;
+        // One 64 KB tile at 0x0010_0000: 128 x 128 pixels of 32 bits.
+        let tile = 0x0010_0000u32;
+        re.write64(base + TLB_A, (0x8000u64 | (tile >> 16) as u64) << 48);
+        let px = |x: u32, y: u32| 0xaa00_0000 | x << 8 | y;
+        {
+            let mut m = ram.lock().unwrap();
+            for y in 60..70u32 {
+                for x in 60..70u32 {
+                    m.write((tile + y * 512 + x * 4) as usize, &px(x, y).to_be_bytes());
+                }
+            }
+        }
+        // Linear A page 2 (byte address 0x2000) onto 0x0030_0000.
+        let buf = 0x0030_0000u32;
+        re.write64(base + TLB_LINEAR_A + 8, (1u64 << 31 | (buf >> 12) as u64) << 32);
+        // A window at (32, 32): offset 32 - 4096 in each half.
+        re.write32(base + WINOFFSET_SRC, 0xf020_f020);
+        re.write32(base + BUFMODE_SRC, 0x228);
+        re.write32(base + BUFMODE_DST, 0x1228);
+        re.write32(base + DRAWMODE, draw::GL | draw::PIXEL_XFER | 0xf << 3);
+        re.write32(base + PRIMITIVE, 3 << 24);
+        // GL rows 30 and 31 of a 64-row window: rows 33 and 32 from its top.
+        let v = |x: u32, y: u32| ((4096 + x) << 6, (4096 + y) << 6);
+        let ((x0, y0), (x1, y1)) = (v(30, 33), v(33, 32));
+        re.write32(base + TRI_V0, x0);
+        re.write32(base + TRI_V0 + 4, y0);
+        re.write32(base + TRI_V0 + 8, x1);
+        re.write32(base + TRI_V0 + 12, y1);
+        re.write32(base + XFER_SRC, 30 << 16 | 33);
+        re.write32(base + XFER_STEP_X, 1);
+        re.write32(base + XFER_STEP_ROW, 1);
+        re.write32(base + XFER_DST_STRIDE, 4);
+        re.write32(base + (XFER_DST | 0x800), 0x2000);
+        let m = ram.lock().unwrap();
+        let got = |i: u32| u32::from_be_bytes(m.bytes((buf + 4 * i) as usize, 4).try_into().unwrap());
+        for (j, row) in [65u32, 64].into_iter().enumerate() {
+            for i in 0..4u32 {
+                assert_eq!(got(4 * j as u32 + i), px(62 + i, row), "pixel {i} of row {j} is screen ({}, {row})", 62 + i);
+            }
         }
     }
 
