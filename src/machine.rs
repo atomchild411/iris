@@ -160,7 +160,7 @@ struct RollbackCheckpoint {
 /// capture and snapshot load so the two paths can't drift.
 /// Inverse of `parse_cow_table`: build a `{"scsi<id>": [dirty sectors...]}`
 /// table from `export_overlays`'s output.
-fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
+pub(crate) fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
     let mut tbl = toml::map::Map::new();
     for (id, dirty) in overlays {
         let arr: Vec<toml::Value> = dirty.into_iter().map(|v| toml::Value::Integer(v as i64)).collect();
@@ -169,7 +169,7 @@ fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
     toml::Value::Table(tbl)
 }
 
-fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> {
+pub(crate) fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> {
     let mut sets = Vec::new();
     if let Some(tbl) = cow_toml.as_table() {
         for (k, v) in tbl {
@@ -1825,6 +1825,9 @@ impl Machine {
         // don't have migration plumbing yet.
         let schema_version = match snap.read_manifest()? {
             Some(m) => {
+                if let Some(other) = &m.machine {
+                    return Err(format!("snapshot {name} is of another machine ({other})"));
+                }
                 if m.host_arch != std::env::consts::ARCH {
                     return Err(format!(
                         "snapshot host_arch '{}' does not match current host '{}'; cross-arch load is not supported",
