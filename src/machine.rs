@@ -1584,13 +1584,16 @@ impl Machine {
         Ok(())
     }
 
-    /// Restart peripherals (MC, HPC3, REX3) without restarting the monitor server.
+    /// Restart everything `stop` stopped, less the CPU, without restarting the
+    /// monitor server.
     fn restart_peripherals(&mut self) {
         self.mc.start();
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
+        if let Some(mgras) = &self._phys.mgras { mgras.start_display(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
         if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
+        if let Some(u64) = &self._phys.ultra64 { u64.start(); }
     }
 
     /// Helper to power-on reset all devices.

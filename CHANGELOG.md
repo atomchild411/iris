@@ -98,6 +98,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   `Machine::start` has bound the monitor, so a successful connection is
   itself a readiness signal. Tests cover a command sent before the monitor is
   ready, duplicate starts, start after halt/reset, and invalid transitions.
+- **IMPACT machines keep their display after a stop and start.** `machine-start`,
+  `reset`, snapshot loads and rollbacks restarted every peripheral a stop had
+  stopped except the IMPACT display engines and the Ultra64 board; those now
+  restart too.
 
 ### NAT gateway
 
