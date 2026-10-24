@@ -69,6 +69,36 @@ where
     }
 }
 
+/// Where the batch hook is in the machine's boot, shared with the machine so
+/// a snapshot carries it: whether POST has finished, whether the CPU is in
+/// the firmware, and the FPU-enable bit the firmware was lent (`arcs_fpu`).
+struct BootState {
+    post_done: AtomicBool,
+    inside: AtomicBool,
+    cu1_saved: std::sync::atomic::AtomicU32,
+}
+
+impl BootState {
+    fn new() -> Self {
+        Self { post_done: AtomicBool::new(false), inside: AtomicBool::new(true), cu1_saved: Default::default() }
+    }
+
+    fn save(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("post_done".into(), toml::Value::Boolean(self.post_done.load(Ordering::Relaxed)));
+        t.insert("inside".into(), toml::Value::Boolean(self.inside.load(Ordering::Relaxed)));
+        t.insert("cu1_saved".into(), crate::snapshot::hex_u32(self.cu1_saved.load(Ordering::Relaxed)));
+        toml::Value::Table(t)
+    }
+
+    fn load(&self, v: &toml::Value) {
+        use crate::snapshot::{get_field, toml_bool, toml_u32};
+        self.post_done.store(get_field(v, "post_done").and_then(toml_bool).unwrap_or(true), Ordering::Relaxed);
+        self.inside.store(get_field(v, "inside").and_then(toml_bool).unwrap_or(false), Ordering::Relaxed);
+        self.cu1_saved.store(get_field(v, "cu1_saved").and_then(toml_u32).unwrap_or(0), Ordering::Relaxed);
+    }
+}
+
 /// The CPU's interrupt pins as a controller: line n is IPn.
 struct CpuIrq(Arc<dyn crate::traits::Device>);
 
@@ -102,7 +132,19 @@ pub struct O2Machine {
     /// process itself on a power-off, as it always has.
     controller_up: Arc<AtomicBool>,
     controller_slot: Option<MachineSlot>,
+    /// The batch hook's place in the boot (see [`BootState`]).
+    boot: Arc<BootState>,
+    /// Set while the machine is stopped: the service thread leaves the
+    /// devices alone, so nothing changes memory under a snapshot.
+    paused: Arc<AtomicBool>,
+    /// The disks as a snapshot records them, to refuse one taken on others.
+    disks: Vec<crate::snapshot::DiskRef>,
+    /// The flash file, recorded in a snapshot's manifest.
+    flash_path: Option<String>,
 }
+
+/// What an O2 snapshot's manifest names as its machine.
+const SNAPSHOT_MACHINE: &str = "o2_ip32";
 
 impl O2Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
@@ -121,7 +163,7 @@ impl O2Machine {
             disks: o2
                 .disks
                 .iter()
-                .map(|d| Ip32Disk { id: Some(d.id), bus: d.bus, path: d.path.clone().into(), cdrom: d.cdrom })
+                .map(|d| Ip32Disk { id: Some(d.id), bus: d.bus, path: d.path.clone().into(), cdrom: d.cdrom, overlay: d.overlay })
                 .collect(),
             flash_file: o2.flash.clone().map(Into::into),
         };
@@ -188,14 +230,15 @@ impl O2Machine {
         let timer_manager = Arc::new(TimerManager::new());
         let sysad: Arc<dyn BusDevice> = bus.clone();
         let arcs_fpu = o2.arcs_fpu;
+        let boot = Arc::new(BootState::new());
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
             // The full cache model through the PROM and the tagless shadow
             // model once the kernel is in charge: the JIT then reaches RAM
             // through the ppmem window with no tag probe, LRU or dirty bit on
             // every load and store (memory-bound code ran 2.5-4x slower than on
             // IP28 with the full model).
-            CpuModel::R10000 => Self::build_cpu::<R10000Handover>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, switch_model, HandoverCache::take_reset_seen),
-            CpuModel::R5000 => Self::build_cpu::<R5000Handover>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, switch_model, HandoverCache::take_reset_seen),
+            CpuModel::R10000 => Self::build_cpu::<R10000Handover>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, boot.clone(), switch_model, HandoverCache::take_reset_seen),
+            CpuModel::R5000 => Self::build_cpu::<R5000Handover>(sysad, &timer_manager, arcs_fpu, o2.cpu_mhz, boot.clone(), switch_model, HandoverCache::take_reset_seen),
             CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
         };
 
@@ -271,6 +314,17 @@ impl O2Machine {
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
 
         let (events, event_rx) = std::sync::mpsc::sync_channel(4);
+        // A snapshot's disks by controller and id (bus * 16 + id) and size.
+        let disks = o2
+            .disks
+            .iter()
+            .filter(|d| !d.cdrom)
+            .map(|d| crate::snapshot::DiskRef {
+                id: d.bus * 16 + d.id,
+                path: d.path.clone(),
+                size_bytes: std::fs::metadata(&d.path).map(|m| m.len()).unwrap_or(0),
+            })
+            .collect();
         Ok(Self {
             bus,
             cpu,
@@ -286,6 +340,10 @@ impl O2Machine {
             event_rx: Some(event_rx),
             controller_up: Arc::new(AtomicBool::new(false)),
             controller_slot: None,
+            boot,
+            paused: Arc::new(AtomicBool::new(false)),
+            disks,
+            flash_path: o2.flash.clone(),
         })
     }
 
@@ -293,7 +351,7 @@ impl O2Machine {
     /// firmware for the kernel (true) and on a PROM starting over (false),
     /// returning whether it changed, so the JIT's memory pointers are
     /// re-published. `reset_seen(cache)` says the PROM has started over.
-    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32,
+    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, boot: Arc<BootState>,
                     kernel_mode: fn(&C, bool) -> bool, reset_seen: fn(&C) -> bool) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>> + 'static,
@@ -305,9 +363,6 @@ impl O2Machine {
         exec.core.set_timer_manager(tm.clone());
         // Count runs at half the pipeline clock on both CPUs.
         exec.core.set_count_hz(mhz.max(1) as u64 * 500_000);
-        let mut post_done = false;
-        let mut inside = true;
-        let mut cu1_saved = 0u32;
         exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
             let pc = exec.core.pc as u32;
             LAST_PC.store(pc, Ordering::Relaxed);
@@ -328,10 +383,10 @@ impl O2Machine {
             // Instructions retired, for an idle-MIPS reading over the control port.
             LAST_REGS[40].store(exec.core.hot.cycles, Ordering::Relaxed);
             LAST_REGS[41].store(exec.core.cp0_config as u64, Ordering::Relaxed);
-            if !post_done {
+            if !boot.post_done.load(Ordering::Relaxed) {
                 // POST is over once the firmware it loaded into RAM runs.
                 if in_loaded_firmware(pc) {
-                    post_done = true;
+                    boot.post_done.store(true, Ordering::Relaxed);
                 } else {
                     return;
                 }
@@ -347,14 +402,14 @@ impl O2Machine {
                 // Not back to waiting for POST: the PROM's cache routine
                 // (`sash` calls it before starting a kernel) sets the tags too,
                 // and the next code outside the firmware hands over again.
-                inside = true;
+                boot.inside.store(true, Ordering::Relaxed);
                 #[cfg(feature = "jitv2")]
                 exec.install_jit_mem_ptrs();
                 return;
             }
             let fw = in_firmware(pc);
-            if fw != inside {
-                inside = fw;
+            if fw != boot.inside.load(Ordering::Relaxed) {
+                boot.inside.store(fw, Ordering::Relaxed);
                 if !fw && kernel_mode(&exec.cache, true) {
                     eprintln!("iris: O2 cache: shadow model from PC {pc:#010x}");
                     #[cfg(feature = "jitv2")]
@@ -363,10 +418,10 @@ impl O2Machine {
                 if arcs_fpu {
                     const CU1: u32 = 1 << 29;
                     if fw {
-                        cu1_saved = exec.core.cp0_status & CU1;
+                        boot.cu1_saved.store(exec.core.cp0_status & CU1, Ordering::Relaxed);
                         exec.core.cp0_status |= CU1;
                     } else {
-                        exec.core.cp0_status = (exec.core.cp0_status & !CU1) | cu1_saved;
+                        exec.core.cp0_status = (exec.core.cp0_status & !CU1) | boot.cu1_saved.load(Ordering::Relaxed);
                     }
                     exec.resync_privilege_state();
                 }
@@ -384,10 +439,11 @@ impl O2Machine {
         let cpu = self.cpu.clone();
         let running = self.running.clone();
         let events = (self.events.clone(), self.controller_up.clone());
+        let paused = self.paused.clone();
         self.threads.push(
             std::thread::Builder::new()
                 .name("O2-Service".into())
-                .spawn(move || Self::service_loop(bus, cpu, running, events))
+                .spawn(move || Self::service_loop(bus, cpu, running, paused, events))
                 .unwrap(),
         );
         // CI mode: the harness starts the CPU (`iris-ci start`).
@@ -402,6 +458,7 @@ impl O2Machine {
         bus: Arc<Ip32Bus>,
         cpu: Arc<dyn CpuDevice>,
         running: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
         (events, controller_up): (std::sync::mpsc::SyncSender<MachineEvent>, Arc<AtomicBool>),
     ) {
         let dev = cpu.clone().as_device();
@@ -410,6 +467,10 @@ impl O2Machine {
         let mut flash_seen = bus.flash_writes();
         let mut flash_check = Instant::now();
         while running.load(Ordering::Relaxed) {
+            if paused.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             if flash_check.elapsed() >= Duration::from_secs(2) {
                 flash_check = Instant::now();
                 let n = bus.flash_writes();
@@ -446,21 +507,184 @@ impl O2Machine {
         }
     }
 
-    /// Stop the CPU and save the PROM's flash. The display and service
-    /// threads and the monitor run on until the machine is dropped, so the
-    /// monitor's `machine-start` and the CI scratch pause can carry on.
+    /// Stop the CPU, hold the service thread off the devices, let the
+    /// rendering engine finish what it was given, and save the PROM's flash.
+    /// The display thread and the monitor run on until the machine is
+    /// dropped; [`Self::restart_peripherals`] lets the service thread go.
     pub fn stop(&mut self) {
         self.cpu.clone().as_device().stop();
+        self.paused.store(true, Ordering::SeqCst);
+        if !self.bus.crime.re.drain(Duration::from_secs(2)) {
+            eprintln!("iris: O2 stopped with rendering engine writes still queued");
+        }
         self.bus.save_flash();
+    }
+
+    /// Let the service thread look after the devices again.
+    pub fn restart_peripherals(&mut self) {
+        self.paused.store(false, Ordering::SeqCst);
     }
 
     /// The hardware as at power-on, with the CPU stopped: what a CRIME cold
     /// reset does, less the restart.
     pub fn reset(&mut self) {
-        let dev = self.cpu.clone().as_device();
-        dev.stop();
+        self.stop();
         crate::traits::Resettable::power_on(&*self.cpu);
         self.bus.power_on();
+        self.restart_peripherals();
+    }
+
+    /// Save the machine to `saves/<name>/`, then run on, as the Indy does.
+    /// The format is the Indy's: device state, memory in the shared chunk
+    /// store (all of it as bank 0), the copy-on-write disks' changes; plus
+    /// the flash and the batch hook's place in the boot. Disks without
+    /// `overlay` are not in it: restoring then pairs saved memory with
+    /// whatever the disk holds by then.
+    pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
+        self.stop();
+        let saved = self.write_snapshot(name);
+        self.restart_peripherals();
+        self.cpu.clone().as_device().start();
+        saved?;
+        println!("Snapshot saved to saves/{name}");
+        Ok(())
+    }
+
+    fn write_snapshot(&self, name: &str) -> Result<(), String> {
+        use crate::chunk_store::{put_words_as_chunks, ChunkStore};
+        use crate::snapshot::{ChunksManifest, Manifest, Snapshot};
+        use crate::traits::Saveable;
+        let snap = Snapshot::new(std::path::PathBuf::from("saves").join(name));
+        snap.ensure_dir().map_err(|e| e.to_string())?;
+        let mut manifest = Manifest::for_current_save();
+        manifest.machine = Some(SNAPSHOT_MACHINE.into());
+        manifest.disks = self.disks.clone();
+        manifest.nvram = self.flash_path.clone();
+        manifest.cpu_model = Some(self.cpu.model_name().to_string());
+        manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
+        snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
+        let sv = manifest.schema_version;
+        snap.write_state("cpu", &self.cpu.save_state(), sv).map_err(|e| e.to_string())?;
+        snap.write_state("o2", &self.bus.save_state(), sv).map_err(|e| e.to_string())?;
+        snap.write_state("boot", &self.boot.save(), sv).map_err(|e| e.to_string())?;
+        snap.write_bin("flash.bin", &self.bus.flash_bytes()).map_err(|e| e.to_string())?;
+        let store = ChunkStore::new("saves");
+        let mut chunks = ChunksManifest::default();
+        chunks.bank_chunks[0] = put_words_as_chunks(&store, self.bus.ram.lock().unwrap().words())
+            .map_err(|e| format!("CAS memory put: {e}"))?;
+        snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
+        for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
+            let dir = snap.dir.join(format!("ctrl{i}"));
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let overlays = ctl.export_overlays(&dir).map_err(|e| format!("COW overlay export (controller {i}): {e}"))?;
+            snap.write_toml(&format!("cow{i}.toml"), &crate::machine::build_cow_table(overlays))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Restore the machine from `saves/<name>/` and run it. Everything is
+    /// read and checked before the machine is touched, so a snapshot that
+    /// does not fit (another machine, CPU, build, memory or disk) leaves it
+    /// as it was.
+    pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
+        let snap = self.read_snapshot(name)?;
+        self.stop();
+        let applied = self.apply_snapshot(snap);
+        self.restart_peripherals();
+        applied?;
+        self.cpu.clone().as_device().start();
+        println!("Snapshot loaded from saves/{name}");
+        Ok(())
+    }
+
+    fn read_snapshot(&self, name: &str) -> Result<O2Snapshot, String> {
+        use crate::chunk_store::{get_chunks_as_words, ChunkStore};
+        use crate::snapshot::{Snapshot, SCHEMA_VERSION};
+        let snap = Snapshot::new(std::path::PathBuf::from("saves").join(name));
+        let m = snap.read_manifest()?.ok_or_else(|| format!("saves/{name}: no snapshot.toml"))?;
+        if m.machine.as_deref() != Some(SNAPSHOT_MACHINE) {
+            return Err(format!("snapshot {name} is not of an O2"));
+        }
+        if m.host_arch != std::env::consts::ARCH {
+            return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
+        }
+        if m.schema_version > SCHEMA_VERSION {
+            return Err(format!("snapshot schema_version {} is newer than this iris build supports ({SCHEMA_VERSION})", m.schema_version));
+        }
+        // As the Indy: build, CPU and disks must match;
+        // IRIS_SNAPSHOT_SKIP_CHECK=1 makes those warnings.
+        let mut fatal = Vec::new();
+        let features: Vec<String> = m.features.iter()
+            .filter(|f| !crate::snapshot::RETIRED_FEATURES.contains(&f.as_str())).cloned().collect();
+        if features != crate::snapshot::enabled_features() {
+            fatal.push(format!("build features differ: snapshot [{}] vs current [{}]",
+                m.features.join(","), crate::snapshot::enabled_features().join(",")));
+        }
+        if let Some(e) = crate::snapshot::cpu_model_mismatch(m.cpu_model.as_deref(), self.cpu.model_name()) {
+            fatal.push(e);
+        }
+        if let Some(e) = crate::snapshot::cache_model_mismatch(m.cpu_cache.as_deref(), m.cpu_model.as_deref(), self.cpu.cache_kind()) {
+            fatal.push(e);
+        }
+        for d in &m.disks {
+            match self.disks.iter().find(|c| c.id == d.id) {
+                None => fatal.push(format!("snapshot disk {}:{} ('{}') is not configured in this run", d.id / 16, d.id % 16, d.path)),
+                Some(c) if c.size_bytes != d.size_bytes => fatal.push(format!(
+                    "disk {}:{} ('{}') size differs: snapshot {} bytes vs current {}", d.id / 16, d.id % 16, d.path, d.size_bytes, c.size_bytes)),
+                Some(_) => {}
+            }
+        }
+        if !fatal.is_empty() {
+            let msg = format!("snapshot provenance mismatch:\n  - {}", fatal.join("\n  - "));
+            if std::env::var("IRIS_SNAPSHOT_SKIP_CHECK").is_ok_and(|v| !v.is_empty() && v != "0") {
+                eprintln!("load_snapshot: {msg} [IRIS_SNAPSHOT_SKIP_CHECK set; continuing]");
+            } else {
+                return Err(format!("{msg}\n(set IRIS_SNAPSHOT_SKIP_CHECK=1 to override)"));
+            }
+        }
+        let sv = m.schema_version;
+        let state = |base: &str| snap.read_state(base, sv).map_err(|e| format!("{base}: {e}"));
+        let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
+        let memory = get_chunks_as_words(&ChunkStore::new("saves"), &chunks.bank_chunks[0])
+            .map_err(|e| format!("CAS memory get: {e}"))?;
+        if memory.len() * 4 != self.bus.ram.lock().unwrap().len() {
+            return Err(format!("snapshot memory is {} MB, this O2 has {} MB",
+                memory.len() >> 18, self.bus.ram.lock().unwrap().len() >> 20));
+        }
+        let ctrls = self.bus.scsi.lock().unwrap().len();
+        let overlays = (0..ctrls)
+            .map(|i| snap.read_toml(&format!("cow{i}.toml")).ok().map(|t| crate::machine::parse_cow_table(&t)))
+            .collect();
+        Ok(O2Snapshot {
+            cpu: state("cpu")?,
+            bus: state("o2")?,
+            boot: state("boot")?,
+            flash: snap.read_bin("flash.bin").map_err(|e| format!("flash.bin: {e}"))?,
+            memory,
+            overlays,
+            dir: snap.dir,
+        })
+    }
+
+    /// Put a read snapshot into the stopped machine: the hardware as at
+    /// power-on first, so nothing the snapshot does not hold is left over.
+    fn apply_snapshot(&mut self, s: O2Snapshot) -> Result<(), String> {
+        use crate::traits::{Resettable, Saveable};
+        Resettable::power_on(&*self.cpu);
+        self.bus.power_on();
+        self.cpu.load_state(&s.cpu)?;
+        self.bus.load_state(&s.bus)?;
+        self.boot.load(&s.boot);
+        self.bus.set_flash(&s.flash)?;
+        self.bus.ram.lock().unwrap().restore_words(&s.memory)?;
+        for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
+            if let Some(Some(sets)) = s.overlays.get(i) {
+                ctl.import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
+                    .map_err(|e| format!("COW overlay import (controller {i}): {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// The shared slot (see [`MachineSlot`]) for this machine, created on
@@ -490,6 +714,18 @@ impl O2Machine {
     }
 }
 
+/// A snapshot read and checked, ready to put into the machine.
+struct O2Snapshot {
+    cpu: toml::Value,
+    bus: toml::Value,
+    boot: toml::Value,
+    flash: Vec<u8>,
+    memory: Vec<u32>,
+    /// Each controller's copy-on-write sets, when the snapshot has them.
+    overlays: Vec<Option<Vec<(usize, Vec<u64>)>>>,
+    dir: std::path::PathBuf,
+}
+
 impl Drop for O2Machine {
     fn drop(&mut self) {
         // First wait out any monitor, event or CI command in flight, so none
@@ -505,14 +741,13 @@ impl Drop for O2Machine {
     }
 }
 
-/// The O2 as the front ends see it. Snapshots, disc changes, the scratch
-/// volume and `--load-elf` are not there yet; the trait's defaults say so.
+/// The O2 as the front ends see it. Disc changes, the scratch volume, the CI
+/// rollback and `--load-elf` are not there yet; the trait's defaults say so.
 impl Workstation for O2Machine {
     fn start(&mut self) { O2Machine::start(self) }
     fn stop(&mut self) { O2Machine::stop(self) }
     fn reset(&mut self) { O2Machine::reset(self) }
-    /// Nothing to do: `stop` leaves the display and service threads running.
-    fn restart_peripherals(&mut self) {}
+    fn restart_peripherals(&mut self) { O2Machine::restart_peripherals(self) }
     fn cpu_start(&self) { self.cpu.clone().as_device().start() }
     fn cpu_is_running(&self) -> bool { self.cpu.clone().as_device().is_running() }
     fn machine_slot(&mut self) -> MachineSlot { O2Machine::machine_slot(self) }
@@ -539,6 +774,9 @@ impl Workstation for O2Machine {
         }
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+
+    fn save_snapshot(&mut self, name: &str) -> Result<(), String> { O2Machine::save_snapshot(self, name) }
+    fn load_snapshot(&mut self, name: &str) -> Result<(), String> { O2Machine::load_snapshot(self, name) }
 
     fn nat_control(&self) -> Option<Arc<crate::net::NatControl>> {
         self.nat.as_ref().map(|(n, _)| n.clone())

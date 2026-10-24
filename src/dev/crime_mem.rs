@@ -236,9 +236,26 @@ impl O2Memory {
     /// generation bumped so no compiled code outlives them.
     pub fn load_raw(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let data = std::fs::read(path)?;
+        self.restore_raw(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Every fitted byte as host words, for a snapshot's chunk store.
+    pub fn words(&self) -> &[u32] {
+        // SAFETY: the store is page-aligned and `total` a multiple of 4.
+        unsafe { std::slice::from_raw_parts(self.host as *const u32, self.total / 4) }
+    }
+
+    /// [`Self::restore_raw`] for words [`Self::words`] gave.
+    pub fn restore_words(&mut self, words: &[u32]) -> Result<(), String> {
+        // SAFETY: a view of the same bytes; u8 has no alignment to keep.
+        self.restore_raw(unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) })
+    }
+
+    /// Put back bytes [`Self::raw`] or [`Self::words`] gave, with every
+    /// page's generation bumped so no compiled code outlives them.
+    pub fn restore_raw(&mut self, data: &[u8]) -> Result<(), String> {
         if data.len() != self.total {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                format!("saved memory is {} bytes, this machine has {}", data.len(), self.total)));
+            return Err(format!("saved memory is {} bytes, this machine has {}", data.len(), self.total));
         }
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.host, self.total) };
         for page in 0..self.total.div_ceil(PAGE) {

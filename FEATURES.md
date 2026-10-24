@@ -302,7 +302,7 @@ iris runs. See [the O2 guide](docs/o2-ip32.md).
 | `o2.flash` | unset | File the PROM's flash (its environment) is loaded from and saved to. |
 | `o2.ram_mb` | `256` | Memory in MB, fitted largest DIMM kits first (up to 1024). |
 | `o2.dimms` | unset | Instead of `ram_mb`: the kit in each DIMM pair, in MB (32, 64, 128 or 256). |
-| `o2.disks` | `[]` | SCSI devices: `{ id, path, cdrom = false, bus = 0 }`; bus 0 internal, 1 external. |
+| `o2.disks` | `[]` | SCSI devices: `{ id, path, cdrom = false, bus = 0, overlay = false }`; bus 0 internal, 1 external; `overlay` writes to `PATH.overlay` and keeps the image as it was (as `[scsi.N] overlay`). |
 | `o2.serial_port` | unset | TCP port on 127.0.0.1 for the first serial port. |
 | `o2.serial_log` | unset | File that copies the first serial port's output. |
 | `o2.graphics` | `true` | PS/2 keyboard and the graphics console; `false` for a serial console. |

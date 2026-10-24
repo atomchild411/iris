@@ -562,8 +562,16 @@ impl Aic7880 {
     pub fn attach_at(&self, target: u8, path: &std::path::Path, cdrom: bool)
         -> std::io::Result<u64>
     {
+        self.attach_with(target, path, cdrom, false)
+    }
+
+    /// [`Self::attach_at`], copy-on-write when `overlay` is set: the image is
+    /// never written, writes go to `{path}.overlay`.
+    pub fn attach_with(&self, target: u8, path: &std::path::Path, cdrom: bool, overlay: bool)
+        -> std::io::Result<u64>
+    {
         let path = path.to_str().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
-        let d = ScsiDevice::open(path, cdrom, Vec::new(), false, None, if cdrom { O2_CDROM } else { O2_DISK })?;
+        let d = ScsiDevice::open(path, cdrom, Vec::new(), overlay, None, if cdrom { O2_CDROM } else { O2_DISK })?;
         let blocks = d.size() / BLOCK_SIZE as u64;
         let mut targets = self.targets.lock().unwrap();
         let slot = targets.get_mut(target as usize).ok_or_else(|| {

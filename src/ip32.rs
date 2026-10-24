@@ -172,6 +172,8 @@ pub struct Ip32Disk {
     pub path: std::path::PathBuf,
     /// A CD-ROM, which the PROM's install menu insists on seeing.
     pub cdrom: bool,
+    /// Copy-on-write: writes go to `{path}.overlay` (see `O2Disk::overlay`).
+    pub overlay: bool,
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -379,7 +381,7 @@ impl Ip32Bus {
                 let ctl = if d.bus == 0 { &scsi } else { &scsi_b };
                 let id = d.id.unwrap_or(ctl.default_target());
                 let at = if d.bus == 0 { format!("id {id}") } else { format!("{}:{id}", d.bus) };
-                match ctl.attach_at(id, &d.path, d.cdrom) {
+                match ctl.attach_with(id, &d.path, d.cdrom, d.overlay) {
                     Ok(b) => eprintln!("ip32: SCSI {at}: {} ({b} blocks)", d.path.display()),
                     Err(e) => eprintln!("ip32: SCSI {at}: {}: {e}", d.path.display()),
                 }
@@ -519,6 +521,22 @@ impl Ip32Bus {
             Ok(()) => eprintln!("ip32: flash saved to {}", path.display()),
             Err(e) => eprintln!("ip32: flash {}: {e}", path.display()),
         }
+    }
+
+    /// The whole flash, PROM and environment, for a snapshot.
+    pub fn flash_bytes(&self) -> Vec<u8> {
+        self.prom.lock().unwrap().clone()
+    }
+
+    /// Put back a flash [`Self::flash_bytes`] took from a machine with the
+    /// same PROM size.
+    pub fn set_flash(&self, bytes: &[u8]) -> Result<(), String> {
+        let mut p = self.prom.lock().unwrap();
+        if bytes.len() != p.len() {
+            return Err(format!("saved flash is {} bytes, this machine's {}", bytes.len(), p.len()));
+        }
+        p.copy_from_slice(bytes);
+        Ok(())
     }
 
     /// How many bytes have been written into the flash so far.

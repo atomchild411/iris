@@ -236,6 +236,29 @@ impl<F: MipsCache + CpuModel, S: MipsCache> MipsCache for HandoverCache<F, S> {
         self.shadow.power_on();
         self.on_shadow.store(false, Ordering::Relaxed);
     }
+    /// Both models and which one is live: a snapshot taken in the PROM has
+    /// its stack in the full model's lines, one taken under a kernel runs on
+    /// the shadow model.
+    fn save_cache_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        t.insert("on_shadow".into(), toml::Value::Boolean(self.on_shadow()));
+        t.insert("full".into(), self.full.save_cache_state());
+        t.insert("shadow".into(), self.shadow.save_cache_state());
+        toml::Value::Table(t)
+    }
+    fn load_cache_state(&self, v: &toml::Value) -> Result<(), String> {
+        use crate::snapshot::{get_field, toml_bool};
+        if let Some(f) = get_field(v, "full") {
+            self.full.load_cache_state(f)?;
+        }
+        if let Some(s) = get_field(v, "shadow") {
+            self.shadow.load_cache_state(s)?;
+        }
+        let shadow = get_field(v, "on_shadow").and_then(toml_bool).unwrap_or(false);
+        self.on_shadow.store(shadow, Ordering::Relaxed);
+        self.reset_seen.store(false, Ordering::Relaxed);
+        Ok(())
+    }
     // The ppmem windows go to both models; everything the JIT's inline
     // path reads comes from the live one, so code compiled after the
     // handover gets the shadow model's tagless path (window only).

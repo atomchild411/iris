@@ -763,6 +763,11 @@ pub struct O2Disk {
     pub path: String,
     #[serde(default)]
     pub cdrom: bool,
+    /// Copy-on-write, as `[scsi.N] overlay`: the image is never written,
+    /// writes go to `{path}.overlay`, and a snapshot carries them, so its
+    /// disk matches its memory.
+    #[serde(default)]
+    pub overlay: bool,
 }
 
 fn default_o2_prom() -> String {
