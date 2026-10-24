@@ -27,6 +27,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   moves the mouse and reads memory ([debug.md](debug.md#sgi-o2-ip32)).
 - **PROM network boot.** `[network] tftp_dir` serves the O2's PROM too:
   `boot -f bootp():FILE`.
+- **Memory through CRIME's no-ECC alias.** Physical 0x00_8000_0000 is a
+  second view of memory, not MACE's PCI window. IRIX maps some pages there,
+  and they read as all ones: `netstat -ni` spun forever, so Netscape never
+  opened, and `/dev/mem` and `/dev/kmem` returned 0xffffffff for about one
+  page in six. IRIX on an R5000 O2 panicked with "init died" for the same
+  reason; it now boots to the desktop.
 
 ### Newport (REX3)
 

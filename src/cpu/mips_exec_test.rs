@@ -929,6 +929,43 @@ mod tests {
                    "setup: ASID 10 should see PFN 0x50");
     }
 
+    /// A machine's physical alias (the O2's no-ECC view of memory at
+    /// 0x8000_0000) reaches memory at its target through both a TLB mapping
+    /// and XKPHYS; without one the address goes to the bus unchanged.
+    #[test]
+    fn a_physical_alias_reaches_its_target() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(a_physical_alias_reaches_its_target_inner)
+            .unwrap().join().unwrap();
+    }
+    fn a_physical_alias_reaches_its_target_inner() {
+        use crate::cpu::mips_tlb::MipsTlb;
+        let read = |alias: Option<(u64, u64, u64)>| {
+            let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+            exec.phys_alias = alias;
+            exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+            exec.update_translate_fn();
+            // VA 0x1000, the odd page of VPN2 0, uncached at PFN 0x80001.
+            exec.core.cp0_index = 3;
+            exec.core.cp0_pagemask = 0;
+            exec.core.cp0_entryhi = 0;
+            exec.core.cp0_entrylo0 = 0;
+            exec.core.cp0_entrylo1 = (0x80001 << 6) | (2 << 3) | (1 << 2) | (1 << 1) | 1;
+            let tlbwi = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+            assert_eq!(exec.exec(tlbwi), EXEC_COMPLETE);
+            mem.set_word(0x4000_1000, 0x1234_5678);
+            mem.set_word(0x8000_1000, 0xdead_beef);
+            let mapped = exec.read_data::<4>(0x1000).unwrap();
+            exec.core.cp0_status |= crate::cpu::mips_core::STATUS_KX;
+            exec.update_translate_fn();
+            let xkphys = exec.read_data::<4>(0x9000_0000_8000_1000).unwrap();
+            (mapped, xkphys)
+        };
+        assert_eq!(read(Some((0x8000_0000, 0x4000_0000, 0x4000_0000))), (0x1234_5678, 0x1234_5678), "the alias reaches memory");
+        assert_eq!(read(None), (0xdead_beef, 0xdead_beef), "no alias: the address as it is");
+    }
+
     #[test]
     fn test_mtc0_entryhi_asid_change_invalidates_nanotlb() {
         std::thread::Builder::new()

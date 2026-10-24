@@ -33,7 +33,7 @@ use crate::dev::crime_mem::O2Memory;
 use crate::dev::ng1::rex3::Renderer;
 use crate::disp::Rex3Screen;
 use crate::hptimer::TimerManager;
-use crate::ip32::{Ip32Bus, Ip32Disk, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN};
+use crate::ip32::{Ip32Bus, Ip32Disk, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, RAM_BASE, RAM_WINDOW_SIZE};
 use crate::traits::{BusDevice, Device, MachineEvent, Signal};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
@@ -363,6 +363,9 @@ impl O2Machine {
         exec.core.set_timer_manager(tm.clone());
         // Count runs at half the pipeline clock on both CPUs.
         exec.core.set_count_hz(mhz.max(1) as u64 * 500_000);
+        // The no-ECC alias of memory reaches memory, not the PCI window the
+        // bus decodes at the same low 32 bits.
+        exec.phys_alias = Some((NO_ECC_BASE, RAM_WINDOW_SIZE as u64, RAM_BASE as u64));
         exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
             let pc = exec.core.pc as u32;
             LAST_PC.store(pc, Ordering::Relaxed);

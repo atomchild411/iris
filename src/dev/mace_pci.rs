@@ -113,7 +113,9 @@ pub const PCI_IO_SIZE: u32 = 0x0200_0000;
 /// PCI memory's second, one-to-one window, from physical 0x2_8000_0000. A
 /// 64-bit kernel (OpenBSD's) reaches devices there; the PROM and NetBSD use
 /// the low window above. Physical addresses reach this bus as 32 bits, so it
-/// arrives as 0x8000_0000 and up, where an O2 has nothing else below 4 GB.
+/// arrives as 0x8000_0000 and up. CRIME's no-ECC memory alias has the same
+/// low 32 bits (0x00_8000_0000); the CPU folds that one onto memory before it
+/// gets here ([`crate::ip32::NO_ECC_BASE`]).
 pub const PCI_HI_MEM_BASE: u32 = 0x8000_0000;
 
 /// Host memory on the PCI bus, as bus masters see it (MACE spec 9.3.1): the

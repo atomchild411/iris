@@ -1532,6 +1532,12 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// shadow model once a kernel starts, and back when POST starts over).
     /// None costs one check per batch.
     pub batch_hook: Option<Box<dyn FnMut(&mut MipsExecutor<T, C>) + Send>>,
+    /// A window of physical addresses that reaches memory at another address,
+    /// `(base, size, target)`, applied to mapped and XKPHYS translations
+    /// before the bus sees the low 32 bits. The O2 has a no-ECC alias of its
+    /// memory at 0x8000_0000 that would otherwise reach the PCI window the
+    /// bus decodes there. None on the other machines.
+    pub phys_alias: Option<(u64, u64, u64)>,
     /// `jitcheck`'s hardware-read fixup: `validate_jit_determinism`'s two
     /// passes run at genuinely different real wall-clock speed, so any
     /// device register whose value is driven by host time (e.g. the MC's
@@ -2936,6 +2942,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "jitv2")]
             jitv2_dispatch_enabled: !matches!(std::env::var("IRIS_JIT_DISPATCH").as_deref(), Ok("off") | Ok("0")),
             batch_hook: None,
+            phys_alias: None,
             #[cfg(feature = "developer")]
             hw_read_fixup_replay: None,
             #[cfg(feature = "developer")]
@@ -4956,7 +4963,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         let phys_addr = virt_addr & 0x07FF_FFFF_FFFF_FFFF;
                         // bits_61_59 is the C field directly: 2=Uncached, 3=Cacheable, 5=CacheableCoherent
                         let c = match bits_61_59 { 3 | 5 => bits_61_59 as u32, _ => TR_UNCACHED };
-                        TranslateResult::ok(phys_addr, c)
+                        TranslateResult::ok(self.fold_phys_alias(phys_addr), c)
                     } else {
                         if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                         TranslateResult::exc(exec_exception(if access_type == AccessType::Write { EXC_ADES } else { EXC_ADEL }))
@@ -5009,6 +5016,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
+    /// A physical address through [`Self::phys_alias`], if it falls in it.
+    #[inline(always)]
+    fn fold_phys_alias(&self, pa: u64) -> u64 {
+        match self.phys_alias {
+            Some((base, size, target)) if pa.wrapping_sub(base) < size => pa - base + target,
+            _ => pa,
+        }
+    }
+
     /// TLB translation.  When `DEBUG` is true, CP0 side-effect registers are
     /// not written on miss/invalid/modified — the exception result is still
     /// returned so the caller knows the translation failed.
@@ -5033,7 +5049,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     // ok_mapped, not ok: this came from the TLB, so the nutlb
                     // fill needs TR_MAPPED plus the entry's G bit to decide
                     // whether to ASID-qualify the tag it stores.
-                    TranslateResult::ok_mapped(phys_addr, cache_attr as u32, global)
+                    TranslateResult::ok_mapped(self.fold_phys_alias(phys_addr), cache_attr as u32, global)
                 }
             }
             TlbResult::Miss { .. } => {

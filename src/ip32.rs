@@ -131,6 +131,13 @@ pub use crate::dev::onewire::*;
 
 
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
+/// CRIME's no-ECC alias of the memory window: the same memory as
+/// [`RAM_BASE`], read without ECC checking, at CPU physical 0x00_8000_0000.
+/// IRIX maps pages it reads uncached here (`/dev/mem`, `/dev/kmem`). The bus
+/// sees physical addresses as 32 bits and has MACE's 64-bit PCI window at
+/// 0x8000_0000 ([`PCI_HI_MEM_BASE`]), so the CPU folds this one onto
+/// `RAM_BASE` before the bus sees it (`MipsExecutor::phys_alias`).
+pub const NO_ECC_BASE: u64 = 0x8000_0000;
 /// How much of memory also answers from address 0: the first 256 MB.
 pub const LOW_ALIAS_SIZE: u32 = 0x1000_0000;
 
