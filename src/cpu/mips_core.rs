@@ -1906,6 +1906,17 @@ impl MipsCore {
         self.schedule_compare_timer();
     }
 
+    /// After a snapshot restore set Count and Compare as raw fields: the
+    /// restored Compare is a deadline the guest programmed, so it gets a
+    /// ticket of its own before the timer is armed against it. A core that
+    /// has not run yet still holds ticket 0, the "already delivered"
+    /// sentinel, and the guest (waiting for that very interrupt before it
+    /// writes Compare again) would never get it.
+    pub fn restore_compare_deadline(&mut self) {
+        self.arm_ip7_sequence();
+        self.reanchor_count_and_reschedule();
+    }
+
     /// CPU thread is stopping: latch the virtual count at its current value
     /// and silence the compare timer, so a stopped CPU (monitor `cpu stop`,
     /// debugger stepping) sees a frozen Count and never gets IP7 raised
@@ -2706,6 +2717,24 @@ mod ip7_ticket_tests {
             shared, core.ip7_seq,
             "the armed one-shot's ticket must be the live sequence"
         );
+    }
+
+    /// A snapshot restored into a core that has never run: its ticket is still
+    /// 0, the "already delivered" sentinel, so a one-shot armed with it could
+    /// never claim, and a guest that waits for that interrupt before writing
+    /// Compare again would stop for good. The restored deadline gets a live
+    /// ticket.
+    #[test]
+    fn a_deadline_restored_into_a_fresh_core_can_be_delivered() {
+        let mut core = MipsCore::default();
+        core.cp0_count = 0x1000;
+        core.cp0_compare = 0x2000;
+        core.restore_compare_deadline();
+        let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
+        assert_ne!(shared, IP7_SEQ_CONSUMED, "the restored deadline was armed with the delivered sentinel");
+        assert_eq!(shared, core.ip7_seq, "the armed one-shot's ticket must be the live sequence");
+        assert!(claim_ip7(&core.ip7_seq_shared, core.ip7_seq, &core.hot.interrupts, &core.fasttick_count),
+            "the restored deadline's one-shot could not deliver IP7");
     }
 
     /// The overrun case still delivers -- suppressing the crossing must not

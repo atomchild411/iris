@@ -14928,8 +14928,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
             // Restart the virtual count from the restored value and re-arm
             // the compare timer — Instants from the previous run are
-            // meaningless here.
-            c.reanchor_count_and_reschedule();
+            // meaningless here — with a live ticket for the restored deadline.
+            c.restore_compare_deadline();
         }
 
         if let Some(fpu) = get_field(v, "fpu") {
