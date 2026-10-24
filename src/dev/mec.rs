@@ -271,13 +271,15 @@ impl Mec {
     /// Run IRIS's NAT gateway behind this interface, on a thread of its own:
     /// DHCP, DNS and the port forwards in `config`, as the Indy's SEEQ 8003
     /// has them.
-    pub fn start_nat(&self, config: crate::net::GatewayConfig) {
+    /// Returns the NAT's controls.
+    pub fn start_nat(&self, config: crate::net::GatewayConfig) -> Arc<crate::net::NatControl> {
         let (to_net, tx_cons) = rtrb::RingBuffer::new(256);
         let (rx_prod, from_net) = rtrb::RingBuffer::new(256);
         let rx_wake = crate::net::Wake::new();
         let tx_wake = crate::net::Wake::new();
         let running = Arc::new(AtomicBool::new(true));
         let ctl = crate::net::NatControl::new();
+        let controls = ctl.clone();
         let tw = tx_wake.clone();
         std::thread::Builder::new()
             .name("ip32-mec-nat".into())
@@ -286,6 +288,7 @@ impl Mec {
             })
             .expect("mec NAT thread");
         self.attach(to_net, from_net, Some(tx_wake));
+        controls
     }
 
     /// Frames sent and received so far, and received ones dropped for want of

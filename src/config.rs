@@ -412,8 +412,8 @@ pub enum MachineProfile {
 }
 
 impl MachineProfile {
-    /// All selectable profiles, in display order. (Not the O2 yet: iris-gui
-    /// builds through `Machine::new`, and the O2 is `ip32_machine::run`.) Single source of truth for the
+    /// All selectable profiles, in display order. (Not the O2 yet: iris-gui's
+    /// machine editor has no `[o2]` section.) Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
     pub const ALL: [Self; 3] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28];
 

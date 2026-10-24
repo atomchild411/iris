@@ -50,12 +50,6 @@ fn main() {
     cfg.debug.apply_env();
     cfg.jitv2.apply_env();
 
-    // The O2 is its own machine (CRIME/MACE/GBE), not a fullhouse/Guinness one.
-    if cfg.machine.profile == iris::config::MachineProfile::O2Ip32 {
-        iris::ip32_machine::run(cfg, scale);
-        return;
-    }
-
     // Machine::new() allocates >1MB on the stack (Physical device_map), which overflows
     // the default stack on Windows (1MB). We spawn a thread with a larger stack to create it.
     let mut machine = std::thread::Builder::new()

@@ -34,7 +34,8 @@ use crate::dev::ng1::rex3::Renderer;
 use crate::disp::Rex3Screen;
 use crate::hptimer::TimerManager;
 use crate::ip32::{Ip32Bus, Ip32Disk, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN};
-use crate::traits::{BusDevice, Device, Signal};
+use crate::traits::{BusDevice, Device, MachineEvent, Signal};
+use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
 const PROM_VA: std::ops::Range<u32> = 0xbfc0_0000..0xbfc8_0000;
 
@@ -88,6 +89,19 @@ pub struct O2Machine {
     /// every O2 device's, through the bus.
     monitor: Arc<crate::monitor::Monitor>,
     monitor_port: u16,
+    /// The console UART's in-process host end in CI mode (`--ci`), which the
+    /// CI socket types into and reads.
+    ci_serial: Option<Arc<crate::dev::z85c30::CiSerialBackend>>,
+    /// The NAT's controls and the addresses it hands the guest (client,
+    /// gateway, netmask), when the Ethernet is plugged in.
+    nat: Option<(Arc<crate::net::NatControl>, (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr))>,
+    /// The guest switching the machine off, for the machine-events thread.
+    events: std::sync::mpsc::SyncSender<MachineEvent>,
+    event_rx: Option<std::sync::mpsc::Receiver<MachineEvent>>,
+    /// Set once that thread runs; until then the service loop exits the
+    /// process itself on a power-off, as it always has.
+    controller_up: Arc<AtomicBool>,
+    controller_slot: Option<MachineSlot>,
 }
 
 impl O2Machine {
@@ -128,7 +142,16 @@ impl O2Machine {
         );
         // The console UART's host end: the shared TCP serial backend (any
         // number of clients), teed to the serial log when one is set.
-        {
+        let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::z85c30::CiSerialBackend::new()));
+        if let Some(ci) = &ci_serial {
+            if let Some(path) = cfg.serial_log.as_deref().or(o2.serial_log.as_deref()) {
+                match ci.set_log_file(path) {
+                    Ok(()) => eprintln!("iris: O2 serial console mirroring to {path}"),
+                    Err(e) => eprintln!("iris: O2 serial log {path}: {e}"),
+                }
+            }
+            bus.mace.com0.set_backend(ci.clone());
+        } else {
             let mut backend = crate::dev::z85c30::null_serial_backend();
             if let Some(port) = o2.serial_port {
                 match crate::dev::z85c30::tcp_serial_backend(port) {
@@ -151,13 +174,15 @@ impl O2Machine {
             }
             bus.mace.com0.set_backend(backend);
         }
+        let mut nat = None;
         if o2.net {
             let mut net = crate::net::GatewayConfig::default();
             net.port_forwards = o2.forwards.clone();
             // `[network] tftp_dir`, so the PROM can `boot -f bootp()FILE`.
             net.tftp_dir = cfg.network.tftp_dir.as_ref().map(std::path::PathBuf::from);
             eprintln!("iris: O2 Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
-            bus.mace.mec.start_nat(net);
+            let addrs = (net.client_ip, net.gateway_ip, net.netmask);
+            nat = Some((bus.mace.mec.start_nat(net), addrs));
         }
 
         let timer_manager = Arc::new(TimerManager::new());
@@ -245,7 +270,23 @@ impl O2Machine {
         monitor.register_device(Arc::new(O2Control::new(bus.clone())));
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
 
-        Ok(Self { bus, cpu, timer_manager, display, running, threads: Vec::new(), monitor: Arc::new(monitor), monitor_port })
+        let (events, event_rx) = std::sync::mpsc::sync_channel(4);
+        Ok(Self {
+            bus,
+            cpu,
+            timer_manager,
+            display,
+            running,
+            threads: Vec::new(),
+            monitor: Arc::new(monitor),
+            monitor_port,
+            ci_serial,
+            nat,
+            events,
+            event_rx: Some(event_rx),
+            controller_up: Arc::new(AtomicBool::new(false)),
+            controller_slot: None,
+        })
     }
 
     /// `kernel_mode(cache, in_kernel)` switches the cache model on leaving the
@@ -342,18 +383,27 @@ impl O2Machine {
         let bus = self.bus.clone();
         let cpu = self.cpu.clone();
         let running = self.running.clone();
+        let events = (self.events.clone(), self.controller_up.clone());
         self.threads.push(
             std::thread::Builder::new()
                 .name("O2-Service".into())
-                .spawn(move || Self::service_loop(bus, cpu, running))
+                .spawn(move || Self::service_loop(bus, cpu, running, events))
                 .unwrap(),
         );
-        self.cpu.clone().as_device().start();
+        // CI mode: the harness starts the CPU (`iris-ci start`).
+        if self.ci_serial.is_none() {
+            self.cpu.clone().as_device().start();
+        }
     }
 
     /// Device interrupts the guest did not cause by an access (network
     /// frames, keys), typing scripts, and the guest's power switch.
-    fn service_loop(bus: Arc<Ip32Bus>, cpu: Arc<dyn CpuDevice>, running: Arc<AtomicBool>) {
+    fn service_loop(
+        bus: Arc<Ip32Bus>,
+        cpu: Arc<dyn CpuDevice>,
+        running: Arc<AtomicBool>,
+        (events, controller_up): (std::sync::mpsc::SyncSender<MachineEvent>, Arc<AtomicBool>),
+    ) {
         let dev = cpu.clone().as_device();
         // The PROM's environment lives in its flash: save it once the guest
         // has written there (setenv) and the writing has stopped.
@@ -384,6 +434,11 @@ impl O2Machine {
                 eprintln!("iris: the O2 switched itself off");
                 dev.stop();
                 bus.save_flash();
+                // The machine-events thread stops the machine and exits,
+                // unless the host embeds iris (IRIS_NO_EXIT_ON_POWEROFF).
+                if controller_up.load(Ordering::SeqCst) && events.try_send(MachineEvent::PowerOff).is_ok() {
+                    return;
+                }
                 running.store(false, Ordering::SeqCst);
                 std::process::exit(0);
             }
@@ -391,14 +446,31 @@ impl O2Machine {
         }
     }
 
+    /// Stop the CPU and save the PROM's flash. The display and service
+    /// threads and the monitor run on until the machine is dropped, so the
+    /// monitor's `machine-start` and the CI scratch pause can carry on.
     pub fn stop(&mut self) {
         self.cpu.clone().as_device().stop();
-        self.monitor.shutdown();
         self.bus.save_flash();
-        self.running.store(false, Ordering::SeqCst);
-        for t in self.threads.drain(..) {
-            let _ = t.join();
-        }
+    }
+
+    /// The hardware as at power-on, with the CPU stopped: what a CRIME cold
+    /// reset does, less the restart.
+    pub fn reset(&mut self) {
+        let dev = self.cpu.clone().as_device();
+        dev.stop();
+        crate::traits::Resettable::power_on(&*self.cpu);
+        self.bus.power_on();
+    }
+
+    /// The shared slot (see [`MachineSlot`]) for this machine, created on
+    /// first use. Only once the machine is boxed: the slot records this
+    /// address.
+    pub fn machine_slot(&mut self) -> MachineSlot {
+        let ptr = self as *mut O2Machine as *mut dyn Workstation;
+        let slot = self.controller_slot.get_or_insert_with(|| Arc::new(Mutex::new(MachineRef(ptr))));
+        debug_assert!(std::ptr::addr_eq(slot.lock().0, ptr), "O2Machine moved after its slot was handed out");
+        slot.clone()
     }
 
     pub fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> {
@@ -415,6 +487,64 @@ impl O2Machine {
 
     pub fn get_timer_manager(&self) -> Arc<TimerManager> {
         self.timer_manager.clone()
+    }
+}
+
+impl Drop for O2Machine {
+    fn drop(&mut self) {
+        // First wait out any monitor, event or CI command in flight, so none
+        // sees a half-destroyed machine (see `Drop for Machine`).
+        if let Some(slot) = self.controller_slot.take() {
+            slot.lock().0 = MachineRef::null();
+        }
+        self.running.store(false, Ordering::SeqCst);
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+        self.monitor.shutdown();
+    }
+}
+
+/// The O2 as the front ends see it. Snapshots, disc changes, the scratch
+/// volume and `--load-elf` are not there yet; the trait's defaults say so.
+impl Workstation for O2Machine {
+    fn start(&mut self) { O2Machine::start(self) }
+    fn stop(&mut self) { O2Machine::stop(self) }
+    fn reset(&mut self) { O2Machine::reset(self) }
+    /// Nothing to do: `stop` leaves the display and service threads running.
+    fn restart_peripherals(&mut self) {}
+    fn cpu_start(&self) { self.cpu.clone().as_device().start() }
+    fn cpu_is_running(&self) -> bool { self.cpu.clone().as_device().is_running() }
+    fn machine_slot(&mut self) -> MachineSlot { O2Machine::machine_slot(self) }
+    fn register_system_controller(&mut self) {
+        let slot = self.machine_slot();
+        let events = self.event_rx.take();
+        assert!(events.is_some(), "register_system_controller called twice");
+        crate::workstation::register_system_controller(&self.monitor, slot, events);
+        self.controller_up.store(true, Ordering::SeqCst);
+    }
+    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { self.monitor.bound_addr() }
+
+    fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Some(O2Machine::get_display(self)) }
+    fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { O2Machine::get_ps2(self) }
+    fn get_timer_manager(&self) -> Arc<TimerManager> { O2Machine::get_timer_manager(self) }
+    fn get_cpu_debug(&self) -> Arc<dyn crate::gdb_stub::CpuDebug> { self.cpu.clone().debug_adapter() }
+    fn fasttick_count(&self) -> Arc<std::sync::atomic::AtomicU64> { self.cpu.fasttick_count() }
+    fn get_ci_serial(&self) -> Option<Arc<crate::dev::z85c30::CiSerialBackend>> { self.ci_serial.clone() }
+    /// Typed at serial port 1, the console with `graphics = false`.
+    fn inject_serial_console(&self, bytes: &[u8]) {
+        match &self.ci_serial {
+            Some(ci) => ci.push_host(bytes),
+            None => self.bus.mace.com0.feed(bytes),
+        }
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+
+    fn nat_control(&self) -> Option<Arc<crate::net::NatControl>> {
+        self.nat.as_ref().map(|(n, _)| n.clone())
+    }
+    fn nat_expected(&self) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+        self.nat.as_ref().map(|(_, a)| *a)
     }
 }
 
@@ -783,30 +913,3 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
     }
 }
 
-/// Run an O2 from `cfg` until the window closes or the guest switches it off.
-pub fn run(cfg: MachineConfig, scale: u32) {
-    let headless = cfg.headless;
-    let scroll = cfg.mouse_scroll_pixels_per_line;
-    let lock_aspect = cfg.lock_aspect_ratio;
-    let mut m = match O2Machine::new(&cfg) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("iris: {e}");
-            std::process::exit(1);
-        }
-    };
-    m.start();
-    if headless {
-        eprintln!("iris: O2 running headless");
-        std::thread::park();
-    } else {
-        use winit::event_loop::EventLoop;
-        let event_loop = EventLoop::new().unwrap();
-        // The window wants the Indy's SCSI controller for its CD menu; the
-        // O2's are on PCI, so it gets one with nothing on it.
-        let scsi = Arc::new(crate::dev::wd33c93a::Wd33c93a::new(None, None, Arc::new(std::sync::atomic::AtomicU64::new(0))));
-        let ui = crate::ui::Ui::new(m.get_ps2(), m.get_display(), scsi, m.get_timer_manager(), &event_loop, scale, scroll, lock_aspect);
-        ui.run(event_loop);
-    }
-    m.stop();
-}
