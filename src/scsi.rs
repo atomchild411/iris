@@ -755,7 +755,8 @@ impl ScsiDevice {
     }
 
     fn exec_request_sense(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        let alloc_len = request_sense_alloc_len(cdb);        // Return stored sense data and clear it
+        let alloc_len = request_sense_alloc_len(cdb);
+        // Return stored sense data and clear it
         let sense = self.pending_sense;
         self.pending_sense = [0u8; 18];
         self.pending_sense[0] = 0x70; // Leave valid response code for next time
