@@ -14957,8 +14957,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
             // Restart the virtual count from the restored value and re-arm
             // the compare timer — Instants from the previous run are
-            // meaningless here.
-            c.reanchor_count_and_reschedule();
+            // meaningless here — with a live ticket for the restored deadline.
+            c.restore_compare_deadline();
         }
 
         if let Some(fpu) = get_field(v, "fpu") {
@@ -14980,6 +14980,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
 
         if let Some(cache_v) = get_field(v, "cache") {
             exec.cache.load_cache_state(cache_v)?;
+            // A cache whose live model is part of its state (the O2's
+            // hand-over) can come back on another model than the one compiled
+            // code reaches through: publish the live one's pointers again.
+            #[cfg(feature = "jitv2")]
+            exec.install_jit_mem_ptrs();
         }
 
         // cp0_status was restored above by direct field write, so translate_fn and the
