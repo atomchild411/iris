@@ -1199,7 +1199,13 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             });
-            ui.menu_button(t!("menu-machine"), |ui| {
+            // Closes only on a click outside it: the Save and Restore state
+            // name boxes take clicks, and the default would close the menu
+            // on the click that focuses one. Its buttons close it themselves.
+            egui::containers::menu::MenuButton::new(t!("menu-machine"))
+                .config(egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+                .ui(ui, |ui| {
                 let running = self.emu.is_running();
                 if ui.add_enabled(!running, egui::Button::new(t!("menu-machine-start"))).clicked() {
                     self.start_emulator();
@@ -1256,6 +1262,7 @@ impl App {
                             self.cfg.machine.cpu = c;
                             self.mark_dirty();
                             self.toast(t!("toast-cpu-set", cpu = c.label()));
+                            ui.close();
                         }
                     }
                 });
@@ -1278,6 +1285,7 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut self.save_state_name).desired_width(120.0));
                     if ui.button(t!("common-save")).clicked() {
                         self.emu.send(Cmd::SaveState(self.save_state_name.clone()));
+                        ui.close();
                     }
                 });
                 ui.horizontal(|ui| {
@@ -1285,6 +1293,7 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut self.restore_state_name).desired_width(120.0));
                     if ui.button(t!("menu-machine-restore")).clicked() {
                         self.emu.send(Cmd::RestoreState(self.restore_state_name.clone()));
+                        ui.close();
                     }
                 });
                 ui.separator();

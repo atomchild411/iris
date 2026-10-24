@@ -591,12 +591,18 @@ fn worker_loop(
                     let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
                     continue;
                 };
-                // save_snapshot stops the CPU as part of its work; once it
-                // returns, restart the CPU so the user can keep using the
-                // machine without an explicit Start.
+                // save_snapshot stops the machine as part of its work; once
+                // it returns, carry on as the monitor's `machine-start` does
+                // (`start` would also start a second monitor server), and
+                // only if the machine was running before.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let was_running = m.cpu_is_running();
                     let r = m.save_snapshot(&name);
-                    m.start();
+                    if was_running {
+                        if let Err(e) = m.start_guest() {
+                            eprintln!("iris-gui: resume after save: {e}");
+                        }
+                    }
                     r
                 }));
                 match result {

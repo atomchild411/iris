@@ -309,6 +309,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### iris-gui
 
+- **Save state keeps the machine running** ([#307](https://github.com/techomancer/iris/issues/307)).
+  It resumed by starting the whole machine again, so the monitor complained
+  that its port was in use; it now resumes as `machine-start` does, and only
+  if the machine was running. The Save and Restore state name boxes no longer
+  close the Machine menu when you click into them.
 - **GUI settings for this month's core changes.** The Networking tab sets the
   TFTP boot folder (`[network] tftp_dir`; NAT mode, with the `boot -f
   bootp()/unix` line to use) and shows and edits the Ethernet address
