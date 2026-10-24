@@ -11,8 +11,7 @@
 //! pretends to be a complete CRIME.
 //!
 //! Everything was derived from observing the PROM's own behaviour and from
-//! NetBSD's published register names. No code or comments were taken from the
-//! GPL-3.0 `ip32prom-decompiler` annotations; IRIS is BSD-3-Clause.
+//! NetBSD's published register names.
 //!
 //! See `docs/o2-ip32.md`; the bring-up log is `clanker/devices/ip32-o2-bringup-log.md`.
 

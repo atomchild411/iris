@@ -2,7 +2,8 @@
 
 Status: history, 2026-09 to 2026-10. How the O2 was brought up, gate by gate,
 with the dead ends. For the machine as it is, read [docs/o2-ip32.md](../../docs/o2-ip32.md);
-its "Today" section below is the most current part of this log.
+the "Today" section below summarises it as of 2026-10-23, and the rest is the
+journal, in order.
 
 ## Today (read this first)
 
@@ -24,13 +25,14 @@ How it is put together now:
   into a window as CRIME's bank controls decode them. The CPU's cache and
   the JIT, and the rendering engine (`RamWindow`), use the window directly.
 - **The rendering engine** (`CrimeRe` in `src/dev/o2gfx.rs`) runs on its own
-  thread, fed by the shared gfifo as CRIME's 128-entry interface buffer; a
+  thread, fed through the shared gfifo standing in for CRIME's interface
+  buffer (far deeper than the real 128 entries); a
   full buffer, or a register read while the engine is busy, makes the CPU
   retry.
-- **The R10000's caches** (`src/ip32_handover.rs`): the full model while the
-  PROM runs, IP28's tagless shadow model once the kernel does, switched at
-  each kernel entry and PROM re-entry. The R5000 turns tcache off and on
-  instead.
+- **Both CPUs' caches** (`src/ip32_handover.rs`): the full model while the
+  PROM runs POST, which keeps its stack in the cache; a tagless shadow model
+  once code outside the firmware runs. POST starting over (its Index Store
+  Tag sweep under the shadow model) hands back.
 
 The rest of this document is the bring-up journal, in order. Its middle
 chapters drive the machine through a test harness steered by `IRIS_IP32_*`
@@ -43,12 +45,13 @@ Diagnostics that remain, all off unless set:
 | variable | what it does |
 |---|---|
 | `IRIS_IP32_HOT` | per-register access counters for MACE, GBE and the rendering engine (finding a driver polling a bit nothing sets) |
-| `IRIS_IP32_WATCHMEM=lo[:hi]` | log accesses to a physical range (`0:0`: whatever GBE scans out); `_CAP` entries kept (256), `_WRITES` writes only; read with the control port's `watchdump` |
 | `IRIS_IP32_RE_TRACE=N` | keep the last N rendering-engine register writes; save with the control port's `retrace` |
 | `IRIS_IP32_MEC_TRACE` | Ethernet frames sent and received, and why a received one was dropped |
 | `IRIS_O2_AUDIO_TRACE` | audio output activity, and each time a ring ran dry between sounds |
 | `IRIS_O2_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling |
 | `IRIS_O2_AUDIO_CAPTURE=file` | what the host plays, after resampling and mixing (raw 16-bit stereo) |
+
+## The assessment (2026-09-19)
 
 Assessment written 2026-09-19. Nothing implemented yet. Scope agreed with the
 owner: **run the real O2 PROM** (not a synthetic ARCS), serial console only,
@@ -75,9 +78,6 @@ NUL-padded name at +12, version string at +44, checksum at +52, then load
 address and .rodata offset for `firmware`.
 
 4.3 has the same five sections at the same offsets bar the last (0x68008).
-
-**Rev 4.18 is the revision `ip32prom-decompiler` is tested against**, so the
-published annotations line up with the image we hold.
 
 ## What tracing the reset path already told us
 
@@ -143,17 +143,6 @@ the firmware section will probe MACE and the PCI bridge. virtio's payoff comes
 after the PROM is satisfied — it means we would not also have to emulate `mec`
 and the `ahc` SCSI controller well enough for a running system, only well
 enough for POST to not reject them.
-
-## Licensing — settle this before writing code
-
-- IRIS is **BSD-3-Clause**.
-- `ip32prom-decompiler` and its annotations are **GPL-3.0**.
-
-Reading the annotations to learn what a register does is fine. Copying comments,
-structure, or generated assembly into IRIS is not. Any CRIME/MACE code must be
-written independently, and commits that were informed by the annotations should
-say so plainly. The PROM binaries themselves are SGI's; they stay out of the
-repo exactly like `ip24prom.070-9101-011.bin` does.
 
 ## Milestone reached (and the check was wrong)
 
@@ -838,10 +827,8 @@ ways forward, and they are very different pieces of work:
    than with the hardware, so a driver that uses the chip differently — or a
    different sequencer program — can break it.
 
-Worth noting before choosing: the licence constraints still apply. MAME and
-recent QEMU forks are GPL and may not be copied from; NetBSD's `ahc` driver is
-BSD and is a legitimate reference for what the *host side* expects to see,
-which is exactly the contract option 2 needs.
+NetBSD's `ahc` driver shows what the *host side* expects to see, which is
+exactly the contract option 2 needs.
 
 ## Emulating above the sequencer
 
@@ -1425,7 +1412,6 @@ Copying installation program to disk.
 ......... 100%
 Copy complete
 IRIX Release 6.5 IP32 Version 01200452 System V
-Copyright 1987-2000 Silicon Graphics, Inc.
 ```
 
 And then it stops, after the banner, every time.
